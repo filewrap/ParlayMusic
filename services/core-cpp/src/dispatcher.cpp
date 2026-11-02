@@ -148,6 +148,8 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onPlayPlaylist(c); });
     add({"skip", "next"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onSkip(c); });
+    add({"autoplay-skip", "askip"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onAutoplaySkip(c); });
     add({"pause"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onPause(c); });
     add({"resume"}, Scope::Group, Perm::Everyone,
@@ -329,7 +331,8 @@ void Dispatcher::registerCommands() {
         {"fvcpay", {"vplayforce", true}}, {"vcplayforce", {"vplayforce", true}},
         {"cpause", {"pause", false}}, {"cresume", {"resume", false}},
         {"cmute", {"mute", false}}, {"cunmute", {"unmute", false}},
-        {"cskip", {"skip", false}}, {"cstop", {"stop", false}},
+        {"cskip", {"skip", false}}, {"caskip", {"autoplay-skip", false}},
+        {"cstop", {"stop", false}},
         {"cend", {"stop", false}}, {"cqueue", {"queue", false}},
         {"cclear", {"clear", false}}, {"cremove", {"remove", false}},
         {"cmove", {"move", false}}, {"crestore", {"restore", false}},
@@ -595,6 +598,54 @@ int Dispatcher::chatIntField(int64_t chat_id, const std::string& field,
     }
 }
 
+double Dispatcher::chatSpeedField(int64_t chat_id) {
+    std::string v = chatField(chat_id, "speed", "");
+    if (v.empty()) return 1.0;
+    char* end = nullptr;
+    double s = std::strtod(v.c_str(), &end);
+    if (end == v.c_str() || *end != '\0' || !std::isfinite(s) ||
+        s < 0.5 || s > 2.0)
+        return 1.0;
+    return s;
+}
+
+bool Dispatcher::applyCoreFilter(const CommandContext& ctx, double speed,
+                                 int bass, const std::string& done_msg) {
+    int64_t chat = vcTarget(ctx);
+    if (chatField(chat, "voice_owner", "") != "core") return false;
+    if (!callActive(chat)) {
+        reply(ctx, "Nothing is playing.");
+        return true;
+    }
+    std::string source = chatField(chat, "core_source", "");
+    if (source.empty()) {
+        // A core session with no recorded source (e.g. joined with
+        // /join but never played a replied file through this build):
+        // there is nothing to re-attach, so say so instead of
+        // claiming the filter was applied.
+        reply(ctx, "This chat's audio is on the core voice backend, but "
+                   "no source was recorded for it, so the filter cannot "
+                   "be re-applied. Play a replied file again, then set "
+                   "the speed/bass.");
+        return true;
+    }
+    std::string title = chatField(chat, "core_title", "Replied file");
+    bool video = chatField(chat, "core_video", "0") == "1";
+    int64_t pos = voice_.time(chat);
+    int seek = pos > 0 ? static_cast<int>(pos) : 0;
+    if (!voice_.play(chat, source, title, video, seek, speed, bass)) {
+        std::string why = voice_.lastError();
+        if (why.empty()) why = voice_.describe();
+        reply(ctx, "Could not apply the filter: " + why);
+        return true;
+    }
+    reply(ctx, done_msg + " (core voice re-attached" +
+                   (seek > 0 ? " at " + fmtSeconds(seek)
+                             : " from the start (position unknown)") +
+                   " with the filter applied).");
+    return true;
+}
+
 bool Dispatcher::isAuthUser(int64_t chat_id, int64_t user_id) const {
     return store_.sismember("auth:" + std::to_string(chat_id),
                             std::to_string(user_id));
@@ -689,6 +740,61 @@ bool Dispatcher::nowPlaying(int64_t chat_id, Json& np_out, Json& track_out) {
     const Json* track = np->find("track");
     if (!track) return false;
     track_out = *track;
+    return true;
+}
+
+// HTTP API seam: the whole now-playing object for one chat, straight
+// from the engines (same vcGet fail-over as the Telegram commands).
+bool Dispatcher::apiNowPlaying(int64_t chat_id, Json& np_out,
+                               std::string& error) {
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    Engine used;
+    bool fb = false;
+    IpcResult r = vcGet(fake, "now-playing", used, fb);
+    if (!r.ok) {
+        error = r.describe();
+        return false;
+    }
+    const Json* np = r.data.find("now_playing");
+    if (!np || !np->isObject()) {
+        error = "engine response has no now_playing object";
+        return false;
+    }
+    // vc-rust answers 200 with an empty room where go/ts 404: a null
+    // track AND an empty queue is no playback state, not a track.
+    const Json* track = np->find("track");
+    const Json* queue = np->find("queue");
+    bool has_track = track && !track->isNull();
+    bool has_queue = queue && queue->isArray() && queue->size() > 0;
+    if (!has_track && !has_queue) {
+        error = "no playback state";
+        return false;
+    }
+    np_out = *np;
+    return true;
+}
+
+// HTTP API seam: the engine's queue list (POST /v1/queue action=list).
+bool Dispatcher::apiQueueList(int64_t chat_id, Json& queue_out,
+                              std::string& error) {
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    Engine used;
+    bool fb = false;
+    Json body = Json::objectOf({{"action", Json("list")},
+                                {"chat_id", Json(chat_id)}});
+    IpcResult r = vcCall(fake, "queue", body, used, fb);
+    if (!r.ok) {
+        error = r.describe();
+        return false;
+    }
+    const Json* q = r.data.find("queue");
+    if (!q || !q->isArray()) {
+        error = "engine response has no queue array";
+        return false;
+    }
+    queue_out = *q;
     return true;
 }
 
@@ -900,7 +1006,7 @@ void Dispatcher::onHelp(const CommandContext& ctx) {
           "/play <song, link or id> — play in voice chat (-f force, -v video)\n"
           "/vplay <...> — play video in voice chat\n"
           "/playplaylist — play your saved playlist\n"
-          "/pause /resume /skip /stop /end — playback\n"
+          "/pause /resume /skip /autoplay-skip /stop /end — playback\n"
           "/loop [n|off] — repeat the current track n times (0-10)\n"
           "/seek <sec> /seekback <sec> /jump <mm:ss> — seek\n"
           "/queue /playing — show the queue\n"
@@ -1059,7 +1165,13 @@ void Dispatcher::playRepliedFile(const CommandContext& ctx,
     // fake track.
     std::string track_title = title.empty() ? "Replied file" : title;
     bool video = kind == "video" || kind == "video_note";
-    if (!voice_.play(chat, saved, track_title, video)) {
+    // The chat's stored speed/bass apply here: the core voice
+    // backend is the only playback path with the filter
+    // (buildFfmpegCmd atempo/bass), so a /speed or /bass set earlier
+    // takes effect on this play, and /speed + /bass later re-attach
+    // this same source (core_source below) with new values.
+    if (!voice_.play(chat, saved, track_title, video, 0,
+                     chatSpeedField(chat), chatIntField(chat, "bass", 0))) {
         std::string why = voice_.lastError();
         if (why.empty()) why = voice_.describe();
         reply(ctx, "Could not play the replied file: " + why);
@@ -1067,6 +1179,9 @@ void Dispatcher::playRepliedFile(const CommandContext& ctx,
     }
     setChatField(chat, "last_track", track_title);
     setChatField(chat, "voice_owner", "core");
+    setChatField(chat, "core_source", saved);
+    setChatField(chat, "core_title", track_title);
+    setChatField(chat, "core_video", video ? "1" : "0");
     setCallActive(chat, true);
     reply(ctx, "▶ Now playing " + track_title +
                    " (replied file, via core voice).");
@@ -1129,6 +1244,36 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
     } else {
         setCallActive(vcTarget(ctx), false);
         reply(ctx, "⏭ Skipped — the queue is now empty.");
+    }
+}
+
+// /autoplay-skip, /askip (Phase 6): force an autoplay mix pick now.
+// Contract vc.autoplay_skip (POST /v1/autoplay-skip) exists in all
+// three VC engines, but the core exposed no command for it —
+// COMMANDS.md listed it, the route table did not. Same shape as
+// onSkip: the engines answer {now_playing} with the picked track
+// (vc-go: plain skip, same envelope); a 400 "autoplay is off" or a
+// 502 "no autoplay recommendation" surfaces honestly via replyError.
+void Dispatcher::onAutoplaySkip(const CommandContext& ctx) {
+    if (!canManageVc(ctx)) return;
+    if (!callActive(vcTarget(ctx))) {
+        reply(ctx, "Nothing is playing.");
+        return;
+    }
+    Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
+    Engine used;
+    bool fell_back = false;
+    IpcResult r = vcCall(ctx, "autoplay-skip", body, used, fell_back);
+    if (!r.ok) {
+        replyError(ctx, r);
+        return;
+    }
+    const Json* np = r.data.find("now_playing");
+    if (np && np->find("track")) {
+        reply(ctx, fmtNowPlaying(*np, "⏭ Autoplay skipped — now playing"));
+    } else {
+        setCallActive(vcTarget(ctx), false);
+        reply(ctx, "⏭ Autoplay skipped — the queue is now empty.");
     }
 }
 
@@ -1628,6 +1773,16 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         reply(ctx, "Speed must be 0.5x to 2.0x.");
         return;
     }
+    setChatField(chat, "speed", std::to_string(s));
+    // Core-owned session first: nowPlaying() below only asks the vc
+    // engines, which know nothing about a core session, so the core
+    // branch must run before it. It applies the speed for real
+    // (buildFfmpegCmd atempo) by re-attaching the source.
+    char b[16];
+    std::snprintf(b, sizeof b, "%.2g", s);
+    if (applyCoreFilter(ctx, s, chatIntField(chat, "bass", 0),
+                        std::string("Speed set to ") + b + "x"))
+        return;
     Json np, track;
     if (!nowPlaying(chat, np, track)) {
         reply(ctx, "Nothing is playing.");
@@ -1638,11 +1793,15 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         reply(ctx, "Playback is paused.");
         return;
     }
-    setChatField(chat, "speed", std::to_string(s));
-    // Restart the stream at the same position with the new speed
-    // (NoxBeats play_media restart). The vc services apply the restart
-    // via seek; the atempo filter itself is applied by engines that
-    // support it — the stored speed is what /pos and /speed report.
+    // Engine-owned session (NoxBeats play_media restart shape):
+    // restart the stream at the same position. Honest limit
+    // (REMAINING.md B11): NO vc engine applies the value — vc-go
+    // keeps queue state only and never touches audio, and vc-ts /
+    // vc-rust run their ffmpeg pipeline once per track and never
+    // re-encode on seek, so the seek-restart below only moves the
+    // position. The value is stored (what /pos and /speed report)
+    // and takes effect on core-voice playback; the reply says so
+    // instead of claiming the speed was set.
     int64_t pos =
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     Json body = Json::objectOf({
@@ -1656,10 +1815,11 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    char b[16];
-    std::snprintf(b, sizeof b, "%.2g", s);
-    reply(ctx, std::string("Speed set to ") + b +
-                   "x (stream restarted at the current position).");
+    reply(ctx, std::string("Speed ") + b +
+                   "x saved, but the " + std::string(engineName(used)) +
+                   " engine cannot apply audio filters — the stream "
+                   "restarted at the current position at the old speed. "
+                   "It applies to core-voice playback (replied files).");
 }
 
 void Dispatcher::onBass(const CommandContext& ctx) {
@@ -1681,6 +1841,14 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         reply(ctx, "Bass must be 0-100.");
         return;
     }
+    setChatField(chat, "bass", std::to_string(lvl));
+    // Core-owned session first: nowPlaying() below only asks the vc
+    // engines, which know nothing about a core session. The core
+    // backend applies the bass boost for real (buildFfmpegCmd lowpass
+    // mix) — see onSpeed.
+    if (applyCoreFilter(ctx, chatSpeedField(chat), lvl,
+                        "Bass set to " + std::to_string(lvl)))
+        return;
     Json np, track;
     if (!nowPlaying(chat, np, track)) {
         reply(ctx, "Nothing is playing.");
@@ -1691,7 +1859,8 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         reply(ctx, "Playback is paused.");
         return;
     }
-    setChatField(chat, "bass", std::to_string(lvl));
+    // Engine-owned session: same honest limit as /speed — the seek
+    // below only moves the position; no engine applies the value.
     int64_t pos =
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     Json body = Json::objectOf({
@@ -1705,8 +1874,11 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    reply(ctx, "Bass set to " + std::to_string(lvl) +
-                   " (stream restarted at the current position).");
+    reply(ctx, "Bass " + std::to_string(lvl) +
+                   " saved, but the " + std::string(engineName(used)) +
+                   " engine cannot apply audio filters — the stream "
+                   "restarted at the current position unchanged. "
+                   "It applies to core-voice playback (replied files).");
 }
 
 void Dispatcher::onMute(const CommandContext& ctx) {
@@ -2800,7 +2972,13 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
                                      std::to_string(targets.size()) +
                                      " chats/users...");
     int count = 0, failed = 0;
-    std::string failures;
+    // One id per line, after a header that says what the failure
+    // was: the Bot API forward/copy calls return only
+    // success/failure, so no per-chat error text exists to list —
+    // each id below is a chat that rejected the broadcast.
+    std::string failures =
+        "# chats that rejected the broadcast (forward/copy failed; "
+        "the Bot API returns no per-chat error text)\n";
     for (int64_t target : targets) {
         bool ok = false;
         if (copy)
@@ -2820,9 +2998,19 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
     std::string text = "Broadcast done: " + std::to_string(count) +
                        " delivered, " + std::to_string(failed) + " failed.";
     if (failed && sent_id > 0) {
-        // Report failures in the same message (NoxBeats sends errors.txt;
-        // the core has no sendDocument yet, so the ids go inline).
-        text += "\nFailed ids:\n" + failures.substr(0, 3000);
+        // Failures go out as an errors.txt attachment (NoxBeats
+        // behaviour), not inline: a big fan-out can fail on hundreds
+        // of chats and the inline list was truncated at 3000 chars.
+        // If the upload itself fails, fall back to the inline list
+        // rather than silently losing the ids.
+        std::string doc_err;
+        std::string caption =
+            "Broadcast failures (" + std::to_string(failed) + " chats):";
+        if (tg_.sendDocument(ctx.message.chat.id, "errors.txt", failures,
+                             caption, &doc_err) < 0) {
+            text += "\nFailed ids (errors.txt upload failed: " + doc_err +
+                    "):\n" + failures.substr(0, 3000);
+        }
     }
     if (sent_id > 0)
         tg_.sendMessageId(ctx.message.chat.id, text);
@@ -2902,25 +3090,58 @@ void Dispatcher::onJson(const CommandContext& ctx) {
     reply(ctx, out);
 }
 
+double Dispatcher::speedMbps(size_t bytes, double secs) {
+    if (secs <= 0) return 0;
+    return static_cast<double>(bytes) * 8.0 / (secs * 1e6);
+}
+
+std::string Dispatcher::formatSpeedtest(double down_mbps, bool up_ok,
+                                        double up_mbps, int up_status,
+                                        const std::string& up_error) {
+    char b[64];
+    std::snprintf(b, sizeof b, "%.2f", down_mbps);
+    std::string out = std::string("Speed test:\nDownload: ") + b + " Mbps";
+    if (!up_ok) {
+        out += "\nUpload probe failed (HTTP " + std::to_string(up_status) +
+               (up_error.empty() ? "" : ": " + up_error) + ").";
+    } else {
+        std::snprintf(b, sizeof b, "%.2f", up_mbps);
+        out += std::string("\nUpload: ") + b + " Mbps";
+    }
+    return out;
+}
+
 void Dispatcher::onSpeedtest(const CommandContext& ctx) {
     reply(ctx, "Running speed test...");
-    // Cloudflare speed endpoints (NoxBeats bot_tools.cpp::run_speedtest).
+    // Cloudflare speed endpoints (NoxBeats bot_tools.cpp::run_speedtest):
+    // download probe (25 MB) + upload probe (4 MB POST to __up, the
+    // endpoint Cloudflare's own speed test uses). Each probe is timed
+    // separately and bounded — the upload is 4 MB / 30 s so a slow
+    // uplink never hangs the chat; an upload failure is reported
+    // honestly next to the download number instead of failing the
+    // whole test.
     auto t0 = std::chrono::steady_clock::now();
     HttpResult down = HttpClient::get(
         "https://speed.cloudflare.com/__down?bytes=25000000", {}, 40);
-    double secs =
+    double down_secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
             .count();
     if (!down.ok() || down.body.empty()) {
         reply(ctx, "Speed test failed (download probe error).");
         return;
     }
-    double down_mbps = down.body.size() * 8.0 / (secs * 1e6);
-    char b[64];
-    std::snprintf(b, sizeof b, "%.2f", down_mbps);
-    reply(ctx, std::string("Speed test:\nDownload: ") + b +
-                   " Mbps\n(Upload probe skipped: the core measures "
-                   "download only; NoxBeats also uploads 8 MB.)");
+    double down_mbps = speedMbps(down.body.size(), down_secs);
+    auto u0 = std::chrono::steady_clock::now();
+    std::string up_body(4 * 1024 * 1024, '\0');
+    HttpResult up = HttpClient::postRaw(
+        "https://speed.cloudflare.com/__up", up_body,
+        "application/octet-stream", {}, 30);
+    double up_secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - u0)
+            .count();
+    reply(ctx, formatSpeedtest(down_mbps, up.ok(),
+                               speedMbps(up_body.size(), up_secs), up.status,
+                               up.error));
 }
 
 void Dispatcher::onBug(const CommandContext& ctx) {

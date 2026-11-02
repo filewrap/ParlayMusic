@@ -100,6 +100,15 @@ GET /healthz without token → HTTP 200   PASS
 
 ## Still stubbed
 
+> **SUPERSEDED in part (Phase 4/5, 2026-11-03).** The bullets below are
+> the Phase 3 state. Since then: `NETEASE_MUSIC_U` login is wired
+> (Phase 5, B3); weapi/linuxapi-encrypted requests exist
+> (`weapi.go`, `linuxapi.go`, `SongURLWithLevel` steps 2/3/5); the
+> mirror fallback downloads real audio (Phase 4: 3 ffprobe-verified
+> FLACs). Still true: audio recognition is not ported (dropped, B7);
+> QR login is not implemented; no *automated* live download test
+> exists (the "works live" claim rests on PHASE4's manual run).
+
 - Audio recognition (`handlers_recognize.go` in the ref) — not ported.
 - No `MUSIC_U` login / QR login — anonymous only, by design.
 - No weapi-encrypted requests — the route to unlock v1 song URLs.

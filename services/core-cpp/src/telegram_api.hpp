@@ -114,11 +114,24 @@ public:
 
     // deleteMessage / leaveChat / forwardMessage / copyMessage — used by
     // clean mode, cmddelete, /broadcast and bot-removed handling.
+    // forward/copy are virtual so dispatcher tests can script fan-out
+    // outcomes without touching the network (like sendMessageId).
     bool deleteMessage(int64_t chat_id, int64_t message_id);
     bool leaveChat(int64_t chat_id);
-    bool forwardMessage(int64_t to_chat, int64_t from_chat,
-                        int64_t message_id);
-    bool copyMessage(int64_t to_chat, int64_t from_chat, int64_t message_id);
+    virtual bool forwardMessage(int64_t to_chat, int64_t from_chat,
+                                int64_t message_id);
+    virtual bool copyMessage(int64_t to_chat, int64_t from_chat,
+                             int64_t message_id);
+    // sendDocument(chat_id, filename, content, caption) -> the new
+    // message id, or -1 + error. Multipart upload (Bot API
+    // sendDocument): the /broadcast failure list goes out as an
+    // errors.txt attachment instead of inline text. Virtual so
+    // dispatcher tests can record the attachment without a network.
+    virtual int64_t sendDocument(int64_t chat_id,
+                                 const std::string& filename,
+                                 const std::string& content,
+                                 const std::string& caption,
+                                 std::string* error_out = nullptr);
     // Invite link for the assistant join (NoxBeats ensure_assistant).
     std::string exportChatInviteLink(int64_t chat_id);
     // Resolve a user id to a display name (best effort).

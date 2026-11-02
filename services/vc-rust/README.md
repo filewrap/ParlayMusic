@@ -107,7 +107,7 @@ Same `vc.*` IPC as vc-go/vc-ts; the core falls back here when Go/TS fail.
   to a live receiver. `joined:true` is never reported without a real
   join; the live join is a live-test-time check.
 
-## Stubbed (out of scope in the sandbox)
+## Known gaps (not implemented — not stubs)
 
 - No cancel-download path (ParvatiMusic lets the user cancel an
   in-flight download; here a download runs to completion or its 300 s

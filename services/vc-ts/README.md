@@ -185,7 +185,9 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
 - `src/resolvers.js` — YouTube (yt-dlp) / JioSaavn / Lemonic / lyrics
   (LRCLib) / radio-track resolvers.
 - `src/voicecall.js` — real voice transport: Opus/RTP pipeline +
-  ntgcalls offer + voice-bridge join client (see above).
+  ntgcalls offer + honest join failure (no MTProto client in-process
+  since the voice bridge was deleted in Phase 5; join via the
+  core-cpp TDLib backend — see above).
 - `tests/run.js` — 32 tests (`npm test`): live JioSaavn/LRCLib/yt-dlp
   + stub-Lemonic keyed/unauthenticated + panel/loop/radio regressions
   + loop/shuffle/autoplay routes + A9 placeholder rejection +

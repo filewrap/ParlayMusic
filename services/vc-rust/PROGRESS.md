@@ -94,11 +94,12 @@ correct header -> 200; /healthz stays open without a token.
 ## Real vs stubbed
 - REAL: state machine, queue, ticker, persistence, pattern + yt-dlp
   resolve, envelopes, auth, loop/shuffle/autoplay (Phase 4).
-- STUBBED: voice join to a live call (Opus/RTP pipeline proven to a
-  file; `LoggingVoiceCall` deleted in Phase 4, `RealVoiceCall` in
-  `src/voice.rs`); no download path. Live yt-dlp resolve works in the
-  sandbox via the downloaders venv (verified 2026-11-02) — the old
-  "yt-dlp absent, pattern-only" line was stale.
+- BLOCKED (host-gated, not a stub): voice join to a live call
+  (Opus/RTP pipeline proven to a file; `LoggingVoiceCall` deleted in
+  Phase 4, `RealVoiceCall` in `src/voice.rs`); no download path. Live
+  yt-dlp resolve works in the sandbox via the downloaders venv
+  (verified 2026-11-02) — the old "yt-dlp absent, pattern-only" line
+  was stale.
 
 ## Voice transport — real pipeline + join client (Phase 4, TDLib wiring B, 2026-11-02)
 

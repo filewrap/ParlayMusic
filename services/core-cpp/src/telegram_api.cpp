@@ -284,6 +284,57 @@ int64_t TelegramApi::sendMessageId(int64_t chat_id, const std::string& text,
     return id ? id->asInt() : -1;
 }
 
+int64_t TelegramApi::sendDocument(int64_t chat_id,
+                                  const std::string& filename,
+                                  const std::string& content,
+                                  const std::string& caption,
+                                  std::string* error_out) {
+    // Bot API sendDocument is multipart: chat_id + caption are text
+    // fields, the file is the "document" part. The filename is
+    // sanitized to one inert token (no path separators, no quotes)
+    // so a caller-supplied name cannot smuggle in a path or a
+    // forged part header; the multipart builder itself also
+    // guarantees the boundary never appears in any value.
+    std::string safe;
+    for (char c : filename) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')
+            safe += c;
+    }
+    if (safe.empty() || safe == "." || safe == "..") safe = "file.txt";
+    HttpResult r = HttpClient::postMultipart(
+        base_ + "/sendDocument",
+        {{"chat_id", std::to_string(chat_id)}, {"caption", caption}},
+        "document", safe, content, "text/plain", {}, 60);
+    if (!r.ok()) {
+        std::string err = "HTTP " + std::to_string(r.status) +
+                          (r.error.empty() ? "" : ": " + r.error);
+        if (!r.body.empty()) err += " body=" + r.body;
+        if (error_out) *error_out = err;
+        std::cerr << "[tg] sendDocument failed: " << err << "\n";
+        return -1;
+    }
+    Json parsed;
+    try {
+        parsed = Json::parse(r.body);
+    } catch (const std::exception& e) {
+        if (error_out)
+            *error_out = std::string("bad JSON from Telegram: ") + e.what();
+        return -1;
+    }
+    if (!parsed.find("ok") || !parsed.find("ok")->asBool()) {
+        const Json* desc = parsed.find("description");
+        if (error_out)
+            *error_out = desc ? desc->asString()
+                              : "Telegram API returned ok=false";
+        return -1;
+    }
+    const Json* result = parsed.find("result");
+    if (!result) return -1;
+    const Json* id = result->find("message_id");
+    return id ? id->asInt() : -1;
+}
+
 std::string TelegramApi::getChatMemberStatus(int64_t chat_id, int64_t user_id) {
     std::string err;
     Json params = Json::objectOf({

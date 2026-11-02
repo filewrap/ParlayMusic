@@ -79,6 +79,15 @@ Smoke test 3 — runner auto-advance, PORT 8003:
 
 ## Real vs stubbed
 
+> **SUPERSEDED in part (Phase 4/5, 2026-11-03).** The bullets below are
+> the Phase 3 state. Since then: the degraded resolver was deleted
+> (Phase 5, A9) — an unresolvable query is 502 `engine_unavailable`;
+> MongoDB persistence is real when `MONGO_URI` is set (Phase 4);
+> yt-dlp resolution + high-perf prefetch + `stream_url` are verified
+> live (Phase 4/5). Still true: ntgcalls voice joining / audio output
+> is out of scope by design (the core's `VoiceCall` job), and actual
+> voice streaming needs the core + a live join (A1).
+
 - REAL: HTTP IPC + auth + envelopes; per-chat queue/playback state
   (thread-safe); both profile paths in the runner (prefetch workers
   exist and are wired — they only resolve when yt-dlp is present);

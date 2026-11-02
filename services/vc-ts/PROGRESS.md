@@ -107,6 +107,17 @@ after killing the node PID worked.)
 
 ## Still stubbed / untested
 
+> **SUPERSEDED in part (Phase 4/5, 2026-11-03).** The bullets below are
+> the Phase 3 state. Since then: voice transport is the real Opus/RTP
+> pipeline + in-process ntgcalls offer (live join blocked in the
+> sandbox, not a stub — see the "Voice transport" section below);
+> JioSaavn durations are real (268 s, Phase 4 fix); lyrics
+> (`POST /v1/lyrics`) and the live control panel (`/v1/panel`,
+> `/v1/volume`) are built and in the contract (Phase 4/5); the
+> degraded placeholder resolve was deleted (Phase 5, A9) — a failed
+> YouTube resolve is `engine_unavailable`, never a fake track.
+> Still true: the Lemonic keyed path is untested (no key in sandbox).
+
 - Voice joining (ntgcalls/tgcalls) — stubbed, see README.
 - Lemonic keyed path (search/download with a real key) — untested, no
   key in sandbox.

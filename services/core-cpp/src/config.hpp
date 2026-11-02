@@ -37,7 +37,7 @@ struct Config {
     std::string dl_url = "http://downloaders:8009";    // DL_URL / DOWNLOADERS_URL
     std::string netease_url = "http://netease-go:8010";  // NETEASE_URL
 
-    int port = 8080;  // PORT — core HTTP port (GUI /api surface, future)
+    int port = 8080;  // PORT — core HTTP port (GUI /api surface, Phase 6 A2)
 
     // Group management (NoxBeats sudo/auth model, ported to env lists).
     int64_t owner_id = 0;                    // OWNER_ID

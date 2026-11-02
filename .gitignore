@@ -27,3 +27,5 @@ phase5/
 *.sqlite3
 *.sqlite
 *.node
+phase6/
+phase6-mongo-data/

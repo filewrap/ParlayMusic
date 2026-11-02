@@ -70,7 +70,10 @@ struct Track {
     source: String,
     url: String,
     duration_sec: i64,
-    /// "yt-dlp" | "url-pattern" | "pattern" — how this track was resolved.
+    /// "yt-dlp" | "spotify-api" | "autoplay-mix" | "client" — how this
+    /// track was resolved. ("pattern" / "url-pattern" values were the
+    /// Phase 3 degraded fallback, deleted in Phase 5 A9; they are never
+    /// produced any more.)
     resolved_by: String,
     /// Local audio file downloaded by `download_audio` (mp3), if any.
     file_path: Option<String>,

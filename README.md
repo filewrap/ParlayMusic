@@ -34,18 +34,20 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) and [PORT_MAP.md](PORT_MAP.md).
 
 ## Status
 
-**Implemented through Phases 2–4 + TDLib wiring (2026-11-03).** All 12
-services build clean and 146 tests pass on re-run (audit:
-`REMAINING.md`); Phase 5 is closing the wiring gaps (compose ports,
-Dockerfiles, contract routes). What is real, per service:
+**Implemented through Phases 2–5 + TDLib wiring (2026-11-03).** All 12
+services build clean and 361 tests pass on re-run (Phase 5
+verification; see `PHASE5.md` §6). Phase 6 closes the remaining
+audit gaps (see `REMAINING.md`). What is real, per service:
 
 - **core-cpp** — full command surface + permissions, engine fail-over
-  (go→ts→rust), Mongo/Redis store, TDLib 1.8.69 client (7/7 tests) +
-  in-process ntgcalls voice backend. No HTTP server yet, so the GUI's
-  now-playing/queue endpoints have no backend (A2).
+  (go→ts→rust), Mongo/Redis store, TDLib 1.8.69 client (26/26 tests) +
+  in-process ntgcalls voice backend. Serves its own HTTP API on
+  `:8080` (`GET /healthz`, `/api/now-playing`, `/api/queue` — Phase 6,
+  A2 closed), so the GUI's now-playing/queue endpoints have a real
+  backend now; with no `BOT_TOKEN` the core runs HTTP-only.
 - **vc-go / vc-ts / vc-rust** — queue + playback state machines, real
-  resolvers (yt-dlp), loop/shuffle/autoplay in Go and Rust (vc-ts has
-  panel toggles only — A3), Opus/RTP pipeline proven to a file in all
+  resolvers (yt-dlp), loop/shuffle/autoplay in all three engines (A3
+  closed in Phase 5), Opus/RTP pipeline proven to a file in all
   three (251 frames). **No live voice join has ever happened** — audio
   has never reached a Telegram voice chat (A1, needs a host with open
   network + assistant session + libntgcalls.so).
@@ -103,7 +105,7 @@ see the header of `docker-compose.yml` for the four code-default
 overrides): core 8080, vc-go 8001, vc-ts 8002, vc-rust 8003, audio-fx
 8004, share 8005, queue 8006, spotify 8007, radio 8008, downloaders
 8009, netease 8010, gui 3000, slskd 5030/5031. Health: `GET /healthz`
-on every service except core-cpp (no HTTP server yet).
+on every service, including core-cpp (:8080).
 
 ## Configuration
 
@@ -113,7 +115,7 @@ No secrets are committed. Copy the template and fill it in locally:
 cp .env.example .env   # BOT_TOKEN, API_ID, API_HASH, MONGO_URI, etc.
 ```
 
-`.env.example` lists every variable the code reads (~60, one line each
+`.env.example` lists every variable the code reads (84, one line each
 with a comment). Never commit `.env`. See `.gitignore`.
 
 ## License

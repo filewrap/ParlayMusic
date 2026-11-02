@@ -67,7 +67,8 @@ honestly, each run.)
 ## Still stubbed / untested
 
 - No audio is relayed to listeners or into a voice call (the VC
-  engine's voice path is itself stubbed; nothing to pipe into yet).
+  engine's voice path is real transport with a blocked live join — A1,
+  not a stub; nothing to pipe into yet).
 - No HTTP listener endpoint (`/<chat-id>` audio/mp3 in upstream) —
   no contract action for it.
 - Fallback playlist entries are Parlay's own labels, not live ICY

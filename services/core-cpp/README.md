@@ -20,7 +20,9 @@ cmake -S . -B build && cmake --build build
 
 No external libraries are linked: the sandbox has no libcurl dev headers,
 no nlohmann/json and no libmongoc. JSON is hand-rolled (`src/json.*`), HTTP
-goes through the system `curl` CLI via popen (`src/http.*`), Redis speaks
+goes through the system `curl` CLI via popen (`src/http.*`), and the
+GUI-facing HTTP server is std-only POSIX sockets on its own thread
+(`src/http_server.*`, `src/core_api.*`). Redis speaks
 RESP over a raw socket and MongoDB speaks the OP_MSG wire protocol
 (`src/store.cpp`) — both hand-rolled, both tested against real servers.
 ntgcalls is dlopen'd at runtime when present (`src/voice_call.cpp`).
@@ -53,9 +55,12 @@ DURATION_LIMIT, QUEUE_LIMIT, SUPPORT_CHAT
 
 Defaults match `docker-compose.yml` (vc-go :8001, vc-ts :8002, vc-rust
 :8003, audio-fx-rust :8004, share-rust :8005, queue-rust :8006,
-radio-js :8008, downloaders :8009). `BOT_TOKEN` and `PARLAY_TOKEN` are
-required; the process exits with a clear message if either is missing.
-`API_ID`/`API_HASH` are the fallback for `TD_API_ID`/`TD_API_HASH`
+spotify-rust :8007, radio-js :8008, downloaders :8009, netease-go
+:8010). `BOT_TOKEN` gates Telegram polling
+only: with no `BOT_TOKEN` the core still starts and serves its HTTP API
+(HTTP-only mode, no polling). With no `PARLAY_TOKEN` it warns and engine
+calls go out unauthenticated (engines that require a token refuse
+honestly). `API_ID`/`API_HASH` are the fallback for `TD_API_ID`/`TD_API_HASH`
 (TDLib voice backend); the Telethon voice bridge that used to need
 them was deleted in Phase 5. Exit code 42 from `/restart` is the
 supervisor-restart signal.
@@ -68,6 +73,20 @@ supervisor-restart signal.
   `getMe`, `deleteMessage`, `leaveChat`, `forwardMessage`, `copyMessage`,
   `exportChatInviteLink`. Plain-text replies on purpose (track titles
   must never break formatting). Base URL from `TELEGRAM_API_BASE`.
+- **HTTP API** (`src/http_server.*`, `src/core_api.*`, Phase 6 A2) — the
+  core's GUI-facing surface on `PORT` (default 8080), std-only POSIX
+  sockets on its own thread so the Telegram long-poll loop is never
+  blocked. `GET /healthz` → `{"ok":true}`;
+  `GET /api/now-playing?chat_id=<id>` → the chat engine's live
+  now-playing object (via `Dispatcher::apiNowPlaying`, same vcGet
+  fail-over as the Telegram commands); `GET /api/queue?chat_id=<id>` →
+  the live queue (now-playing's `queue` field, falling back to the
+  engine's queue list when now-playing reports no state but the list
+  is non-empty). No state / no engine reachable →
+  `404 {"ok":false,"error":"no playback state"}` — never demo/fake
+  data. Flat JSON, not the IPC envelope (see `contracts/README.md`).
+  The server starts before any token check: with no `BOT_TOKEN` the
+  core runs HTTP-only and the API can still proxy real engine state.
 - **Command dispatcher** (`src/dispatcher.*`, 3,199 lines) — the full
   NoxBeats inventory from `Bad/cmd/register.hpp`, with the same route
   shape (Scope Any/Group/Private, Perm Everyone/Sudo/Owner), the same
@@ -84,6 +103,16 @@ supervisor-restart signal.
   background sweeper deletes bot + command messages), `thumbnail/nothumb`,
   `autoplay [on|off|lang|mood]` (background watcher queues a related
   track when a session drains). Channel-play: `channelplay`, `userbot`.
+  `/autoplay-skip` / `/askip` (Phase 6): forces an autoplay mix pick now
+  (`vc.autoplay_skip`, all three engines; 400 when autoplay is off).
+- **`/mute` + replied-media `/play` (Phase 5, were limits)** —
+  `/mute`/`/unmute` call the real voice backend on core-owned sessions
+  (`vc.mute`, `VoiceCall::mute()`/`unmute()` → TDLib/ntgcalls; a backend
+  failure replies honestly and leaves the flag untouched); engine-owned
+  sessions honestly refuse. `/play` auto-takes the `file_id` from
+  `reply_to_message` (audio/document/voice/video_note), downloads via
+  Bot API `getFile` (20 MB cap, traversal rejected) and plays through
+  the core voice backend; no media + no query keeps the usage error.
   Admin: `auth/unauth/authlist`, `admincache` (600 s per-user cooldown),
   `blacklist/unblacklist/whitelist`, `blacklisted`. Sudo:
   `addsudo/delsudo/listsudo`, `ac/activevc`, `broadcast` (reply-required,
@@ -178,6 +207,22 @@ supervisor-restart signal.
   `g++ -std=c++20 -I src tests/store_test.cpp src/store.cpp src/json.cpp
   src/config.cpp -o /tmp/store_test && /tmp/store_test
   "mongodb://127.0.0.1:27017/parlay_test" "redis://127.0.0.1:6399/0"`.
+- `tests/router_test.cpp` — **20/20 PASS** (fail-over on 5xx / transport
+  errors / `engine_unavailable` / 404-for-known-action).
+  `tests/dispatcher_test.cpp` — **81/81 PASS** (47 Phase 5 + 6 Phase 6
+  `/autoplay-skip`/`/askip` + 10 Phase 6 `/broadcast`
+  `errors.txt` + 13 Phase 6 Worker C `/speed`/`/bass` core-voice
+  filter path + 5 `/speedtest` helpers): reply-media parsing, replied-media
+  `/play`, mute/unmute core + engine sessions, join, autoplay-skip
+  success/alias/nothing-playing/engine-400, broadcast attachment /
+  all-delivered / upload-failure fallback / no-reply, speed/bass
+  core re-attach at the stored position / no-source honest reply /
+  engine saved-not-applied reply / stored values into replied-file
+  plays, speedMbps + formatSpeedtest. Rebuild + run:
+  `g++ -std=c++20 -I src tests/dispatcher_test.cpp src/dispatcher.cpp
+  src/telegram_api.cpp src/ipc.cpp src/engine_router.cpp src/store.cpp
+  src/json.cpp src/config.cpp src/http.cpp src/voice_call.cpp
+  src/tdlib_client.cpp -o /tmp/dispatcher_test -ldl && /tmp/dispatcher_test`.
 - Opus pipeline proof (`/tmp/opus_proof.cpp`, `/tmp/rtp_recv.py`): 5 s
   440 Hz tone → **251 Opus frames, 83,736 bytes, 5.0065 s** (ffprobe).
   RTP packetization proven to a file: 85,973 bytes, SDP
@@ -195,8 +240,38 @@ supervisor-restart signal.
   linked in-process). The paragraph below described the old route; it
   is kept only as history. Join now goes through the TDLib backend
   (`TD_SESSION_DIR` + `TDJSON_LIB`).
-- Binary smoke: no env → exit 1 in 0.00 s,
-  `missing required env vars: BOT_TOKEN PARLAY_TOKEN`.
+- **HTTP API** (`tests/http_api_test.cpp`, Phase 6 A2) — **37/37 PASS**:
+  CoreApi routing with a scripted provider (healthz, now-playing /
+  queue success + honest 404/400/405, queue-list fallback); the server
+  over a real socket on an ephemeral port (curl-CLI client); the
+  Dispatcher proxying a stub VC engine on 127.0.0.1 (canned IPC
+  envelopes) end to end; plus the Worker C stop-race check (25
+  start/serve/stop cycles). Rebuild + run: the `g++` line in the test
+  file's header comment.
+- **Telegram API** (`tests/telegram_api_test.cpp`, Phase 6 Worker C) —
+  **24/24 PASS** against a local stub server: `sendDocument`
+  multipart body (chat_id/caption fields, `errors.txt` part, exact
+  file bytes, boundary), hostile-filename sanitizing, ok:false and
+  HTTP 500 honest failures, `postRaw` binary body byte-exact
+  (the `/speedtest` upload mechanism), `postJson` still
+  `application/json`. Rebuild + run: the `g++` line in the test
+  file's header comment.
+- **Shutdown (Phase 6 Worker C):** `SIGTERM` used to abort the core
+  (exit 134, glibc `FD_SETSIZE` — `HttpServer::stop()` closed the
+  listen socket and stored -1 while the accept thread was between
+  `select()` and `FD_ISSET()`). Fixed by snapshotting the fd per
+  iteration + an atomic exchange in `stop()`; verified old binary
+  8/8 aborts vs fixed binary 8/8 clean exits 0 with
+  `parlay-core: shutting down.` Teardown takes ~2 s (TDLib close
+  pump); give the process a 5 s SIGTERM grace before SIGKILL.
+- Binary smoke: no env → HTTP API on `:8080` starts and answers
+  `/healthz`; Telegram polling stays off
+  (`missing env vars: BOT_TOKEN PARLAY_TOKEN`) until a token is set.
+  Live smoke 2026-11-03 (no tokens): core `:18080` + real vc-go
+  `:18001` — `/healthz` 200, no-state `/api/now-playing` /
+  `/api/queue` 404 `{"ok":false,"error":"no playback state"}`, and
+  after a queue add to vc-go the core proxied the real track
+  (`yt:smoke1`) on both endpoints.
 - TDLib: build **finished 100%** 2026-11-02 (log `phase4/tdlib-build.log`,
   933 lines, 0 errors, `libtdjson.so.1.8.69`, 50 MB); the C++ client
   `src/tdlib_client.{hpp,cpp}` exists and passes 26/26 checks
@@ -211,43 +286,38 @@ supervisor-restart signal.
 
 ## Honest limits (not stubs — reported as limits)
 
-- **Mute is flag-only**: no vc mute action exists in the IPC contract,
-  so `/mute`/`/unmute` store the per-chat flag and say so.
-- **Speed/bass filters are not applied by vc services**: `/speed` and
-  `/bass` seek-restart at the same position and store the value; the
-  filter itself is not yet applied downstream.
-- **`/play` from a replied-to media file** reports that the downloaders
-  file_id hand-off is not implemented yet (link/search/reply-text
-  paths work).
+- **Speed/bass filters are applied only on core-voice sessions**:
+  `/speed` and `/bass` re-attach the core backend's source with the
+  filter (ffmpeg `atempo` / lowpass) at the current position, and
+  stored values apply to later core plays. On vc-engine sessions
+  they seek-restart at the same position and store the value only —
+  vc-go/vc-ts/vc-rust expose no speed/pitch/bass control over IPC
+  or in their playback paths, so applying it there needs a new
+  audio-filter subsystem in the engines. The engine reply says the
+  value was only saved instead of claiming it was set.
 - **`/lang` is English-only**: non-`en` is not stored (no locale files).
-- **`/broadcast`** lists failed ids inline; there is no `sendDocument`
-  `errors.txt` attachment yet.
-- **`/speedtest`** is download-only (Cloudflare probe); upload is
-  skipped honestly.
+- **`/broadcast`** sends failed ids as an `errors.txt` attachment
+  (real Bot API `sendDocument`, Phase 6 Worker C); inline list only
+  if the upload itself fails.
+- **`/speedtest`** measures download (25 MB) + upload (4 MB POST to
+  Cloudflare `__up`, 30 s timeout, Phase 6 Worker C); a failed upload probe is
+  reported honestly next to the download number. Note: from this
+  sandbox the upload probe times out (the sandbox egress stalls
+  POSTs — verified: 100 KB POSTs to `speed.cloudflare.com/__up` and
+  to httpbin.org both time out while GETs succeed), so a sandbox run
+  reports the download number plus an honest upload failure — the
+  probe needs a host with open egress to show an upload number.
 - **`/eval`** is a real owner shell (`sh -c`, 60 s) — owner-only, as in
   NoxBeats.
 - **Mongo SCRAM auth** is not implemented; the wire client rejects
   authenticated URIs with an exact message.
 - **Voice joining needs a real assistant session + network to Telegram
   DCs**: the sandbox has no direct TCP route to Telegram (proxy-only
-  egress), so Telethon connect fails here with a connection error. Every
-  step up to the network call is exercised; live join is a
-  live-test-time check.
+  egress), so the TDLib client cannot authorize here. Every step up to
+  the network call is exercised; live join is a live-test-time check.
 
 ## Not yet implemented
 
-- **Core HTTP port (`PORT`, GUI `/api/*`)** — not served yet; the core
-  currently only long-polls Telegram. The GUI contract
-  (`gui.now_playing`, `gui.queue`) is a follow-up.
 - **File delivery for `/download`** — the core reports the downloader's
   `file_path`; sending the audio file into chat (Bot API `sendAudio` /
   MTProto for oversize) is a follow-up.
-- **TDLib C++ client** — implemented (`src/tdlib_client.{hpp,cpp}`,
-  26/26 checks, TDLib 1.8.69 built 2026-11-02). First-time auth is
-  env-gated end to end: phone/code/password, email/email-code,
-  first registration, or QR login (`TD_QR=1`, link in
-  `otherDeviceLink()`); only an in-store Premium purchase cannot be
-  driven headless. A live join still needs a `TD_SESSION_DIR`
-  (pre-authorized, or created by the first-time flow above) +
-  `libntgcalls.so` on a host with open network; see the TDLib test
-  bullet above.

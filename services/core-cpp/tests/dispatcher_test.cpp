@@ -1,5 +1,7 @@
 // dispatcher_test.cpp — Dispatcher: /play from replied-to media, /mute,
-// /join (Phase 5, Worker B).
+// /join (Phase 5, Worker B); /autoplay-skip, /broadcast errors.txt
+// (Phase 6, Worker B); /speed + /bass core-voice filter path,
+// engine honest replies, /speedtest helpers (Phase 6, Worker C).
 //
 // - TelegramApi::parseMessage: reply with audio / document / video_note
 //   file_id is captured; a reply with no media captures nothing.
@@ -22,6 +24,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -62,6 +65,41 @@ public:
     bool download_ok = true;
     std::string download_saved =
         "/tmp/parlay-dispatcher-test/replied/BQACAgAAA.ogg";
+    // Broadcast fan-out scripting (Phase 6, B11): forward/copy fail
+    // for the chats in forward_fail; sendDocument records the
+    // attachment (or fails when doc_ok is false).
+    std::set<int64_t> forward_fail;
+    bool doc_ok = true;
+    struct DocCall {
+        int64_t chat;
+        std::string filename;
+        std::string content;
+        std::string caption;
+    };
+    std::vector<DocCall> docs;
+    bool forwardMessage(int64_t to_chat, int64_t from_chat,
+                        int64_t message_id) override {
+        (void)from_chat;
+        (void)message_id;
+        return forward_fail.count(to_chat) == 0;
+    }
+    bool copyMessage(int64_t to_chat, int64_t from_chat,
+                     int64_t message_id) override {
+        (void)from_chat;
+        (void)message_id;
+        return forward_fail.count(to_chat) == 0;
+    }
+    int64_t sendDocument(int64_t chat_id, const std::string& filename,
+                         const std::string& content,
+                         const std::string& caption,
+                         std::string* error_out) override {
+        if (!doc_ok) {
+            if (error_out) *error_out = "simulated upload failure";
+            return -1;
+        }
+        docs.push_back({chat_id, filename, content, caption});
+        return 99;
+    }
     int64_t sendMessageId(int64_t chat_id, const std::string& text,
                           int64_t reply_to,
                           std::string* error_out) override {
@@ -99,6 +137,13 @@ public:
     explicit FakeIpc(const parlay::Config& cfg) : parlay::IpcClient(cfg) {}
     mutable std::vector<std::string> posts;  // "base|action"
     mutable std::vector<std::string> gets;   // path
+    // Scripted autoplay-skip answer (Phase 6): empty = success with a
+    // canned mix pick; non-empty = fail with this message (bad_request).
+    mutable std::string autoplay_skip_error;
+    // Scripted playback state (Phase 6, B11 speed/bass engine path):
+    // when true, GET now-playing returns a playing track and POST
+    // seek succeeds; when false (default) the engines know nothing.
+    mutable bool np_ok = false;
     parlay::IpcResult post(const std::string& base_url,
                            const std::string& action, const parlay::Json& body,
                            int timeout_sec = 30) const override {
@@ -106,6 +151,26 @@ public:
         (void)timeout_sec;
         posts.push_back(base_url + "|" + action);
         parlay::IpcResult r;
+        if (action == "seek" && np_ok) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(
+                R"({"now_playing":{"track":{"title":"T","duration_sec":200},"position_sec":30,"paused":false}})");
+            return r;
+        }
+        if (action == "autoplay-skip") {
+            if (!autoplay_skip_error.empty()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = autoplay_skip_error;
+                return r;
+            }
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(
+                R"({"now_playing":{"track":{"title":"Mix Pick","artist":"Mix Artist","duration_sec":200}}})");
+            return r;
+        }
         r.http_status = 404;
         r.error_code = "not_found";
         r.error_message = "fake: no engine here";
@@ -117,7 +182,15 @@ public:
         (void)base_url;
         (void)timeout_sec;
         gets.push_back(path);
-        parlay::IpcResult r;  // no now-playing state in this fake
+        parlay::IpcResult r;
+        if (np_ok && path.rfind("/v1/now-playing", 0) == 0) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(
+                R"({"now_playing":{"track":{"title":"T","duration_sec":200},"position_sec":30,"paused":false}})");
+            return r;
+        }
+        // no now-playing state in this fake
         r.http_status = 404;
         r.error_code = "not_found";
         r.error_message = "fake: nothing playing";
@@ -140,16 +213,19 @@ public:
         std::string url;
         std::string title;
         bool video;
+        int seek_sec = 0;
+        double speed = 1.0;
+        int bass = 0;
     };
     std::vector<PlayCall> plays;
     std::vector<int64_t> joins, mutes, unmutes, stops;
+    // Scripted position for time() (Phase 6, B11): -1 = unknown.
+    int64_t time_value = -1;
     bool play(int64_t chat_id, const std::string& stream_url,
               const std::string& title, bool video, int seek_sec, double speed,
               int bass) override {
-        (void)seek_sec;
-        (void)speed;
-        (void)bass;
-        plays.push_back({chat_id, stream_url, title, video});
+        plays.push_back({chat_id, stream_url, title, video, seek_sec, speed,
+                         bass});
         if (!play_ok) {
             last_error_ = fail_reason;
             return false;
@@ -194,7 +270,7 @@ public:
     }
     int64_t time(int64_t chat_id) override {
         (void)chat_id;
-        return -1;
+        return time_value;
     }
     bool available() const override { return avail; }
     std::string describe() const override { return "fake-voice"; }
@@ -506,6 +582,249 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Already in the voice chat"),
               "join when engine session active: Already reply");
+    }
+
+    // --- E. onAutoplaySkip (Phase 6) --------------------------------------
+    {
+        Rig rig;
+        rig.store.set("call:-1031", "1");
+        rig.d.handleMessage(makeMsg(-1031, 111, "/autoplay-skip"));
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|autoplay-skip") != std::string::npos,
+              "autoplay-skip: vcCall autoplay-skip issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Autoplay skipped") &&
+                  contains(rig.tg.replies[0], "Mix Pick"),
+              "autoplay-skip: picked track reported");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1032", "1");
+        rig.d.handleMessage(makeMsg(-1032, 111, "/askip"));
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|autoplay-skip") != std::string::npos,
+              "askip alias: same vcCall autoplay-skip");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1033, 111, "/autoplay-skip"));
+        CHECK(rig.ipc.posts.empty(),
+              "autoplay-skip nothing playing: no engine call");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Nothing is playing.",
+              "autoplay-skip nothing playing: honest reply");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1034", "1");
+        rig.ipc.autoplay_skip_error = "autoplay is off in this chat";
+        rig.d.handleMessage(makeMsg(-1034, 111, "/autoplay-skip"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Service error") &&
+                  contains(rig.tg.replies[0], "autoplay is off"),
+              "autoplay-skip engine 400: honest error, no fake pick");
+    }
+
+    // --- F. onBroadcast: errors.txt attachment (Phase 6, B11) ------------
+    // Each block wipes the shared store dir first: Rig instances share
+    // /tmp/parlay-dispatcher-test, and "chats" is a set that would
+    // otherwise leak targets between blocks. /broadcast does NOT add
+    // the source chat itself (only /start and /play record chats), so
+    // the fan-out targets are exactly the seeded chats.
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.store.sadd("chats", "-1036");
+        rig.store.sadd("chats", "-1037");
+        rig.tg.forward_fail = {-1036};
+        parlay::TgMessage m = makeMsg(-1035, 999, "/broadcast");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 5;
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[0], "Broadcasting to 2"),
+              "broadcast: announces 2 seeded targets");
+        CHECK(contains(rig.tg.replies[1], "1 delivered, 1 failed"),
+              "broadcast: summary counts delivered/failed");
+        CHECK(!contains(rig.tg.replies[1], "Failed ids"),
+              "broadcast: failures NOT inline in the summary");
+        CHECK(rig.tg.docs.size() == 1,
+              "broadcast: one errors.txt attachment sent");
+        CHECK(!rig.tg.docs.empty() &&
+                  rig.tg.docs[0].chat == -1035 &&
+                  rig.tg.docs[0].filename == "errors.txt" &&
+                  contains(rig.tg.docs[0].content, "-1036\n") &&
+                  !contains(rig.tg.docs[0].content, "-1037\n") &&
+                  contains(rig.tg.docs[0].content,
+                           "no per-chat error text") &&
+                  contains(rig.tg.docs[0].caption, "1 chats"),
+              "broadcast: errors.txt to the source chat lists only the failed id, with the no-per-chat-error header");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.store.sadd("chats", "-1036");
+        rig.store.sadd("chats", "-1037");
+        parlay::TgMessage m = makeMsg(-1035, 999, "/broadcast");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 5;
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.docs.empty(),
+              "broadcast all delivered: no errors.txt sent");
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[1], "2 delivered, 0 failed"),
+              "broadcast all delivered: summary 2/0");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.store.sadd("chats", "-1036");
+        rig.tg.forward_fail = {-1036};
+        rig.tg.doc_ok = false;
+        parlay::TgMessage m = makeMsg(-1035, 999, "/broadcast");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 5;
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.docs.empty(),
+              "broadcast doc upload fails: no attachment recorded");
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[1], "Failed ids (errors.txt upload failed:") &&
+                  contains(rig.tg.replies[1], "-1036") &&
+                  contains(rig.tg.replies[1], "simulated upload failure"),
+              "broadcast doc upload fails: honest inline fallback");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1035, 999, "/broadcast"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Reply to a message to broadcast it.",
+              "broadcast without reply: usage error, no fan-out");
+    }
+
+    // --- G. /speed + /bass: core voice applies, engines honestly don't --
+    // (Phase 6, B11). Core-owned session = voice_owner "core" + call
+    // active + a recorded core_source; the filter is re-attached
+    // through voice_.play with the stored speed/bass at the current
+    // position (voice_.time). Engine sessions keep the seek-restart
+    // but the reply says the value was only saved.
+    {
+        Rig rig;
+        rig.store.set("call:-1041", "1");
+        rig.store.hset("chat:-1041", "voice_owner", "core");
+        rig.store.hset("chat:-1041", "core_source", "/tmp/song.ogg");
+        rig.store.hset("chat:-1041", "core_title", "Song");
+        rig.store.hset("chat:-1041", "core_video", "0");
+        rig.voice.time_value = 42;
+        rig.d.handleMessage(makeMsg(-1041, 111, "/speed 1.5"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url == "/tmp/song.ogg" &&
+                  rig.voice.plays[0].speed == 1.5 &&
+                  rig.voice.plays[0].seek_sec == 42 &&
+                  rig.voice.plays[0].bass == 0,
+              "speed core session: voice re-attached at 42s with 1.5x");
+        CHECK(rig.ipc.posts.empty(),
+              "speed core session: no engine seek call");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Speed set to 1.5x") &&
+                  contains(rig.tg.replies[0], "core voice re-attached") &&
+                  contains(rig.tg.replies[0], "0:42"),
+              "speed core session: applied reply names the position");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1042", "1");
+        rig.store.hset("chat:-1042", "voice_owner", "core");
+        rig.store.hset("chat:-1042", "core_source", "/tmp/song.ogg");
+        rig.store.hset("chat:-1042", "core_title", "Song");
+        rig.store.hset("chat:-1042", "speed", "1.25");
+        rig.voice.time_value = 90;
+        rig.d.handleMessage(makeMsg(-1042, 111, "/bass 40"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].bass == 40 &&
+                  rig.voice.plays[0].speed == 1.25 &&
+                  rig.voice.plays[0].seek_sec == 90,
+              "bass core session: voice re-attached with bass 40 + stored speed 1.25x");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Bass set to 40"),
+              "bass core session: applied reply");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1043", "1");
+        rig.store.hset("chat:-1043", "voice_owner", "core");
+        rig.voice.time_value = 10;
+        rig.d.handleMessage(makeMsg(-1043, 111, "/speed 1.5"));
+        CHECK(rig.voice.plays.empty(),
+              "speed core session, no source: no re-attach attempted");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "no source was recorded"),
+              "speed core session, no source: honest reply, no fake success");
+    }
+    {
+        Rig rig;
+        rig.store.hset("chat:-1044", "voice_owner", "core");
+        rig.store.hset("chat:-1044", "core_source", "/tmp/song.ogg");
+        rig.d.handleMessage(makeMsg(-1044, 111, "/bass 30"));
+        CHECK(rig.voice.plays.empty() &&
+                  rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Nothing is playing.",
+              "bass core session, call inactive: nothing playing");
+    }
+    {
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.d.handleMessage(makeMsg(-1045, 111, "/speed 1.5"));
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|seek") != std::string::npos,
+              "speed engine session: seek-restart issued to the engine");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "1.5x saved") &&
+                  contains(rig.tg.replies[0],
+                           "cannot apply audio filters"),
+              "speed engine session: honest saved-not-applied reply");
+        CHECK(rig.voice.plays.empty(),
+              "speed engine session: core voice untouched");
+    }
+    {
+        Rig rig;
+        rig.store.hset("chat:-1046", "speed", "1.5");
+        rig.store.hset("chat:-1046", "bass", "40");
+        parlay::TgMessage m = makeMsg(-1046, 111, "/play");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 5;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "AUDIO123";
+        m.reply_media_kind = "audio";
+        m.reply_media_title = "Artist - Song";
+        rig.d.handleMessage(m);
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].speed == 1.5 &&
+                  rig.voice.plays[0].bass == 40,
+              "play replied file: stored speed/bass passed to core voice");
+        auto fields = rig.store.hgetall("chat:-1046");
+        CHECK(fields["core_source"] == rig.tg.download_saved &&
+                  fields["core_title"] == "Artist - Song" &&
+                  fields["voice_owner"] == "core",
+              "play replied file: core source recorded for later /speed+/bass");
+    }
+
+    // --- H. /speedtest pure helpers (Phase 6, B11) ------------------------
+    {
+        CHECK(parlay::Dispatcher::speedMbps(25000000, 10.0) == 20.0,
+              "speedMbps: 25 MB in 10 s = 20 Mbps");
+        CHECK(parlay::Dispatcher::speedMbps(0, 5.0) == 0.0,
+              "speedMbps: 0 bytes = 0 Mbps");
+        CHECK(parlay::Dispatcher::speedMbps(1000000, 0.0) == 0.0,
+              "speedMbps: 0 seconds = 0 Mbps, no division by zero");
+        CHECK(parlay::Dispatcher::formatSpeedtest(20.0, true, 10.0, 200,
+                                                  "") ==
+                  "Speed test:\nDownload: 20.00 Mbps\nUpload: 10.00 Mbps",
+              "formatSpeedtest: up+down both reported");
+        CHECK(contains(parlay::Dispatcher::formatSpeedtest(
+                           20.0, false, 0.0, 0, "curl timeout"),
+                       "Upload probe failed (HTTP 0: curl timeout)"),
+              "formatSpeedtest: failed upload reported honestly next to download");
     }
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");

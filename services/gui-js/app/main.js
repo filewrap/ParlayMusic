@@ -16,8 +16,9 @@
 // Routes:
 //   GET  /                          player page (Telegram Mini App entry)
 //   GET  /healthz                   {ok:true,service:"gui-js"}
-//   GET  /api/now-playing?chat_id=  proxy CORE_URL, else local demo state
-//   GET  /api/queue?chat_id=        proxy CORE_URL, else local demo state
+//   GET  /api/now-playing?chat_id=  proxy CORE_URL (flat core shape,
+//               see below); CORE_URL unset = local demo state (dev only)
+//   GET  /api/queue?chat_id=        same as now-playing
 //   GET  /api/search?q=             proxy CORE_URL, else NETEASE_URL, else engine_unavailable
 //   GET  /api/stream-url?chat_id=   direct audio URL for the current track
 //                                   (jiosaavn stream_url, radio stream, file
@@ -33,6 +34,10 @@
 //
 // Every /api response uses the Parlay envelope:
 //   {ok:true,data:{...}} or {ok:false,error:{code,message}}
+// EXCEPT the core-proxied now-playing/queue failures (Phase 6, A2):
+// the core answers flat errors ({"ok":false,"error":"<message>"}) and
+// the GUI passes them through verbatim, so a configured core that is
+// down or has no state is reported honestly instead of demo state.
 // Demo (non-proxied) data is always labelled source:"local-demo" so the
 // page never pretends a live engine is behind it.
 "use strict";
@@ -48,7 +53,10 @@ const NETEASE_URL = (process.env.NETEASE_URL || "").replace(/\/$/, "");
 const TOKEN = process.env.PARLAY_TOKEN || "";
 
 // ---------------------------------------------------------------------------
-// Local demo state (used ONLY when no core is reachable). Honestly labelled.
+// Local demo state (DEV ONLY: used ONLY when CORE_URL is unset, i.e. no
+// core is configured at all). Honestly labelled. When CORE_URL is set
+// the core is the only source of truth and a failure is an honest
+// error, never this demo state (Phase 6, A2 — see handleNowPlaying).
 // ---------------------------------------------------------------------------
 const demoQueue = [
   { position: 0, requested_by: 0, track: { id: "demo-1", title: "Demo Track — Raag Bhairavi (local demo)", artist: "Parlay demo", duration_sec: 214, source: "file", url: "" } },
@@ -74,6 +82,24 @@ function fail(res, code, message, status = 502) {
   const body = JSON.stringify({ ok: false, error: { code, message } });
   res.writeHead(status, { "content-type": "application/json" });
   res.end(body);
+}
+// Flat error body, exactly as the core answers it:
+// {"ok":false,"error":"<message>"}. Used for core-proxied
+// now-playing/queue failures so the core's honest error reaches the
+// caller verbatim (Phase 6, A2).
+function failFlat(res, message, status = 502) {
+  const body = JSON.stringify({ ok: false, error: message });
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(body);
+}
+// The core answers flat errors (error is a string); other upstreams
+// use the envelope (error is {code,message}).
+function upstreamErrorMessage(up) {
+  if (!up || !up.json) return "core unreachable";
+  const e = up.json.error;
+  if (typeof e === "string" && e) return e;
+  if (e && typeof e === "object") return e.message || e.code || "core error";
+  return "core error";
 }
 
 async function readJson(req) {
@@ -254,11 +280,11 @@ const PAGE = `<!doctype html>
     var qs = chatId ? ("?chat_id=" + encodeURIComponent(chatId)) : "";
     api("/api/now-playing" + qs).then(function (env) {
       if (env.ok) renderNowPlaying(env.data.now_playing || env.data);
-      else setStatus("now-playing: " + (env.error && env.error.message), true);
+      else setStatus("now-playing: " + (typeof env.error === "string" ? env.error : (env.error && env.error.message)), true);
     }).catch(function (e) { setStatus("now-playing failed: " + e.message, true); });
     api("/api/queue" + qs).then(function (env) {
       if (env.ok) renderQueue(env.data.queue || []);
-      else setStatus("queue: " + (env.error && env.error.message), true);
+      else setStatus("queue: " + (typeof env.error === "string" ? env.error : (env.error && env.error.message)), true);
     }).catch(function (e) { setStatus("queue failed: " + e.message, true); });
     if (listening) refreshStream();
   }
@@ -456,33 +482,42 @@ const PAGE = `<!doctype html>
 async function handleNowPlaying(req, res, url) {
   const chatId = url.searchParams.get("chat_id") || "";
   if (CORE_URL) {
+    // CORE_URL is configured: the core is the only source of truth.
+    // A failure is an honest error, NEVER demo state (Phase 6, A2).
     const up = await proxyJson(CORE_URL, "GET", "/api/now-playing?chat_id=" + encodeURIComponent(chatId));
     if (up && up.json && up.json.ok) {
-      const np = up.json.data.now_playing || up.json.data;
+      // Core shape is flat: {ok:true, now_playing:{...}}. Accept the
+      // envelope form too (data.now_playing) if a proxy ever wraps it.
+      const np = up.json.now_playing || (up.json.data && up.json.data.now_playing) || up.json.data;
       if (np && !np.source) np.source = "core";
       return ok(res, { now_playing: np });
     }
     if (up && up.json && !up.json.ok) {
-      return fail(res, up.json.error.code || "engine_unavailable", up.json.error.message || "core error", up.status || 502);
+      return failFlat(res, upstreamErrorMessage(up), up.status || 502);
     }
-    // CORE_URL set but unreachable: fall through to honest demo state.
+    return failFlat(res, "core unreachable", 502);
   }
+  // DEV ONLY: CORE_URL is unset, so there is no core to ask.
   const np = { ...demoNowPlaying, chat_id: chatId ? Number(chatId) : 0 };
-  return ok(res, { now_playing: np, note: "core unreachable or CORE_URL unset — serving local demo state" });
+  return ok(res, { now_playing: np, note: "CORE_URL unset — serving local demo state (dev only)" });
 }
 
 async function handleQueue(req, res, url) {
   const chatId = url.searchParams.get("chat_id") || "";
   if (CORE_URL) {
+    // Same rule as now-playing: configured core, honest error, no demo.
     const up = await proxyJson(CORE_URL, "GET", "/api/queue?chat_id=" + encodeURIComponent(chatId));
     if (up && up.json && up.json.ok) {
-      return ok(res, { queue: up.json.data.queue || [], source: "core" });
+      const queue = up.json.queue || (up.json.data && up.json.data.queue) || [];
+      return ok(res, { queue, source: "core" });
     }
     if (up && up.json && !up.json.ok) {
-      return fail(res, up.json.error.code || "engine_unavailable", up.json.error.message || "core error", up.status || 502);
+      return failFlat(res, upstreamErrorMessage(up), up.status || 502);
     }
+    return failFlat(res, "core unreachable", 502);
   }
-  return ok(res, { queue: demoQueue, source: "local-demo", note: "core unreachable or CORE_URL unset — serving local demo queue" });
+  // DEV ONLY: CORE_URL is unset, so there is no core to ask.
+  return ok(res, { queue: demoQueue, source: "local-demo", note: "CORE_URL unset — serving local demo queue (dev only)" });
 }
 
 async function handleStreamUrl(req, res, url) {
@@ -526,7 +561,8 @@ async function fetchNowPlaying(chatId) {
   if (CORE_URL) {
     const up = await proxyJson(CORE_URL, "GET", "/api/now-playing?chat_id=" + encodeURIComponent(chatId));
     if (up && up.json && up.json.ok) {
-      const np = up.json.data.now_playing || up.json.data;
+      // Core shape is flat: {ok:true, now_playing:{...}}.
+      const np = up.json.now_playing || (up.json.data && up.json.data.now_playing);
       if (np && np.track) return { ...np, source: "core" };
     }
   }

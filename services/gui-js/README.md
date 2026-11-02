@@ -29,7 +29,7 @@ Endpoints (all `/api/*` use the Parlay envelope
 | Route | Behaviour |
 |---|---|
 | `GET /healthz` | `{ok:true, service:"gui-js"}` (top-level, per contract) |
-| `GET /api/now-playing?chat_id=` | Proxies `CORE_URL` if set and reachable, else local demo state labelled `source:"local-demo"` |
+| `GET /api/now-playing?chat_id=` | Proxies `CORE_URL` (flat core shape) when set; a core failure is an honest error (`{"ok":false,"error":"core unreachable"}` or the core's own error), never demo state. `CORE_URL` unset = local demo state labelled `source:"local-demo"` (dev only) |
 | `GET /api/queue?chat_id=` | Same as above |
 | `GET /api/search?q=` | Proxies `CORE_URL` (`POST /v1/search`), else `NETEASE_URL` (`POST /v1/netease/search`), else `engine_unavailable` |
 | `GET /api/stream-url?chat_id=` | **(Phase 4)** Direct audio URL for the current track, from the VC engines (`VC_GO_URL` then `VC_TS_URL`, then `CORE_URL`): `{playable, url, direct_url, source, track}`. Playable only when the track carries a real media URL (`stream_url`, or a radio/file `url`). YouTube watch pages are not audio — `{playable:false, reason}` says so honestly. `url` is the same-origin `/api/audio?src=…` proxy URL. |
@@ -71,7 +71,7 @@ a plain `<audio>` element whose `src` is the track's download URL,
 - `VC_GO_URL` / `VC_TS_URL` — VC engine base URLs
 - `NETEASE_URL` — netease-go base URL (search fallback)
 - `PARLAY_TOKEN` — forwarded as `X-Parlay-Token` when proxying
-- Tests: `npm test` (`node --test tests/run.js`; 7 tests)
+- Tests: `npm test` (`node --test tests/run.js`; 11 tests)
 
 ## Still stubbed / not implemented
 
@@ -96,6 +96,7 @@ a plain `<audio>` element whose `src` is the track's download URL,
 - Proxy verified live: `/api/play` through `VC_GO_URL` reached a real
   vc-go and returned `engine:"go"`; `/api/search` through `NETEASE_URL`
   returned 10 real NetEase results.
+- **Phase 6, A2 (`npm test`, 11 tests)**: with `CORE_URL` set, `/api/now-playing` and `/api/queue` proxy a (stub) core's flat shape and return `source:"core"`; a core 404 passes through as `{"ok":false,"error":"no playback state"}`; a dead core returns `{"ok":false,"error":"core unreachable"}` with no demo data anywhere. With `CORE_URL` unset the demo state is still served, labelled `local-demo` (dev only). Live smoke 2026-11-03: gui `:18030` → real core `:18080` → real vc-go `:18001` returned the queued track (`yt:smoke1`, `source:"core"`) on both endpoints.
 - **Phase 4 (`npm test`, 7 tests)**: page ships `<audio>` +
   `createMediaElementSource`/`GainNode` wiring (`gainNode.gain.value
   = v / 100`); `/api/stream-url` returns a real Saavn direct URL for

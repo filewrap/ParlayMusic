@@ -79,6 +79,13 @@ Both proxies PASS. All test servers killed afterwards (ports 13000/13001/
 
 ## Still stubbed
 
+> **SUPERSEDED in part (Phase 4, 2026-11-02).** The in-browser-audio
+> bullet below is Phase 3 state — real in-browser playback shipped in
+> Phase 4 (see the "Phase 4" section below: `/api/stream-url` +
+> `/api/audio` proxy + WebAudio gain volume). Still true: no Next.js
+> build / wavetune React components / album & artist browse; demo
+> state is in-memory only, no Mongo/Redis, no GUI-side auth.
+
 - No Next.js build / wavetune React components / album & artist browse.
 - No in-browser audio playback (no stream URL exposed yet); controls are
   remote controls for the VC engine; volume slider is display-only.

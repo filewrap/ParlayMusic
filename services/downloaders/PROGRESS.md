@@ -71,6 +71,13 @@ Server started with:
 
 ## Real vs stubbed
 
+> **SUPERSEDED (Phase 4/5, 2026-11-03).** The "STUBBED" line below is
+> the Phase 3 state — deezer, tiktok and navidrome are real since the
+> "Phase 4" section below (public-API previews / direct CDN audio /
+> Subsonic download), Deezer full tracks are env-gated on `DEEZER_ARL`
+> and Soulseek is real via slskd (Phase 5). See `README.md`
+> "Implemented vs stubbed" for current status.
+
 - REAL: YouTube search + download (mp3), Spotify track resolve +
   download, Spotify search marking, playlist endpoint mechanics
   (resolve → per-track download → zip/files, 50-track cap, per-track

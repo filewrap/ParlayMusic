@@ -18,10 +18,11 @@
 # and queue/share/spotify/vc-rust all write their own JSON files.
 # Downloaders and netease-go write downloads to separate subdirs too.
 #
-# HEALTH: every HTTP service answers GET /healthz (core-cpp does NOT serve
-# HTTP yet — A2 — so it has no healthcheck). core depends_on the default-
-# profile services with condition: service_healthy; full-profile services
-# are not a core dependency (they are not started in a default `up`).
+# HEALTH: every HTTP service answers GET /healthz (core-cpp serves
+# its GUI API on :8080 since Phase 6 A2, so it has a healthcheck too).
+# core depends_on the default-profile services with condition:
+# service_healthy; full-profile services are not a core dependency
+# (they are not started in a default `up`).
 #
 # SOULSEEK (B4): the slskd service is opt-in (profile: full). Worker D
 # wires the client; this file only provides the daemon. Per slskd's own
@@ -85,6 +86,12 @@ services:
       - TD_PASSWORD=${TD_PASSWORD:-}
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       mongo:
         condition: service_healthy

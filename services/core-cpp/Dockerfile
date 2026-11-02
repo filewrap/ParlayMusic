@@ -25,6 +25,6 @@ COPY --from=build /src/build/parlay-core /usr/local/bin/parlay-core
 ENV PORT=8080
 ENV PARLAY_DATA_DIR=/data/core
 EXPOSE 8080
-# No HEALTHCHECK: the core serves no HTTP yet (A2 — GUI /api surface is
-# a follow-up); compose therefore has no healthcheck for this service.
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
+  CMD curl -fsS http://localhost:8080/healthz || exit 1
 CMD ["parlay-core"]

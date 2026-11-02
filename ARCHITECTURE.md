@@ -161,7 +161,9 @@ core handler — never the other way round.
   fail-over loses queue state. That is a documented limit (A11), not a
   bug to silently paper over.
 - Services never share a database table directly; they share it *through*
-  the contract (e.g. the GUI reads now-playing from Redis via the core).
+  the contract (e.g. the GUI reads now-playing from the core's HTTP API,
+  `GET /api/now-playing`, which proxies the live engine state — Phase 6,
+  A2; Redis only mirrors it inside the core).
 
 ## Deploy
 

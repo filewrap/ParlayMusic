@@ -53,6 +53,23 @@ public:
     void startBackground();
     void stopBackground();
     void setBotId(int64_t id) { bot_id_ = id; }
+    void setBotUsername(const std::string& name) { bot_username_ = name; }
+
+    // HTTP API seam (core_api.hpp VcStateProvider): live engine state
+    // for one chat, for GET /api/now-playing and GET /api/queue.
+    // apiNowPlaying returns the whole now-playing object; false when
+    // the engines report no state (or none is reachable).
+    bool apiNowPlaying(int64_t chat_id, Json& np_out, std::string& error);
+    // The engine's queue list (POST /v1/queue action=list).
+    bool apiQueueList(int64_t chat_id, Json& queue_out, std::string& error);
+
+    // Pure /speedtest helpers (no I/O; unit-tested in
+    // dispatcher_test.cpp): Mbps from a byte count + elapsed seconds,
+    // and the reply text from a download result + an upload outcome.
+    static double speedMbps(size_t bytes, double secs);
+    static std::string formatSpeedtest(double down_mbps, bool up_ok,
+                                       double up_mbps, int up_status,
+                                       const std::string& up_error);
 
 private:
     enum class Scope { Any, Group, Private };
@@ -94,6 +111,21 @@ private:
     void setChatField(int64_t chat_id, const std::string& field,
                       const std::string& value);
     int chatIntField(int64_t chat_id, const std::string& field, int def = 0);
+    // Stored playback speed (0.5-2.0) for the chat, 1.0 when unset or
+    // unparseable. Used by /speed reporting and by the core voice
+    // backend, which is the only playback path that applies it.
+    double chatSpeedField(int64_t chat_id);
+    // Core-voice filter path for /speed and /bass: when the chat's
+    // audio is on the core voice backend (voice_owner == "core"), the
+    // stored speed/bass ARE applied — the source is re-attached at the
+    // current position with the new filter values (buildFfmpegCmd
+    // atempo/bass). Returns true when it handled the command (core
+    // session, including the nothing-playing / no-source honest
+    // replies); false when the session belongs to a vc engine, and
+    // the caller falls through to the engine seek-restart, which
+    // moves the position but cannot apply the filter.
+    bool applyCoreFilter(const CommandContext& ctx, double speed, int bass,
+                         const std::string& done_msg);
     bool isAuthUser(int64_t chat_id, int64_t user_id) const;
     // Effective voice-chat target: linked channel when via_channel.
     int64_t vcTarget(const CommandContext& ctx) const;
@@ -147,6 +179,7 @@ private:
     void onPause(const CommandContext& ctx);
     void onResume(const CommandContext& ctx);
     void onSkip(const CommandContext& ctx);
+    void onAutoplaySkip(const CommandContext& ctx);
     void onQueue(const CommandContext& ctx);
     void onStop(const CommandContext& ctx);
     void onLoop(const CommandContext& ctx);

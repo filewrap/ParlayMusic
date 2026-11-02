@@ -22,6 +22,8 @@ add_executable(parlay-core
     src/main.cpp
     src/json.cpp
     src/http.cpp
+    src/http_server.cpp
+    src/core_api.cpp
     src/config.cpp
     src/telegram_api.cpp
     src/ipc.cpp

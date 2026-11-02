@@ -105,13 +105,16 @@ profane / AI-generated lyrics, auto-skips tracks the user disliked.
   `X-Parlay-Token` auth when `PARLAY_TOKEN` is set (401 without/wrong,
   `/healthz` open).
 
-## NOT implemented — needs credentials
+## Wired, key-gated — only the credentials are missing
 
-- **Genius / Musixmatch lyrics — DONE in code (Phase 5 scope update).**
-  Both providers are wired against the public APIs, env-gated by
-  `GENIUS_ACCESS_TOKEN` / `MUSIXMATCH_API_KEY`, falling back to LRCLib;
-  only the keys are missing. (This line used to say only LRCLib was
-  wired — superseded 2026-11-03.)
+- **Genius / Musixmatch lyrics (Phase 5).** Both providers are wired
+  against the public APIs, env-gated by `GENIUS_ACCESS_TOKEN` /
+  `MUSIXMATCH_API_KEY`, falling back to LRCLib; only the keys are
+  missing. (This line used to say only LRCLib was wired — superseded
+  2026-11-03.)
+
+## NOT implemented
+
 - **Skip execution.** The poller decides skips and records them; no
   code issues a skip to the VC engine yet — issuing the skip is a
   core-cpp action outside this service.

@@ -1,6 +1,7 @@
 // http.cpp — curl-CLI based HTTP client (see http.hpp).
 #include "http.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,62 @@ HttpResult HttpClient::postJson(const std::string& url, const std::string& body,
     return run(url, body, true, headers, timeout_sec);
 }
 
+HttpResult HttpClient::postRaw(const std::string& url,
+                               const std::string& body,
+                               const std::string& content_type,
+                               const std::vector<std::string>& headers,
+                               int timeout_sec) {
+    return runWithContentType(url, body, true, headers, timeout_sec,
+                              content_type);
+}
+
+HttpResult HttpClient::postMultipart(
+    const std::string& url,
+    const std::vector<std::pair<std::string, std::string>>& fields,
+    const std::string& file_field, const std::string& filename,
+    const std::string& file_content,
+    const std::string& file_content_type,
+    const std::vector<std::string>& headers, int timeout_sec) {
+    // Boundary: per-call, from pid + a monotonic tick, so two
+    // concurrent uploads cannot share one. Regenerate while it
+    // appears in any value (paranoia: errors.txt is chat ids, but a
+    // hostile filename must never be able to forge a part boundary).
+    std::string boundary;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+        boundary = "----ParlayBoundary" + std::to_string(getpid()) + "-" +
+                   std::to_string(ticks) + "-" + std::to_string(attempt);
+        bool clash = file_content.find(boundary) != std::string::npos ||
+                     filename.find(boundary) != std::string::npos ||
+                     file_field.find(boundary) != std::string::npos;
+        for (const auto& f : fields) {
+            if (f.first.find(boundary) != std::string::npos ||
+                f.second.find(boundary) != std::string::npos)
+                clash = true;
+        }
+        if (!clash) break;
+    }
+    std::string body;
+    auto appendPart = [&](const std::string& part_headers,
+                          const std::string& content) {
+        body += "--" + boundary + "\r\n";
+        body += part_headers + "\r\n\r\n";
+        body += content;
+        body += "\r\n";
+    };
+    for (const auto& f : fields) {
+        appendPart("Content-Disposition: form-data; name=\"" + f.first + "\"",
+                   f.second);
+    }
+    appendPart("Content-Disposition: form-data; name=\"" + file_field +
+                   "\"; filename=\"" + filename + "\"\r\n" +
+                   "Content-Type: " + file_content_type,
+               file_content);
+    body += "--" + boundary + "--\r\n";
+    return runWithContentType(url, body, true, headers, timeout_sec,
+                              "multipart/form-data; boundary=" + boundary);
+}
+
 HttpResult HttpClient::get(const std::string& url,
                            const std::vector<std::string>& headers,
                            int timeout_sec) {
@@ -35,6 +92,14 @@ HttpResult HttpClient::get(const std::string& url,
 HttpResult HttpClient::run(const std::string& url, const std::string& body,
                            bool is_post, const std::vector<std::string>& headers,
                            int timeout_sec) {
+    return runWithContentType(url, body, is_post, headers, timeout_sec,
+                              is_post ? "application/json" : "");
+}
+
+HttpResult HttpClient::runWithContentType(
+    const std::string& url, const std::string& body, bool is_post,
+    const std::vector<std::string>& headers, int timeout_sec,
+    const std::string& content_type) {
     HttpResult result;
 
     // Request body goes through a temp file so arbitrary bytes (quotes,
@@ -62,8 +127,10 @@ HttpResult HttpClient::run(const std::string& url, const std::string& body,
     std::string cmd = "curl -sS --max-time " + std::to_string(timeout_sec) +
                       " -w '\n__PARLAY_HTTP_CODE__:%{http_code}'";
     if (is_post) {
-        cmd += " -X POST -H 'Content-Type: application/json' --data-binary @" +
-               shellQuote(body_path);
+        cmd += " -X POST";
+        if (!content_type.empty())
+            cmd += " -H " + shellQuote("Content-Type: " + content_type);
+        cmd += " --data-binary @" + shellQuote(body_path);
     }
     for (const auto& h : headers) cmd += " -H " + shellQuote(h);
     cmd += " " + shellQuote(url) + " 2>&1";

@@ -102,11 +102,9 @@ first JSON value, so this is tolerated.
   dropped from scope in Phase 5 (B7): it needs an external fingerprint
   backend and the ref's flow needs login. No `netease.recognize` action
   exists in the contract.
-- `MUSIC_U` login — DONE in code (Phase 5 scope update): env
-  `NETEASE_MUSIC_U` is read once at startup and sent as a cookie only
-  to NetEase hosts (never the mirror). QR login (`qrlogin.go` in the
-  ref) is still not implemented — no QR flow, the cookie must come
-  from the user.
+- QR login (`qrlogin.go` in the ref) is not implemented — no QR flow;
+  the `MUSIC_U` cookie must come from the user (the cookie path itself
+  is DONE in code, Phase 5 — see "MUSIC_U login" above).
 - weapi/linuxapi-encrypted requests exist (`weapi.go`, `linuxapi.go`,
   `SongURLWithLevel` steps 2/3/5) but are only fallbacks: direct
   (non-mirror) song URLs still return `url:null` server-side without

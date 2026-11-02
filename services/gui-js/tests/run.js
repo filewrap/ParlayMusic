@@ -14,7 +14,9 @@
 // proxy code serves the Saavn bytes.
 //
 // Run:  node --test tests/run.js
-// Ports: 18122 vc-ts, 18130 gui-js, 18131 stub audio server.
+// Ports: 18122 vc-ts, 18130 gui-js, 18131 stub audio server,
+//   18132 gui-js with CORE_URL -> stub core, 18133 stub core,
+//   18134 gui-js with CORE_URL -> dead port (core unreachable).
 // Data dirs under /tmp/p4-gui/.
 
 "use strict";
@@ -101,7 +103,40 @@ function startStubAudio(port) {
   });
 }
 
-let vcts, gui;
+let vcts, gui, guiCore, guiDead, stubCore;
+
+// Stub core (Phase 6, A2): answers the core's flat HTTP shape
+// ({"ok":true,"now_playing":{...}} / {"ok":false,"error":"..."}).
+// -100999 has no playback state; every other chat plays CORE_NP.
+const CORE_NP = {
+  chat_id: CHAT, engine: "go",
+  track: { id: "core-test-track", title: "Core Test Track", artist: "Core Artist", duration_sec: 200, source: "youtube", url: "" },
+  paused: false, position_sec: 42, volume: 80,
+  queue: [{ position: 0, requested_by: 1, track: { id: "core-test-next", title: "Core Next", artist: "Core Artist", duration_sec: 180, source: "youtube", url: "" } }],
+};
+function startStubCore(port) {
+  return new Promise((resolve) => {
+    stubCore = http.createServer((req, res) => {
+      const u = new URL(req.url, "http://127.0.0.1");
+      const send = (status, obj) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(obj));
+      };
+      if (u.pathname === "/healthz") return send(200, { ok: true });
+      if (u.pathname === "/api/now-playing") {
+        if (u.searchParams.get("chat_id") === "-100999") {
+          return send(404, { ok: false, error: "no playback state" });
+        }
+        return send(200, { ok: true, now_playing: CORE_NP });
+      }
+      if (u.pathname === "/api/queue") {
+        return send(200, { ok: true, queue: CORE_NP.queue, chat_id: Number(u.searchParams.get("chat_id")) || 0 });
+      }
+      return send(404, { ok: false, error: "not found" });
+    });
+    stubCore.listen(port, () => resolve());
+  });
+}
 
 test.before(async () => {
   fs.mkdirSync(BASE, { recursive: true });
@@ -112,11 +147,18 @@ test.before(async () => {
   gui = startService("gui-js", 18130, { VC_TS_URL: "http://127.0.0.1:18122" }, "app/main.js");
   await waitHealth(18122);
   await waitHealth(18130);
+  // Phase 6 (A2): one gui with a live (stub) core, one with a dead one.
+  await startStubCore(18133);
+  guiCore = startService("gui-js", 18132, { CORE_URL: "http://127.0.0.1:18133" }, "app/main.js");
+  guiDead = startService("gui-js", 18134, { CORE_URL: "http://127.0.0.1:9" }, "app/main.js");
+  await waitHealth(18132);
+  await waitHealth(18134);
 });
 
 test.after(() => {
-  for (const c of [vcts, gui]) { try { c.kill("SIGTERM"); } catch { /* dead */ } }
+  for (const c of [vcts, gui, guiCore, guiDead]) { try { c.kill("SIGTERM"); } catch { /* dead */ } }
   if (stubAudio) stubAudio.close();
+  if (stubCore) stubCore.close();
 });
 
 test("player page ships a real <audio> element + WebAudio gain wiring", async () => {
@@ -196,4 +238,50 @@ test("/api/play still proxies to vc-ts (engine ts)", async () => {
   assert.equal(r.json.data.engine, "ts");
   assert.equal(r.json.data.now_playing.track.id, "jsvn:rjkrTnma");
   await req(18122, "POST", "/v1/stop", { chat_id: CHAT });
+});
+
+// --- Phase 6 (A2): CORE_URL configured -> core is the only source ---
+// --- of truth; demo state is dev-only (CORE_URL unset). ---
+
+test("CORE_URL set: now-playing/queue proxy the core (flat shape), never demo", async () => {
+  const np = await req(18132, "GET", `/api/now-playing?chat_id=${CHAT}`);
+  assert.equal(np.status, 200, JSON.stringify(np.json));
+  assert.equal(np.json.ok, true);
+  assert.equal(np.json.data.now_playing.track.id, "core-test-track");
+  assert.equal(np.json.data.now_playing.source, "core");
+  assert.ok(!JSON.stringify(np.json).includes("local-demo"), "no demo leakage");
+  const q = await req(18132, "GET", `/api/queue?chat_id=${CHAT}`);
+  assert.equal(q.status, 200, JSON.stringify(q.json));
+  assert.equal(q.json.data.source, "core");
+  assert.equal(q.json.data.queue[0].track.id, "core-test-next");
+});
+
+test("CORE_URL set: core 404 passes through as an honest error, not demo", async () => {
+  const np = await req(18132, "GET", "/api/now-playing?chat_id=-100999");
+  assert.equal(np.status, 404, JSON.stringify(np.json));
+  assert.equal(np.json.ok, false);
+  assert.equal(np.json.error, "no playback state");
+  assert.ok(!JSON.stringify(np.json).includes("local-demo"), "no demo leakage");
+});
+
+test("CORE_URL set + core down: honest core-unreachable error, never demo", async () => {
+  const np = await req(18134, "GET", `/api/now-playing?chat_id=${CHAT}`);
+  assert.equal(np.status, 502, JSON.stringify(np.json));
+  assert.equal(np.json.ok, false);
+  assert.equal(np.json.error, "core unreachable");
+  assert.ok(!JSON.stringify(np.json).includes("Demo Track"), "no demo track served");
+  assert.ok(!JSON.stringify(np.json).includes("local-demo"), "no demo label served");
+  const q = await req(18134, "GET", `/api/queue?chat_id=${CHAT}`);
+  assert.equal(q.status, 502, JSON.stringify(q.json));
+  assert.equal(q.json.ok, false);
+  assert.equal(q.json.error, "core unreachable");
+  assert.ok(!JSON.stringify(q.json).includes("local-demo"), "no demo queue served");
+});
+
+test("CORE_URL unset: demo state is still served, labelled local-demo (dev only)", async () => {
+  const np = await req(18130, "GET", `/api/now-playing?chat_id=${CHAT}`);
+  assert.equal(np.status, 200, JSON.stringify(np.json));
+  assert.equal(np.json.data.now_playing.source, "local-demo");
+  const q = await req(18130, "GET", `/api/queue?chat_id=${CHAT}`);
+  assert.equal(q.json.data.source, "local-demo");
 });
