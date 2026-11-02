@@ -1,5 +1,6 @@
 // VoiceCall — real voice transport for vc-ts (Opus/RTP pipeline +
-// TDLib-join client). Node stdlib only.
+// in-process ntgcalls). Node stdlib only (+ one tiny N-API addon,
+// src/ntg_addon.cc, when libntgcalls.so exists).
 //
 // The voice path, as in the upstream refs (TGVCBot tgcalls.ts, remix
 // stream.ts, TinaMusic tinaproto/mtproto.cpp JoinGroupCall):
@@ -9,6 +10,20 @@
 //   4. ntgcalls connect(remote)             -> live call
 //   5. ntgcalls set_stream_sources(ffmpeg)  -> audio flows
 //
+// Phase 5 (in-process ntgcalls, voice bridge deleted): ntgcalls is a
+// C++ NATIVE LIBRARY linked into the process, not a server. The
+// refs/ntgcalls repo ships three bindings — C (libntgcalls.so, the
+// ntg_* API core-cpp dlopens), Node (official N-API addon under
+// targets/node, built by the same CMake), and Python (the wheel in
+// phase4/voice-venv). For vc-ts the binding is a minimal hand-written
+// N-API addon (src/ntg_addon.cc) that dlopens libntgcalls.so at
+// runtime — it reuses the already-built C library instead of
+// rebuilding the whole ntgcalls core, compiles in seconds with the
+// system g++ + /usr/include/node/node_api.h, and has zero npm
+// dependencies. When libntgcalls.so (or the addon) is absent, the
+// local offer falls back to the Python-wheel probe (src/ntg_offer.py,
+// one-shot, purely local WebRTC — not a server, not a join path).
+//
 // What is REAL here:
 //   * The Opus/RTP pipeline (opusPipeline): ffmpeg encodes the source
 //     to libopus 48 kHz stereo (Ogg Opus file, ffprobe-verified frame
@@ -17,15 +32,20 @@
 //     the packet count proven by parsing the RTP file (SSRC-anchored
 //     scan). Proof on a 5 s 440 Hz tone: 251 frames, 83,736 bytes,
 //     5.0065 s; 251 RTP packets + 1 RTCP SR, 85,973 bytes.
-//   * The local offer (createLocalOffer): the ntgcalls 3.0.5 wheel in
-//     phase4/voice-venv builds a real offer offline (466 chars on the
-//     probe chat) — no MTProto, no network, no credentials.
-//   * The join client (join): drives the same voice_bridge.py
-//     (Telethon + ntgcalls) that core-cpp spawns, and reports the
-//     exact failure when the backend is not configured. There is NO
-//     voice-join action in contracts/ipc.json and core-cpp exposes no
-//     HTTP join endpoint, so the join goes through the bridge process
-//     directly — the IPC contract only carries vc.play/pause/etc.
+//   * The local offer (createLocalOffer): ntgcalls create_call via the
+//     in-process N-API addon when libntgcalls.so exists, else the
+//     ntgcalls 3.0.5 wheel probe — both purely local WebRTC, no
+//     MTProto, no network, no credentials.
+//   * The join (join): HONESTLY UNAVAILABLE in this service. The
+//     voice_bridge.py Telethon child that used to do
+//     phone.joinGroupCall was deleted in Phase 5 (user order), and
+//     Node stdlib has no MTProto client — there is no Telethon in
+//     Node. The MTProto join now lives only in core-cpp's
+//     TdLibVoiceCall (TDLib joinVideoChat + in-process ntgcalls).
+//     join() therefore always returns {ok:false, joined:false} with
+//     the exact reason; joined:true is NEVER reported without a real
+//     join. A Node MTProto client (TGVCBot/remix style grammy +
+//     tgcalls-next) would be a new dependency and is out of scope.
 //
 // What is BLOCKED (sandbox, proven, not worked around):
 //   * UDP sendto is EPERM even to loopback (plain-Python probe:
@@ -33,17 +53,18 @@
 //     `-f rtp rtp://127.0.0.1:PORT` fails the same way, exit 255).
 //     RTP packets are therefore proven to a FILE, never to a live
 //     UDP receiver, and rtp_udp_ok stays false.
-//   * No MTProto session / credentials in this sandbox
-//     (ASSISTANT_SESSION_FILE, API_ID, API_HASH unset), so join()
-//     fails at the config gate with the exact missing pieces named.
-//     Without a session there is no phone.joinGroupCall and no live
-//     call; joined:true is NEVER reported without a real join.
+//   * libntgcalls.so is BUILT (phase5/ntg-build.log, 3.0.5) and the
+//     N-API addon loads it in-process; the offer comes from the addon,
+//     with the wheel probe only as the fallback when the .so/addon is
+//     absent.
+//   * No MTProto session / credentials in this service, and no
+//     client to use them with — see join() above.
 //
-// playStream() runs the pipeline and then attempts the join: when a
-// voice backend is available the stream is fed into the join; when it
-// is not, the exact reason is recorded in the per-chat voice state
-// (now-playing `voice` / `voice_joined` / `voice_reason`) — no silent
-// stub. Nothing here throws: every failure is a returned reason.
+// playStream() runs the pipeline, builds the local offer as a
+// pre-flight proof, then attempts the join: the exact reason is
+// recorded in the per-chat voice state (now-playing `voice` /
+// `voice_joined` / `voice_reason`) — no silent stub. Nothing here
+// throws: every failure is a returned reason.
 
 "use strict";
 
@@ -54,8 +75,8 @@ const os = require("node:os");
 const path = require("node:path");
 
 const REPO_ROOT = path.join(__dirname, "..", "..", "..");
-const BRIDGE_DEFAULT = path.join(REPO_ROOT, "services", "core-cpp", "voice_bridge.py");
 const NTG_OFFER_PY = path.join(__dirname, "ntg_offer.py");
+const NTG_ADDON_PATH = path.join(__dirname, "ntg_addon.node");
 
 // ------------------------------------------------------------------ state --
 /* Per-chat voice state:
@@ -73,27 +94,56 @@ function chatState(chatId) {
 }
 
 // ------------------------------------------------------------ config ------
+// In-process ntgcalls state: the C library (libntgcalls.so, same .so
+// core-cpp dlopens) + the N-API addon that wraps it. No bridge, no
+// Telethon, no session file — vc-ts holds no MTProto credentials and
+// no MTProto client; the join gate is reported separately by join().
+function ntgLibCandidates() {
+  const out = [];
+  if (process.env.NTGCALLS_LIB) out.push(process.env.NTGCALLS_LIB);
+  out.push(path.join(REPO_ROOT, "refs", "ntgcalls", "shared-output", "lib", "libntgcalls.so"));
+  out.push(path.join(REPO_ROOT, "refs", "ntgcalls", "build-c", "shared-output", "lib", "libntgcalls.so"));
+  out.push("./lib/libntgcalls.so");
+  out.push("/usr/local/lib/libntgcalls.so");
+  out.push("/usr/lib/libntgcalls.so");
+  out.push("libntgcalls.so");
+  return out;
+}
+
+let addonCache = null; // {loaded, addon?, error?}
+function loadAddon() {
+  if (addonCache) return addonCache;
+  try {
+    const addon = require(NTG_ADDON_PATH);
+    addonCache = { loaded: true, addon, error: null };
+  } catch (e) {
+    addonCache = { loaded: false, addon: null, error: String((e && e.message) || e) };
+  }
+  return addonCache;
+}
+
 function backendConfig() {
   const missing = [];
-  const bridge = process.env.VOICE_BRIDGE || BRIDGE_DEFAULT;
-  if (!fs.existsSync(bridge)) missing.push(`VOICE_BRIDGE missing (${bridge})`);
-  const session = process.env.ASSISTANT_SESSION_FILE || "";
-  if (!session) missing.push("ASSISTANT_SESSION_FILE unset");
-  else if (!fs.existsSync(session)) missing.push(`ASSISTANT_SESSION_FILE not found (${session})`);
-  const apiId = Number(process.env.API_ID || 0);
-  if (!apiId) missing.push("API_ID unset");
-  const apiHash = process.env.API_HASH || "";
-  if (!apiHash) missing.push("API_HASH unset");
+  const lib = ntgLibCandidates().find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  }) || "";
+  if (!lib) missing.push("libntgcalls.so not found (NTGCALLS_LIB unset and no .so at the candidate paths — see phase5/ntg-build.log)");
+  const addon = loadAddon();
+  if (!addon.loaded) missing.push(`ntg_addon.node not loaded (${addon.error})`);
+  const wheelPy = path.join(REPO_ROOT, "phase4", "voice-venv", "bin", "python");
+  const offerFallback = fs.existsSync(wheelPy)
+    ? "local offer via ntgcalls wheel probe (src/ntg_offer.py)"
+    : "no local-offer fallback (voice-venv python missing)";
   return {
     ok: missing.length === 0,
     missing,
-    bridge,
-    session,
-    apiId,
-    apiHash,
+    lib,
+    addonLoaded: addon.loaded,
+    addonError: addon.error,
+    offerFallback,
     describe: missing.length
-      ? `voice join unavailable: ${missing.join("; ")}`
-      : `voice-bridge via ${bridge} (Telethon + ntgcalls)`,
+      ? `voice media unavailable: ${missing.join("; ")}; ${offerFallback}`
+      : `ntgcalls in-process via ${lib} (N-API addon)`,
   };
 }
 
@@ -105,10 +155,6 @@ function voicePython() {
 }
 
 // ------------------------------------------------------------- helpers ----
-function shellQuote(s) {
-  return "'" + String(s).replace(/'/g, "'\\''") + "'";
-}
-
 function runCmd(cmd, args, timeoutMs) {
   return new Promise((resolve) => {
     let child;
@@ -286,101 +332,79 @@ async function opusPipeline(source, opts) {
 }
 
 // ----------------------------------------------------- local SDP offer ---
-// ntgcalls create_call(chat_id) via the voice-venv wheel. Offline:
-// proves the engine can build a call; the offer is what
-// phone.joinGroupCall carries. Returns {ok, offer, offer_len} or
-// {ok:false, error}.
+// ntgcalls create_call(chat_id). In-process first: the N-API addon
+// (src/ntg_addon.cc) dlopens libntgcalls.so and calls ntg_create_call
+// (3.0.5 synchronous C API) in this Node process. Fallback when the
+// .so/addon is absent: the ntgcalls 3.0.5 wheel probe (src/ntg_offer.py)
+// — a one-shot local call, still offline, no MTProto, no network,
+// no credentials. Either way the offer is what phone.joinGroupCall
+// would carry. Returns {ok, offer, offer_len, via} or {ok:false, error}.
+// Note: ntgcalls refuses a second create_call for the same chat
+// (-202 "Connection cannot be initialized more than once"), so on
+// failure we stop any stale call for that chat and retry once.
 async function createLocalOffer(chatId) {
+  const addon = loadAddon();
+  if (addon.loaded) {
+    try {
+      const offer = await addon.addon.createCall(chatId);
+      if (typeof offer === "string" && offer.length > 0)
+        return { ok: true, offer, offer_len: offer.length, via: "ntg_addon.node (in-process libntgcalls.so)" };
+      return { ok: false, error: "ntgcalls addon createCall returned no offer" };
+    } catch (e) {
+      const firstErr = e && e.message || e;
+      try { await addon.addon.stop(chatId); } catch { /* stale call, ignore */ }
+      try {
+        const offer = await addon.addon.createCall(chatId);
+        if (typeof offer === "string" && offer.length > 0)
+          return { ok: true, offer, offer_len: offer.length, via: "ntg_addon.node (in-process libntgcalls.so, after stop+retry)" };
+        return { ok: false, error: "ntgcalls addon createCall returned no offer" };
+      } catch (e2) {
+        return { ok: false, error: `ntgcalls addon createCall failed: ${firstErr} (retry also failed: ${e2 && e2.message || e2})` };
+      }
+    }
+  }
   const py = voicePython();
   const r = await runCmd(py, [NTG_OFFER_PY, String(chatId)], 60000);
   let parsed = null;
   try { parsed = JSON.parse(String(r.stdout || "").trim().split("\n").filter(Boolean).pop() || ""); } catch { /* not JSON */ }
-  if (parsed && parsed.ok) return { ok: true, offer: parsed.offer, offer_len: parsed.offer_len };
+  if (parsed && parsed.ok) return { ok: true, offer: parsed.offer, offer_len: parsed.offer_len, via: "ntg_offer.py (wheel probe fallback; addon unavailable)" };
   const why = (parsed && parsed.error) || lastLine(r.stderr) || `ntg_offer.py failed (exit ${r.code})`;
   return { ok: false, error: `ntgcalls create_call failed: ${why}` };
 }
 
 // ------------------------------------------------------------- join -------
 // The MTProto step: phone.joinGroupCall(local SDP) -> remote transport
-// -> ntgcalls connect(remote). Done by voice_bridge.py join-call, the
-// same child core-cpp spawns. The bridge prints one JSON object per
-// line; we watch for {"event":"joined"} (then SIGTERM the child — the
-// join is proven, the stream would run until stopped) or
-// {"event":"error"} (the exact failure). Bounded at 30 s.
-// Returns {ok, joined, remote_len?} or {ok:false, joined:false, error}.
+// -> ntgcalls connect(remote). HONESTLY UNAVAILABLE in vc-ts: the
+// voice_bridge.py Telethon child that did this was deleted in Phase 5
+// (user order — ntgcalls is a native library linked in-process, not a
+// server), and Node stdlib has no MTProto client to replace it with.
+// The join lives only in core-cpp's TdLibVoiceCall (TDLib
+// joinVideoChat + in-process ntgcalls, TD_API_ID/TD_API_HASH/
+// TD_SESSION_DIR). This function therefore always returns
+// {ok:false, joined:false} with the exact reason — never a spawned
+// process, never a faked join. `localSdp` is accepted (and its length
+// recorded) so callers can pass the pre-flight offer from
+// createLocalOffer; it is NOT sent anywhere.
 async function join(chatId, localSdp) {
-  const cfg = backendConfig();
-  if (!cfg.ok) return { ok: false, joined: false, error: cfg.describe };
-  let offer = localSdp || "";
-  let offerLen = offer ? offer.length : 0;
-  if (!offer) {
-    const o = await createLocalOffer(chatId);
-    if (!o.ok) return { ok: false, joined: false, error: o.error };
-    offer = o.offer;
-    offerLen = o.offer_len;
-  }
   const st = chatState(chatId);
-  st.offer_len = offerLen;
-  // ffmpeg shell command for the bridge (TinaMusic buildFfmpegCmd shape):
-  // the already-encoded Opus file, decoded back to s16le 48 kHz stereo.
-  const opusFile = st.pipeline && st.pipeline.opus_file;
-  const src = opusFile && fs.existsSync(opusFile) ? opusFile : null;
-  const ffmpegCmd = src
-    ? `ffmpeg -v quiet -i ${shellQuote(src)} -vn -f s16le -ac 2 -ar 48000 pipe:1`
-    : `ffmpeg -v quiet -f lavfi -i "sine=frequency=440:duration=5" -vn -f s16le -ac 2 -ar 48000 pipe:1`;
-  const py = voicePython();
-  const args = [cfg.bridge, "join-call", "--chat-id", String(chatId),
-    "--session", cfg.session, "--api-id", String(cfg.apiId), "--api-hash", cfg.apiHash,
-    "--ffmpeg-cmd", ffmpegCmd];
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(py, args, { timeout: 35000 });
-    } catch (e) {
-      return resolve({ ok: false, joined: false, error: `cannot spawn voice bridge: ${e.message}` });
-    }
-    let out = "";
-    let settled = false;
-    const done = (r) => { if (!settled) { settled = true; try { child.kill("SIGKILL"); } catch { /* */ } resolve(r); } };
-    const timer = setTimeout(() => done({ ok: false, joined: false, error: `voice bridge join timed out after 30 s (no joined/error event; output: ${lastLine(out) || "(none)"})` }), 30000);
-    child.stdout.on("data", (d) => {
-      out += d;
-      for (const line of String(d).split("\n")) {
-        let ev = null;
-        try { ev = JSON.parse(line); } catch { /* not JSON */ }
-        if (!ev) continue;
-        if (ev.event === "joined") {
-          clearTimeout(timer);
-          return done({ ok: true, joined: true, remote_len: ev.transport_len || 0 });
-        }
-        if (ev.event === "error") {
-          clearTimeout(timer);
-          return done({ ok: false, joined: false, error: `voice bridge join failed: ${ev.error}` });
-        }
-        // main() wrapper failure shape (e.g. session file unreadable
-        // before connect): {"ok": false, "error": ...}
-        if (ev.ok === false && ev.error) {
-          clearTimeout(timer);
-          return done({ ok: false, joined: false, error: `voice bridge join failed: ${ev.error}` });
-        }
-      }
-    });
-    child.stderr.on("data", (d) => { out += d; });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      done({ ok: false, joined: false, error: `voice bridge exited (${code}) without joining: ${lastLine(out) || "(no output)"}` });
-    });
-    child.on("error", (e) => {
-      clearTimeout(timer);
-      done({ ok: false, joined: false, error: `cannot spawn voice bridge: ${e.message}` });
-    });
-  });
+  if (localSdp) st.offer_len = String(localSdp).length;
+  return {
+    ok: false,
+    joined: false,
+    error: "voice join unavailable in vc-ts: no MTProto client in-process "
+      + "(voice_bridge.py deleted Phase 5); join via the core-cpp tdlib "
+      + "backend (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + libntgcalls.so)",
+  };
 }
 
 // ------------------------------------------------------------ play --------
-// Run the Opus/RTP pipeline for `source`, then attempt the join so the
-// stream feeds a live call when a backend exists. Never throws; the
-// result (and the per-chat voice state) always names the exact outcome.
+// Run the Opus/RTP pipeline for `source`, build the local ntgcalls
+// offer as a pre-flight proof, then attempt the join. The join is
+// honestly unavailable in vc-ts (no MTProto client — see join()), so
+// the result is always {streaming:false, voice:"opus-rtp-ready",
+// reason:<exact join reason>} on a good pipeline — the voice state
+// never claims joined:true. Never throws; the result (and the
+// per-chat voice state) always names the exact outcome.
 async function playStream(chatId, source) {
   const st = chatState(chatId);
   st.voice = "encoding";
@@ -398,7 +422,18 @@ async function playStream(chatId, source) {
   } else {
     st.voice = `opus-file-only:${pipeline.rtp_error || "no RTP packets"}`;
   }
-  const j = await join(chatId);
+  // Pre-flight: prove in-process ntgcalls can build a call (addon, or
+  // wheel probe fallback). The offer is what the MTProto join would
+  // carry — but there is no MTProto client in this service to carry it.
+  const offer = await createLocalOffer(chatId);
+  if (offer.ok) {
+    st.offer_len = offer.offer_len;
+  } else {
+    st.reason = offer.error;
+    st.joined = false;
+    return { streaming: false, voice: st.voice, reason: offer.error, pipeline };
+  }
+  const j = await join(chatId, offer.offer);
   if (j.ok && j.joined) {
     st.joined = true;
     st.voice = "live";
@@ -431,8 +466,8 @@ function leaveVoiceChat(chatId) {
 
 function voiceState(chatId) {
   const st = chats.get(chatId);
-  if (!st) return { voice: "unavailable:not started", joined: false, reason: null, pipeline: null };
-  return { voice: st.voice, joined: st.joined, reason: st.reason, pipeline: st.pipeline };
+  if (!st) return { voice: "unavailable:not started", joined: false, reason: null, pipeline: null, offer_len: null };
+  return { voice: st.voice, joined: st.joined, reason: st.reason, pipeline: st.pipeline, offer_len: st.offer_len };
 }
 
 function status() {
@@ -446,7 +481,7 @@ function status() {
   }
   return {
     voice,
-    engine: "ffmpeg-libopus-rtp + ntgcalls-3.0.5 + voice_bridge(telethon)",
+    engine: "ffmpeg-libopus-rtp + ntgcalls-3.0.5 in-process (N-API addon; wheel-probe fallback for the local offer)",
     backend: cfg.describe,
     joined,
     chats: chats.size,

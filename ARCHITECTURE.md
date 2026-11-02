@@ -3,26 +3,32 @@
 ## The idea
 
 One bot, many experts. Each language does what it is best at, behind one
-narrow contract. The C++ core never downloads, never streams, never talks
-to Spotify — it routes. The services never talk to Telegram directly (except
-the voice engines, which must hold the MTProto voice session) — they answer
-IPC calls from the core.
+narrow contract. The C++ core routes and owns the in-process voice
+backends (TDLib + ntgcalls, Opus pipeline) — it never downloads via
+yt-dlp and never talks to Spotify. The services never talk to Telegram
+directly (except the voice engines, which must hold the MTProto voice
+session) — they answer IPC calls from the core.
 
 ```
-Telegram ──► core-cpp (C++20, Bot API / MTProto)
+Telegram ──► core-cpp (C++20, Bot API / TDLib / ntgcalls in-process)
                │  HTTP+JSON, X-Parlay-Token, contracts/ipc.json
-               ├─► vc-go        (Go, ntgcalls)      play/pause/queue in VC
-               ├─► vc-ts        (TS, grammy)        TS VC + Lemonic + inline
-               ├─► vc-rust      (Rust, ntgcalls)    fallback VC engine
+               ├─► vc-go        (Go, queue + resolver)  play/pause/queue in VC
+               ├─► vc-ts        (TS, plain Node)        TS VC + Lemonic + inline
+               ├─► vc-rust      (Rust, Opus/RTP)        fallback VC engine
                ├─► audio-fx-rust (Rust, FFmpeg)     Slow+Reverb / Nightcore / …
                ├─► share-rust   (Rust)              anonymous share links
                ├─► queue-rust   (Rust)              crowd voting queue → Spotify
                ├─► spotify-rust (Rust)              Spotify watch + profanity skip
-               ├─► gui-js       (Next.js Mini App)  web player, talks to core /api
+               ├─► gui-js       (plain Node web player) web player, talks to core /api
+               │                 + directly to vc-go/vc-ts for play/pause/skip
                ├─► radio-js     (Node)              radio stations as live sources
-               ├─► downloaders  (Python)            yt-dlp / spotdl / Soulseek
+               ├─► downloaders  (Python)            yt-dlp / spotdl / Navidrome
+               │                 (+ slskd daemon, opt-in, for Soulseek)
                └─► netease-go   (Go)                NetEase search/download/lyrics
-               └─► MongoDB + Redis (shared state: queues, auth, shares)
+               └─► MongoDB + Redis (core + vc-go only: chats, auth, settings,
+                                    cached queues — every other service keeps
+                                    its own JSON file; queues do NOT survive
+                                    an engine switch)
 ```
 
 ## C++ core base — anonx-cpp + NoxBeats + TinaMusic
@@ -38,8 +44,11 @@ from the three C++ refs, each contributing a different layer:
 
 Design rules for the core:
 1. **Route, don't do.** A command handler validates permissions, then emits
-   one IPC call and formats the result. No yt-dlp, no FFmpeg, no Spotify
-   client in the core binary.
+   one IPC call and formats the result. No yt-dlp, no Spotify client in
+   the core binary. (Exception, narrow and deliberate: the core owns the
+   in-process voice backends — TDLib signaling + ntgcalls WebRTC + the
+   ffmpeg Opus pipeline — because the assistant MTProto client must join
+   the voice chat itself; the vc-* services own queue/playback state.)
 2. **One queue schema.** `QueueItem` is defined once in `contracts/ipc.json`.
    VC services own runtime queue state; the core only mirrors now-playing
    for the GUI.
@@ -55,7 +64,10 @@ All three Go refs are the *same* lineage (YukkiMusicBot → Go ports) with
 different tunings, so they land as **one service, two profiles**:
 
 - `services/vc-go`, `VC_PROFILE=low-ram` — TgMusicBot tuning: single
-  ntgcalls instance, minimal prefetch/cache, smallest RAM. The default.
+  voice session, minimal prefetch/cache, smallest RAM. The default.
+  (Voice joining itself is NOT done here: the C++ core owns the voice
+  connection through its VoiceCall interface. This service owns queue
+  and playback state only, plus resolving the next track's stream URL.)
 - `services/vc-go`, `VC_PROFILE=high-perf` — ArcMusic tuning: MongoDB
   queue cache, prefetch, channel-play. For big groups.
 - Shared behaviour (from YukkiMusic-Go): `play/pause/resume/skip/seek/
@@ -64,9 +76,10 @@ different tunings, so they land as **one service, two profiles**:
 
 ## TS engines — TGVCBot + remix (+ Lemonic)
 
-- `services/vc-ts` runs the TS VC path (grammy, `tgcalls.ts` /
-  `streamer/stream.ts` shapes): YouTube + JioSaavn providers, radio
-  handler, live control panel, lyrics handler.
+- `services/vc-ts` runs the TS VC path (plain Node, stdlib only — no
+  grammy, no tgcalls library; the streamer shape follows the refs):
+  YouTube + JioSaavn providers, radio handler, live control panel,
+  lyrics handler.
 - The same service hosts the Lemonic module (`lemonic.search/download/
   stream`, Spotify link resolution) and the inline-query path.
 
@@ -74,7 +87,7 @@ different tunings, so they land as **one service, two profiles**:
 
 | Service | From | Owns |
 |---|---|---|
-| `vc-rust` | ParvatiMusic (`bot/src/modules/play.rs`, `mtproto/`, `ntg/`) | Fallback VC engine: MTProto + ntgcalls, live message editing, cancel-download |
+| `vc-rust` | ParvatiMusic (`bot/src/modules/play.rs`, `mtproto/`, `ntg/`) | Fallback VC engine: Opus/RTP pipeline + ntgcalls local offer; the old Telethon voice_bridge.py join client was deleted in Phase 5 (in-process model now — join via the core's TDLib backend) |
 | `audio-fx-rust` | telegram-music-bot-rust (`main.rs`) | Pure audio transforms: `fx.apply` with FFmpeg filter chains |
 | `share-rust` | feel-me (`src/{main,lib,models}.rs`, teloxide + Diesel) | Anonymous share links: create/resolve, tokenised, no identity stored |
 | `queue-rust` | daslui (`src/spotify.rs`) | Crowd queue: Spotify link → voting chat → approve/decline → Spotify playback queue |
@@ -85,9 +98,11 @@ Rust services are deliberately stateless apart from their own tables
 
 ## JS services — GUI/webapp + radio
 
-- `services/gui-js` (wavetune: Next.js Mini App) — the only service users
-  see in a browser. Talks **only** to the core (`/api/*`), never to voice
-  or downloader services. Now-playing, queue, search, player controls.
+- `services/gui-js` (wavetune: plain Node web player, stdlib only — no
+  Next.js build) — the only service users see in a browser. Now-playing
+  and queue proxy the core (`/api/*`); play/pause/skip/search talk
+  directly to `VC_GO_URL`/`VC_TS_URL` (and `NETEASE_URL` as a search
+  fallback) — the old "talks ONLY to the core" claim was false.
 - `services/radio-js` (openradiobot: `index.js`) — radio stations as live
   sources: `radio.start` hands a stream URL to the active VC engine.
 
@@ -97,17 +112,26 @@ Rust services are deliberately stateless apart from their own tables
   `download.youtube`, `download.spotify`, `download.spotify_playlist`
   (`mode: zip | files`), `download.deezer`, `download.tiktok`,
   `download.navidrome` (link → Deezer/Last.fm metadata → Soulseek →
-  tag → Navidrome library import).
+  tag → Navidrome library import; Soulseek goes through the separate
+  slskd daemon, opt-in), `spotify.collection` (metadata only).
 - Provider registry pattern from beetube (`providers/*.js`): each provider
-  is one handler; music is the default, movies/anime/torrents behind a flag.
+  is one handler. **Scope decision (Phase 5, B6): music only.**
+  Beetube's movie/anime/torrent providers were NOT ported — they depend
+  on Beetube's external API backend and torrent clients, and Parlay is a
+  music bot. No movie/anime/torrent handlers exist; do not add a stub
+  that returns `engine_unavailable` and call it a port.
 - 50 MB Bot API cap: files over the cap are queued, not failed — a later
   MTProto pass sends them (same rule as the user's @oldlibs pipeline).
 
 ## NetEase — `services/netease-go`
 
-Music163bot-Go, isolated on purpose: its cookie/login handling and lyric +
-audio-recognition handlers stay inside this service and never leak into
-the core. IPC: `netease.search/download/lyrics/recognize`.
+Music163bot-Go, isolated on purpose: its cookie/login handling and lyric
+handlers stay inside this service and never leak into the core. IPC:
+`netease.search/download/lyrics` + the generic `search.query` route
+(`POST /v1/search`, Phase 5). Audio recognition
+(`handlers_recognize.go` in the ref) was NOT ported — dropped from scope
+in Phase 5 (B7): it needs an external fingerprint backend and the ref's
+recognize flow needs login; no `netease.recognize` action exists.
 
 ## Shared IPC contract
 
@@ -125,9 +149,17 @@ core handler — never the other way round.
 
 ## Data
 
-- **MongoDB** — chats, auth users, settings, queues (cached), shares, votes.
+- **MongoDB** — chats, auth users, settings, queues (cached). Used by
+  the core and vc-go only.
 - **Redis** — now-playing mirror for the GUI, rate-limit counters, download
-  job locks.
+  job locks. Used by the core only.
+- **Everything else is a JSON file** under each service's
+  `$PARLAY_DATA_DIR` (vc-rust `vc-state.json`, vc-ts `state.json`,
+  queue-rust `votes.json`, share-rust `shares.json`, spotify-rust
+  `spotify-state.json`, radio-js `state.json`). A queue in vc-go/Mongo
+  is invisible to vc-ts/vc-rust JSON files and vice versa — engine
+  fail-over loses queue state. That is a documented limit (A11), not a
+  bug to silently paper over.
 - Services never share a database table directly; they share it *through*
   the contract (e.g. the GUI reads now-playing from Redis via the core).
 

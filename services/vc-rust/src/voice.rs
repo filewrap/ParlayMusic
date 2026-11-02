@@ -1,5 +1,5 @@
-//! Real voice transport for vc-rust: Opus/RTP pipeline + TDLib-join
-//! client. Std-only (no new crates, `cargo --offline`).
+//! Real voice transport for vc-rust: Opus/RTP pipeline + in-process
+//! ntgcalls. Std-only (no new crates, `cargo --offline`).
 //!
 //! The voice path, as in the upstream refs (ParvatiMusic `mtproto/` +
 //! `ntg/`, TinaMusic `tinaproto/mtproto.cpp` JoinGroupCall):
@@ -9,6 +9,20 @@
 //!   4. ntgcalls connect(remote)             -> live call
 //!   5. ntgcalls set_stream_sources(ffmpeg)  -> audio flows
 //!
+//! Phase 5 (in-process ntgcalls, voice bridge deleted): ntgcalls is a
+//! C++ NATIVE LIBRARY linked into the process, not a server. The
+//! refs/ntgcalls repo ships a C target (libntgcalls.so) and a Rust
+//! target (ntgcalls/ntgcalls-sys crates over PREBUILT static libs —
+//! final-only, no local build). Depending on ntgcalls-sys would add a
+//! crates.io dependency plus a prebuilt-binary download, so vc-rust
+//! uses a minimal hand-written FFI module instead (`ntg.rs`, loaded
+//! via `#[path]` below): it dlopens libntgcalls.so at runtime with
+//! libc's dlopen (std-only, no crates) and resolves the ntg_*
+//! functions — the same pattern as core-cpp NtgCallsVoiceCall and the
+//! vc-ts N-API addon. When the .so is absent, the local offer falls
+//! back to the ntgcalls-wheel probe (src/ntg_offer.py, one-shot,
+//! purely local WebRTC — not a server, not a join path).
+//!
 //! What is REAL here:
 //!   * The Opus/RTP pipeline (`opus_pipeline`): ffmpeg encodes the
 //!     source to libopus 48 kHz stereo (Ogg Opus file, ffprobe-verified
@@ -17,42 +31,53 @@
 //!     the packet count proven by parsing the RTP file (SSRC-anchored
 //!     scan). Proof on a 5 s 440 Hz tone: 251 frames, 83,736 bytes,
 //!     5.0065 s; 251 RTP packets + 1 RTCP SR, 85,973 bytes.
-//!   * The local offer (`create_local_offer`): the ntgcalls 3.0.5 wheel
-//!     in phase4/voice-venv builds a real offer offline — no MTProto,
-//!     no network, no credentials.
-//!   * The join client (`join`): drives the same voice_bridge.py
-//!     (Telethon + ntgcalls) that core-cpp spawns, and reports the
-//!     exact failure when the backend is not configured. There is NO
-//!     voice-join action in contracts/ipc.json and core-cpp exposes no
-//!     HTTP join endpoint, so the join goes through the bridge process
-//!     directly — the IPC contract only carries vc.play/pause/etc.
+//!   * The local offer (`create_local_offer`): ntgcalls create_call
+//!     in-process via the FFI module when libntgcalls.so exists, else
+//!     the wheel probe — both purely local WebRTC, no MTProto, no
+//!     network, no credentials.
+//!   * The join (`join`): HONESTLY UNAVAILABLE in this service. The
+//!     voice_bridge.py Telethon child that used to do
+//!     phone.joinGroupCall was deleted in Phase 5 (user order), and
+//!     Rust stdlib has no MTProto client — there is no Telethon in
+//!     Rust. The MTProto join now lives only in core-cpp's
+//!     TdLibVoiceCall (TDLib joinVideoChat + in-process ntgcalls).
+//!     join() therefore always returns Err with the exact reason;
+//!     `joined:true` is NEVER reported without a real join. A Rust
+//!     MTProto client (ParvatiMusic-style `mtproto/`) would be a new
+//!     subsystem and is out of scope.
 //!
 //! What is BLOCKED (sandbox, proven, not worked around):
 //!   * UDP sendto is EPERM even to loopback (`probe_udp`: io error 1,
 //!     Permission denied; ffmpeg `-f rtp rtp://127.0.0.1:PORT` fails
 //!     the same way, exit 255). RTP packets are therefore proven to a
 //!     FILE, never to a live UDP receiver.
-//!   * No MTProto session / credentials in this sandbox
-//!     (ASSISTANT_SESSION_FILE, API_ID, API_HASH unset), so `join`
-//!     fails at the config gate with the exact missing pieces named.
-//!     Without a session there is no phone.joinGroupCall and no live
-//!     call; `joined:true` is NEVER reported without a real join.
+//!   * libntgcalls.so is BUILT (refs/ntgcalls/shared-output/lib,
+//!     phase5/ntg-build.log, 3.0.5, 98 MB) and the FFI module loads
+//!     it in-process; the offer now comes from ntg_create_call via
+//!     the FFI, with the wheel probe only as the fallback when the
+//!     .so is absent.
+//!   * No MTProto session / credentials in this service, and no
+//!     client to use them with — see join() above.
 //!
 //! `RealVoiceCall` implements the `VoiceCall` trait in main.rs.
-//! `play_stream` runs the pipeline and then attempts the join, so
-//! now-playing `voice` reports the real state: `"opus-rtp-ready"` when
-//! the pipeline is proven, `"opus-file-only:<reason>"` when the Opus
-//! file is good but RTP packetization failed, or
-//! `"unavailable:<exact reason>"` otherwise. Nothing here panics on a
-//! voice failure: every failure is a returned reason string.
+//! `play_stream` runs the pipeline, builds the local offer as a
+//! pre-flight proof, then attempts the join, so now-playing `voice`
+//! reports the real state: `"opus-rtp-ready"` when the pipeline is
+//! proven, `"opus-file-only:<reason>"` when the Opus file is good but
+//! RTP packetization failed, or `"unavailable:<exact reason>"`
+//! otherwise. Nothing here panics on a voice failure: every failure
+//! is a returned reason string.
+
+#[path = "ntg.rs"]
+mod ntg;
 
 use super::{parse_json, Track, VoiceCall};
 use crate::data_file;
+use ntg::NtgLib;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- stats ---
@@ -75,21 +100,6 @@ pub struct OpusStats {
 }
 
 // ------------------------------------------------------------ helpers -----
-
-/// POSIX single-quote a string so it is one inert shell word (NoxBeats
-/// media_common.cpp::shell_quote; same as core-cpp voice_call.cpp).
-pub fn shell_quote(s: &str) -> String {
-    let mut out = String::from("'");
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
 
 fn last_line(s: &str) -> String {
     s.trim()
@@ -516,81 +526,54 @@ pub fn opus_pipeline(source: &str, work_root: &Path) -> OpusStats {
 pub struct BackendConfig {
     pub ok: bool,
     pub missing: Vec<String>,
-    pub bridge: String,
-    pub session: String,
-    pub api_id: i64,
-    pub api_hash: String,
+    // Resolved libntgcalls.so path ("" when none found). The media
+    // side only: even a fully-configured lib does NOT make join()
+    // possible — there is no MTProto client in this service.
+    pub lib: String,
+    pub offer_fallback: String,
 }
 
 impl BackendConfig {
     pub fn describe(&self) -> String {
         if self.ok {
-            format!("voice-bridge via {} (Telethon + ntgcalls)", self.bridge)
+            format!("ntgcalls in-process via {} (FFI)", self.lib)
         } else {
-            format!("voice join unavailable: {}", self.missing.join("; "))
+            format!(
+                "voice media unavailable: {}; {}",
+                self.missing.join("; "),
+                self.offer_fallback
+            )
         }
     }
-}
-
-fn bridge_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(b) = std::env::var("VOICE_BRIDGE") {
-        if !b.is_empty() {
-            out.push(PathBuf::from(b));
-        }
-    }
-    out.extend(repo_candidates("services/core-cpp/voice_bridge.py"));
-    out
 }
 
 /// Pure config check (env-independent so tests can exercise it without
 /// touching process env).
-pub fn backend_config_from(
-    session: Option<String>,
-    api_id: i64,
-    api_hash: Option<String>,
-    bridge: Option<String>,
-) -> BackendConfig {
+pub fn backend_config_from(ntgcalls_lib: Option<String>) -> BackendConfig {
     let mut missing = Vec::new();
-    let bridge_path = bridge.unwrap_or_default();
-    if bridge_path.is_empty() {
-        missing.push("VOICE_BRIDGE not found (no voice_bridge.py under the repo)".to_string());
-    } else if !Path::new(&bridge_path).exists() {
-        missing.push(format!("VOICE_BRIDGE missing ({})", bridge_path));
+    let lib = ntgcalls_lib.unwrap_or_default();
+    if lib.is_empty() {
+        missing.push(
+            "libntgcalls.so not found (NTGCALLS_LIB unset and no .so at the candidate paths — see phase5/ntg-build.log)".to_string(),
+        );
+    } else if !Path::new(&lib).exists() {
+        missing.push(format!("NTGCALLS_LIB missing ({})", lib));
     }
-    let session = session.unwrap_or_default();
-    if session.is_empty() {
-        missing.push("ASSISTANT_SESSION_FILE unset".to_string());
-    } else if !Path::new(&session).exists() {
-        missing.push(format!("ASSISTANT_SESSION_FILE not found ({})", session));
-    }
-    if api_id == 0 {
-        missing.push("API_ID unset".to_string());
-    }
-    let api_hash = api_hash.unwrap_or_default();
-    if api_hash.is_empty() {
-        missing.push("API_HASH unset".to_string());
-    }
+    let offer_fallback = "local offer via ntgcalls wheel probe (src/ntg_offer.py)".to_string();
     BackendConfig {
         ok: missing.is_empty(),
         missing,
-        bridge: bridge_path,
-        session,
-        api_id,
-        api_hash,
+        lib,
+        offer_fallback,
     }
 }
 
 pub fn backend_config_from_env() -> BackendConfig {
-    let bridge = first_existing(&bridge_candidates())
-        .map(|p| p.to_string_lossy().to_string());
-    let session = std::env::var("ASSISTANT_SESSION_FILE").ok();
-    let api_id = std::env::var("API_ID")
+    let lib = std::env::var("NTGCALLS_LIB")
         .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-    let api_hash = std::env::var("API_HASH").ok();
-    backend_config_from(session, api_id, api_hash, bridge)
+        .filter(|v| !v.is_empty())
+        .or_else(NtgLib::first_existing);
+    backend_config_from(lib)
 }
 
 fn voice_python() -> String {
@@ -610,208 +593,107 @@ fn ntg_offer_py() -> Option<PathBuf> {
 }
 
 // ----------------------------------------------------- local SDP offer ---
-// ntgcalls create_call(chat_id) via the voice-venv wheel. Offline:
-// proves the engine can build a call; the offer is what
-// phone.joinGroupCall carries.
+// ntgcalls create_call(chat_id). In-process first: the FFI module
+// (ntg.rs) dlopens libntgcalls.so and calls ntg_create_call (3.0.5
+// synchronous C API) in this process. Fallback when the .so is
+// probe (src/ntg_offer.py) — a one-shot local call, still offline, no
+// MTProto, no network, no credentials. Either way the offer is what
+// phone.joinGroupCall would carry.
 pub fn create_local_offer(chat_id: i64) -> Result<String, String> {
-    let script = match ntg_offer_py() {
-        Some(p) => p,
-        None => return Err("ntg_offer.py not found under services/vc-rust/src/".to_string()),
-    };
-    let (code, out, err) = run_cmd(
-        &voice_python(),
-        &[
-            script.to_string_lossy().to_string(),
-            chat_id.to_string(),
-        ],
-        Duration::from_secs(60),
-    );
-    let last_json = out.lines().filter(|l| !l.trim().is_empty()).last();
-    if let Some(line) = last_json {
-        if let Some(v) = parse_json(line) {
-            if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
-                if let Some(offer) = v.get("offer").and_then(|x| x.as_str()) {
-                    return Ok(offer.to_string());
+    // In-process FFI first (NTGCALLS_LIB, else the C-build output).
+    // ntgcalls refuses a second create_call for the same chat (-202
+    // "Connection cannot be initialized more than once"), so on
+    // failure we stop any stale call for that chat and retry once.
+    match NtgLib::load(None) {
+        Ok(lib) => match lib.create_offer(chat_id) {
+            Ok(offer) => return Ok(offer),
+            Err(e) => {
+                let first_err = e;
+                let _ = lib.stop(chat_id);
+                match lib.create_offer(chat_id) {
+                    Ok(offer) => return Ok(offer),
+                    Err(e2) => {
+                        return Err(format!(
+                            "ntgcalls create_call failed (in-process FFI via {}): {} (retry also failed: {})",
+                            lib.lib_path(),
+                            first_err,
+                            e2
+                        ));
+                    }
                 }
             }
-            if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
-                return Err(format!("ntgcalls create_call failed: {}", e));
+        },
+        Err(load_err) => {
+            // Fall through to the wheel probe; the load error is kept
+            // for the failure message if the probe fails too.
+            let script = match ntg_offer_py() {
+                Some(p) => p,
+                None => {
+                    return Err(format!(
+                        "ntgcalls create_call failed: {} (and ntg_offer.py not found)",
+                        load_err
+                    ));
+                }
+            };
+            let (code, out, err) = run_cmd(
+                &voice_python(),
+                &[script.to_string_lossy().to_string(), chat_id.to_string()],
+                Duration::from_secs(60),
+            );
+            let last_json = out.lines().filter(|l| !l.trim().is_empty()).last();
+            if let Some(line) = last_json {
+                if let Some(v) = parse_json(line) {
+                    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        if let Some(offer) = v.get("offer").and_then(|x| x.as_str()) {
+                            return Ok(offer.to_string());
+                        }
+                    }
+                    if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+                        return Err(format!(
+                            "ntgcalls create_call failed (wheel probe; FFI unavailable: {}): {}",
+                            load_err, e
+                        ));
+                    }
+                }
             }
+            Err(format!(
+                "ntgcalls create_call failed (exit {}): {} (FFI unavailable: {})",
+                code,
+                last_line(&err),
+                load_err
+            ))
         }
     }
-    Err(format!(
-        "ntgcalls create_call failed (exit {}): {}",
-        code,
-        last_line(&err)
-    ))
 }
 
 // ------------------------------------------------------------- join -------
 // The MTProto step: phone.joinGroupCall(local SDP) -> remote transport
-// -> ntgcalls connect(remote). Done by voice_bridge.py join-call, the
-// same child core-cpp spawns. The bridge prints one JSON object per
-// line; we watch for {"event":"joined"} (then SIGTERM the child — the
-// join is proven, the stream would run until stopped) or
-// {"event":"error"} (the exact failure). Bounded at 30 s.
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
+// -> ntgcalls connect(remote). HONESTLY UNAVAILABLE in vc-rust: the
+// voice_bridge.py Telethon child that did this was deleted in Phase 5
+// (user order — ntgcalls is a native library linked in-process, not a
+// server), and Rust stdlib has no MTProto client to replace it with.
+// The join lives only in core-cpp's TdLibVoiceCall (TDLib
+// joinVideoChat + in-process ntgcalls, TD_API_ID/TD_API_HASH/
+// TD_SESSION_DIR). This function therefore always returns Err with
+// the exact reason — never a spawned process, never a faked join.
+// The arguments are kept (offer pre-flight proof + opus source) so
+// the call shape survives for the day a Rust MTProto client exists.
 pub fn join(chat_id: i64, local_sdp: &str, opus_file: Option<&str>) -> Result<(usize, usize), String> {
     join_with_config(chat_id, local_sdp, opus_file, &backend_config_from_env())
 }
 
-// NOTE on the offer: the local SDP handed here is a pre-flight — it
-// proves ntgcalls can build a call (create_local_offer, offline).
-// The bridge builds its OWN offer on the NTgCalls instance that will
-// later connect, because the offer and the connect must share one
-// instance (voice_bridge.py cmd_join_call does create_call ->
-// JoinGroupCallRequest(offer) -> connect(remote) on one NTgCalls).
-// Both offers are ntgcalls create_call outputs; the one that reaches
-// phone.joinGroupCall is the bridge's.
 pub fn join_with_config(
     chat_id: i64,
     local_sdp: &str,
-    opus_file: Option<&str>,
-    cfg: &BackendConfig,
+    _opus_file: Option<&str>,
+    _cfg: &BackendConfig,
 ) -> Result<(usize, usize), String> {
-    if !cfg.ok {
-        return Err(cfg.describe());
-    }
-    let (offer_len, offer) = if !local_sdp.is_empty() {
-        (local_sdp.len(), local_sdp.to_string())
-    } else {
-        let o = create_local_offer(chat_id)?;
-        let n = o.len();
-        (n, o)
-    };
-    let _ = &offer; // pre-flight proof only; the bridge builds its own offer (see NOTE above)
-    // ffmpeg shell command for the bridge (TinaMusic buildFfmpegCmd
-    // shape): the already-encoded Opus file, decoded back to s16le
-    // 48 kHz stereo — or a 5 s test tone when there is no pipeline yet.
-    let ffmpeg_cmd = match opus_file {
-        Some(f) if Path::new(f).exists() => format!(
-            "ffmpeg -v quiet -i {} -vn -f s16le -ac 2 -ar 48000 pipe:1",
-            shell_quote(f)
-        ),
-        _ => "ffmpeg -v quiet -f lavfi -i \"sine=frequency=440:duration=5\" -vn -f s16le -ac 2 -ar 48000 pipe:1".to_string(),
-    };
-    let mut child = Command::new(voice_python())
-        .arg(&cfg.bridge)
-        .arg("join-call")
-        .arg("--chat-id")
-        .arg(chat_id.to_string())
-        .arg("--session")
-        .arg(&cfg.session)
-        .arg("--api-id")
-        .arg(cfg.api_id.to_string())
-        .arg("--api-hash")
-        .arg(&cfg.api_hash)
-        .arg("--ffmpeg-cmd")
-        .arg(&ffmpeg_cmd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot spawn voice bridge: {}", e))?;
-
-    // Drain stderr on a thread (a failed python start reports there).
-    let stderr_text = std::sync::Arc::new(Mutex::new(String::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let acc = std::sync::Arc::clone(&stderr_text);
-        std::thread::spawn(move || {
-            let mut r = BufReader::new(stderr);
-            let mut buf = String::new();
-            if r.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
-                if let Ok(mut g) = acc.lock() {
-                    *g = buf;
-                }
-            }
-        });
-    }
-    let (tx, rx) = mpsc::channel::<String>();
-    if let Some(stdout) = child.stdout.take() {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        if tx.send(l).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-    drop(tx);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last = String::new();
-    loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(line) => {
-                last = line.clone();
-                if let Some(v) = parse_json(&line) {
-                    if let Some(ev) = v.get("event").and_then(|x| x.as_str()) {
-                        if ev == "joined" {
-                            let n = v
-                                .get("transport_len")
-                                .and_then(|x| x.as_i64())
-                                .unwrap_or(0) as usize;
-                            kill_child(&mut child);
-                            return Ok((n, offer_len));
-                        }
-                        if ev == "error" {
-                            let e = v
-                                .get("error")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("unknown bridge error");
-                            kill_child(&mut child);
-                            return Err(format!("voice bridge join failed: {}", e));
-                        }
-                    }
-                    // main() wrapper failure shape (e.g. session file
-                    // unreadable before connect): {"ok": false, "error": ...}
-                    if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
-                        let e = v
-                            .get("error")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("unknown bridge error");
-                        kill_child(&mut child);
-                        return Err(format!("voice bridge join failed: {}", e));
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= deadline {
-                    kill_child(&mut child);
-                    return Err(format!(
-                        "voice bridge join timed out after 30 s (no joined/error event; last output: {})",
-                        last_line(&last)
-                    ));
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let status = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                let stderr = stderr_text
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
-                let tail = if !last_line(&last).is_empty() {
-                    last_line(&last)
-                } else {
-                    last_line(&stderr)
-                };
-                return Err(format!(
-                    "voice bridge exited ({}) without joining: {}",
-                    status,
-                    if tail.is_empty() { "(no output)".to_string() } else { tail }
-                ));
-            }
-        }
-    }
+    let _ = chat_id;
+    let _ = local_sdp;
+    Err("voice join unavailable in vc-rust: no MTProto client in-process \
+         (voice_bridge.py deleted Phase 5); join via the core-cpp tdlib \
+         backend (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + libntgcalls.so)"
+        .to_string())
 }
 
 // ---------------------------------------------------------- per-chat ------
@@ -870,7 +752,12 @@ impl RealVoiceCall {
     }
 
     /// Attempt the MTProto join for a chat and record the outcome.
-    /// Returns true only on a real join.
+    /// Returns true only on a real join. Pre-flight: prove in-process
+    /// ntgcalls can build a call (create_local_offer — FFI, or wheel
+    /// probe fallback) and record the offer length; the join itself is
+    /// honestly unavailable in this service (no MTProto client —
+    /// see join()), so the outcome is always "not joined" with the
+    /// exact reason until a Rust MTProto client exists.
     fn attempt_join(&self, chat_id: i64) -> bool {
         let opus_file = {
             let st = self.state_mut();
@@ -878,6 +765,21 @@ impl RealVoiceCall {
                 .and_then(|c| c.pipeline.as_ref())
                 .map(|p| p.opus_file.clone())
         };
+        match create_local_offer(chat_id) {
+            Ok(offer) => {
+                let mut st = self.state_mut();
+                let c = st.entry(chat_id).or_insert_with(ChatVoice::fresh);
+                c.offer_len = Some(offer.len());
+            }
+            Err(e) => {
+                let mut st = self.state_mut();
+                let c = st.entry(chat_id).or_insert_with(ChatVoice::fresh);
+                c.joined = false;
+                c.reason = Some(e.clone());
+                eprintln!("[voice] chat {} offer failed: {}", chat_id, e);
+                return false;
+            }
+        }
         match join(chat_id, "", opus_file.as_deref()) {
             Ok((remote_len, offer_len)) => {
                 let mut st = self.state_mut();
@@ -1103,37 +1005,49 @@ mod tests {
     }
 
     #[test]
-    fn backend_config_names_missing_pieces() {
-        let cfg = backend_config_from(None, 0, None, Some("/nonexistent/voice_bridge.py".to_string()));
+    fn backend_config_names_missing_lib() {
+        let cfg = backend_config_from(None);
         assert!(!cfg.ok);
         let d = cfg.describe();
         eprintln!("backend describe: {}", d);
-        assert!(d.contains("ASSISTANT_SESSION_FILE"), "{}", d);
-        assert!(d.contains("API_ID"), "{}", d);
-        assert!(d.contains("API_HASH"), "{}", d);
-        assert!(d.contains("VOICE_BRIDGE"), "{}", d);
-        // Fully configured (paths need only exist for the check).
-        let cfg2 = backend_config_from(
-            Some("/tmp".to_string()),
-            12345,
-            Some("hash".to_string()),
-            Some("/tmp".to_string()),
-        );
+        assert!(d.contains("libntgcalls.so"), "{}", d);
+        assert!(d.contains("wheel probe"), "{}", d);
+        // A lib path that exists is "configured" for the media side
+        // (existence only — loading is proven by create_local_offer).
+        let cfg2 = backend_config_from(Some("/tmp".to_string()));
         assert!(cfg2.ok, "{}", cfg2.describe());
+        assert!(cfg2.describe().contains("in-process"), "{}", cfg2.describe());
+        // Nonexistent explicit path is named.
+        let cfg3 = backend_config_from(Some("/nonexistent/libntgcalls.so".to_string()));
+        assert!(!cfg3.ok);
+        assert!(cfg3.describe().contains("NTGCALLS_LIB missing"), "{}", cfg3.describe());
     }
 
     #[test]
-    fn join_without_credentials_names_the_missing_pieces() {
-        // Env-independent path: join_with_config with an empty config
-        // must fail at the gate before any process is spawned.
-        let cfg = backend_config_from(None, 0, None, None);
-        assert!(!cfg.ok);
+    fn join_fails_honestly_no_mtproto_client() {
+        // Env-independent path: join_with_config must fail with the
+        // no-MTProto-client reason before any process is spawned —
+        // vc-rust holds no MTProto client since the bridge was deleted.
+        let cfg = backend_config_from(None);
         let err = join_with_config(-1004243, "", None, &cfg)
-            .expect_err("join must fail without credentials");
+            .expect_err("join must fail without an MTProto client");
         eprintln!("join error: {}", err);
-        assert!(err.contains("ASSISTANT_SESSION_FILE"), "{}", err);
-        assert!(err.contains("API_ID"), "{}", err);
-        assert!(err.contains("API_HASH"), "{}", err);
+        assert!(err.contains("no MTProto client"), "{}", err);
+        assert!(err.contains("voice_bridge.py deleted"), "{}", err);
+        assert!(err.contains("tdlib"), "{}", err);
+    }
+
+    #[test]
+    fn join_still_fails_when_ntg_lib_is_configured() {
+        // Media vs signaling are separate gates: even with a lib path
+        // configured, join() cannot phone.joinGroupCall — there is no
+        // MTProto client in this service.
+        let cfg = backend_config_from(Some("/tmp".to_string()));
+        assert!(cfg.ok, "{}", cfg.describe());
+        let err = join_with_config(-1004243, "dummy-offer", None, &cfg)
+            .expect_err("join must fail even with ntgcalls configured");
+        eprintln!("join with lib configured: {}", err);
+        assert!(err.contains("no MTProto client"), "{}", err);
     }
 
     #[test]
@@ -1145,41 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn join_with_empty_session_reports_bridge_value_error() {
-        // One level past the config gate: a session file that exists
-        // but is empty makes the bridge fail in read_session before any
-        // network — the join client must surface the bridge's exact
-        // {"ok": false, "error": ...} shape, not a generic exit line.
-        let dir = work_dir("join-empty-session");
-        let session = dir.join("empty.session");
-        std::fs::write(&session, "").expect("write empty session");
-        let bridge = first_existing(&bridge_candidates()).expect("voice_bridge.py must exist");
-        let cfg = backend_config_from(
-            Some(session.to_string_lossy().to_string()),
-            12345,
-            Some("dummyhash".to_string()),
-            Some(bridge.to_string_lossy().to_string()),
-        );
-        assert!(cfg.ok, "{}", cfg.describe());
-        let err = join_with_config(-1004243, "", None, &cfg)
-            .expect_err("empty session must fail the join");
-        eprintln!("join with empty session: {}", err);
-        assert!(err.contains("ValueError"), "{}", err);
-        assert!(
-            !err.contains("without joining"),
-            "should use the ok:false shape, got: {}",
-            err
-        );
-    }
-
-    #[test]
     fn play_stream_reports_real_voice_state_never_joined() {
-        // Deterministic: drop any MTProto credentials from this test
-        // process first, so the join attempt always hits the config
-        // gate (the sandbox has none set; this guards CI parity).
-        for k in ["ASSISTANT_SESSION_FILE", "API_ID", "API_HASH"] {
-            std::env::remove_var(k);
-        }
         let vc = RealVoiceCall::new();
         let track = Track {
             id: "tone5".to_string(),
@@ -1201,16 +1081,20 @@ mod tests {
         vc.play_stream(-1004243, &track);
         let detail = vc.voice_detail(-1004243).expect("voice state recorded");
         eprintln!(
-            "play_stream voice={} joined={} reason={:?} frames={:?} rtp={:?}",
+            "play_stream voice={} joined={} reason={:?} frames={:?} rtp={:?} offer_len={:?}",
             detail.voice,
             detail.joined,
             detail.reason,
             detail.pipeline.as_ref().map(|p| p.frames),
-            detail.pipeline.as_ref().map(|p| p.rtp_packets)
+            detail.pipeline.as_ref().map(|p| p.rtp_packets),
+            detail.offer_len
         );
         assert_eq!(detail.voice, "opus-rtp-ready");
         assert!(!detail.joined, "never joined:true without a real join");
-        assert!(detail.reason.as_deref().unwrap_or("").contains("ASSISTANT_SESSION_FILE"));
+        assert!(detail.reason.as_deref().unwrap_or("").contains("no MTProto client"));
+        // Pre-flight offer was built (FFI, or wheel probe fallback).
+        let offer_len = detail.offer_len.expect("offer_len recorded");
+        assert!(offer_len > 100, "offer_len {}", offer_len);
         let p = detail.pipeline.expect("pipeline stats recorded");
         assert_eq!(p.frames, 251);
         assert_eq!(p.rtp_packets, 251);

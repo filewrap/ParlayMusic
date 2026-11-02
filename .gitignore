@@ -20,8 +20,10 @@ __pycache__/
 *.log
 .DS_Store
 phase4/
+phase5/
 .tools/
 **/.venv/
 **/venv/
 *.sqlite3
 *.sqlite
+*.node

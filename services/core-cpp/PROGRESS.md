@@ -1,5 +1,15 @@
 # core-cpp — Worker A progress
 
+> **SUPERSEDED as a status snapshot (Phase 5, 2026-11-03).** This file is
+> the Phase 2 (2026-11-02) build log, kept as history — do not read its
+> "What is stubbed" section as current status. Superseded since:
+> `LoggingVoiceCall` is deleted (real `TdLibVoiceCall` +
+> `NtgCallsVoiceCall` + `OpusPipeline` backends, 7/7 TDLib tests);
+> MongoDB/Redis are connected (store_test 40/40 vs real mongod/redis);
+> the voice bridge (`voice_bridge.py`) was deleted in Phase 5; the vc-*
+> and downloader services are real, tested services (see root
+> `REMAINING.md` + each service README's Implemented section).
+
 Date: 2026-11-02. Scope: `services/core-cpp/` only (read `refs/`, `contracts/ipc.json`, `ARCHITECTURE.md`, `PORT_MAP.md`). No push, no tokens, no secrets in files.
 
 ## Commands run

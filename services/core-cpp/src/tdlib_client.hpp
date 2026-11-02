@@ -14,11 +14,21 @@
 // Auth state machine (td_api.tl, authorizationState*):
 //   WaitTdlibParameters -> setTdlibParameters (TD_API_ID / TD_API_HASH /
 //   TD_SESSION_DIR) -> WaitPhoneNumber -> setAuthenticationPhoneNumber
-//   (TD_PHONE) -> WaitCode -> checkAuthenticationCode (TD_CODE) ->
-//   WaitPassword -> checkAuthenticationPassword (TD_PASSWORD) -> Ready.
-//   A fresh session directory with no credentials stops honestly at the
-//   first state that needs one: "not authorized: no credentials".
-//   No values are ever logged; only env var NAMES are recorded.
+//   (TD_PHONE) — or, with TD_QR=1, requestQrCodeAuthentication, after
+//   which TDLib reports WaitOtherDeviceConfirmation with the login
+//   link (see otherDeviceLink()) -> WaitCode -> checkAuthenticationCode
+//   (TD_CODE) -> WaitPassword -> checkAuthenticationPassword
+//   (TD_PASSWORD) -> Ready. Email accounts go WaitEmailAddress ->
+//   setAuthenticationEmailAddress (TD_EMAIL) -> WaitEmailCode ->
+//   checkAuthenticationEmailCode (TD_EMAIL_CODE) -> Ready. A fresh
+//   phone number goes WaitRegistration -> registerUser (TD_FIRST_NAME,
+//   TD_LAST_NAME) -> Ready. A fresh session directory with no
+//   credentials stops honestly at the first state that needs one:
+//   "not authorized: no credentials". The one state this client
+//   cannot drive is WaitPremiumPurchase (an in-store purchase) — it
+//   fails honestly and names the workaround (log in once with a full
+//   client, reuse TD_SESSION_DIR). No values are ever logged; only
+//   env var NAMES are recorded.
 #pragma once
 
 #include <cstdint>
@@ -68,13 +78,34 @@ public:
 
     // Drive the auth state machine to Ready using env credentials:
     //   TD_API_ID, TD_API_HASH, TD_SESSION_DIR (always required),
-    //   TD_PHONE, TD_CODE, TD_PASSWORD (as each state demands).
+    //   TD_PHONE, TD_CODE, TD_PASSWORD (as each state demands),
+    //   TD_EMAIL, TD_EMAIL_CODE (email login), TD_FIRST_NAME,
+    //   TD_LAST_NAME (first registration), TD_QR=1 (QR login instead
+    //   of phone at WaitPhoneNumber; the link arrives in
+    //   otherDeviceLink()).
     // Returns false + lastError() when a needed credential is missing
     // ("not authorized: no credentials ..."), when TDLib reports an
     // error, or when timeout_sec elapses without reaching Ready.
     // An already-authorized session directory reaches Ready with no
     // phone/code/password at all.
     bool authorize(double timeout_sec = 60.0);
+
+    // QR login link, captured from the authorization_state object
+    // when TDLib reports authorizationStateWaitOtherDeviceConfirmation
+    // (after requestQrCodeAuthentication). Empty until that state is
+    // seen; the user scans it with Telegram on another device.
+    // The link itself only arrives after a live DC round-trip, so it
+    // is empty in offline runs — the request path is still real.
+    std::string otherDeviceLink() const { return other_device_link_; }
+
+    // Drive ONE auth state from env (what authorize() calls per state
+    // change). Public so offline tests can exercise each state without
+    // a live TDLib session: returns false + error_out when the state
+    // needs a credential that is not set, or when the state cannot be
+    // driven headless (WaitPremiumPurchase). Returns true when the
+    // state was driven (request sent) or needs no action (Ready,
+    // WaitOtherDeviceConfirmation — the user scans the link).
+    bool handleAuthState(const std::string& state, std::string& error_out);
 
     // Best-effort graceful shutdown: send "close", wait for
     // authorizationStateClosed, then destroy the client.
@@ -88,6 +119,11 @@ public:
         std::string phone;           // TD_PHONE
         std::string code;            // TD_CODE
         std::string password;        // TD_PASSWORD
+        std::string email;           // TD_EMAIL (email login)
+        std::string email_code;      // TD_EMAIL_CODE (email login code)
+        std::string first_name;      // TD_FIRST_NAME (first registration)
+        std::string last_name;       // TD_LAST_NAME (first registration)
+        bool qr = false;             // TD_QR=1 (QR login, not phone)
         static Params fromEnv();
         bool configured() const {
             return api_id != 0 && !api_hash.empty() && !session_dir.empty();
@@ -99,13 +135,13 @@ private:
     // updateAuthorizationState, stash other updates. Returns the raw
     // JSON string ("" on timeout) and whether it was an update.
     std::string pump(double timeout_sec, bool* was_update);
-    bool handleAuthState(const std::string& state, std::string& error_out);
 
     void* handle_ = nullptr;
     void* client_ = nullptr;
     std::string lib_path_;
     std::string last_error_;
     std::string auth_state_;
+    std::string other_device_link_;
     Json last_update_;
     int64_t next_extra_ = 1;
 

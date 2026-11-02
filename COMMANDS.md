@@ -24,13 +24,14 @@ linked channel (`via_channel=true`, 34 commands).
 | `/pause`, `/resume` | — | play_mode | `vc.pause` / `vc.resume` |
 | `/skip`, `/next` | — | play_mode | `vc.skip` (resets loop) |
 | `/stop`, `/end` | — | play_mode | `vc.stop` |
+| `/join` | — | admin | `vc.join` (core-cpp TDLib backend; needs TD_* + libntgcalls.so) |
 | `/loop` | `[n 0-10 \| off]` | play_mode | `vc.loop` |
 | `/seek` | `<sec>` (min 10) | play_mode | `vc.seek` |
 | `/seekback` | `<sec>` | play_mode | `vc.seek` (back) |
 | `/jump` | `<mm:ss>` | play_mode | `vc.seek` |
 | `/speed` | `[0.5–2.0]` | play_mode | stored + seek-restart |
 | `/bass` | `[0–100]` | play_mode | stored + seek-restart (lowpass) |
-| `/mute`, `/unmute` | — | admin | flag-only (no vc mute IPC action yet) |
+| `/mute`, `/unmute` | — | admin | `vc.mute` on core-owned sessions (real ntgcalls mute); engine-owned sessions honestly refuse |
 | `/replay` | — | play_mode | `vc.seek` 0 |
 | `/player` | — | E | now-playing panel |
 | `/volume` | `[0–200]` | play_mode | `vc-ts` volume / panel (remix scale) |
@@ -125,10 +126,7 @@ linked channel (`via_channel=true`, 34 commands).
 
 ## Not yet (named, with reason)
 
-- `/mute` downstream: flag-only — no `vc.mute` action exists in
-  `contracts/ipc.json` yet (contract-first rule: add it there first).
-- `/play` from replied-to media: needs the `file_id` hand-off
-  (core ↔ Telegram file path not implemented).
+- `/play` from replied-to media: implemented (Phase 5) — core takes the `file_id` from `reply_to_message` (audio/document/voice/video_note) and plays it through the core voice backend.
 - `/speed` / `/bass` audio filter: seek-restart + stored value;
   VC services do not apply the filter yet.
 - `/broadcast` errors file: failures inline, no `errors.txt`

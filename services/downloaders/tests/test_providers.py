@@ -14,11 +14,14 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src import deezer as deezer_mod
 from src import navidrome as navidrome_mod
+from src import providers as providers_mod
+from src import server as server_mod
 from src import spotify as spotify_mod
 from src import spotify_api
 from src import tiktok as tiktok_mod
@@ -288,6 +291,66 @@ class TestLiveDownloads(unittest.TestCase):
         self.assertGreater(len(tracks), 5)
         print("\nspotify API live OK: track=%s; playlist %r: %d/%d tracks"
               % (track["title"], name, len(tracks), total))
+
+
+class TestSpotifyCollection(unittest.TestCase):
+    """POST /v1/spotify/collection (B9, Phase 5 Worker E): metadata only,
+    no downloads. All network is mocked — these are offline unit tests."""
+
+    PLAYLIST = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+    FAKE_TRACKS = [
+        {"id": "t1", "title": "One", "artist": "A", "source": "spotify"},
+        {"id": "t2", "title": "Two", "artist": "B", "source": "spotify"},
+    ]
+
+    def test_route_registered(self):
+        self.assertIn(("POST", "/v1/spotify/collection"), server_mod.ROUTES)
+
+    def test_rejects_bad_urls(self):
+        for body in ({}, {"url": ""},
+                     {"url": "https://example.com/nope"},
+                     {"url": "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"}):
+            with self.assertRaises(ApiError, msg=repr(body)):
+                providers_mod.spotify_collection(body)
+
+    @mock.patch("src.providers.spotify_api.configured", return_value=False)
+    @mock.patch("src.providers.spotify_mod.resolve_collection")
+    @mock.patch("src.providers.spotify_mod._oembed_title",
+                return_value=("My Playlist", "Someone"))
+    def test_fallback_path(self, _oembed, resolve, _configured):
+        resolve.return_value = list(self.FAKE_TRACKS)
+        out = providers_mod.spotify_collection({"url": self.PLAYLIST})
+        self.assertEqual(out["api"], "yt-dlp/oEmbed fallback")
+        self.assertEqual(out["kind"], "playlist")
+        self.assertEqual(out["name"], "My Playlist")
+        self.assertEqual(out["tracks"], self.FAKE_TRACKS)
+        self.assertFalse(out["truncated"])
+        resolve.assert_called_once()
+
+    @mock.patch("src.providers.spotify_api.configured", return_value=True)
+    @mock.patch("src.providers.spotify_api.get_playlist")
+    def test_api_path(self, get_playlist, _configured):
+        get_playlist.return_value = ("Top Hits", list(self.FAKE_TRACKS),
+                                     100, True)
+        out = providers_mod.spotify_collection({"url": self.PLAYLIST})
+        self.assertEqual(out["api"], "spotify-web-api")
+        self.assertEqual(out["kind"], "playlist")
+        self.assertEqual(out["name"], "Top Hits")
+        self.assertEqual(len(out["tracks"]), 2)
+        self.assertTrue(out["truncated"])
+
+    @mock.patch("src.providers.spotify_api.configured", return_value=False)
+    @mock.patch("src.providers.spotify_mod.resolve_collection")
+    @mock.patch("src.providers.spotify_mod._oembed_title",
+                return_value=(None, None))
+    def test_truncates_to_50(self, _oembed, resolve, _configured):
+        resolve.return_value = [
+            {"id": "t%d" % i, "title": "T%d" % i, "source": "spotify"}
+            for i in range(60)]
+        out = providers_mod.spotify_collection({"url": self.PLAYLIST})
+        self.assertEqual(len(out["tracks"]), 50)
+        self.assertTrue(out["truncated"])
+        self.assertEqual(out["name"], "")
 
 
 if __name__ == "__main__":

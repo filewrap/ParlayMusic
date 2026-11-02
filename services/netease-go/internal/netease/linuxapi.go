@@ -32,20 +32,19 @@ const linuxapiKey = "rFgB&h#%2?^eDg:Q"
 func (c *Client) linuxapiPost(path, innerJSON string, v any) error {
 	fwd, err := json.Marshal(map[string]any{
 		"method": "POST",
-		"url":    baseURL + path,
+		"url":    c.base + path,
 		"params": json.RawMessage(innerJSON),
 	})
 	if err != nil {
 		return err
 	}
 	body := "eparams=" + fmt.Sprintf("%X", encryptECB(string(fwd), linuxapiKey))
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/linux/forward", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, c.base+"/api/linux/forward", strings.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Referer", "https://music.163.com/")
+	c.setAuthHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("netease linuxapi request failed: %w", err)

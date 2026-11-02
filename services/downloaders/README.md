@@ -8,11 +8,13 @@ movies, anime, torrents) + eeegoloauq music-bot (`src/navidrome.py`,
 
 Behaviour is re-implemented (not copied) behind Parlay's IPC contract
 (`contracts/ipc.json`). One HTTP surface: `download.youtube/spotify/
-spotify_playlist/deezer/tiktok/navidrome` + `search`. Provider registry
-pattern from beetube: each provider is one handler in `src/providers.py`;
-music is default, others behind a flag. Files over the 50 MB Bot API cap
-return `oversize: true` and are queued for a later MTProto pass — never
-failed.
+spotify_playlist/deezer/tiktok/navidrome/soulseek` + `spotify.collection`
+(metadata only) + `search`. Provider registry pattern from beetube:
+each provider is one handler in `src/providers.py`. **Scope: music
+only (Phase 5, B6).** Beetube's movie/anime/torrent providers were NOT
+ported — they depend on Beetube's external API backend and torrent
+clients. Files over the 50 MB Bot API cap return `oversize: true` and
+are queued for a later MTProto pass — never failed.
 
 ## Run
 
@@ -22,6 +24,8 @@ python3 -m venv .venv
 PORT=8010 PARLAY_TOKEN=... PARLAY_DL_DIR=./downloads \
   .venv/bin/python -m src.main
 ```
+(8010 is the code default for local runs; under compose `PORT=8009` —
+see `docker-compose.yml`.)
 
 Stdlib-only HTTP server (`http.server.ThreadingHTTPServer`); the only
 non-stdlib piece is the `yt-dlp` binary invoked as a subprocess.
@@ -35,10 +39,12 @@ non-stdlib piece is the `yt-dlp` binary invoked as a subprocess.
 | `POST /v1/download/youtube` | `{query, requested_by}` | `{file_path, track, size_bytes, oversize}` |
 | `POST /v1/download/spotify` | `{url, requested_by}` | same as above (track `source=spotify`) |
 | `POST /v1/download/spotify-playlist` | `{url, mode: zip\|files, requested_by}` | `{count, file_path\|file_paths, size_bytes, oversize, truncated}` |
+| `POST /v1/spotify/collection` | `{url}` | `{api, kind, name, tracks, truncated}` — metadata only, no files (Phase 5, B9). `api` is `spotify-web-api` with creds, else `yt-dlp/oEmbed fallback` |
 | `POST /v1/search` | `{query, source: youtube\|spotify\|all, limit}` | `{results: [Track]}` |
-| `POST /v1/download/deezer` | `{query\|url, requested_by}` | `{file_path, track}` (single: 30 s preview mp3; album: ZIP of previews, `count`) |
+| `POST /v1/download/deezer` | `{query\|url, requested_by}` | `{file_path, track}` (single: 30 s preview mp3, or full track when `DEEZER_ARL` is set; album: ZIP of previews/full tracks, `count`) |
 | `POST /v1/download/tiktok` | `{url, requested_by}` | `{file_path, track, size_bytes, oversize}` (audio mp3) |
 | `POST /v1/download/navidrome` | `{query\|url, requested_by}` | `{file_path, track, size_bytes, oversize, imported:true}` (original file) |
+| `POST /v1/download/soulseek` | `{query\|artist+title\|album, accept_lossy?, requested_by}` | `{file_path, track, peer, format}` (single) or `{count, total, failed, format, source_counts, album_dir}` (album) |
 
 Auth: `X-Parlay-Token` on every POST when `$PARLAY_TOKEN` is set.
 Envelopes per `contracts/ipc.json`: `{ok:true, data:{...}}` /
@@ -56,7 +62,7 @@ the API (real track lists, real titles/durations) and `/v1/search`
 old yt-dlp/oEmbed fallback runs and every track carries a `note`
 saying so — a track list is never fabricated.
 
-## Deezer / TikTok / Navidrome (Phase 4)
+## Deezer / TikTok / Navidrome / Soulseek (Phase 4 + 5)
 
 - **Deezer** (`src/deezer.py`) — public API `api.deezer.com`, no auth
   (same shape as music-bot-navidrome `src/metadata/deezer.py`).
@@ -66,6 +72,20 @@ saying so — a track list is never fabricated.
   full track needs a Deezer account (ARL cookie, not held here). Album
   input → ZIP of all previews. Live-tested 2026-11-02: search +
   preview download, Daft Punk *Discovery* album → 14-preview ZIP.
+  - **Full tracks with `DEEZER_ARL` (Phase 5):** when the env var
+    holds the 192-character `arl` session cookie from a logged-in
+    Deezer browser session (value never stored in the repo — set it
+    in the environment only), downloads use the real Deezer flow:
+    `api_token` scrape → `song.getData` (MD5_ORIGIN, TRACK_TOKEN,
+    MEDIA_VERSION) → `media.deezer.com/v1/get_url` with the license
+    token → CDN URL, Blowfish-CBC-decrypted (deemix scheme, legacy
+    AES-ECB stream path as fallback). Format ladder by
+    `DEEZER_FORMAT` (default `MP3_320`; `MP3_128`, `FLAC`); free
+    accounts only get MP3_128. Any ARL failure falls back to the
+    preview with an honest note. Without the cookie the behaviour is
+    unchanged (previews only). Tested offline against a stubbed
+    Deezer (8 tests, `tests/test_deezer_arl.py`); no real ARL cookie
+    has ever been used here.
 - **TikTok** (`src/tiktok.py`) — yt-dlp `-J` metadata + best-audio
   URL (works), then the bytes via plain urllib GET of the signed CDN
   URL: yt-dlp's own downloader stalls on reads from this egress proxy
@@ -81,6 +101,28 @@ saying so — a track list is never fabricated.
   vars answer `engine_unavailable` naming them. Live-tested
   2026-11-02 against demo.navidrome.org: search → download,
   5,365,035-byte mp3.
+- **Soulseek** (`src/soulseek/`, Phase 5) — slskd HTTP API, ported
+  from music-bot-navidrome `src/soulseek/*` (client, matcher,
+  scorer, selection, downloader) into sync stdlib Python. Single
+  track (`{query}` or `{artist, title, duration_sec?}`) or whole
+  album (`{album:{artist, title, tracks:[...]}}`); FLAC preferred,
+  `accept_lossy:true` allows mp3 ≥ 256 kbps / m4a when no FLAC
+  exists. Matching: duration ±30 s + artist/name gates, version
+  penalty (live/remix ×0.30), free-upload-slot + queue-length
+  scoring; folder match first for albums, per-track fallback after.
+  Env: `SLSKD_URL` (default `http://slskd:5030`), `SLSKD_API_KEY`,
+  `SLSKD_DOWNLOAD_DIR`, `SLSKD_DOWNLOAD_TIMEOUT` (default 900 s),
+  `SLSKD_MAX_PEER_ATTEMPTS` (default 3). slskd down or not logged in
+  → `engine_unavailable` naming `SLSKD_URL`; a search that ran and
+  found nothing → `download_failed` with the honest reason. Status
+  2026-11-03: slskd 0.26.2 installed and running in the sandbox
+  (`phase5/slskd/`, API on :5030), wired end-to-end against a stub
+  slskd (16 tests, `tests/test_soulseek.py`) and verified against
+  the real daemon — which answers exactly `"The server connection
+  must be connected and logged in to perform a search (currently:
+  Disconnected)"`. **No real Soulseek search/download has happened:
+  that needs a Soulseek account username + password, which only the
+  user can supply.**
 
 ## Implemented vs stubbed
 
@@ -111,14 +153,18 @@ Implemented (live-tested 2026-11-02, see PROGRESS.md):
   else YouTube matches marked `source=spotify` with an honest `note`.
 - **Deezer** — public API search/track/album; 30 s preview mp3
   download (yt-dlp refuses Deezer: DRM); album → ZIP of previews.
+  With `DEEZER_ARL` set, full tracks via the deemix flow (see above).
+- **Soulseek** — slskd-backed search + download, single track or
+  album; FLAC preferred, optional lossy fallback (see above).
+  Live-unproven: needs a Soulseek account.
 - **TikTok** — yt-dlp metadata + direct CDN download of the audio mp3
   (yt-dlp's own downloader stalls on reads from this egress).
 - **Navidrome** — Subsonic search + `rest/download` of the original
   file; `NAVIDROME_URL`/`NAVIDROME_USER`/`NAVIDROME_PASSWORD` env.
 
-Stubbed: nothing. All five providers are real (see the Phase 4
-sections above). Soulseek-via-slskd (Navidrome's lossy-download path)
-is a separate opt-in job — it needs its own slskd daemon.
+Stubbed: nothing. All six providers are real (see the Phase 4/5
+sections above). Soulseek is real code but live-unproven: it needs a
+Soulseek account to search, which only the user can supply.
 
 ## Notes / limits
 

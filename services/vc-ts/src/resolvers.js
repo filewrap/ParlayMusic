@@ -100,6 +100,24 @@ function runYtDlp(args, timeoutMs = 30000) {
   });
 }
 
+// Same bot-check test as the downloaders service (ytdlp.py) and
+// vc-rust: YouTube's "Sign in to confirm you're not a bot" gate.
+function isBotCheck(text) {
+  const s = String(text || "");
+  return s.includes("not a bot") || s.includes("Sign in to confirm");
+}
+
+// Run yt-dlp, retrying once with the android player client when
+// YouTube answers its bot check (same retry as the downloaders
+// service; no cookies or credentials). The android client is not
+// gated the same way from this egress IP.
+async function runYtDlpResilient(args, timeoutMs = 30000) {
+  const first = await runYtDlp(args, timeoutMs);
+  if (first.ok) return first;
+  if (!isBotCheck(first.error)) return first;
+  return runYtDlp(["--extractor-args", "youtube:player_client=android", ...args], timeoutMs);
+}
+
 const YT_URL_RE =
   /(?:youtube\.com\/(?:watch\?[^#\s]*v=|shorts\/|embed\/|v\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/;
 
@@ -120,59 +138,76 @@ function ytTrackFromInfo(info, fallbackUrl) {
   };
 }
 
-function degradedYouTubeTrack(query, videoId) {
-  // yt-dlp missing/failed/rate-limited (YouTube 429s the sandbox egress
-  // IP): keep a placeholder so play/queue still work, and say so.
-  if (videoId) {
-    return {
-      id: `yt:${videoId}`,
-      title: `YouTube video ${videoId}`,
-      artist: "Unknown",
-      duration_sec: 0,
-      url: `https://www.youtube.com/watch?v=${videoId}`,
-      thumbnail: null,
-      source: "youtube",
-      degraded: true,
-      resolve_note: "yt-dlp resolve failed (missing or YouTube 429); degraded placeholder",
-    };
-  }
-  const hash = crypto.createHash("sha1").update(String(query)).digest("hex").slice(0, 16);
-  return {
-    id: `query:${hash}`,
-    title: String(query),
-    artist: "Unknown",
-    duration_sec: 0,
-    url: null,
-    thumbnail: null,
-    source: "youtube",
-    degraded: true,
-    resolve_note: "yt-dlp search failed (missing or YouTube 429); degraded placeholder",
-  };
-}
-
 // Resolve a YouTube URL or a free-text query to one Track.
+//
+// Phase 5 (A9): there is no degraded placeholder any more. yt-dlp is
+// retried once with the android player client on YouTube's bot check,
+// and a failure after that throws EngineUnavailable (HTTP 502) instead
+// of inventing a track — a fake track with duration 0 would sit in the
+// queue forever and the core could never fail over to another engine.
 async function resolveYouTube(query) {
   const videoId = extractYouTubeId(query);
   if (videoId) {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    const r = await runYtDlp(["-j", "--no-playlist", url]);
-    if (r.ok && r.json) return { track: ytTrackFromInfo(r.json, url), degraded: false };
-    return { track: degradedYouTubeTrack(query, videoId), degraded: true, error: r.error };
+    const r = await runYtDlpResilient(["-j", "--no-playlist", url]);
+    if (r.ok && r.json) return { track: ytTrackFromInfo(r.json, url) };
+    throw new EngineUnavailable("youtube", `yt-dlp resolve failed for ${url}: ${r.error || "unknown error"}`);
   }
-  const r = await runYtDlp(["-j", "--no-playlist", `ytsearch1:${query}`]);
-  if (r.ok && r.json) return { track: ytTrackFromInfo(r.json, null), degraded: false };
-  return { track: degradedYouTubeTrack(query, null), degraded: true, error: r.error };
+  const r = await runYtDlpResilient(["-j", "--no-playlist", `ytsearch1:${query}`]);
+  if (r.ok && r.json) return { track: ytTrackFromInfo(r.json, null) };
+  throw new EngineUnavailable("youtube", `yt-dlp search failed for ${JSON.stringify(query)}: ${r.error || "unknown error"}`);
 }
 
 // Search YouTube, up to `limit` tracks. On yt-dlp failure returns an
-// empty list plus the error instead of inventing results.
+// empty list plus the error instead of inventing results. The android
+// client retry applies here too (same as the downloaders service).
 async function searchYouTube(query, limit = 5) {
   const n = Math.max(1, Math.min(10, Number(limit) || 5));
-  const r = await runYtDlp(["-j", "--no-playlist", `ytsearch${n}:${query}`]);
+  const r = await runYtDlpResilient(["-j", "--no-playlist", `ytsearch${n}:${query}`]);
   if (r.ok && r.entries) {
     return { results: r.entries.filter(Boolean).map((e) => ytTrackFromInfo(e, null)), error: null };
   }
   return { results: [], error: r.error || "yt-dlp search failed" };
+}
+
+// Autoplay pick (vc-go resolver.Related / vc-rust autoplay_pick):
+// fetch the YouTube mix playlist `RD<video_id>` flat and take the
+// first entry that is neither the last track nor in `excludeIds`
+// (queue + play history). Only YouTube tracks autoplay. Returns the
+// picked Track, or null when the mix was fetched but every candidate
+// was already played. Throws EngineUnavailable when the mix fetch
+// itself fails (yt-dlp missing / YouTube gated) — the caller decides
+// whether that idles the room (ticker) or answers 502 (autoplay-skip).
+async function autoplayPick(lastTrack, excludeIds) {
+  if (!lastTrack || lastTrack.source !== "youtube") return null;
+  const id = String(lastTrack.id || "").replace(/^yt:/, "");
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id)) return null;
+  const exclude = new Set(excludeIds || []);
+  exclude.add(lastTrack.id);
+  const mixUrl = `https://www.youtube.com/watch?v=${id}&list=RD${id}`;
+  const r = await runYtDlpResilient(
+    ["--flat-playlist", "-J", "--no-warnings", "--quiet", "--playlist-end", "10", mixUrl],
+    60000
+  );
+  if (!r.ok || !r.json) {
+    throw new EngineUnavailable("youtube", `autoplay mix fetch failed for ${id}: ${r.error || "no output"}`);
+  }
+  const entries = Array.isArray(r.json.entries) ? r.json.entries : [];
+  for (const e of entries) {
+    if (!e || !e.id) continue;
+    const candId = `yt:${e.id}`;
+    if (candId === lastTrack.id || exclude.has(candId)) continue;
+    return {
+      id: candId,
+      title: e.title || e.id,
+      artist: e.uploader || e.channel || "Unknown",
+      duration_sec: Math.round(Number(e.duration) || 0),
+      url: e.webpage_url || `https://www.youtube.com/watch?v=${e.id}`,
+      thumbnail: e.thumbnail || null,
+      source: "youtube",
+    };
+  }
+  return null;
 }
 
 // --- JioSaavn (TGVCBot provider shape) -------------------------------------
@@ -525,9 +560,11 @@ module.exports = {
   parseDuration,
   ytDlpPath,
   ytDlpAvailable,
+  isBotCheck,
   extractYouTubeId,
   resolveYouTube,
   searchYouTube,
+  autoplayPick,
   searchJioSaavn,
   resolveJioSaavnSong,
   lemonicConfigured,

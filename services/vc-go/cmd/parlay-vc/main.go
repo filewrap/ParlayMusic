@@ -62,9 +62,8 @@ func main() {
 	if res.Available() {
 		log.Printf("resolver: yt-dlp found at %s", res.YtDlp)
 	} else {
-		log.Printf("resolver: yt-dlp NOT found — running in degraded mode " +
-			"(URL-pattern resolve only; stream URLs resolved on demand; " +
-			"autoplay picks unavailable)")
+		log.Printf("resolver: yt-dlp NOT found — resolve returns engine_unavailable " +
+			"(no yt-dlp binary; set YT_DLP or install it; autoplay picks unavailable)")
 	}
 	log.Printf("profile: %s (prefetchers=%d, buffer=%dKB)",
 		cfg.Profile, cfg.Prefetchers, cfg.BufferKB)

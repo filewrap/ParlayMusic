@@ -120,12 +120,27 @@ function startStubLemonic(port) {
 }
 
 // ------------------------------------------------------------------ setup --
-let main, keyed, down;
+let main, keyed, down, broken;
 
 test.before(async () => {
   // 5 s 440 Hz tone for the offline voice-pipeline proofs.
   fs.mkdirSync(BASE, { recursive: true });
   execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=5", "-ar", "48000", "-ac", "2", path.join(BASE, "tone5.wav")]);
+  // Fake yt-dlp for the android-retry unit test: it fails with
+  // YouTube's bot-check text unless the android player client is
+  // requested, then prints one video's JSON.
+  const stubYtDlp = path.join(BASE, "stub-ytdlp.sh");
+  fs.writeFileSync(stubYtDlp, [
+    "#!/bin/sh",
+    "case \"$*\" in",
+    "  *player_client=android*)",
+    "    printf '%s' '{\"id\":\"dQw4w9WgXcQ\",\"title\":\"Stub Video\",\"duration\":213,\"uploader\":\"Stub Channel\",\"webpage_url\":\"https://www.youtube.com/watch?v=dQw4w9WgXcQ\",\"thumbnail\":null}';;",
+    "  *)",
+    "    echo \"ERROR: Sign in to confirm you're not a bot\" >&2; exit 1;;",
+    "esac",
+    "",
+  ].join("\n"));
+  fs.chmodSync(stubYtDlp, 0o755);
   await startStubLemonic(18109);
   main = startServer(18102, { LEMONIC_API: "http://127.0.0.1:18109" });
   keyed = startServer(18103, {
@@ -134,13 +149,17 @@ test.before(async () => {
   });
   // LEMONIC_API points at a closed port: every Lemonic fallback fails.
   down = startServer(18104, { LEMONIC_API: "http://127.0.0.1:9" });
+  // YT_DLP points at a nonexistent binary: every yt-dlp resolve fails,
+  // so the A9 behaviour (engine_unavailable, no placeholder) is testable.
+  broken = startServer(18105, { YT_DLP: "/nonexistent/yt-dlp-xyz" });
   await waitHealth(18102);
   await waitHealth(18103);
   await waitHealth(18104);
+  await waitHealth(18105);
 });
 
 test.after(() => {
-  for (const c of [main, keyed, down]) { try { c.kill("SIGTERM"); } catch { /* already dead */ } }
+  for (const c of [main, keyed, down, broken]) { try { c.kill("SIGTERM"); } catch { /* already dead */ } }
   if (stubServer) stubServer.close();
 });
 
@@ -156,9 +175,11 @@ test("parseDuration handles seconds, m:ss, h:mm:ss (regression: '4:28' was 0)", 
 });
 
 // ------------------------------------------------------- voice transport --
-// Real Opus/RTP pipeline + ntgcalls offer + join client (src/voicecall.js).
-// All offline: the tone is generated locally, the offer comes from the
-// ntgcalls wheel, and the join fails at the (missing) MTProto config.
+// Real Opus/RTP pipeline + in-process ntgcalls offer + honest join
+// failure (src/voicecall.js). All offline: the tone is generated
+// locally, the offer comes from the ntgcalls addon (or the wheel probe
+// fallback until libntgcalls.so is built), and the join fails honestly
+// — vc-ts has no MTProto client since the bridge was deleted.
 const TONE = path.join(BASE, "tone5.wav");
 const VOICE_CHAT = -1004243; // throwaway chat id for the voice proofs
 
@@ -182,23 +203,33 @@ test("voice: ntgcalls create_call produces a real local offer offline", async ()
   assert.equal(o.ok, true, JSON.stringify(o));
   assert.ok(o.offer_len > 100, `offer_len ${o.offer_len}`);
   assert.ok(o.offer.includes("ufrag"), "offer carries an ICE ufrag");
+  // In-process addon when libntgcalls.so exists, wheel probe fallback
+  // until the C build lands (phase5/ntg-build.log) — either is a real
+  // ntgcalls offer; the path is named, never hidden.
+  assert.ok(typeof o.via === "string" && o.via.length > 0, JSON.stringify(o));
 });
 
-test("voice: join without credentials names the exact missing pieces", async () => {
-  const saved = {};
-  for (const k of ["ASSISTANT_SESSION_FILE", "API_ID", "API_HASH"]) {
-    if (k in process.env) { saved[k] = process.env[k]; delete process.env[k]; }
-  }
-  try {
-    const j = await voicecall.join(VOICE_CHAT, "dummy-offer");
-    assert.equal(j.ok, false);
-    assert.equal(j.joined, false);
-    assert.ok(j.error.includes("ASSISTANT_SESSION_FILE"), j.error);
-    assert.ok(j.error.includes("API_ID"), j.error);
-    assert.ok(j.error.includes("API_HASH"), j.error);
-  } finally {
-    Object.assign(process.env, saved);
-  }
+test("voice: join fails honestly — no MTProto client in vc-ts (bridge deleted)", async () => {
+  // The voice_bridge.py Telethon child is deleted (Phase 5); Node
+  // stdlib has no MTProto client, so join() cannot phone.joinGroupCall.
+  // It must fail with the exact reason + the tdlib-backend route, and
+  // never report joined:true.
+  const j = await voicecall.join(VOICE_CHAT, "dummy-offer");
+  assert.equal(j.ok, false);
+  assert.equal(j.joined, false);
+  assert.ok(j.error.includes("no MTProto client"), j.error);
+  assert.ok(j.error.includes("voice_bridge.py deleted"), j.error);
+  assert.ok(j.error.includes("tdlib"), j.error);
+  // backendConfig now describes the in-process ntgcalls media state,
+  // not bridge credentials. The addon loads exactly when the built
+  // libntgcalls.so exists (phase5/ntg-build.log) — it is built now,
+  // so addonLoaded is true in this tree; it would be false before
+  // the C build lands.
+  const cfg = voicecall.backendConfig();
+  assert.equal(typeof cfg.describe, "string");
+  assert.ok(cfg.describe.length > 0);
+  const soBuilt = fs.existsSync("../../refs/ntgcalls/shared-output/lib/libntgcalls.so");
+  assert.equal(cfg.addonLoaded, soBuilt, `addonLoaded ${cfg.addonLoaded} vs .so built ${soBuilt}`);
 });
 
 test("voice: playStream on a local tone reports opus-rtp-ready + exact join reason, never joined:true", async () => {
@@ -207,10 +238,11 @@ test("voice: playStream on a local tone reports opus-rtp-ready + exact join reas
   assert.equal(r.voice, "opus-rtp-ready");
   assert.equal(r.pipeline.frames, 251);
   assert.equal(r.pipeline.rtp_packets, 251);
-  assert.ok(r.reason.includes("ASSISTANT_SESSION_FILE"), r.reason);
+  assert.ok(r.reason.includes("no MTProto client"), r.reason);
   const st = voicecall.voiceState(VOICE_CHAT);
   assert.equal(st.voice, "opus-rtp-ready");
   assert.equal(st.joined, false);
+  assert.ok(st.offer_len > 100, `pre-flight offer recorded, len ${st.offer_len}`);
 });
 
 test("voice: now-playing surfaces the real voice state (string, joined false)", async () => {
@@ -408,12 +440,19 @@ test("raw http(s) URL plays as a radio track (duration 0, never advances)", asyn
 
 test("YouTube URL still resolves as youtube, not radio (regression)", async () => {
   const r = await req(18102, "POST", "/v1/play", { chat_id: CHAT, query: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" });
-  assert.equal(r.status, 200, JSON.stringify(r.json));
   const q = await req(18102, "POST", "/v1/queue", { action: "list", chat_id: CHAT });
   const yt = q.json.data.queue.find((it) => it.track.id === "yt:dQw4w9WgXcQ");
+  if (r.status === 502) {
+    // YouTube gated right now: the honest failure — and, the A9 point,
+    // no fake placeholder track was queued in its place.
+    assert.equal(r.json.error.code, "engine_unavailable");
+    assert.equal(yt, undefined, "a failed resolve must not queue a placeholder");
+    return;
+  }
+  assert.equal(r.status, 200, JSON.stringify(r.json));
   assert.ok(yt, "youtube track queued with yt: id");
   assert.equal(yt.track.source, "youtube");
-  if (!yt.track.degraded) assert.equal(yt.track.duration_sec, 213);
+  assert.equal(yt.track.duration_sec, 213);
 });
 
 // ---------------------------------------------------------------- lemonics --
@@ -466,4 +505,200 @@ test("queue add/remove/clear + stop still work", async () => {
   assert.equal(rem.json.data.queue[0].track.title, "Two");
   const clr = await req(18102, "POST", "/v1/queue", { action: "clear", chat_id: CHAT });
   assert.deepEqual(clr.json.data.queue, []);
+});
+
+// ------------------------------------------------- Phase 5: A9 placeholders --
+// A failed YouTube resolve must surface engine_unavailable, never a
+// fake track. The broken server (:18105) has YT_DLP pointed at a
+// nonexistent binary, so every yt-dlp call fails there.
+const BROKEN_CHAT = -1004247;
+
+test("A9 unit: isBotCheck spots YouTube's bot-check text", () => {
+  assert.equal(R.isBotCheck("ERROR: Sign in to confirm you're not a bot"), true);
+  assert.equal(R.isBotCheck("... not a bot ..."), true);
+  assert.equal(R.isBotCheck("ERROR: Video unavailable"), false);
+  assert.equal(R.isBotCheck(""), false);
+});
+
+test("A9 unit: resolveYouTube rejects engine_unavailable when yt-dlp is missing", async () => {
+  const saved = process.env.YT_DLP;
+  process.env.YT_DLP = "/nonexistent/yt-dlp-xyz";
+  try {
+    await assert.rejects(
+      R.resolveYouTube("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+      (e) => e.code === "engine_unavailable" && e.message.includes("yt-dlp")
+    );
+    await assert.rejects(
+      R.resolveYouTube("some free text query"),
+      (e) => e.code === "engine_unavailable" && e.message.includes("yt-dlp")
+    );
+  } finally {
+    if (saved === undefined) delete process.env.YT_DLP;
+    else process.env.YT_DLP = saved;
+  }
+});
+
+test("A9 unit: bot-check failure retries once with the android client (stub yt-dlp)", async () => {
+  const saved = process.env.YT_DLP;
+  process.env.YT_DLP = path.join(BASE, "stub-ytdlp.sh");
+  try {
+    // The stub fails the first call with bot-check text and answers
+    // only when the android player client is requested.
+    const { track } = await R.resolveYouTube("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    assert.equal(track.id, "yt:dQw4w9WgXcQ");
+    assert.equal(track.title, "Stub Video");
+    assert.equal(track.duration_sec, 213);
+    const { track: searched } = await R.resolveYouTube("a free text query");
+    assert.equal(searched.id, "yt:dQw4w9WgXcQ");
+  } finally {
+    if (saved === undefined) delete process.env.YT_DLP;
+    else process.env.YT_DLP = saved;
+  }
+});
+
+test("A9 http: failed YouTube resolve is 502 engine_unavailable, nothing queued", async () => {
+  const playUrl = await req(18105, "POST", "/v1/play", { chat_id: BROKEN_CHAT, query: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" });
+  assert.equal(playUrl.status, 502, JSON.stringify(playUrl.json));
+  assert.equal(playUrl.json.error.code, "engine_unavailable");
+  const playQuery = await req(18105, "POST", "/v1/play", { chat_id: BROKEN_CHAT, query: "never gonna give you up" });
+  assert.equal(playQuery.status, 502);
+  assert.equal(playQuery.json.error.code, "engine_unavailable");
+  // No placeholder was queued: the room has no playback state at all.
+  const np = await req(18105, "GET", `/v1/now-playing?chat_id=${BROKEN_CHAT}`);
+  assert.equal(np.status, 404);
+  assert.equal(np.json.error.code, "not_found");
+  const q = await req(18105, "POST", "/v1/queue", { action: "list", chat_id: BROKEN_CHAT });
+  assert.deepEqual(q.json.data.queue, []);
+  const add = await req(18105, "POST", "/v1/queue", { action: "add", chat_id: BROKEN_CHAT, query: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" });
+  assert.equal(add.status, 502);
+  assert.equal(add.json.error.code, "engine_unavailable");
+  const search = await req(18105, "POST", "/v1/search", { query: "kesariya", source: "youtube" });
+  assert.equal(search.status, 502);
+  assert.equal(search.json.error.code, "engine_unavailable");
+});
+
+// ------------------------------------------------- Phase 5: loop/shuffle/autoplay --
+// Dedicated chats so these tests never disturb the shared CHAT room.
+const LOOP_CHAT = -1004245;
+const AUTO_CHAT = -1004246;
+
+test("loop route sets a 0-10 count, validates, reports an integer", async () => {
+  const play = await req(18102, "POST", "/v1/play", { chat_id: LOOP_CHAT, query: "jiosaavn:kesariya" });
+  assert.equal(play.status, 200, JSON.stringify(play.json));
+  assert.equal(play.json.data.now_playing.track.id, "jsvn:rjkrTnma");
+  await req(18102, "POST", "/v1/queue", { action: "add", chat_id: LOOP_CHAT, query: "jiosaavn:tum hi ho" });
+  const set = await req(18102, "POST", "/v1/loop", { chat_id: LOOP_CHAT, count: 2 });
+  assert.equal(set.status, 200, JSON.stringify(set.json));
+  assert.equal(set.json.data.now_playing.loop, 2);
+  assert.equal(typeof set.json.data.now_playing.loop, "number");
+  for (const bad of [{ count: 11 }, { count: -1 }, { count: 2.5 }, {}]) {
+    const r = await req(18102, "POST", "/v1/loop", { chat_id: LOOP_CHAT, ...bad });
+    assert.equal(r.status, 400, JSON.stringify(r.json));
+    assert.equal(r.json.error.code, "bad_request");
+  }
+  const missing = await req(18102, "POST", "/v1/loop", { chat_id: -999999, count: 1 });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.json.error.code, "not_found");
+});
+
+test("loop count replays the track, drains, then advances", async () => {
+  // Current: Kesariya (268 s), loop 2, Tum Hi Ho queued.
+  const seek = async () => {
+    const s = await req(18102, "POST", "/v1/seek", { chat_id: LOOP_CHAT, position_sec: 267 });
+    assert.equal(s.status, 200);
+    await sleep(3500);
+    const np = await req(18102, "GET", `/v1/now-playing?chat_id=${LOOP_CHAT}`);
+    assert.equal(np.status, 200, JSON.stringify(np.json));
+    return np.json.data.now_playing;
+  };
+  let np = await seek();
+  assert.equal(np.track.id, "jsvn:rjkrTnma", "loop 2 -> replay 1");
+  assert.equal(np.loop, 1);
+  np = await seek();
+  assert.equal(np.track.id, "jsvn:rjkrTnma", "loop 1 -> replay 2");
+  assert.equal(np.loop, 0);
+  np = await seek();
+  assert.notEqual(np.track.id, "jsvn:rjkrTnma", "loop drained -> advance to queue");
+  assert.equal(np.queue.length, 0);
+  assert.ok(np.track.duration_sec > 0, "next track has a real duration");
+});
+
+test("shuffle route toggles mode; skip pops from the queue", async () => {
+  // Current: Tum Hi Ho (from the loop test). Queue 3 fake tracks.
+  for (const [id, title] of [["sh1", "Shuffle One"], ["sh2", "Shuffle Two"], ["sh3", "Shuffle Three"]]) {
+    const a = await req(18102, "POST", "/v1/queue", { action: "add", chat_id: LOOP_CHAT, track: { id, title, source: "file" } });
+    assert.equal(a.status, 200, JSON.stringify(a.json));
+  }
+  const on = await req(18102, "POST", "/v1/shuffle", { chat_id: LOOP_CHAT, enabled: true });
+  assert.equal(on.status, 200, JSON.stringify(on.json));
+  assert.equal(on.json.data.now_playing.shuffle, true);
+  const list = await req(18102, "POST", "/v1/queue", { action: "list", chat_id: LOOP_CHAT });
+  assert.deepEqual(
+    list.json.data.queue.map((it) => it.track.id).sort(),
+    ["sh1", "sh2", "sh3"],
+    "shuffle keeps every queued track"
+  );
+  const sk = await req(18102, "POST", "/v1/skip", { chat_id: LOOP_CHAT });
+  assert.equal(sk.status, 200, JSON.stringify(sk.json));
+  assert.ok(["sh1", "sh2", "sh3"].includes(sk.json.data.now_playing.track.id), "skip popped a queued track");
+  assert.equal(sk.json.data.now_playing.queue.length, 2);
+  assert.equal(sk.json.data.now_playing.loop, 0, "skip resets the loop count");
+  const off = await req(18102, "POST", "/v1/shuffle", { chat_id: LOOP_CHAT, enabled: false });
+  assert.equal(off.json.data.now_playing.shuffle, false);
+  const bad = await req(18102, "POST", "/v1/shuffle", { chat_id: LOOP_CHAT, enabled: "yes" });
+  assert.equal(bad.status, 400);
+  const missing = await req(18102, "POST", "/v1/shuffle", { chat_id: -999999, enabled: true });
+  assert.equal(missing.status, 404);
+  await req(18102, "POST", "/v1/stop", { chat_id: LOOP_CHAT });
+});
+
+test("autoplay route toggles mode; autoplay-skip needs it on", async () => {
+  const none = await req(18102, "POST", "/v1/autoplay-skip", { chat_id: -999999 });
+  assert.equal(none.status, 404);
+  // Play a real YouTube track; if YouTube is gated right now the
+  // honest 502 is the whole test — autoplay cannot pick without it.
+  const play = await req(18102, "POST", "/v1/play", { chat_id: AUTO_CHAT, query: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" });
+  if (play.status === 502) {
+    assert.equal(play.json.error.code, "engine_unavailable");
+    return;
+  }
+  assert.equal(play.status, 200, JSON.stringify(play.json));
+  assert.equal(play.json.data.now_playing.track.id, "yt:dQw4w9WgXcQ");
+  assert.ok(play.json.data.now_playing.track.duration_sec > 0);
+  const skipOff = await req(18102, "POST", "/v1/autoplay-skip", { chat_id: AUTO_CHAT });
+  assert.equal(skipOff.status, 400, JSON.stringify(skipOff.json));
+  assert.equal(skipOff.json.error.code, "bad_request");
+  const on = await req(18102, "POST", "/v1/autoplay", { chat_id: AUTO_CHAT, enabled: true });
+  assert.equal(on.status, 200, JSON.stringify(on.json));
+  assert.equal(on.json.data.now_playing.autoplay, true);
+  const bad = await req(18102, "POST", "/v1/autoplay", { chat_id: AUTO_CHAT, enabled: "yes" });
+  assert.equal(bad.status, 400);
+  const skip = await req(18102, "POST", "/v1/autoplay-skip", { chat_id: AUTO_CHAT });
+  assert.equal(skip.status, 200, JSON.stringify(skip.json));
+  const picked = skip.json.data.now_playing.track;
+  assert.ok(picked.id.startsWith("yt:"), `expected a YouTube mix pick, got ${picked.id}`);
+  assert.notEqual(picked.id, "yt:dQw4w9WgXcQ", "the pick is not the track it replaces");
+  assert.ok(picked.duration_sec > 0, "the mix pick has a real duration");
+  assert.equal(skip.json.data.now_playing.loop, 0, "autoplay-skip resets the loop count");
+  // Drain: seek to the end of the mix pick; the ticker must fetch a
+  // second mix pick (room goes idle while it is in flight, so
+  // now-playing 404s meanwhile — keep polling).
+  const dur = picked.duration_sec;
+  const s = await req(18102, "POST", "/v1/seek", { chat_id: AUTO_CHAT, position_sec: dur - 1 });
+  assert.equal(s.status, 200);
+  let drained = null;
+  for (let i = 0; i < 15; i++) {
+    await sleep(2000);
+    const np = await req(18102, "GET", `/v1/now-playing?chat_id=${AUTO_CHAT}`);
+    if (np.status === 200 && np.json.data.now_playing.track) {
+      if (np.json.data.now_playing.track.id !== picked.id) { drained = np.json.data.now_playing.track; break; }
+    }
+    // 404 = room idle while the mix pick is in flight; keep waiting.
+  }
+  assert.ok(drained, "autoplay on drain must start a second mix pick");
+  assert.ok(drained.id.startsWith("yt:"), `expected a YouTube mix pick, got ${drained.id}`);
+  assert.notEqual(drained.id, picked.id);
+  const off = await req(18102, "POST", "/v1/autoplay", { chat_id: AUTO_CHAT, enabled: false });
+  assert.equal(off.json.data.now_playing.autoplay, false);
+  await req(18102, "POST", "/v1/stop", { chat_id: AUTO_CHAT });
 });

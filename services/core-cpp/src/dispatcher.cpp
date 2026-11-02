@@ -229,6 +229,8 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onChannelplay(c); });
     add({"userbot"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onUserbot(c); });
+    add({"join"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onJoin(c); });
     // Admin / sudo / broadcast / tools.
     add({"auth", "unauth"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onAuth(c); });
@@ -315,7 +317,7 @@ void Dispatcher::registerCommands() {
         {"saveplaylist", "addplaylist"}, {"addsong", "addplaylist"},
         {"maint", "maintenance"}, {"spt", "speedtest"},
         {"assistant", "userbot"}, {"userbotjoin", "userbot"},
-        {"assistantjoin", "userbot"}, {"join", "userbot"},
+        {"assistantjoin", "userbot"},
         {"setcplay", "channelplay"}, {"rtmp", "setrtmp"},
     };
     // c-commands (NoxBeats channel_commands()): name -> (base, is_play).
@@ -361,6 +363,7 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
     if (msg.video_chat_started || msg.video_chat_ended) {
         // Auto-end: a voice chat ending kills the session (tools.cpp).
         setCallActive(msg.chat.id, false);
+        setChatField(msg.chat.id, "voice_owner", "");
         Engine used;
         bool fb = false;
         vcCall({msg, "stop", "", false}, "stop",
@@ -663,7 +666,7 @@ IpcResult Dispatcher::vcGet(const CommandContext& ctx, const std::string& action
         std::string path = "/v1/" + action +
                            "?chat_id=" + std::to_string(vcTarget(ctx));
         last = ipc_.get(router_.baseUrl(e), path, 10);
-        if (!last.unavailable()) {
+        if (!last.unavailable(action)) {
             used = e;
             fell_back = (e != preferred);
             return last;
@@ -903,7 +906,7 @@ void Dispatcher::onHelp(const CommandContext& ctx) {
           "/queue /playing — show the queue\n"
           "/clear /restore /remove <n> /move <a> <b> /shuffle — queue edits\n"
           "/pos — current position  /speed [0.5-2.0] /bass [0-100]\n"
-          "/mute /unmute /replay /player — more playback\n"
+          "/mute /unmute /replay /player /join — more playback\n"
           "/lyrics [song] — lyrics for the current (or named) song\n"
           "/search <query> — search YouTube / NetEase / Lemonic\n"
           "/download <song or link> — download the audio file\n"
@@ -943,22 +946,35 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
             query += w;
         }
     }
-    // Reply-to media: /play on a replied audio/video plays that file.
-    if (query.empty() && ctx.message.has_reply_to &&
-        ctx.message.has_media) {
-        reply(ctx, "Playing a replied-to file needs the downloaders "
-                   "service (file_id hand-off); use /play <title or link> "
-                   "for now.");
-        return;
-    }
-    if (query.empty() && ctx.command != "playplaylist") {
-        reply(ctx, "Usage: /play <song title, link or track id>");
-        return;
-    }
     bool force = flag_f ||
                  ctx.command == "playforce" || ctx.command == "vplayforce";
     bool video = (ctx.command == "vplay" || ctx.command == "vplayforce" ||
                   flag_v);
+    // Reply-to media (or media sent with the command as its caption):
+    // /play on a replied audio/video/voice/video_note/document plays
+    // that Telegram file (source "file"). The core downloads it via
+    // the Bot API getFile and plays it through its own in-process
+    // voice backend — the vc engines cannot resolve a Telegram
+    // file_id. No query is needed; a missing backend fails honestly.
+    if (query.empty() && ctx.command != "playplaylist") {
+        std::string file_id, title, kind;
+        if (ctx.message.has_reply_media) {
+            file_id = ctx.message.reply_media_file_id;
+            title = ctx.message.reply_media_title;
+            kind = ctx.message.reply_media_kind;
+        } else if (ctx.message.has_media) {
+            file_id = ctx.message.media_file_id;
+            title = ctx.message.media_title;
+            kind = ctx.message.media_kind;
+        }
+        if (!file_id.empty()) {
+            if (!playAllowed(ctx, force)) return;
+            playRepliedFile(ctx, file_id, title, kind);
+            return;
+        }
+        reply(ctx, "Usage: /play <song title, link or track id>");
+        return;
+    }
     if (!playAllowed(ctx, force)) return;
     if (ctx.via_channel && chatField(ctx.message.chat.id, "cplay", "0") == "0") {
         reply(ctx, "No channel linked. Use /channelplay first.");
@@ -1009,6 +1025,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
                      track->find("title") ? track->find("title")->asString() : "");
     }
     setCallActive(vcTarget(ctx), true);
+    setChatField(vcTarget(ctx), "voice_owner", engineName(used));
     if (chatField(vcTarget(ctx), "logger_on", "") == "1" ||
         store_.get("logger_on") == std::optional<std::string>("1"))
         logToLogger("Play in " + std::to_string(vcTarget(ctx)) + ": " +
@@ -1022,6 +1039,37 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     if (chatIntField(vcTarget(ctx), "muted", 0))
         text += "(muted — use /unmute)\n";
     reply(ctx, text);
+    deleteCommandMessage(ctx);
+}
+
+// --- /play from a replied-to Telegram file ----------------------------------
+void Dispatcher::playRepliedFile(const CommandContext& ctx,
+                                 const std::string& file_id,
+                                 const std::string& title,
+                                 const std::string& kind) {
+    int64_t chat = vcTarget(ctx);
+    std::string saved, err;
+    if (!tg_.downloadFile(file_id, cfg_.data_dir + "/replied", saved, err)) {
+        reply(ctx, "Could not fetch the replied file: " + err);
+        return;
+    }
+    // The downloaded file is the stream source for the core's own voice
+    // backend (ffmpeg input): a local path, not a vc.play query — the
+    // engines have no Telegram access and would degrade a file_id to a
+    // fake track.
+    std::string track_title = title.empty() ? "Replied file" : title;
+    bool video = kind == "video" || kind == "video_note";
+    if (!voice_.play(chat, saved, track_title, video)) {
+        std::string why = voice_.lastError();
+        if (why.empty()) why = voice_.describe();
+        reply(ctx, "Could not play the replied file: " + why);
+        return;
+    }
+    setChatField(chat, "last_track", track_title);
+    setChatField(chat, "voice_owner", "core");
+    setCallActive(chat, true);
+    reply(ctx, "▶ Now playing " + track_title +
+                   " (replied file, via core voice).");
     deleteCommandMessage(ctx);
 }
 
@@ -1092,6 +1140,11 @@ void Dispatcher::onStop(const CommandContext& ctx) {
     bool fell_back = false;
     IpcResult r = vcCall(ctx, "stop", body, used, fell_back);
     setCallActive(vcTarget(ctx), false);
+    setChatField(vcTarget(ctx), "voice_owner", "");
+    // Also stop a session the core voice backend itself holds
+    // (replied-file playback, /join): /stop must end that too.
+    // Best effort — false when the backend holds no call here.
+    voice_.stop(vcTarget(ctx));
     setChatField(vcTarget(ctx), "loop", "0");
     setChatField(vcTarget(ctx), "speed", "1.0");
     setChatField(vcTarget(ctx), "bass", "0");
@@ -1658,24 +1711,73 @@ void Dispatcher::onBass(const CommandContext& ctx) {
 
 void Dispatcher::onMute(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
-    Json np, track;
-    if (!nowPlaying(vcTarget(ctx), np, track)) {
-        reply(ctx, "Nothing is playing.");
-        return;
-    }
     bool mute = ctx.command == "mute";
-    int cur = chatIntField(vcTarget(ctx), "muted", 0);
+    int64_t chat = vcTarget(ctx);
+    int cur = chatIntField(chat, "muted", 0);
     if ((cur != 0) == mute) {
         reply(ctx, mute ? "Already muted." : "Already unmuted.");
         return;
     }
-    // The vc services expose no mute action: the flag is stored per chat
-    // and honoured at the next /play (the engine is told the session is
-    // muted) and reported by /pos. This is the honest limit of the
-    // current IPC contract — the state itself is real.
-    setChatField(vcTarget(ctx), "muted", mute ? "1" : "0");
-    reply(ctx, mute ? "Muted (applies to the next track the engine starts)."
-                    : "Unmuted.");
+    // Mute reaches the voice session the core backend itself holds
+    // (/join, replied-file playback) through the backend's mute() /
+    // unmute() — not a stored flag. A session owned by a vc engine
+    // cannot be muted from the core: the engines expose no vc.mute
+    // action, so claiming otherwise would be a fake success.
+    std::string owner = chatField(chat, "voice_owner", "");
+    if (owner != "core") {
+        Json np, track;
+        if (nowPlaying(chat, np, track) || callActive(chat)) {
+            reply(ctx, "The " +
+                           (owner.empty() ? std::string("engine") : owner) +
+                           " session is playing this chat; the core cannot "
+                           "mute it — the voice engines expose no vc.mute "
+                           "action yet. Mute works on sessions the core "
+                           "voice backend holds (/join, replied-file "
+                           "playback).");
+            return;
+        }
+        reply(ctx, "Nothing is playing.");
+        return;
+    }
+    bool ok = mute ? voice_.mute(chat) : voice_.unmute(chat);
+    if (!ok) {
+        std::string why = voice_.lastError();
+        if (why.empty()) why = voice_.describe();
+        reply(ctx, std::string("Could not ") +
+                       (mute ? "mute: " : "unmute: ") + why);
+        return;
+    }
+    setChatField(chat, "muted", mute ? "1" : "0");
+    reply(ctx, mute ? "Muted." : "Unmuted.");
+}
+
+void Dispatcher::onJoin(const CommandContext& ctx) {
+    if (!canManageVc(ctx)) return;
+    int64_t chat = vcTarget(ctx);
+    if (callActive(chat)) {
+        std::string owner = chatField(chat, "voice_owner", "");
+        if (owner == "core") {
+            reply(ctx, "Already in the voice chat.");
+        } else {
+            reply(ctx, "Already in the voice chat (the " +
+                           (owner.empty() ? std::string("engine") : owner) +
+                           " session is playing here).");
+        }
+        return;
+    }
+    if (!voice_.available()) {
+        reply(ctx, "Cannot join the voice chat: " + voice_.describe());
+        return;
+    }
+    if (!voice_.join(chat)) {
+        std::string why = voice_.lastError();
+        if (why.empty()) why = voice_.describe();
+        reply(ctx, "Could not join the voice chat: " + why);
+        return;
+    }
+    setChatField(chat, "voice_owner", "core");
+    setCallActive(chat, true);
+    reply(ctx, "Joined the voice chat.");
 }
 
 void Dispatcher::onReplay(const CommandContext& ctx) {
@@ -1914,6 +2016,7 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
         return;
     }
     setCallActive(vcTarget(ctx), true);
+    setChatField(vcTarget(ctx), "voice_owner", engineName(used));
     reply(ctx, "📻 Radio: " + station + " is now playing in the voice chat.");
 }
 
@@ -2168,6 +2271,7 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
         return;
     }
     setCallActive(vcTarget(ctx), true);
+    setChatField(vcTarget(ctx), "voice_owner", engineName(used));
     int queued = 0;
     for (size_t i = 1; i < tracks.size(); ++i) {
         Json add = Json::objectOf({
@@ -2477,29 +2581,19 @@ void Dispatcher::onUserbot(const CommandContext& ctx) {
         reply(ctx, "The assistant cannot join from here: " +
                        voice_.describe() +
                        ". Add the assistant user account to the chat "
-                       "manually, or configure ASSISTANT_SESSION_FILE + "
-                       "API_ID/API_HASH for the voice bridge.");
+                       "manually, or configure TD_API_ID/TD_API_HASH/"
+                       "TD_SESSION_DIR for the TDLib voice backend.");
         return;
     }
-    // Export an invite link and have the bridge join with it (NoxBeats
-    // ensure_assistant).
-    std::string invite = tg_.exportChatInviteLink(vc);
-    if (invite.empty()) {
-        reply(ctx, "Could not export an invite link (bot must be an admin).");
-        return;
-    }
-    auto* bridge = dynamic_cast<VoiceBridge*>(&voice_);
-    if (!bridge) {
-        reply(ctx, "In-process voice backend is not the bridge: " +
-                       voice_.describe());
-        return;
-    }
-    std::string err;
-    if (bridge->joinChat(vc, invite, err)) {
-        reply(ctx, "Assistant joined the chat.");
-    } else {
-        reply(ctx, "Assistant could not join: " + err);
-    }
+    // The Telethon voice bridge that used to join via an invite link
+    // was deleted in Phase 5 (user order: ntgcalls is now a native
+    // library linked in-process). There is no in-process path that
+    // adds the assistant account to a chat anymore — it must already
+    // be a member. /join (vc.join) puts the assistant's voice session
+    // into the call once it is a member.
+    reply(ctx, "The assistant is not in this chat yet. Add the assistant "
+               "user account to the chat manually, then use /join to put "
+               "it in the voice call.");
 }
 
 // --- handlers: admin / sudo / broadcast / tools --------------------------------

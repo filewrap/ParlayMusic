@@ -54,6 +54,64 @@ impl Store {
     }
 }
 
+fn handle(state: &Arc<Mutex<Store>>, bot: &str, req: &Request) -> (u16, String) {
+    if req.method == "POST" && req.path == "/v1/share" {
+        let body = match parse_json(&req.body) {
+            Some(b @ Json::Obj(_)) => b,
+            _ => return (400, err("bad_request", "invalid JSON body")),
+        };
+        // created_by is accepted per contract but not stored:
+        // links are anonymous by design (see module docs).
+        let track = match body.get("track") {
+            Some(t @ Json::Obj(_)) => t.clone(),
+            _ => {
+                return (
+                    400,
+                    err("bad_request", "missing object field: track"),
+                )
+            }
+        };
+        let mut store = state.lock().unwrap();
+        let mut token = random_token(16);
+        while store.map.contains_key(&token) {
+            token = random_token(16);
+        }
+        store.map.insert(token.clone(), track);
+        if let Err(e) = store.save() {
+            store.map.remove(&token);
+            return (
+                500,
+                err("internal", &format!("persist failed: {}", e)),
+            );
+        }
+        let link = format!("https://t.me/{}?start=share_{}", bot, token);
+        (
+            200,
+            ok(&format!(
+                "{{\"link\":{},\"token\":{}}}",
+                quote(&link),
+                quote(&token)
+            )),
+        )
+    } else if req.method == "GET" {
+        if let Some(tok) = req.path.strip_prefix("/v1/share/") {
+            if tok.is_empty() || tok.contains('/') {
+                return (404, err("not_found", "unknown share token"));
+            }
+            let store = state.lock().unwrap();
+            return match store.map.get(tok) {
+                Some(track) => {
+                    (200, ok(&format!("{{\"track\":{}}}", track.render())))
+                }
+                None => (404, err("not_found", "unknown share token")),
+            };
+        }
+        (404, err("not_found", "route not found (GET /v1/share/:token)"))
+    } else {
+        (404, err("not_found", "route not found"))
+    }
+}
+
 fn main() {
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -66,67 +124,120 @@ fn main() {
     let handler = {
         let state = Arc::clone(&state);
         let bot = Arc::clone(&bot);
-        move |req: &Request| -> (u16, String) {
-            if req.method == "POST" && req.path == "/v1/share" {
-                let body = match parse_json(&req.body) {
-                    Some(b @ Json::Obj(_)) => b,
-                    _ => return (400, err("bad_request", "invalid JSON body")),
-                };
-                // created_by is accepted per contract but not stored:
-                // links are anonymous by design (see module docs).
-                let track = match body.get("track") {
-                    Some(t @ Json::Obj(_)) => t.clone(),
-                    _ => {
-                        return (
-                            400,
-                            err("bad_request", "missing object field: track"),
-                        )
-                    }
-                };
-                let mut store = state.lock().unwrap();
-                let mut token = random_token(16);
-                while store.map.contains_key(&token) {
-                    token = random_token(16);
-                }
-                store.map.insert(token.clone(), track);
-                if let Err(e) = store.save() {
-                    store.map.remove(&token);
-                    return (
-                        500,
-                        err("internal", &format!("persist failed: {}", e)),
-                    );
-                }
-                let link = format!("https://t.me/{}?start=share_{}", bot, token);
-                (
-                    200,
-                    ok(&format!(
-                        "{{\"link\":{},\"token\":{}}}",
-                        quote(&link),
-                        quote(&token)
-                    )),
-                )
-            } else if req.method == "GET" {
-                if let Some(tok) = req.path.strip_prefix("/v1/share/") {
-                    if tok.is_empty() || tok.contains('/') {
-                        return (404, err("not_found", "unknown share token"));
-                    }
-                    let store = state.lock().unwrap();
-                    return match store.map.get(tok) {
-                        Some(track) => {
-                            (200, ok(&format!("{{\"track\":{}}}", track.render())))
-                        }
-                        None => (404, err("not_found", "unknown share token")),
-                    };
-                }
-                (404, err("not_found", "route not found (GET /v1/share/:token)"))
-            } else {
-                (404, err("not_found", "route not found"))
-            }
-        }
+        move |req: &Request| -> (u16, String) { handle(&state, &bot, req) }
     };
 
     if let Err(e) = run_server(port, SERVICE, handler) {
         eprintln!("parlay {} failed to listen on {}: {}", SERVICE, port, e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(method: &str, path: &str, body: &str) -> Request {
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: Vec::new(),
+            body: body.to_string(),
+        }
+    }
+
+    /// Fresh store backed by a unique temp file (tests run in parallel).
+    fn tmp_store(name: &str) -> (Arc<Mutex<Store>>, std::path::PathBuf) {
+        let file = std::env::temp_dir()
+            .join(format!("parlay-share-test-{}-{}.json", std::process::id(), name));
+        let _ = std::fs::remove_file(&file);
+        (Arc::new(Mutex::new(Store::load(file.clone()))), file)
+    }
+
+    fn data_field(body: &str, key: &str) -> Json {
+        let v = parse_json(body).expect("response parses");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true), "ok:true in {body}");
+        v.get("data").and_then(|d| d.get(key)).cloned().expect("data field present")
+    }
+
+    const TRACK: &str = r#"{"id":"trk-1","title":"Test Song","artist":"Test Artist"}"#;
+
+    #[test]
+    fn create_resolve_round_trip() {
+        let (state, file) = tmp_store("roundtrip");
+        let body = format!(r#"{{"created_by":987654321,"track":{}}}"#, TRACK);
+        let (st, resp) = handle(&state, "ParlayBot", &req("POST", "/v1/share", &body));
+        assert_eq!(st, 200, "{resp}");
+        let token = data_field(&resp, "token").as_str().unwrap().to_string();
+        let link = data_field(&resp, "link").as_str().unwrap().to_string();
+        assert_eq!(token.len(), 16, "token is 16 chars");
+        assert!(token.chars().all(|c| c.is_ascii_alphanumeric()), "token is alnum");
+        assert_eq!(link, format!("https://t.me/ParlayBot?start=share_{}", token));
+
+        // Resolve returns the same track, byte-for-byte in content.
+        let (st, resp) = handle(&state, "ParlayBot", &req("GET", &format!("/v1/share/{}", token), ""));
+        assert_eq!(st, 200, "{resp}");
+        let track = data_field(&resp, "track");
+        assert_eq!(track.get("id").and_then(|x| x.as_str()), Some("trk-1"));
+        assert_eq!(track.get("title").and_then(|x| x.as_str()), Some("Test Song"));
+        assert_eq!(track.get("artist").and_then(|x| x.as_str()), Some("Test Artist"));
+
+        // Anonymity: created_by was accepted but is NOT in the persisted file.
+        let persisted = std::fs::read_to_string(&file).expect("shares file written");
+        assert!(!persisted.contains("987654321"), "created_by must not be stored");
+        assert!(persisted.contains("trk-1"), "track is stored");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn two_creates_give_different_tokens() {
+        let (state, file) = tmp_store("distinct");
+        let body = format!(r#"{{"track":{}}}"#, TRACK);
+        let (_, r1) = handle(&state, "ParlayBot", &req("POST", "/v1/share", &body));
+        let (_, r2) = handle(&state, "ParlayBot", &req("POST", "/v1/share", &body));
+        let t1 = data_field(&r1, "token").as_str().unwrap().to_string();
+        let t2 = data_field(&r2, "token").as_str().unwrap().to_string();
+        assert_ne!(t1, t2, "tokens are unique");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn unknown_token_404() {
+        let (state, file) = tmp_store("unknown");
+        let (st, _) = handle(&state, "ParlayBot", &req("GET", "/v1/share/doesnotexist1234", ""));
+        assert_eq!(st, 404);
+        let (st, _) = handle(&state, "ParlayBot", &req("GET", "/v1/share/", ""));
+        assert_eq!(st, 404);
+        let (st, _) = handle(&state, "ParlayBot", &req("GET", "/v1/share/a/b", ""));
+        assert_eq!(st, 404);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn create_requires_track_object() {
+        let (state, file) = tmp_store("badtrack");
+        let (st, _) = handle(&state, "ParlayBot", &req("POST", "/v1/share", r#"{"track":"nope"}"#));
+        assert_eq!(st, 400);
+        let (st, _) = handle(&state, "ParlayBot", &req("POST", "/v1/share", r#"{}"#));
+        assert_eq!(st, 400);
+        let (st, _) = handle(&state, "ParlayBot", &req("POST", "/v1/share", "not json"));
+        assert_eq!(st, 400);
+        let (st, _) = handle(&state, "ParlayBot", &req("DELETE", "/v1/share", "{}"));
+        assert_eq!(st, 404);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn store_survives_reload() {
+        let (state, file) = tmp_store("reload");
+        let body = format!(r#"{{"track":{}}}"#, TRACK);
+        let (_, resp) = handle(&state, "ParlayBot", &req("POST", "/v1/share", &body));
+        let token = data_field(&resp, "token").as_str().unwrap().to_string();
+        drop(state);
+        // A fresh Store over the same file still resolves the token.
+        let reloaded = Arc::new(Mutex::new(Store::load(file.clone())));
+        let (st, resp) = handle(&reloaded, "ParlayBot", &req("GET", &format!("/v1/share/{}", token), ""));
+        assert_eq!(st, 200, "{resp}");
+        let _ = std::fs::remove_file(&file);
     }
 }

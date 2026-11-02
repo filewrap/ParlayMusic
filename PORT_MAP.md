@@ -1,9 +1,9 @@
 # Parlay — Port Map
 
-Scaffold-only port map. No code was copied from the reference repos into
-`services/` — the skeletons are original stubs. Porting means **re-implementing
-the behaviour** behind Parlay's own IPC contract (see `contracts/ipc.json`),
-not vendoring upstream code.
+Port map for the behaviour ported from the reference repos into
+`services/` (re-implemented, not copied — see the license warning
+below). Porting means **re-implementing the behaviour** behind Parlay's
+own IPC contract (see `contracts/ipc.json`), not vendoring upstream code.
 
 > **License warning — read before porting anything.** Most refs are
 > GPLv3 / AGPLv3 (YukkiMusic-Go, TinaMusic, remix, wavetune, lemonic,
@@ -15,6 +15,7 @@ not vendoring upstream code.
 > (NoxBeats, telegram-music-bot-rust, feel-me) are all-rights-reserved by
 > default — port the *idea* only, never the code. If Parlay ever ships,
 > pick one license for the whole tree and re-check each port against it.
+> (Per the user's order, licensing is not re-raised as a task.)
 
 Stars are the 2026-11-02 snapshot from the earlier search; rustify was not
 in that snapshot. All 21 refs cloned OK (`refs/`, shallow `--depth 1`).
@@ -57,7 +58,7 @@ See `clone-log.txt` for the per-repo log.
 | Feature the user wants | Source repo(s) | Source file(s) | Ports into Parlay as | How |
 |---|---|---|---|---|
 | VC streaming (play/pause/skip/seek/loop/queue) | YukkiMusic-Go, ArcMusic, TgMusicBot | `internal/core/queue.go`, `internal/core/room*.go`, `internal/bot/play.go`, `queue.go`, `loop.go`, `seek.go` | `svc:vc-go` (primary) + `svc:vc-rust` (alt) | Go service owns ntgcalls voice; core sends `play/pause/skip/seek/queue` IPC. Rust ParvatiMusic is the fallback VC engine behind the same contract |
-| VC streaming, TS engine | TGVCBot, remix | `apps/tgvcbot/src/tgcalls.ts`, `handlers/play.ts`, `queue.ts`; `src/bot/streamer/stream.ts`, `handlers/stream.ts`, `queues.ts` | `svc:vc-ts` | TS service for groups that want the grammy/TS stack; same IPC, core picks engine per-chat in `services/core-cpp` config |
+| VC streaming, TS engine | TGVCBot, remix | `apps/tgvcbot/src/tgcalls.ts`, `handlers/play.ts`, `queue.ts`; `src/bot/streamer/stream.ts`, `handlers/stream.ts`, `queues.ts` | `svc:vc-ts` | TS service for groups that want the plain-Node/TS stack (no grammy, no tgcalls lib — shapes only); same IPC, core picks engine per-chat in `services/core-cpp` config |
 | Group management (admin, sudo, auth users, blacklist, chat settings, broadcast) | NoxBeats, TgMusicBot, ParvatiMusic | `Bad/cmd/{sudo,settings,broadcast,chat_settings}.cpp`, `Bad/core/app.cpp`; `internal/bot/{admins,auth,filters}.go`; `bot/src/modules/{admin,moderation}.rs` | `core` | Port the *command table + permission model* into the C++ core; admin state lives in the core DB, not in VC services |
 | Anonymous music sharing | feel-me | `src/{main,lib,models}.rs` (teloxide + Diesel) | `svc:share-rust` | Rust service: `share.create` → unique link + token; `share.resolve` → track. Core exposes `/share`; no identity attached to the link |
 | Downloads — YouTube (free) | sanila2007 Telegram-Song-Downloader-Bot, telegram-music-bot-rust | `bot.py`; `main.rs` (yt-dlp call) | `svc:downloaders` | Python worker: `download.youtube` IPC → yt-dlp → audio file → core sends it (50 MB Bot API cap noted; larger files queued for MTProto later) |
@@ -65,25 +66,35 @@ See `clone-log.txt` for the per-repo log.
 | Downloads — NetEase | Music163bot-Go | `internal/bot/handlers_music.go`, `handlers_search.go`, `handlers_lyric.go` | `svc:netease-go` | Go service: `netease.search/download/lyrics` IPC; cookie/login handling stays inside this service only |
 | Downloads — Deezer / TikTok / multi-source | telegram-music-bot-rust, beetube-bot, lemonic | `main.rs`; `providers/{music,movie,anime,torrent}.js`; `modules/lemonic.ts` | `svc:downloaders` + `svc:vc-ts` (Lemonic) | `download.deezer/tiktok` in the Python worker; beetube's provider table becomes the downloader's provider registry |
 | Streaming (non-VC: send audio in chat, inline) | lemonic-telegram-bot, remix | `handlers/inline_query.ts`, `modules/lemonic.ts`; `src/bot/handlers/stream.ts` | `svc:vc-ts` | Inline query path: `search.inline` IPC → Lemonic/YouTube results → core answers inline query |
-| GUI + webapp playing | wavetune | `app/(player)/`, `app/(root)/page.js`, `components/music-provider.jsx` | `svc:gui-js` | Next.js Mini App: now-playing, queue, search, player controls — talks to the core over HTTP (`/api/*` in `contracts/ipc.json`), never directly to voice services |
+| GUI + webapp playing | wavetune | `app/(player)/`, `app/(root)/page.js`, `components/music-provider.jsx` | `svc:gui-js` | Plain-Node web player (no Next.js build): now-playing, queue, search, player controls — now-playing/queue proxy the core over HTTP (`/api/*` in `contracts/ipc.json`); play/pause/skip/search talk directly to vc-go/vc-ts |
 | Radio | openradiobot | `index.js` | `svc:radio-js` | Node service: `radio.start/stop/stations` IPC; openradio + ytdl-core stream fed into the active VC engine as a live source |
 | Navidrome companion | music-bot-navidrome | `src/navidrome.py`, `src/soulseek/*.py`, `src/metadata/{deezer,lastfm,resolver}.py`, `src/library/tagger.py` | `svc:downloaders` (navidrome route) | Python worker route: link → metadata resolve (Deezer/Last.fm) → Soulseek fetch → tag → Navidrome library import. Separate opt-in service, own config |
 | Lemonic API | lemonic-telegram-bot | `modules/{lemonic,spotify,songlink}.ts`, `handlers/search_command.ts` | `svc:vc-ts` | TS service module: `lemonic.search/download/stream` IPC; Spotify→Lemonic link resolution |
 | Spotify loader (playlists as ZIP / one-by-one) | Spotify-Loader | `bot.py` | `svc:downloaders` | Same worker as Spotify downloads; `download.spotify_playlist` with `mode: zip \| files` |
-| Beetube multi-download | beetube-bot | `providers/{music,movie,anime,torrent}.js`, `commands/{search,list}.js` | `svc:downloaders` | Provider registry pattern: each provider is a `download.*` handler; music is the default, others behind a flag |
+| Beetube multi-download | beetube-bot | `providers/{music,movie,anime,torrent}.js`, `commands/{search,list}.js` | `svc:downloaders` | Provider registry pattern: each provider is a `download.*` handler. **Music only** (Phase 5, B6) — movie/anime/torrent were NOT ported |
 | Audio FX — Slow+Reverb / Nightcore / Bass Boost / 8D | telegram-music-bot-rust | `main.rs` (FFmpeg filter chains) | `svc:audio-fx-rust` | Rust service: `fx.apply {effect, input}` → FFmpeg filter graph → processed file. Effects are pure functions on audio; no bot logic inside |
 | Spotify profanity filter / auto-skip disliked | rustify | `src/profanity.rs`, `src/lyrics/{genius,lrclib,musixmatch}.rs`, `src/spotify/*`, `src/queue/*` | `svc:spotify-rust` | Rust service: watches Spotify playback, checks lyrics, skips profane/AI-flagged/disliked tracks; `spotify.skip` IPC to the VC engine |
 | Low-RAM Go engine | TgMusicBot | `main.go`, `internal/bot/*.go`, `ntgcalls/` | `svc:vc-go` (profile: low-ram) | Same Go service, `VC_PROFILE=low-ram` (TgMusicBot tuning: single ntgcalls instance, minimal cache) |
 | High-perf Go engine | ArcMusic | `internal/core/room_queue.go`, `internal/database/*` (MongoDB caching) | `svc:vc-go` (profile: high-perf) | Same Go service, `VC_PROFILE=high-perf` (ArcMusic tuning: MongoDB queue cache, prefetch) |
-| C++ core / router (base) | anonx-cpp + NoxBeats + TinaMusic | `src/telegram/dispatcher.cpp`, `src/audio/ntgcalls_client.cpp`; `Bad/core/app.cpp`, `Bad/cmd/*.cpp`; `src/bot_engine.cpp`, `include/tinaproto/*.hpp` | `core` | anonx-cpp gives the skeleton (dispatcher + ntgcalls client + thread pool); NoxBeats gives the command/permission surface; TinaMusic gives the native MTProto/WebRTC voice path and the ~30MB-RAM design goal. Core routes every command to a service via IPC and owns no download/stream logic itself |
+| C++ core / router (base) | anonx-cpp + NoxBeats + TinaMusic | `src/telegram/dispatcher.cpp`, `src/audio/ntgcalls_client.cpp`; `Bad/core/app.cpp`, `Bad/cmd/*.cpp`; `src/bot_engine.cpp`, `include/tinaproto/*.hpp` | `core` | anonx-cpp gives the skeleton (dispatcher + ntgcalls client + thread pool); NoxBeats gives the command/permission surface; TinaMusic gives the native MTProto/WebRTC voice path and the ~30MB-RAM design goal. Core routes every command to a service via IPC and owns no download logic itself; the narrow exception is the in-process voice backends (TDLib + ntgcalls + Opus pipeline) |
 | Queue / room state model | YukkiMusic-Go, ArcMusic, remix | `internal/core/queue.go`, `room_state.go`; `src/bot/queues.ts` | `core` (schema) + `svc:vc-go` (runtime) | Queue schema defined once in `contracts/ipc.json` (`QueueItem`); runtime state lives in the VC service, core only mirrors now-playing for the GUI |
 
 ## 3. What is NOT ported
 
 - Any upstream `config.py` / `.env` / session files, bot tokens, API keys,
-  cookies, or MongoDB credentials — none exist in this scaffold, none are
+  cookies, or MongoDB credentials — none exist in this tree, none are
   in `refs/` by design (shallow clones contain only public code).
 - Whole-repo vendoring: `refs/` is reference-only and gitignored from any
-  future Parlay repo; `services/` contains only original stubs.
+  future Parlay repo.
 - NoxBeats / telegram-music-bot-rust / feel-me code: no LICENSE file, so
   ideas only (see license warning above).
+- **Beetube movie/anime/torrent providers** — music-only scope decision,
+  Phase 5 (B6): they depend on Beetube's external API backend and
+  torrent clients; not ported, not stubbed.
+- **NetEase audio recognition** (`handlers_recognize.go`) — dropped from
+  scope in Phase 5 (B7): needs an external fingerprint backend + login.
+- **Navidrome Soulseek** — not in `services/downloaders` code; the
+  Soulseek path runs through the separate slskd daemon (compose profile
+  `full`), client wiring in progress (Phase 5, Worker D).
+- **Per-user Spotify watch** (OAuth + playback polling) — intent-only in
+  spotify-rust (B1); no user tokens exist in the tree.

@@ -2,8 +2,6 @@
 #include "voice_call.hpp"
 
 #include <dlfcn.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
@@ -99,31 +97,41 @@ std::string buildFfmpegCmd(const std::string& src, int seek_sec, double speed,
 }
 
 // --- NtgCallsVoiceCall ------------------------------------------------------
+// ntgcalls 3.0.5 C API (generated header ntgcalls.h, from the C build in
+// refs/ntgcalls/shared-output/include/): SYNCHRONOUS. No ntg_async_struct
+// any more — every call returns ntg_result directly (NTG_OK = 0) and the
+// error text comes from ntg_last_error(). The instance is an opaque
+// ntg_instance* from ntg_instance_create(). Out strings (create_call
+// offer) are freed with ntg_string_free().
 namespace {
-typedef uintptr_t (*fn_ntg_init)();
-typedef int (*fn_ntg_destroy)(uintptr_t);
-typedef int (*fn_ntg_create)(uintptr_t, int64_t, char**, ntg_async_struct);
-typedef int (*fn_ntg_connect)(uintptr_t, int64_t, char*, bool,
-                              ntg_async_struct);
-typedef int (*fn_ntg_set_stream_sources)(uintptr_t, int64_t,
-                                         ntg_stream_mode_enum,
-                                         ntg_media_description_struct,
-                                         ntg_async_struct);
-typedef int (*fn_ntg_pause)(uintptr_t, int64_t, ntg_async_struct);
-typedef int (*fn_ntg_resume)(uintptr_t, int64_t, ntg_async_struct);
-typedef int (*fn_ntg_mute)(uintptr_t, int64_t, ntg_async_struct);
-typedef int (*fn_ntg_unmute)(uintptr_t, int64_t, ntg_async_struct);
-typedef int (*fn_ntg_stop)(uintptr_t, int64_t, ntg_async_struct);
-typedef int (*fn_ntg_time)(uintptr_t, int64_t, ntg_stream_mode_enum, int64_t*,
-                           ntg_async_struct);
-typedef int (*fn_ntg_on_stream_end)(uintptr_t, ntg_stream_callback, void*);
-typedef int (*fn_ntg_on_connection_change)(uintptr_t, ntg_connection_callback,
+typedef ntg_instance* (*fn_ntg_instance_create)();
+typedef void (*fn_ntg_instance_destroy)(ntg_instance*);
+typedef ntg_result (*fn_ntg_create_call)(ntg_instance*, int64_t, char**);
+typedef ntg_result (*fn_ntg_connect)(ntg_instance*, int64_t, const char*,
+                                     bool);
+typedef ntg_result (*fn_ntg_set_stream_sources)(ntg_instance*, int64_t,
+                                                ntg_stream_mode,
+                                                ntg_media_description);
+typedef ntg_result (*fn_ntg_pause)(ntg_instance*, int64_t, bool*);
+typedef ntg_result (*fn_ntg_resume)(ntg_instance*, int64_t, bool*);
+typedef ntg_result (*fn_ntg_mute)(ntg_instance*, int64_t, bool*);
+typedef ntg_result (*fn_ntg_unmute)(ntg_instance*, int64_t, bool*);
+typedef ntg_result (*fn_ntg_stop)(ntg_instance*, int64_t);
+typedef ntg_result (*fn_ntg_time)(ntg_instance*, int64_t, ntg_stream_mode,
+                                  uint64_t*);
+typedef const char* (*fn_ntg_get_version)();
+typedef const char* (*fn_ntg_last_error)();
+typedef void (*fn_ntg_string_free)(char*);
+typedef ntg_result (*fn_ntg_on_stream_end)(ntg_instance*,
+                                           ntg_stream_end_callback_cb,
                                            void*);
+typedef ntg_result (*fn_ntg_on_connection_change)(
+    ntg_instance*, ntg_connection_change_callback_cb, void*);
 
 struct NtgApi {
-    fn_ntg_init init = nullptr;
-    fn_ntg_destroy destroy = nullptr;
-    fn_ntg_create create = nullptr;
+    fn_ntg_instance_create instance_create = nullptr;
+    fn_ntg_instance_destroy instance_destroy = nullptr;
+    fn_ntg_create_call create_call = nullptr;
     fn_ntg_connect connect = nullptr;
     fn_ntg_set_stream_sources set_stream_sources = nullptr;
     fn_ntg_pause pause = nullptr;
@@ -132,63 +140,32 @@ struct NtgApi {
     fn_ntg_unmute unmute = nullptr;
     fn_ntg_stop stop = nullptr;
     fn_ntg_time time = nullptr;
+    fn_ntg_get_version get_version = nullptr;
+    fn_ntg_last_error last_error = nullptr;
+    fn_ntg_string_free string_free = nullptr;
     fn_ntg_on_stream_end on_stream_end = nullptr;
     fn_ntg_on_connection_change on_connection_change = nullptr;
 };
 
-struct FutState {
-    std::mutex mu;
-    std::condition_variable cv;
-    bool ready = false;
-    int code = 0;
-    char* msg = nullptr;
-};
-void onNtgDone(void* ud) {
-    auto* sp = static_cast<std::shared_ptr<FutState>*>(ud);
-    {
-        std::lock_guard<std::mutex> lk((*sp)->mu);
-        (*sp)->ready = true;
-    }
-    (*sp)->cv.notify_all();
-    delete sp;
-}
-
-// Runs start(fut) and waits for the async callback (NoxBeats media_ntg.cpp
-// run()). Throws std::runtime_error on failure/timeout.
-template <class F>
-void ntgRun(const char* what, F start, int timeout_sec = 60) {
-    auto st = std::make_shared<FutState>();
-    auto* cb = new std::shared_ptr<FutState>(st);
-    ntg_async_struct f{};
-    f.userData = cb;
-    f.promise = onNtgDone;
-    f.errorCode = &st->code;
-    f.errorMessage = &st->msg;
-    int rc = start(f);
-    std::unique_lock<std::mutex> lk(st->mu);
-    if (!st->cv.wait_for(lk, std::chrono::seconds(timeout_sec),
-                         [&] { return st->ready; }))
-        throw std::runtime_error(std::string("ntgcalls ") + what +
-                                 " timed out");
-    std::string m;
-    if (st->msg) {
-        m = st->msg;
-        std::free(st->msg);
-    }
-    int code = st->code < 0 ? st->code : (rc < 0 ? rc : 0);
-    if (code < 0)
-        throw std::runtime_error(std::string("ntgcalls ") + what +
-                                 " failed (" + std::to_string(code) + "): " +
-                                 m);
-}
-
 NtgApi g_ntg{};
+
+// Format a failed ntg_result with the library's own error text.
+std::string ntgError(const char* what, ntg_result rc) {
+    std::string msg = std::string("ntgcalls ") + what + " failed (" +
+                      std::to_string(static_cast<int>(rc)) + ")";
+    if (g_ntg.last_error) {
+        const char* e = g_ntg.last_error();
+        if (e && *e) msg += ": " + std::string(e);
+    }
+    return msg;
+}
 }  // namespace
 
 NtgCallsVoiceCall::NtgCallsVoiceCall(const std::string& explicit_path) {
     std::vector<std::string> candidates;
     if (!explicit_path.empty()) candidates.push_back(explicit_path);
     candidates.push_back("./lib/libntgcalls.so");
+    candidates.push_back("../../refs/ntgcalls/shared-output/lib/libntgcalls.so");  // repo build output, when run from services/core-cpp
     candidates.push_back("/usr/local/lib/libntgcalls.so");
     candidates.push_back("/usr/lib/libntgcalls.so");
     candidates.push_back("/usr/lib/x86_64-linux-gnu/libntgcalls.so");
@@ -208,9 +185,12 @@ NtgCallsVoiceCall::NtgCallsVoiceCall(const std::string& explicit_path) {
     auto sym = [&](const char* name) {
         return dlsym(handle_, name);
     };
-    g_ntg.init = reinterpret_cast<fn_ntg_init>(sym("ntg_init"));
-    g_ntg.destroy = reinterpret_cast<fn_ntg_destroy>(sym("ntg_destroy"));
-    g_ntg.create = reinterpret_cast<fn_ntg_create>(sym("ntg_create"));
+    g_ntg.instance_create = reinterpret_cast<fn_ntg_instance_create>(
+        sym("ntg_instance_create"));
+    g_ntg.instance_destroy = reinterpret_cast<fn_ntg_instance_destroy>(
+        sym("ntg_instance_destroy"));
+    g_ntg.create_call =
+        reinterpret_cast<fn_ntg_create_call>(sym("ntg_create_call"));
     g_ntg.connect = reinterpret_cast<fn_ntg_connect>(sym("ntg_connect"));
     g_ntg.set_stream_sources = reinterpret_cast<fn_ntg_set_stream_sources>(
         sym("ntg_set_stream_sources"));
@@ -220,211 +200,193 @@ NtgCallsVoiceCall::NtgCallsVoiceCall(const std::string& explicit_path) {
     g_ntg.unmute = reinterpret_cast<fn_ntg_unmute>(sym("ntg_unmute"));
     g_ntg.stop = reinterpret_cast<fn_ntg_stop>(sym("ntg_stop"));
     g_ntg.time = reinterpret_cast<fn_ntg_time>(sym("ntg_time"));
-    g_ntg.on_stream_end =
-        reinterpret_cast<fn_ntg_on_stream_end>(sym("ntg_on_stream_end"));
+    g_ntg.get_version =
+        reinterpret_cast<fn_ntg_get_version>(sym("ntg_get_version"));
+    g_ntg.last_error =
+        reinterpret_cast<fn_ntg_last_error>(sym("ntg_last_error"));
+    g_ntg.string_free =
+        reinterpret_cast<fn_ntg_string_free>(sym("ntg_string_free"));
+    g_ntg.on_stream_end = reinterpret_cast<fn_ntg_on_stream_end>(
+        sym("ntg_on_stream_end_callback"));
     g_ntg.on_connection_change = reinterpret_cast<fn_ntg_on_connection_change>(
-        sym("ntg_on_connection_change"));
-    if (!g_ntg.init || !g_ntg.create || !g_ntg.connect) {
+        sym("ntg_on_connection_change_callback"));
+    if (!g_ntg.instance_create || !g_ntg.create_call || !g_ntg.connect) {
         last_error_ = "libntgcalls.so at " + lib_path_ +
-                      " lacks the ntg_init/create/connect symbols";
+                      " lacks the ntg_instance_create/create_call/connect "
+                      "symbols (wrong ntgcalls version?)";
         dlclose(handle_);
         handle_ = nullptr;
         return;
     }
-    ntg_ = g_ntg.init();
+    ntg_ = g_ntg.instance_create();
     if (!ntg_) {
-        last_error_ = "ntg_init() failed";
+        last_error_ = "ntg_instance_create() failed";
         dlclose(handle_);
         handle_ = nullptr;
     }
 }
 
 NtgCallsVoiceCall::~NtgCallsVoiceCall() {
-    if (ntg_ && g_ntg.destroy) g_ntg.destroy(ntg_);
+    if (ntg_ && g_ntg.instance_destroy) g_ntg.instance_destroy(ntg_);
     if (handle_) dlclose(handle_);
 }
 
 std::string NtgCallsVoiceCall::describe() const {
     if (!handle_) return "ntgcalls unavailable: " + last_error_;
-    return "ntgcalls via " + lib_path_;
+    std::string v;
+    if (g_ntg.get_version) {
+        const char* ver = g_ntg.get_version();
+        if (ver) v = std::string(" ") + ver;
+    }
+    return "ntgcalls via " + lib_path_ + v;
 }
 
 bool NtgCallsVoiceCall::createOffer(int64_t chat_id,
                                     std::string& offer_out) {
     if (!available()) return false;
-    try {
-        char* buf = nullptr;
-        ntgRun("create", [&](ntg_async_struct f) {
-            return g_ntg.create(ntg_, chat_id, &buf, f);
-        });
-        offer_out = buf ? buf : "";
-        std::free(buf);
-        if (offer_out.empty()) {
-            last_error_ = "ntg_create returned no params";
-            return false;
-        }
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    char* buf = nullptr;
+    ntg_result rc = g_ntg.create_call(ntg_, chat_id, &buf);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("create_call", rc);
         return false;
     }
+    offer_out = buf ? buf : "";
+    if (g_ntg.string_free && buf) g_ntg.string_free(buf);
+    if (offer_out.empty()) {
+        last_error_ = "ntg_create_call returned no params";
+        return false;
+    }
+    return true;
 }
 
 bool NtgCallsVoiceCall::setSources(int64_t chat_id,
                                    const std::string& stream_url, bool video,
                                    int seek_sec, double speed, int bass) {
     if (!available()) return false;
-    try {
-        std::string cmd = buildFfmpegCmd(stream_url, seek_sec, speed, bass);
-        std::string video_cmd;
-        if (video) video_cmd = buildFfmpegCmd(stream_url, seek_sec, speed, 0,
-                                              true);
-        ntg_audio_description_struct a{};
-        a.mediaSource = NTG_SHELL;
-        a.input = const_cast<char*>(cmd.c_str());
-        a.sampleRate = 48000;
-        a.channelCount = 2;
-        a.keepOpen = false;
-        ntg_video_description_struct v{};
-        v.mediaSource = NTG_SHELL;
-        v.input = const_cast<char*>(video_cmd.c_str());
-        v.width = 1280;
-        v.height = 720;
-        v.fps = 30;
-        v.keepOpen = false;
-        ntg_media_description_struct d{};
-        d.microphone = &a;
-        if (!video_cmd.empty()) d.camera = &v;
-        ntgRun("set_stream_sources", [&](ntg_async_struct f) {
-            return g_ntg.set_stream_sources(ntg_, chat_id, NTG_STREAM_CAPTURE,
-                                            d, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    std::string cmd = buildFfmpegCmd(stream_url, seek_sec, speed, bass);
+    std::string video_cmd;
+    if (video) video_cmd = buildFfmpegCmd(stream_url, seek_sec, speed, 0,
+                                          true);
+    // New header field order: media_source, sample_rate, channel_count,
+    // input, keep_open. SHELL = NTG_MEDIA_SOURCE_SHELL (2).
+    ntg_audio_description a{};
+    a.media_source = NTG_MEDIA_SOURCE_SHELL;
+    a.sample_rate = 48000;
+    a.channel_count = 2;
+    a.input = const_cast<char*>(cmd.c_str());
+    a.keep_open = false;
+    ntg_video_description v{};
+    v.media_source = NTG_MEDIA_SOURCE_SHELL;
+    v.width = 1280;
+    v.height = 720;
+    v.fps = 30;
+    v.input = const_cast<char*>(video_cmd.c_str());
+    v.keep_open = false;
+    ntg_media_description d{};
+    d.microphone = &a;
+    if (!video_cmd.empty()) d.camera = &v;
+    ntg_result rc = g_ntg.set_stream_sources(ntg_, chat_id,
+                                             NTG_STREAM_MODE_CAPTURE, d);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("set_stream_sources", rc);
         return false;
     }
+    return true;
 }
 
 bool NtgCallsVoiceCall::play(int64_t chat_id, const std::string& stream_url,
                              const std::string&, bool video, int seek_sec,
                              double speed, int bass) {
     if (!available()) return false;
-    try {
-        // TinaMusic Play() step 1-2: create the call (local SDP offer),
-        // attach the ffmpeg shell command as the audio source.
-        std::string offer;
-        if (!createOffer(chat_id, offer)) return false;
-        if (!setSources(chat_id, stream_url, video, seek_sec, speed, bass))
-            return false;
-        // Step 3 (TinaMusic): the caller must now phone.joinGroupCall with
-        // this offer via MTProto and call connect() with the remote
-        // transport. Without an MTProto session this backend can create
-        // the offer but cannot join — report that honestly.
-        last_error_ =
-            "local SDP offer created (" + std::to_string(offer.size()) +
-            " bytes) but no MTProto join happened: call connect() with the "
-            "remote transport from phone.joinGroupCall, or use the "
-            "tdlib / voice-bridge backend which does the join";
+    // TinaMusic Play() step 1-2: create the call (local SDP offer),
+    // attach the ffmpeg shell command as the audio source.
+    std::string offer;
+    if (!createOffer(chat_id, offer)) return false;
+    if (!setSources(chat_id, stream_url, video, seek_sec, speed, bass))
         return false;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
-        return false;
-    }
+    // Step 3 (TinaMusic): the caller must now phone.joinGroupCall with
+    // this offer via MTProto and call connect() with the remote
+    // transport. Without an MTProto session this backend can create
+    // the offer but cannot join — report that honestly.
+    last_error_ =
+        "local SDP offer created (" + std::to_string(offer.size()) +
+        " bytes) but no MTProto join happened: call connect() with the "
+        "remote transport from joinVideoChat, or use the tdlib "
+        "backend which does the join in-process";
+    return false;
 }
 
 bool NtgCallsVoiceCall::connect(int64_t chat_id,
                                 const std::string& remote_params) {
     if (!available()) return false;
-    try {
-        ntgRun("connect", [&](ntg_async_struct f) {
-            return g_ntg.connect(ntg_, chat_id,
-                                 const_cast<char*>(remote_params.c_str()),
-                                 false, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    ntg_result rc = g_ntg.connect(ntg_, chat_id, remote_params.c_str(), false);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("connect", rc);
         return false;
     }
+    return true;
 }
 
 bool NtgCallsVoiceCall::stop(int64_t chat_id) {
     if (!available()) return false;
-    try {
-        ntgRun("stop", [&](ntg_async_struct f) {
-            return g_ntg.stop(ntg_, chat_id, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    ntg_result rc = g_ntg.stop(ntg_, chat_id);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("stop", rc);
         return false;
     }
+    return true;
 }
 
 bool NtgCallsVoiceCall::pause(int64_t chat_id) {
     if (!available()) return false;
-    try {
-        ntgRun("pause", [&](ntg_async_struct f) {
-            return g_ntg.pause(ntg_, chat_id, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    bool ok = false;
+    ntg_result rc = g_ntg.pause(ntg_, chat_id, &ok);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("pause", rc);
         return false;
     }
+    return true;
 }
 
 bool NtgCallsVoiceCall::resume(int64_t chat_id) {
     if (!available()) return false;
-    try {
-        ntgRun("resume", [&](ntg_async_struct f) {
-            return g_ntg.resume(ntg_, chat_id, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    bool ok = false;
+    ntg_result rc = g_ntg.resume(ntg_, chat_id, &ok);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("resume", rc);
         return false;
     }
+    return true;
 }
 
 bool NtgCallsVoiceCall::mute(int64_t chat_id) {
     if (!available()) return false;
-    try {
-        ntgRun("mute", [&](ntg_async_struct f) {
-            return g_ntg.mute(ntg_, chat_id, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    bool ok = false;
+    ntg_result rc = g_ntg.mute(ntg_, chat_id, &ok);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("mute", rc);
         return false;
     }
+    return true;
 }
 
 bool NtgCallsVoiceCall::unmute(int64_t chat_id) {
     if (!available()) return false;
-    try {
-        ntgRun("unmute", [&](ntg_async_struct f) {
-            return g_ntg.unmute(ntg_, chat_id, f);
-        });
-        return true;
-    } catch (const std::exception& e) {
-        last_error_ = e.what();
+    bool ok = false;
+    ntg_result rc = g_ntg.unmute(ntg_, chat_id, &ok);
+    if (rc != NTG_OK) {
+        last_error_ = ntgError("unmute", rc);
         return false;
     }
+    return true;
 }
 
 int64_t NtgCallsVoiceCall::time(int64_t chat_id) {
     if (!available() || !g_ntg.time) return -1;
-    try {
-        int64_t t = 0;
-        ntgRun("time", [&](ntg_async_struct f) {
-            return g_ntg.time(ntg_, chat_id, NTG_STREAM_CAPTURE, &t, f);
-        });
-        return t;
-    } catch (...) {
-        return -1;
-    }
+    uint64_t t = 0;
+    ntg_result rc = g_ntg.time(ntg_, chat_id, NTG_STREAM_MODE_CAPTURE, &t);
+    if (rc != NTG_OK) return -1;
+    return static_cast<int64_t>(t);
 }
 
 // --- OpusPipeline ------------------------------------------------------------
@@ -515,173 +477,6 @@ OpusStats OpusPipeline::run(const std::string& source,
     st.ok = st.frames > 0 && st.bytes > 0;
     if (!st.ok) st.error = "opus file has no frames";
     return st;
-}
-
-// --- VoiceBridge ---------------------------------------------------------------
-VoiceBridge::VoiceBridge(const Config& cfg) : cfg_(cfg) {
-    // Prefer the phase4 voice venv (ntgcalls + telethon installed there);
-    // fall back to system python3.
-    std::string venv_py =
-        std::filesystem::path(cfg_.voice_bridge).parent_path().string() +
-        "/../phase4/voice-venv/bin/python";
-    if (std::filesystem::exists(venv_py)) {
-        python_ = venv_py;
-    } else {
-        python_ = "python3";
-    }
-}
-
-VoiceBridge::~VoiceBridge() {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (auto& [chat, pid] : children_) {
-        if (pid > 0) {
-            kill(pid, SIGTERM);
-            int status = 0;
-            waitpid(pid, &status, WNOHANG);
-        }
-    }
-}
-
-bool VoiceBridge::available() const {
-    if (cfg_.assistant_session_file.empty() || cfg_.api_id == 0 ||
-        cfg_.api_hash.empty())
-        return false;
-    if (cfg_.voice_bridge.empty() ||
-        !std::filesystem::exists(cfg_.voice_bridge))
-        return false;
-    return std::filesystem::exists(cfg_.assistant_session_file);
-}
-
-std::string VoiceBridge::describe() const {
-    if (cfg_.assistant_session_file.empty())
-        return "voice-bridge unavailable: ASSISTANT_SESSION_FILE not set";
-    if (cfg_.api_id == 0 || cfg_.api_hash.empty())
-        return "voice-bridge unavailable: API_ID/API_HASH not set";
-    if (cfg_.voice_bridge.empty())
-        return "voice-bridge unavailable: VOICE_BRIDGE path not set";
-    return "voice-bridge via " + cfg_.voice_bridge + " (Telethon + ntgcalls)";
-}
-
-bool VoiceBridge::spawn(int64_t chat_id, const std::string& stream_url,
-                        bool video, int seek_sec, double speed, int bass) {
-    std::string cmd = buildFfmpegCmd(stream_url, seek_sec, speed, bass);
-    std::string video_cmd;
-    if (video) video_cmd = buildFfmpegCmd(stream_url, seek_sec, speed, 0, true);
-    // Child: python voice_bridge.py join-call --chat-id N --session FILE
-    // --api-id N --api-hash X --ffmpeg-cmd '...' [--video-cmd '...']
-    // The bridge prints JSON lines; the core does not parse them here —
-    // the child is tracked by pid and killed on stop().
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child: silence stdin, redirect stdout/stderr to a per-chat log.
-        std::string log = cfg_.data_dir + "/voice-" +
-                          std::to_string(chat_id) + ".log";
-        std::error_code ec;
-        std::filesystem::create_directories(cfg_.data_dir, ec);
-        FILE* lf = freopen(log.c_str(), "a", stdout);
-        if (lf) dup2(fileno(stdout), STDERR_FILENO);
-        execlp(python_.c_str(), python_.c_str(), cfg_.voice_bridge.c_str(),
-               "join-call", "--chat-id", std::to_string(chat_id).c_str(),
-               "--session", cfg_.assistant_session_file.c_str(), "--api-id",
-               std::to_string(cfg_.api_id).c_str(), "--api-hash",
-               cfg_.api_hash.c_str(), "--ffmpeg-cmd", cmd.c_str(),
-               "--video-cmd", video_cmd.c_str(), nullptr);
-        _exit(127);
-    }
-    if (pid < 0) {
-        last_error_ = "fork() failed";
-        return false;
-    }
-    std::lock_guard<std::mutex> lk(mu_);
-    children_[chat_id] = pid;
-    return true;
-}
-
-bool VoiceBridge::play(int64_t chat_id, const std::string& stream_url,
-                       const std::string& title, bool video, int seek_sec,
-                       double speed, int bass) {
-    (void)title;
-    if (!available()) {
-        last_error_ = describe();
-        return false;
-    }
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = children_.find(chat_id);
-        if (it != children_.end() && it->second > 0) {
-            kill(it->second, SIGTERM);
-            int status = 0;
-            waitpid(it->second, &status, 0);
-            children_.erase(it);
-        }
-    }
-    return spawn(chat_id, stream_url, video, seek_sec, speed, bass);
-}
-
-bool VoiceBridge::stop(int64_t chat_id) {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = children_.find(chat_id);
-    if (it == children_.end()) return false;
-    if (it->second > 0) {
-        kill(it->second, SIGTERM);
-        int status = 0;
-        waitpid(it->second, &status, WNOHANG);
-    }
-    children_.erase(it);
-    return true;
-}
-
-bool VoiceBridge::pause(int64_t chat_id) {
-    // The bridge child owns the ntgcalls session; pause/resume/mute are
-    // signalled by sending SIGUSR1/SIGUSR2 to the child, which the bridge
-    // maps to ntgcalls pause/resume. (Not yet wired in the bridge: these
-    // return false until the signal protocol lands.)
-    (void)chat_id;
-    last_error_ = "pause via bridge not wired yet (child signal protocol)";
-    return false;
-}
-bool VoiceBridge::resume(int64_t chat_id) {
-    (void)chat_id;
-    last_error_ = "resume via bridge not wired yet (child signal protocol)";
-    return false;
-}
-bool VoiceBridge::mute(int64_t chat_id) {
-    (void)chat_id;
-    last_error_ = "mute via bridge not wired yet (child signal protocol)";
-    return false;
-}
-bool VoiceBridge::unmute(int64_t chat_id) {
-    (void)chat_id;
-    last_error_ = "unmute via bridge not wired yet (child signal protocol)";
-    return false;
-}
-
-bool VoiceBridge::joinChat(int64_t chat_id, const std::string& invite_link,
-                           std::string& error_out) {
-    if (cfg_.assistant_session_file.empty() || cfg_.api_id == 0 ||
-        cfg_.api_hash.empty()) {
-        error_out = describe();
-        return false;
-    }
-    if (invite_link.empty()) {
-        error_out = "no invite link (bot must be admin to export one)";
-        return false;
-    }
-    // One-shot: python voice_bridge.py join-chat --chat-id N ...
-    // The bridge prints {"ok": true, ...} or {"ok": false, "error": ...}.
-    std::string out = runCapture(
-        shellQuote(python_) + " " + shellQuote(cfg_.voice_bridge) +
-        " join-chat --chat-id " + std::to_string(chat_id) + " --session " +
-        shellQuote(cfg_.assistant_session_file) + " --api-id " +
-        std::to_string(cfg_.api_id) + " --api-hash " +
-        shellQuote(cfg_.api_hash) + " --invite " + shellQuote(invite_link) +
-        " 2>&1");
-    if (out.find("\"ok\": true") != std::string::npos ||
-        out.find("\"ok\":true") != std::string::npos)
-        return true;
-    error_out = out.empty() ? "voice bridge produced no output"
-                            : out.substr(0, 500);
-    return false;
 }
 
 // --- TdLibVoiceCall ----------------------------------------------------------
@@ -808,6 +603,47 @@ std::string TdLibVoiceCall::joinVideoChat(int32_t group_call_id,
     return text->asString();
 }
 
+bool TdLibVoiceCall::join(int64_t chat_id) {
+    if (!available()) {
+        last_error_ = describe();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (joined_.count(chat_id)) return true;  // already in the call
+    }
+    // Same steps as play() minus the audio source: authorize ->
+    // ntgcalls create_call (local SDP offer) -> resolve/create the
+    // video chat -> joinVideoChat -> ntgcalls connect. No setSources:
+    // the call is joined silent until a track plays.
+    if (!tdlib_.authorized() && !tdlib_.authorize(60.0)) {
+        last_error_ = tdlib_.lastError();
+        return false;
+    }
+    std::string offer;
+    if (!ntg_.createOffer(chat_id, offer)) {
+        last_error_ = "ntgcalls create failed: " + ntg_.lastError();
+        return false;
+    }
+    int32_t gcid = groupCallId(chat_id);
+    if (gcid < 0) return false;
+    if (gcid == 0) {
+        gcid = createVideoChat(chat_id, "Parlay");
+        if (gcid == 0) return false;
+    }
+    std::string remote = joinVideoChat(gcid, offer, false);
+    if (remote.empty()) return false;
+    if (!ntg_.connect(chat_id, remote)) {
+        last_error_ = "ntgcalls connect failed: " + ntg_.lastError();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        joined_[chat_id] = gcid;
+    }
+    return true;
+}
+
 bool TdLibVoiceCall::play(int64_t chat_id, const std::string& stream_url,
                           const std::string& title, bool video, int seek_sec,
                           double speed, int bass) {
@@ -815,41 +651,51 @@ bool TdLibVoiceCall::play(int64_t chat_id, const std::string& stream_url,
         last_error_ = describe();
         return false;
     }
-    // 1. Authorize the TDLib session (honest stop without credentials).
-    if (!tdlib_.authorized() && !tdlib_.authorize(60.0)) {
-        last_error_ = tdlib_.lastError();
-        return false;
+    // Already in this chat's call (via /join)? Skip the join steps and
+    // attach the new source to the live call; re-joining would fail.
+    bool already_joined = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        already_joined = joined_.count(chat_id) != 0;
     }
-    // 2. ntgcalls create_call -> local SDP offer.
-    std::string offer;
-    if (!ntg_.createOffer(chat_id, offer)) {
-        last_error_ = "ntgcalls create failed: " + ntg_.lastError();
-        return false;
+    if (!already_joined) {
+        // 1. Authorize the TDLib session (honest stop without credentials).
+        if (!tdlib_.authorized() && !tdlib_.authorize(60.0)) {
+            last_error_ = tdlib_.lastError();
+            return false;
+        }
+        // 2. ntgcalls create_call -> local SDP offer.
+        std::string offer;
+        if (!ntg_.createOffer(chat_id, offer)) {
+            last_error_ = "ntgcalls create failed: " + ntg_.lastError();
+            return false;
+        }
+        // 3. Resolve the chat's video chat; create one when none exists.
+        int32_t gcid = groupCallId(chat_id);
+        if (gcid < 0) return false;
+        if (gcid == 0) {
+            gcid = createVideoChat(chat_id, title);
+            if (gcid == 0) return false;
+        }
+        // 4. joinVideoChat(local SDP) -> remote transport payload.
+        std::string remote = joinVideoChat(gcid, offer, video);
+        if (remote.empty()) return false;
+        // 5. ntgcalls connect(remote).
+        if (!ntg_.connect(chat_id, remote)) {
+            last_error_ = "ntgcalls connect failed: " + ntg_.lastError();
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            joined_[chat_id] = gcid;
+        }
     }
-    // 3. Resolve the chat's video chat; create one when none exists.
-    int32_t gcid = groupCallId(chat_id);
-    if (gcid < 0) return false;
-    if (gcid == 0) {
-        gcid = createVideoChat(chat_id, title);
-        if (gcid == 0) return false;
-    }
-    // 4. joinVideoChat(local SDP) -> remote transport payload.
-    std::string remote = joinVideoChat(gcid, offer, video);
-    if (remote.empty()) return false;
-    // 5. ntgcalls connect(remote) -> set_stream_sources(ffmpeg cmd).
-    if (!ntg_.connect(chat_id, remote)) {
-        last_error_ = "ntgcalls connect failed: " + ntg_.lastError();
-        return false;
-    }
+    // 6. set_stream_sources(ffmpeg cmd).
     if (!ntg_.setSources(chat_id, stream_url, video, seek_sec, speed,
                          bass)) {
         last_error_ = "ntgcalls set_stream_sources failed: " +
                       ntg_.lastError();
         return false;
-    }
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        joined_[chat_id] = gcid;
     }
     return true;
 }
@@ -883,17 +729,16 @@ bool TdLibVoiceCall::unmute(int64_t chat_id) { return ntg_.unmute(chat_id); }
 int64_t TdLibVoiceCall::time(int64_t chat_id) { return ntg_.time(chat_id); }
 
 // --- factory -------------------------------------------------------------------
+// In-process only: TDLib (signaling + ntgcalls media) when TD_* are set
+// and both .so files load, else bare dlopen'd ntgcalls (offer/sources,
+// no join without an MTProto session), else unavailable with the exact
+// reason. No bridge fallback exists any more (Phase 5: deleted).
 std::unique_ptr<VoiceCall> makeVoiceCall(const Config& cfg) {
     TdLibVoiceCall tdlib_probe(cfg);
     if (tdlib_probe.available()) {
         std::cout << "[voice] backend=tdlib (" << tdlib_probe.describe()
                   << ")\n";
         return std::make_unique<TdLibVoiceCall>(cfg);
-    }
-    VoiceBridge bridge_probe(cfg);
-    if (bridge_probe.available()) {
-        std::cout << "[voice] backend=voice-bridge (Telethon + ntgcalls)\n";
-        return std::make_unique<VoiceBridge>(cfg);
     }
     NtgCallsVoiceCall ntg(cfg.ntgcalls_lib);
     if (ntg.available()) {
@@ -902,16 +747,11 @@ std::unique_ptr<VoiceCall> makeVoiceCall(const Config& cfg) {
         return std::make_unique<NtgCallsVoiceCall>(cfg.ntgcalls_lib);
     }
     std::string reason;
-    if (!cfg.assistant_session_file.empty()) {
-        reason = "bridge session configured but " + bridge_probe.describe() +
-                 "; tdlib: " + tdlib_probe.describe() +
-                 "; ntgcalls: " + ntg.lastError();
-    } else if (cfg.td_api_id != 0) {
+    if (cfg.td_api_id != 0) {
         reason = "tdlib configured but " + tdlib_probe.describe() +
                  "; ntgcalls: " + ntg.lastError();
     } else {
-        reason = "no ASSISTANT_SESSION_FILE (bridge off) and no "
-                 "TD_API_ID/TD_API_HASH/TD_SESSION_DIR (tdlib off); "
+        reason = "no TD_API_ID/TD_API_HASH/TD_SESSION_DIR (tdlib off); "
                  "ntgcalls: " +
                  ntg.lastError();
     }

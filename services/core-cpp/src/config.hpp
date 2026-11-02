@@ -46,11 +46,11 @@ struct Config {
     std::set<int64_t> allow_chats;           // PARLAY_ALLOW_CHATS, comma-sep
     std::set<int64_t> block_chats;           // PARLAY_BLOCK_CHATS, comma-sep
 
-    // Voice (TinaMusic/NoxBeats assistant model).
+    // Voice (TinaMusic/NoxBeats assistant model). The assistant session
+    // lives in TD_SESSION_DIR (TDLib); there is no Telethon session
+    // file and no voice bridge any more (Phase 5: deleted).
     std::set<int64_t> assistant_ids;         // ASSISTANT_IDS, comma-sep
-    std::string assistant_session_file;      // ASSISTANT_SESSION_FILE (Telethon session string file, 0600)
     std::string ntgcalls_lib;                // NTGCALLS_LIB (explicit libntgcalls.so path)
-    std::string voice_bridge;                // VOICE_BRIDGE (voice_bridge.py path)
     std::string rtp_sink;                    // VOICE_RTP_SINK host:port for Opus pipeline proof
 
     // TDLib voice backend (names only — values stay in the environment).
@@ -61,6 +61,11 @@ struct Config {
     std::string td_phone;           // TD_PHONE (login phone, if auth needed)
     std::string td_code;            // TD_CODE (login code, if auth needed)
     std::string td_password;        // TD_PASSWORD (2FA password, if auth needed)
+    std::string td_email;           // TD_EMAIL (email login, if auth needed)
+    std::string td_email_code;      // TD_EMAIL_CODE (email login code)
+    std::string td_first_name;      // TD_FIRST_NAME (first registration)
+    std::string td_last_name;       // TD_LAST_NAME (first registration)
+    bool td_qr = false;             // TD_QR=1 (QR login instead of phone)
 
     // Local state / logging.
     std::string data_dir = "data";           // PARLAY_DATA_DIR (file-backend state)

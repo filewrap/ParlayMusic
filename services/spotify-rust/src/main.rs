@@ -8,6 +8,9 @@
 //!                        with word-boundary matching, std-only)
 //!   `src/lyrics/lrclib.rs` — LRCLib lyrics fetch (`plainLyrics`)
 //!   `src/lyrics/{genius,musixmatch}.rs` — credentialed lyrics providers
+//!     (ported against the public Genius / Musixmatch APIs, env-gated:
+//!     GENIUS_ACCESS_TOKEN / MUSIXMATCH_API_KEY; Genius → Musixmatch →
+//!     LRCLib fallback in `fetch_lyrics`)
 //!   `src/spotify/*` — Spotify playback monitoring (OAuth + Web API)
 //!   `src/queue/track_check.rs` — skip decision: profanity / disliked
 //!
@@ -19,10 +22,12 @@
 //!   * profanity filter — curated English wordlist, case-insensitive,
 //!     word-boundary match over title + artist (+ LRCLib lyrics when
 //!     reachable); reports the matched word
-//!   * lyrics check — real LRCLib fetch via a `curl` subprocess with a
-//!     5s cap; when LRCLib is unreachable the response says
-//!     `lyrics_available:false` and falls back to the title/artist
-//!     check — a lyrics verdict is never faked
+//!   * lyrics check — real fetch via a `curl` subprocess with a
+//!     5s cap, provider chain Genius → Musixmatch → LRCLib (the
+//!     first two env-gated by their keys); when no provider is
+//!     reachable the response says `lyrics_available:false` and
+//!     falls back to the title/artist check — a lyrics verdict is
+//!     never faked
 //!   * Spotify link resolve — `POST /v1/spotify/resolve` parses
 //!     `open.spotify.com/<kind>/<id>` and `spotify:<kind>:<id>` URLs
 //!     into a track id. No API call.
@@ -38,14 +43,25 @@
 //!     `POST /v1/spotify/collection` returns real album/playlist/
 //!     artist track lists from the Web API). Without credentials both
 //!     say so and never fabricate a track list.
-//!   * Genius / Musixmatch lyrics — need GENIUS_ACCESS_TOKEN /
-//!     MUSIXMATCH_API_KEY.
+//!   * Genius / Musixmatch lyrics — wired (Phase 5 scope update):
+//!     Genius public search API + song-page scrape, Musixmatch
+//!     `matcher.lyrics.get`; both env-gated (GENIUS_ACCESS_TOKEN /
+//!     MUSIXMATCH_API_KEY) and falling back to LRCLib; without keys
+//!     the chain is LRCLib only.
 //!   * AI-generated-lyrics detection — rustify flags tracks whose
 //!     lyrics look AI-written; there is no classifier in this service,
 //!     so `reason:"ai-generated"` is never emitted. The field stays in
 //!     the contract for a future detector.
+//!
+//! Phase 5 (2026-11-03) closed the three gaps above — see README.md:
+//! Gemini classifier (`src/classifier.rs`), per-user OAuth tokens
+//! encrypted at rest + currently-playing polling (`src/auth.rs`,
+//! `src/crypto.rs`), and the poller thread in `main()`.
 
+mod auth;
+mod classifier;
 mod common;
+mod crypto;
 
 use common::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -275,6 +291,291 @@ fn fetch_lrclib_lyrics(title: &str, artist: &str) -> Option<String> {
         .and_then(|x| x.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
+}
+
+/// Genius lyrics (rustify `src/lyrics/genius.rs`, re-implemented against
+/// the PUBLIC Genius API — the ref talks to a self-hosted Genius proxy
+/// service that does not exist in Parlay, so this port uses
+/// api.genius.com directly; the only missing piece is the key).
+///
+/// Flow: `GET https://api.genius.com/search?q=<title artist>` with
+/// `Authorization: Bearer $GENIUS_ACCESS_TOKEN`, pick the best hit, then
+/// fetch the song page and scrape the `data-lyrics-container="true"`
+/// divs (the standard Genius page shape). Returns None when the key is
+/// unset, the network fails, no hit matches, or the page has no lyrics
+/// container — never faked. The token is passed to curl as an argv
+/// `-H` value only, never logged and never stored.
+fn genius_configured() -> bool {
+    std::env::var("GENIUS_ACCESS_TOKEN")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn fetch_genius_lyrics(title: &str, artist: &str) -> Option<String> {
+    let token = std::env::var("GENIUS_ACCESS_TOKEN").ok()?;
+    if token.trim().is_empty() {
+        return None;
+    }
+    fetch_genius_lyrics_with(title, artist, token.trim())
+}
+
+fn fetch_genius_lyrics_with(title: &str, artist: &str, token: &str) -> Option<String> {
+    let q = format!("{} {}", title, artist);
+    let url = format!(
+        "https://api.genius.com/search?q={}",
+        percent_encode(q.trim())
+    );
+    let out = Command::new("curl")
+        .arg("-s")
+        .arg("--max-time")
+        .arg(LYRICS_TIMEOUT_SECS)
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", token))
+        .arg(&url)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v = parse_json(text.trim())?;
+    let page_url = pick_genius_hit(&v, artist)?;
+    let page = Command::new("curl")
+        .arg("-s")
+        .arg("--max-time")
+        .arg(LYRICS_TIMEOUT_SECS)
+        .arg("-A")
+        .arg("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .arg(&page_url)
+        .output()
+        .ok()?;
+    if !page.status.success() {
+        return None;
+    }
+    extract_genius_lyrics_html(&String::from_utf8_lossy(&page.stdout))
+}
+
+/// Pick the Genius song-page URL from a public-API search response
+/// (`response.hits[].result`): the first hit whose primary artist
+/// matches (case-insensitive substring either way), else the first hit
+/// with a URL, else None.
+fn pick_genius_hit(v: &Json, artist: &str) -> Option<String> {
+    let hits = v.get("response")?.get("hits")?;
+    let items = match hits {
+        Json::Arr(items) => items,
+        _ => return None,
+    };
+    let want = artist.to_lowercase();
+    let mut first: Option<String> = None;
+    for hit in items {
+        let result = hit.get("result")?;
+        let url = result.get("url")?.as_str()?.to_string();
+        if first.is_none() {
+            first = Some(url.clone());
+        }
+        let hit_artist = result
+            .get("primary_artist")
+            .and_then(|a| a.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !want.is_empty()
+            && !hit_artist.is_empty()
+            && (hit_artist.contains(&want) || want.contains(&hit_artist))
+        {
+            return Some(url);
+        }
+    }
+    first
+}
+
+/// Extract lyrics text from a Genius song page: every
+/// `<div data-lyrics-container="true">…</div>` block, tags stripped,
+/// `<br>` → newline, entities unescaped. Returns None when there is no
+/// lyrics container or nothing survives stripping (page shape changed —
+/// lyrics unavailable, never faked).
+fn extract_genius_lyrics_html(html: &str) -> Option<String> {
+    const MARKER: &str = "data-lyrics-container=\"true\"";
+    let mut lines: Vec<String> = Vec::new();
+    let mut rest = html;
+    loop {
+        let at = match rest.find(MARKER) {
+            Some(i) => i,
+            None => break,
+        };
+        let after = &rest[at..];
+        // End of the opening <div ...> tag; content starts after it.
+        let tag_end = after.find('>')? + 1;
+        let inner = &after[tag_end..];
+        // Find the matching </div> with a depth counter (containers nest divs).
+        let mut depth: i32 = 1;
+        let mut pos = 0usize;
+        let mut end: Option<usize> = None;
+        while pos < inner.len() {
+            let slice = &inner[pos..];
+            let open = slice.find("<div");
+            let close = slice.find("</div>");
+            match (open, close) {
+                (Some(o), Some(c)) if o < c => {
+                    depth += 1;
+                    pos += o + 4;
+                }
+                (_, Some(c)) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(pos + c);
+                        break;
+                    }
+                    pos += c + 6;
+                }
+                _ => break,
+            }
+        }
+        let block = match end {
+            Some(e) => &inner[..e],
+            None => break,
+        };
+        // <br> variants become newlines before the remaining tags go.
+        let with_breaks = block
+            .replace("<br>", "\n")
+            .replace("<br/>", "\n")
+            .replace("<br />", "\n");
+        let text = unescape_html_entities(&strip_html_tags(&with_breaks));
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                lines.push(line.to_string());
+            }
+        }
+        rest = &inner[end.unwrap_or(inner.len())..];
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+/// Strip `<...>` tags (comments included) from a snippet.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Unescape the HTML entities Genius pages use in lyrics. `&amp;` is
+/// replaced last so `&amp;lt;` becomes `&lt;`, not `<`.
+fn unescape_html_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+/// Musixmatch lyrics (rustify `src/lyrics/musixmatch.rs`, re-implemented
+/// against the PUBLIC Musixmatch API — the ref uses the desktop endpoint
+/// with rotating usertokens; this port uses `matcher.lyrics.get` with
+/// `$MUSIXMATCH_API_KEY`, the credential the env var names).
+///
+/// Returns None when the key is unset, the network fails, the API
+/// status is not 200, the track is restricted (free tier returns partial
+/// lyrics — reported as unavailable rather than classified on a
+/// fragment) or instrumental, or the body is empty. Never faked.
+fn musixmatch_configured() -> bool {
+    std::env::var("MUSIXMATCH_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn fetch_musixmatch_lyrics(title: &str, artist: &str) -> Option<String> {
+    let key = std::env::var("MUSIXMATCH_API_KEY").ok()?;
+    if key.trim().is_empty() {
+        return None;
+    }
+    fetch_musixmatch_lyrics_with(title, artist, key.trim())
+}
+
+fn fetch_musixmatch_lyrics_with(title: &str, artist: &str, key: &str) -> Option<String> {
+    let url = format!(
+        "https://api.musixmatch.com/ws/1.1/matcher.lyrics.get?format=json&q_track={}&q_artist={}&apikey={}",
+        percent_encode(title),
+        percent_encode(artist),
+        percent_encode(key)
+    );
+    let out = Command::new("curl")
+        .arg("-s")
+        .arg("--max-time")
+        .arg(LYRICS_TIMEOUT_SECS)
+        .arg(&url)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v = parse_json(text.trim())?;
+    parse_musixmatch_lyrics(&v)
+}
+
+/// Parse a `matcher.lyrics.get` response: status 200 + a non-empty,
+/// unrestricted, non-instrumental `lyrics_body`.
+fn parse_musixmatch_lyrics(v: &Json) -> Option<String> {
+    let message = v.get("message")?;
+    let status = message
+        .get("header")
+        .and_then(|h| h.get("status_code"))
+        .and_then(|s| s.as_i64())?;
+    if status != 200 {
+        return None;
+    }
+    let lyrics = message.get("body")?.get("lyrics")?;
+    let is_set = |key: &str| -> bool {
+        match lyrics.get(key) {
+            Some(Json::Num(n)) => *n != 0.0,
+            Some(Json::Bool(b)) => *b,
+            _ => false,
+        }
+    };
+    if is_set("restricted") || is_set("instrumental") {
+        return None;
+    }
+    lyrics
+        .get("lyrics_body")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Lyrics fetch with provider fallback, in order: Genius (keyed),
+/// Musixmatch (keyed), LRCLib (keyless). Returns the lyrics and which
+/// provider supplied them (`lyrics_source` in the skip-check response).
+/// No key anywhere → LRCLib only; nothing reachable → (None, None).
+fn fetch_lyrics(title: &str, artist: &str) -> (Option<String>, Option<&'static str>) {
+    if genius_configured() {
+        if let Some(lyrics) = fetch_genius_lyrics(title, artist) {
+            return (Some(lyrics), Some("genius"));
+        }
+    }
+    if musixmatch_configured() {
+        if let Some(lyrics) = fetch_musixmatch_lyrics(title, artist) {
+            return (Some(lyrics), Some("musixmatch"));
+        }
+    }
+    match fetch_lrclib_lyrics(title, artist) {
+        Some(lyrics) => (Some(lyrics), Some("lrclib")),
+        None => (None, None),
+    }
 }
 
 // ------------------------------------------------- spotify web api ---
@@ -700,10 +1001,148 @@ fn handle_dislike(st: &mut State, body: &Json) -> (u16, String) {
     }
 }
 
+/// The skip-check decision, shared by the HTTP handler and the
+/// currently-playing poller. `disliked_by` is precomputed by the
+/// caller (it needs the State lock); everything else here is network
+/// I/O (LRCLib + optionally Gemini) and must NOT run under the lock.
+struct SkipDecision {
+    skip: bool,
+    reason: Option<String>,
+    matched_word: Option<String>,
+    disliked_by: Option<i64>,
+    lyrics_checked: bool,
+    lyrics_available: bool,
+    lyrics_source: Option<String>,
+    classifier_provider: String,
+    classifier_verdict: String,
+    classifier_confidence: Option<f64>,
+    classifier_detail: String,
+}
+
+impl SkipDecision {
+    fn clean(classifier_provider: &str, classifier_verdict: &str, detail: &str) -> SkipDecision {
+        SkipDecision {
+            skip: false,
+            reason: None,
+            matched_word: None,
+            disliked_by: None,
+            lyrics_checked: false,
+            lyrics_available: false,
+            lyrics_source: None,
+            classifier_provider: classifier_provider.to_string(),
+            classifier_verdict: classifier_verdict.to_string(),
+            classifier_confidence: None,
+            classifier_detail: detail.to_string(),
+        }
+    }
+}
+
+/// Decision order (rustify `src/queue/track_check.rs`, extended with
+/// the Phase 5 Gemini classifier):
+///   1. disliked -> skip, reason disliked.
+///   2. No Gemini key: wordlist profanity on title/artist first (the
+///      old fast path — no lyrics fetch when the title itself is
+///      profane).
+///   3. Lyrics via LRCLib (real fetch; None = unavailable, never
+///      faked), then the classifier: Gemini when a key is set (it
+///      replaces the wordlist verdict), wordlist otherwise.
+///   4. `ai_generated` skips only at confidence >= 0.7; below that
+///      the verdict is reported but does not skip.
+fn decide_skip(
+    disliked_by: Option<i64>,
+    _track_id: &str,
+    title: &str,
+    artist: &str,
+) -> SkipDecision {
+    // 1. Disliked by this user (or by anyone, when no user is given).
+    if let Some(by) = disliked_by {
+        let mut d = SkipDecision::clean("none", "unknown", "disliked short-circuits classification");
+        d.skip = true;
+        d.reason = Some("disliked".to_string());
+        d.disliked_by = Some(by);
+        return d;
+    }
+
+    // 2. Wordlist fast path when no Gemini key is configured.
+    if !classifier::gemini_configured() {
+        let text = format!("{} {}", title, artist);
+        if let Some(word) = profanity_check(&text) {
+            let mut d = SkipDecision::clean("wordlist", "profanity", "profanity in title/artist (wordlist)");
+            d.skip = true;
+            d.reason = Some("profanity".to_string());
+            d.matched_word = Some(word);
+            return d;
+        }
+    }
+
+    // 3. Profanity/AI verdict over lyrics (Genius -> Musixmatch ->
+    //    LRCLib, real fetch). Unreachable or no lyrics =>
+    //    lyrics_available:false.
+    let (lyrics, lyrics_source) = if title.is_empty() {
+        (None, None)
+    } else {
+        let (lyrics, source) = fetch_lyrics(title, artist);
+        (lyrics, source.map(|s| s.to_string()))
+    };
+    let lyrics_available = lyrics.is_some();
+    let result = classifier::classify_track(title, artist, lyrics.as_deref(), &profanity_check);
+    let mut d = SkipDecision {
+        skip: false,
+        reason: None,
+        matched_word: None,
+        disliked_by: None,
+        lyrics_checked: lyrics_available,
+        lyrics_available,
+        lyrics_source,
+        classifier_provider: result.provider.clone(),
+        classifier_verdict: classifier::verdict_name(&result.verdict).to_string(),
+        classifier_confidence: match &result.verdict {
+            classifier::AiVerdict::AiGenerated { confidence } => Some(*confidence),
+            _ => None,
+        },
+        classifier_detail: result.detail.clone(),
+    };
+    match &result.verdict {
+        classifier::AiVerdict::Profanity { matched } => {
+            d.skip = true;
+            d.reason = Some("profanity".to_string());
+            d.matched_word = Some(matched.clone());
+        }
+        classifier::AiVerdict::AiGenerated { confidence }
+            if *confidence >= classifier::AI_SKIP_CONFIDENCE =>
+        {
+            d.skip = true;
+            d.reason = Some("ai-generated".to_string());
+        }
+        _ => {}
+    }
+    d
+}
+
+/// Last polled currently-playing state for one watched user
+/// (in-memory only — playback state is ephemeral; the watch registry
+/// itself is persisted, this is not).
+#[derive(Debug, Clone, Default)]
+struct NowPlaying {
+    track_id: String,
+    title: String,
+    artist: String,
+    duration_sec: i64,
+    is_playing: bool,
+    checked_at: i64,
+    last_skip: bool,
+    last_reason: Option<String>,
+    classifier_verdict: String,
+}
+
 /// skip-check decision order (rustify `src/queue/track_check.rs`):
 /// disliked -> profanity in title/artist -> profanity in LRCLib lyrics.
 /// `reason` is one of profanity | disliked | null. `ai-generated` is
 /// never emitted: no classifier exists in this service (see README).
+///
+/// The decision itself lives in `decide_skip` (shared by the HTTP
+/// handler and the poller); this handler only validates input and
+/// renders the response.
 fn handle_skip_check(st: &State, body: &Json) -> (u16, String) {
     let track = match body.get("track") {
         Some(t @ Json::Obj(_)) => t,
@@ -729,58 +1168,40 @@ fn handle_skip_check(st: &State, body: &Json) -> (u16, String) {
         .unwrap_or("")
         .to_string();
     let user_id = body.get("user_id").and_then(|v| v.as_i64());
-
-    // 1. Disliked by this user (or by anyone, when no user is given).
-    if let Some(by) = st.disliked_by(&track_id, user_id) {
-        return (
-            200,
-            ok(&format!(
-                "{{\"skip\":true,\"reason\":\"disliked\",\"matched_word\":null,\"disliked_by\":{},\"lyrics_checked\":false,\"lyrics_available\":false,\"lyrics_source\":null}}",
-                by
-            )),
-        );
-    }
-
-    // 2. Profanity in title / artist.
-    let text = format!("{} {}", title, artist);
-    if let Some(word) = profanity_check(&text) {
-        return (
-            200,
-            ok(&format!(
-                "{{\"skip\":true,\"reason\":\"profanity\",\"matched_word\":{},\"lyrics_checked\":false,\"lyrics_available\":false,\"lyrics_source\":null}}",
-                quote(&word)
-            )),
-        );
-    }
-
-    // 3. Profanity in lyrics (LRCLib, real fetch). Unreachable or no
-    //    lyrics => lyrics_available:false, no lyrics verdict at all.
-    let lyrics = if title.is_empty() {
-        None
-    } else {
-        fetch_lrclib_lyrics(&title, &artist)
-    };
-    match lyrics {
-        Some(lyr) => {
-            if let Some(word) = profanity_check(&lyr) {
-                return (
-                    200,
-                    ok(&format!(
-                        "{{\"skip\":true,\"reason\":\"profanity\",\"matched_word\":{},\"lyrics_checked\":true,\"lyrics_available\":true,\"lyrics_source\":\"lrclib\"}}",
-                        quote(&word)
-                    )),
-                );
-            }
-            (
-                200,
-                ok("{\"skip\":false,\"reason\":null,\"matched_word\":null,\"lyrics_checked\":true,\"lyrics_available\":true,\"lyrics_source\":\"lrclib\"}"),
-            )
-        }
-        None => (
-            200,
-            ok("{\"skip\":false,\"reason\":null,\"matched_word\":null,\"lyrics_checked\":false,\"lyrics_available\":false,\"lyrics_source\":null}"),
-        ),
-    }
+    let disliked_by = st.disliked_by(&track_id, user_id);
+    let d = decide_skip(disliked_by, &track_id, &title, &artist);
+    (
+        200,
+        ok(&format!(
+            "{{\"skip\":{},\"reason\":{},\"matched_word\":{},\"disliked_by\":{},\"lyrics_checked\":{},\"lyrics_available\":{},\"lyrics_source\":{},\"classifier_provider\":{},\"classifier_verdict\":{},\"classifier_confidence\":{},\"classifier_detail\":{}}}",
+            d.skip,
+            match &d.reason {
+                Some(r) => quote(r),
+                None => "null".to_string(),
+            },
+            match &d.matched_word {
+                Some(w) => quote(w),
+                None => "null".to_string(),
+            },
+            match d.disliked_by {
+                Some(u) => u.to_string(),
+                None => "null".to_string(),
+            },
+            d.lyrics_checked,
+            d.lyrics_available,
+            match &d.lyrics_source {
+                Some(s) => quote(s),
+                None => "null".to_string(),
+            },
+            quote(&d.classifier_provider),
+            quote(&d.classifier_verdict),
+            match d.classifier_confidence {
+                Some(c) => format!("{}", c),
+                None => "null".to_string(),
+            },
+            quote(&d.classifier_detail),
+        )),
+    )
 }
 
 /// `POST /v1/spotify/resolve` — parses the link, then, when
@@ -911,7 +1332,12 @@ fn handle_collection(tokens: &TokenCache, body: &Json) -> (u16, String) {
 }
 
 /// `GET /v1/spotify/status` — credential/token state (no secrets).
-fn handle_status(tokens: &TokenCache) -> (u16, String) {
+fn handle_status(
+    tokens: &TokenCache,
+    user_tokens: usize,
+    watching: usize,
+    poll_interval_secs: u64,
+) -> (u16, String) {
     let configured = spotify_creds().is_some();
     let cached = {
         let guard = tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -920,15 +1346,211 @@ fn handle_status(tokens: &TokenCache) -> (u16, String) {
     (
         200,
         ok(&format!(
-            "{{\"credentials_configured\":{},\"token_cached\":{},\"api\":\"spotify-web-api\"}}",
-            configured, cached
+            "{{\"credentials_configured\":{},\"token_cached\":{},\"api\":\"spotify-web-api\",\"user_tokens\":{},\"watching\":{},\"gemini_configured\":{},\"poll_interval_secs\":{},\"polling\":{}}}",
+            configured,
+            cached,
+            user_tokens,
+            watching,
+            classifier::gemini_configured(),
+            poll_interval_secs,
+            poll_interval_secs > 0
         )),
     )
 }
 
-fn handle(state: &Arc<Mutex<State>>, tokens: &TokenCache, req: &Request) -> (u16, String) {
+/// `POST /v1/spotify/auth` — per-user OAuth (rustify
+/// `src/spotify/auth.rs` + `Manager::for_user`).
+///   {action:"login", user_id}    -> {authorize_url} (user completes
+///                                    it in a browser; the code comes
+///                                    back via "callback")
+///   {action:"callback", user_id, code} -> exchanges the code, stores
+///                                    the encrypted tokens
+///   {action:"refresh", user_id}  -> refreshes the stored token
+///   {action:"revoke", user_id}   -> deletes the stored token
+fn handle_auth(
+    tokens: &mut auth::TokenStore,
+    data_dir: &std::path::Path,
+    body: &Json,
+) -> (u16, String) {
+    let action = match body.get("action").and_then(|v| v.as_str()) {
+        Some(a) => a.to_string(),
+        None => return (400, err("bad_request", "missing string field: action")),
+    };
+    let user_id = match need_user(body) {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let (client_id, secret, redirect) = match auth::oauth_client() {
+        Some(c) => c,
+        None => {
+            return (
+                503,
+                err(
+                    "engine_unavailable",
+                    "per-user Spotify auth needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET (and SPOTIFY_REDIRECT_URI for login)",
+                ),
+            )
+        }
+    };
+    match action.as_str() {
+        "login" => {
+            let state = format!("{}-{}", user_id, crate::common::random_token(16));
+            let url = auth::authorize_url(&client_id, &redirect, &state);
+            (
+                200,
+                ok(&format!(
+                    "{{\"authorized\":false,\"user_id\":{},\"authorize_url\":{},\"note\":\"complete the URL in a browser, then POST action:callback with the returned code\"}}",
+                    user_id,
+                    quote(&url)
+                )),
+            )
+        }
+        "callback" => {
+            let code = match body.get("code").and_then(|v| v.as_str()) {
+                Some(c) if !c.is_empty() => c.to_string(),
+                _ => return (400, err("bad_request", "missing string field: code")),
+            };
+            match auth::exchange_code(
+                &auth::accounts_base(),
+                &client_id,
+                &secret,
+                &redirect,
+                &code,
+                now_unix(),
+            ) {
+                Some(tok) => {
+                    let expires_at = tok.expires_at;
+                    tokens.set(user_id, tok);
+                    tokens.save(data_dir);
+                    (
+                        200,
+                        ok(&format!(
+                            "{{\"authorized\":true,\"user_id\":{},\"expires_at\":{},\"note\":\"token stored encrypted at rest\"}}",
+                            user_id, expires_at
+                        )),
+                    )
+                }
+                None => (
+                    502,
+                    err(
+                        "download_failed",
+                        "authorization code exchange failed (bad/expired code, or Spotify rejected the client)",
+                    ),
+                ),
+            }
+        }
+        "refresh" => {
+            let old = match tokens.get(user_id) {
+                Some(t) => t.clone(),
+                None => {
+                    return (
+                        404,
+                        err(
+                            "not_found",
+                            "no stored token for this user (login first via action:login)",
+                        ),
+                    )
+                }
+            };
+            match auth::refresh_token(&auth::accounts_base(), &client_id, &secret, &old, now_unix())
+            {
+                Some(tok) => {
+                    let expires_at = tok.expires_at;
+                    tokens.set(user_id, tok);
+                    tokens.save(data_dir);
+                    (
+                        200,
+                        ok(&format!(
+                            "{{\"authorized\":true,\"user_id\":{},\"expires_at\":{}}}",
+                            user_id, expires_at
+                        )),
+                    )
+                }
+                None => {
+                    // Refresh token dead (revoked/expired): drop it so
+                    // the user is prompted to log in again instead of
+                    // retrying forever (rustify token_refresh).
+                    tokens.remove(user_id);
+                    tokens.save(data_dir);
+                    (
+                        401,
+                        err(
+                            "unauthorized",
+                            "refresh token rejected by Spotify (invalid_grant); token dropped, login again via action:login",
+                        ),
+                    )
+                }
+            }
+        }
+        "revoke" => {
+            let was = tokens.remove(user_id);
+            tokens.save(data_dir);
+            (
+                200,
+                ok(&format!(
+                    "{{\"authorized\":false,\"user_id\":{},\"was_authorized\":{}}}",
+                    user_id, was
+                )),
+            )
+        }
+        _ => (
+            400,
+            err("bad_request", "unknown action (login|callback|refresh|revoke)"),
+        ),
+    }
+}
+
+/// `GET /v1/spotify/now-playing?user_id=N` — last polled
+/// currently-playing track for a watched user (from the poller, not
+/// a live fetch: the poller is the only thing that talks to Spotify
+/// on a schedule).
+fn handle_now_playing(
+    now_playing: &BTreeMap<i64, NowPlaying>,
+    user_id: i64,
+) -> (u16, String) {
+    match now_playing.get(&user_id) {
+        Some(np) if !np.track_id.is_empty() => (
+            200,
+            ok(&format!(
+                "{{\"playing\":{},\"user_id\":{},\"track\":{{\"id\":{},\"title\":{},\"artist\":{},\"duration_sec\":{}}},\"checked_at\":{},\"last_skip\":{},\"last_reason\":{},\"classifier_verdict\":{}}}",
+                np.is_playing,
+                user_id,
+                quote(&np.track_id),
+                quote(&np.title),
+                quote(&np.artist),
+                np.duration_sec,
+                np.checked_at,
+                np.last_skip,
+                match &np.last_reason {
+                    Some(r) => quote(r),
+                    None => "null".to_string(),
+                },
+                quote(&np.classifier_verdict),
+            )),
+        ),
+        _ => (
+            200,
+            ok(&format!(
+                "{{\"playing\":false,\"user_id\":{},\"track\":null,\"note\":\"no currently-playing track polled for this user (not watched, no token, or nothing playing)\"}}",
+                user_id
+            )),
+        ),
+    }
+}
+
+/// Shared service state, cloned into the HTTP handler and the poller.
+struct App {
+    state: Arc<Mutex<State>>,
+    tokens: TokenCache,
+    user_tokens: Arc<Mutex<auth::TokenStore>>,
+    now_playing: Arc<Mutex<BTreeMap<i64, NowPlaying>>>,
+    data_dir: std::path::PathBuf,
+    poll_interval_secs: u64,
+}
+
+fn handle(app: &App, req: &Request) -> (u16, String) {
     if req.method == "GET" && req.path == "/v1/spotify/watches" {
-        let st = lock(state);
+        let st = lock(&app.state);
         let ids: Vec<String> = st.watches.keys().map(|u| u.to_string()).collect();
         return (
             200,
@@ -936,7 +1558,25 @@ fn handle(state: &Arc<Mutex<State>>, tokens: &TokenCache, req: &Request) -> (u16
         );
     }
     if req.method == "GET" && req.path == "/v1/spotify/status" {
-        return handle_status(tokens);
+        let (user_tokens, watching) = {
+            let ut = app.user_tokens.lock().unwrap_or_else(|e| e.into_inner());
+            let st = lock(&app.state);
+            (ut.len(), st.watches.len())
+        };
+        return handle_status(&app.tokens, user_tokens, watching, app.poll_interval_secs);
+    }
+    if req.method == "GET" && req.path == "/v1/spotify/now-playing" {
+        let user_id = match req.query_param("user_id").and_then(|v| v.parse::<i64>().ok()) {
+            Some(u) => u,
+            None => {
+                return (
+                    400,
+                    err("bad_request", "missing integer query param: user_id"),
+                )
+            }
+        };
+        let np = app.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+        return handle_now_playing(&np, user_id);
     }
     if req.method != "POST" {
         return (404, err("not_found", "route not found"));
@@ -945,12 +1585,18 @@ fn handle(state: &Arc<Mutex<State>>, tokens: &TokenCache, req: &Request) -> (u16
         Some(b @ Json::Obj(_)) => b,
         _ => return (400, err("bad_request", "invalid JSON body")),
     };
-    let mut st = lock(state);
+    // Auth mutates the token store, not the watch registry: handle it
+    // before taking the State lock.
+    if req.path == "/v1/spotify/auth" {
+        let mut ut = app.user_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        return handle_auth(&mut ut, &app.data_dir, &body);
+    }
+    let mut st = lock(&app.state);
     let res = match req.path.as_str() {
         "/v1/spotify/watch" => handle_watch(&mut st, &body),
         "/v1/spotify/dislike" => handle_dislike(&mut st, &body),
-        "/v1/spotify/resolve" => handle_resolve(&st, tokens, &body),
-        "/v1/spotify/collection" => handle_collection(tokens, &body),
+        "/v1/spotify/resolve" => handle_resolve(&st, &app.tokens, &body),
+        "/v1/spotify/collection" => handle_collection(&app.tokens, &body),
         "/v1/spotify/skip-check" => handle_skip_check(&st, &body),
         _ => return (404, err("not_found", "route not found")),
     };
@@ -960,18 +1606,160 @@ fn handle(state: &Arc<Mutex<State>>, tokens: &TokenCache, req: &Request) -> (u16
     res
 }
 
+/// Currently-playing poller (rustify `src/tick/user.rs::check`):
+/// for each watched user that has a stored OAuth token, refresh the
+/// token when it is near expiry, fetch `/v1/me/player/currently-
+/// playing`, and — when the track changed — run the same skip-check
+/// decision the HTTP handler runs and record the verdict. A 401
+/// drops the token (user must log in again); any other failure is
+/// logged and the previous state is kept.
+///
+/// This is what moves `spotify.watch` from intent-only to real
+/// polling. It does NOT skip the track on the user's Spotify player:
+/// Parlay never requests playback-modification scopes, so the
+/// verdict is recorded (and visible via `/v1/spotify/now-playing`)
+/// for the VC engine / core to act on.
+fn poller_loop(app: Arc<App>) {
+    let interval = std::time::Duration::from_secs(app.poll_interval_secs);
+    loop {
+        std::thread::sleep(interval);
+        let watched: Vec<i64> = {
+            let st = lock(&app.state);
+            st.watches.keys().copied().collect()
+        };
+        for user_id in watched {
+            // Snapshot the token (clone) so no lock is held during
+            // network I/O.
+            let tok = {
+                let ut = app.user_tokens.lock().unwrap_or_else(|e| e.into_inner());
+                ut.get(user_id).cloned()
+            };
+            let mut tok = match tok {
+                Some(t) => t,
+                None => continue, // watched but never logged in: intent only
+            };
+            // Refresh when near expiry.
+            if tok.needs_refresh(now_unix()) {
+                let (client_id, secret, _) = match auth::oauth_client() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                match auth::refresh_token(
+                    &auth::accounts_base(),
+                    &client_id,
+                    &secret,
+                    &tok,
+                    now_unix(),
+                ) {
+                    Some(new_tok) => {
+                        tok = new_tok.clone();
+                        let mut ut = app.user_tokens.lock().unwrap_or_else(|e| e.into_inner());
+                        ut.set(user_id, new_tok);
+                        ut.save(&app.data_dir);
+                    }
+                    None => {
+                        eprintln!(
+                            "[spotify-rust] poll: dropping dead token for user {} (refresh rejected)",
+                            user_id
+                        );
+                        let mut ut = app.user_tokens.lock().unwrap_or_else(|e| e.into_inner());
+                        ut.remove(user_id);
+                        ut.save(&app.data_dir);
+                        continue;
+                    }
+                }
+            }
+            let np = match auth::currently_playing(&auth::api_base(), &tok.access_token) {
+                Ok(v) => v,
+                Err(e) => {
+                    if e.contains("unauthorized") {
+                        eprintln!(
+                            "[spotify-rust] poll: dropping unauthorized token for user {}",
+                            user_id
+                        );
+                        let mut ut = app.user_tokens.lock().unwrap_or_else(|e| e.into_inner());
+                        ut.remove(user_id);
+                        ut.save(&app.data_dir);
+                    } else {
+                        eprintln!("[spotify-rust] poll: user {}: {}", user_id, e);
+                    }
+                    continue;
+                }
+            };
+            let mut map = app.now_playing.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = map.entry(user_id).or_default();
+            match np {
+                None => {
+                    entry.is_playing = false;
+                    entry.checked_at = now_unix();
+                }
+                Some(track) => {
+                    let changed = entry.track_id != track.id;
+                    entry.track_id = track.id.clone();
+                    entry.title = track.title.clone();
+                    entry.artist = track.artist.clone();
+                    entry.duration_sec = track.duration_sec;
+                    entry.is_playing = track.is_playing;
+                    entry.checked_at = now_unix();
+                    if changed && track.is_playing {
+                        // Same decision as the HTTP skip-check; the
+                        // disliked lookup needs the State lock briefly.
+                        let disliked_by = {
+                            let st = lock(&app.state);
+                            st.disliked_by(&track.id, Some(user_id))
+                        };
+                        let d = decide_skip(disliked_by, &track.id, &track.title, &track.artist);
+                        entry.last_skip = d.skip;
+                        entry.last_reason = d.reason.clone();
+                        entry.classifier_verdict = d.classifier_verdict.clone();
+                        if d.skip {
+                            eprintln!(
+                                "[spotify-rust] poll: user {} now playing {} — {} (skip:{}, reason:{:?})",
+                                user_id, track.title, track.artist, d.skip, d.reason
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8007);
-    let state = Arc::new(Mutex::new(load_state()));
-    // App-token cache lives outside the persisted State: the access
-    // token is a secret and is never written to disk.
-    let tokens: TokenCache = Arc::new(Mutex::new(None));
-    let handler_state = Arc::clone(&state);
-    let handler_tokens = Arc::clone(&tokens);
-    let handler = move |req: &Request| handle(&handler_state, &handler_tokens, req);
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("PARLAY_DATA_DIR").unwrap_or_else(|_| "data".to_string()),
+    );
+    let _ = std::fs::create_dir_all(&data_dir);
+    let poll_interval_secs: u64 = std::env::var("SPOTIFY_POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let app = Arc::new(App {
+        state: Arc::new(Mutex::new(load_state())),
+        // App-token cache lives outside the persisted State: the access
+        // token is a secret and is never written to disk.
+        tokens: Arc::new(Mutex::new(None)),
+        user_tokens: Arc::new(Mutex::new(auth::TokenStore::load(&data_dir))),
+        now_playing: Arc::new(Mutex::new(BTreeMap::new())),
+        data_dir,
+        poll_interval_secs,
+    });
+    if poll_interval_secs > 0 {
+        let poller_app = Arc::clone(&app);
+        std::thread::spawn(move || poller_loop(poller_app));
+        eprintln!(
+            "[spotify-rust] currently-playing poller running every {}s",
+            poll_interval_secs
+        );
+    } else {
+        eprintln!("[spotify-rust] poller disabled (SPOTIFY_POLL_INTERVAL_SECS=0)");
+    }
+    let handler_app = Arc::clone(&app);
+    let handler = move |req: &Request| handle(&handler_app, req);
     if let Err(e) = run_server(port, SERVICE, handler) {
         eprintln!("parlay {} failed to listen on {}: {}", SERVICE, port, e);
         std::process::exit(1);
@@ -1107,5 +1895,159 @@ mod tests {
             total,
             truncated
         );
+    }
+
+    // ------------------------------------------- Genius / Musixmatch ---
+
+    const GENIUS_SEARCH_FIXTURE: &str = r#"{
+        "response": {"hits": [
+            {"result": {"url": "https://genius.com/Cover-Artist-Wrong-Song-lyrics",
+                        "title": "Wrong Song",
+                        "primary_artist": {"name": "Cover Artist"}}},
+            {"result": {"url": "https://genius.com/Rick-Astley-Never-Gonna-Give-You-Up-lyrics",
+                        "title": "Never Gonna Give You Up",
+                        "primary_artist": {"name": "Rick Astley"}}}
+        ]}
+    }"#;
+
+    #[test]
+    fn genius_hit_prefers_matching_artist() {
+        let v = parse_json(GENIUS_SEARCH_FIXTURE).expect("fixture parses");
+        assert_eq!(
+            pick_genius_hit(&v, "Rick Astley"),
+            Some(
+                "https://genius.com/Rick-Astley-Never-Gonna-Give-You-Up-lyrics"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn genius_hit_falls_back_to_first_hit() {
+        let v = parse_json(GENIUS_SEARCH_FIXTURE).expect("fixture parses");
+        assert_eq!(
+            pick_genius_hit(&v, "Nobody In Particular"),
+            Some("https://genius.com/Cover-Artist-Wrong-Song-lyrics".to_string())
+        );
+    }
+
+    #[test]
+    fn genius_hit_none_on_empty_response() {
+        let v = parse_json(r#"{"response": {"hits": []}}"#).expect("parses");
+        assert_eq!(pick_genius_hit(&v, "Rick Astley"), None);
+        let v2 = parse_json(r#"{}"#).expect("parses");
+        assert_eq!(pick_genius_hit(&v2, "Rick Astley"), None);
+    }
+
+    const GENIUS_PAGE_FIXTURE: &str = r#"<html><body>
+        <div class="noise">not lyrics</div>
+        <div data-lyrics-container="true" class="Lyrics__Container-sc-1ynbvzw-1">
+            [Verse 1]<br>We're no strangers to love<br>
+            You know the rules &amp; so do I
+            <div class="nested">A <a href="/x">nested</a> line</div>
+            <span>Don't tell me you're too blind to see</span>
+        </div>
+        <div data-lyrics-container="true">[Chorus]<br>Never gonna give you up</div>
+    </body></html>"#;
+
+    #[test]
+    fn genius_page_extraction() {
+        let lyrics = extract_genius_lyrics_html(GENIUS_PAGE_FIXTURE)
+            .expect("containers present");
+        assert!(lyrics.contains("[Verse 1]"), "lyrics:\n{}", lyrics);
+        assert!(lyrics.contains("We're no strangers to love"), "lyrics:\n{}", lyrics);
+        assert!(
+            lyrics.contains("You know the rules & so do I"),
+            "entity unescaped: {}", lyrics
+        );
+        assert!(lyrics.contains("A nested line"), "nested div: {}", lyrics);
+        assert!(lyrics.contains("[Chorus]"), "second container: {}", lyrics);
+        assert!(lyrics.contains("Never gonna give you up"), "lyrics:\n{}", lyrics);
+        assert!(!lyrics.contains("not lyrics"), "noise excluded");
+        assert!(!lyrics.contains("<div"), "tags stripped");
+    }
+
+    #[test]
+    fn genius_page_none_without_container() {
+        assert_eq!(extract_genius_lyrics_html("<html><body>no lyrics here</body></html>"), None);
+        assert_eq!(
+            extract_genius_lyrics_html(r#"<div data-lyrics-container="true"></div>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn html_tag_strip_and_entities() {
+        assert_eq!(strip_html_tags("<p>hello <b>world</b></p>"), "hello world");
+        assert_eq!(strip_html_tags("a<!-- c -->b"), "ab");
+        assert_eq!(
+            unescape_html_entities("a &amp; b &lt;c&gt; &quot;q&quot; &#39;x&#39; &nbsp;end"),
+            "a & b <c> \"q\" 'x'  end"
+        );
+    }
+
+    const MUSIXMATCH_OK_FIXTURE: &str = r#"{
+        "message": {"header": {"status_code": 200},
+                    "body": {"lyrics": {"lyrics_body": "Never gonna give you up\nNever gonna let you down",
+                                        "restricted": 0, "instrumental": 0}}}
+    }"#;
+
+    #[test]
+    fn musixmatch_parse_ok() {
+        let v = parse_json(MUSIXMATCH_OK_FIXTURE).expect("fixture parses");
+        let lyrics = parse_musixmatch_lyrics(&v).expect("200 + body");
+        assert!(lyrics.contains("Never gonna give you up"), "{}", lyrics);
+    }
+
+    #[test]
+    fn musixmatch_parse_rejects_restricted_instrumental_error() {
+        let restricted = parse_json(
+            r#"{"message": {"header": {"status_code": 200},
+               "body": {"lyrics": {"lyrics_body": "partial…", "restricted": 1, "instrumental": 0}}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(parse_musixmatch_lyrics(&restricted), None, "restricted -> None");
+        let instrumental = parse_json(
+            r#"{"message": {"header": {"status_code": 200},
+               "body": {"lyrics": {"lyrics_body": "", "restricted": 0, "instrumental": 1}}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(parse_musixmatch_lyrics(&instrumental), None, "instrumental -> None");
+        let not_found = parse_json(
+            r#"{"message": {"header": {"status_code": 404}, "body": {}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(parse_musixmatch_lyrics(&not_found), None, "404 -> None");
+        let empty = parse_json(
+            r#"{"message": {"header": {"status_code": 200},
+               "body": {"lyrics": {"lyrics_body": "   ", "restricted": 0, "instrumental": 0}}}}"#,
+        )
+        .expect("parses");
+        assert_eq!(parse_musixmatch_lyrics(&empty), None, "empty body -> None");
+    }
+
+    /// Env-gating: with no keys in the environment both credentialed
+    /// providers return None immediately (no network attempted). Skips
+    /// honestly if a key happens to be set in the test environment.
+    #[test]
+    fn lyrics_providers_none_without_keys() {
+        if std::env::var("GENIUS_ACCESS_TOKEN")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping Genius no-key test (GENIUS_ACCESS_TOKEN set)");
+        } else {
+            assert_eq!(fetch_genius_lyrics("Never Gonna Give You Up", "Rick Astley"), None);
+            assert!(!genius_configured());
+        }
+        if std::env::var("MUSIXMATCH_API_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping Musixmatch no-key test (MUSIXMATCH_API_KEY set)");
+        } else {
+            assert_eq!(fetch_musixmatch_lyrics("Never Gonna Give You Up", "Rick Astley"), None);
+            assert!(!musixmatch_configured());
+        }
     }
 }

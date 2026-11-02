@@ -166,3 +166,131 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn req(method: &str, path: &str, body: &str) -> Request {
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: Vec::new(),
+            body: body.to_string(),
+        }
+    }
+
+    /// Unique temp dir per test (tests run in parallel in one process).
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("parlay-fx-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create tmpdir");
+        dir
+    }
+
+    /// 1 s 440 Hz sine WAV fixture, via real ffmpeg.
+    fn sine_wav(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("tone.wav");
+        let out = Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                   "-ac", "1", "-ar", "44100"])
+            .arg(&path)
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "ffmpeg fixture failed: {}",
+                String::from_utf8_lossy(&out.stderr));
+        assert!(path.is_file(), "fixture wav missing");
+        path
+    }
+
+    fn data_field(body: &str, key: &str) -> Json {
+        let v = parse_json(body).expect("response parses");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true), "ok:true in {body}");
+        v.get("data").and_then(|d| d.get(key)).cloned().expect("data field present")
+    }
+
+    #[test]
+    fn filter_for_known_effects() {
+        for effect in ["slow-reverb", "nightcore", "bass-boost", "8d", "original"] {
+            assert!(filter_for(effect).is_some(), "{effect} has a filter");
+        }
+        assert!(filter_for("chipmunk").is_none());
+        assert!(filter_for("").is_none());
+    }
+
+    #[test]
+    fn derive_output_naming() {
+        let out = derive_output(Path::new("/tmp/track.mp3"), "nightcore");
+        assert_eq!(out.to_string_lossy(), "/tmp/track_nightcore.mp3");
+        let out = derive_output(Path::new("song.wav"), "8d");
+        assert_eq!(out.to_string_lossy(), "song_8d.wav");
+    }
+
+    #[test]
+    fn sanitize_rejects_traversal() {
+        assert!(sanitize_path("../secret.wav").is_err());
+        assert!(sanitize_path("/tmp/../etc/passwd").is_err());
+        assert!(sanitize_path("").is_err());
+        assert!(sanitize_path("/tmp/tone.wav").is_ok());
+    }
+
+    #[test]
+    fn handle_rejects_bad_requests() {
+        // Wrong route / method.
+        let (st, _) = handle(&req("GET", "/v1/fx", ""));
+        assert_eq!(st, 404);
+        let (st, _) = handle(&req("POST", "/v1/other", "{}"));
+        assert_eq!(st, 404);
+        // Invalid JSON, unknown effect, missing input file.
+        let (st, _) = handle(&req("POST", "/v1/fx", "not json"));
+        assert_eq!(st, 400);
+        let (st, _) = handle(&req(
+            "POST", "/v1/fx",
+            r#"{"effect":"chipmunk","input_path":"/tmp/tone.wav"}"#,
+        ));
+        assert_eq!(st, 400);
+        let (st, _) = handle(&req(
+            "POST", "/v1/fx",
+            r#"{"effect":"nightcore","input_path":"/tmp/no-such-file.wav"}"#,
+        ));
+        assert_eq!(st, 400);
+        let (st, _) = handle(&req("POST", "/v1/fx", r#"{"effect":"nightcore"}"#));
+        assert_eq!(st, 400);
+    }
+
+    #[test]
+    fn fx_nightcore_produces_nonempty_output() {
+        let dir = tmpdir("nightcore");
+        let input = sine_wav(&dir);
+        let body = format!(
+            r#"{{"effect":"nightcore","input_path":{}}}"#,
+            quote(&input.to_string_lossy())
+        );
+        let (st, resp) = handle(&req("POST", "/v1/fx", &body));
+        assert_eq!(st, 200, "nightcore: {resp}");
+        let out = data_field(&resp, "output_path");
+        let out_path = std::path::PathBuf::from(out.as_str().unwrap());
+        assert!(out_path.is_file(), "output file exists: {}", out_path.display());
+        assert!(std::fs::metadata(&out_path).unwrap().len() > 0, "output non-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fx_original_stream_copy_produces_nonempty_output() {
+        let dir = tmpdir("original");
+        let input = sine_wav(&dir);
+        let body = format!(
+            r#"{{"effect":"original","input_path":{}}}"#,
+            quote(&input.to_string_lossy())
+        );
+        let (st, resp) = handle(&req("POST", "/v1/fx", &body));
+        assert_eq!(st, 200, "original: {resp}");
+        let out = data_field(&resp, "output_path");
+        let out_path = std::path::PathBuf::from(out.as_str().unwrap());
+        assert!(out_path.is_file(), "output file exists: {}", out_path.display());
+        assert!(std::fs::metadata(&out_path).unwrap().len() > 0, "output non-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

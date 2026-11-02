@@ -68,9 +68,7 @@ Config Config::fromEnv() {
     c.allow_chats = envIdSet("PARLAY_ALLOW_CHATS");
     c.block_chats = envIdSet("PARLAY_BLOCK_CHATS");
     c.assistant_ids = envIdSet("ASSISTANT_IDS");
-    c.assistant_session_file = envStr("ASSISTANT_SESSION_FILE");
     c.ntgcalls_lib = envStr("NTGCALLS_LIB");
-    c.voice_bridge = envStr("VOICE_BRIDGE");
     c.rtp_sink = envStr("VOICE_RTP_SINK");
     c.td_api_id = envInt("TD_API_ID", c.api_id);
     c.td_api_hash = envStr("TD_API_HASH", c.api_hash);
@@ -79,6 +77,12 @@ Config Config::fromEnv() {
     c.td_phone = envStr("TD_PHONE");
     c.td_code = envStr("TD_CODE");
     c.td_password = envStr("TD_PASSWORD");
+    c.td_email = envStr("TD_EMAIL");
+    c.td_email_code = envStr("TD_EMAIL_CODE");
+    c.td_first_name = envStr("TD_FIRST_NAME");
+    c.td_last_name = envStr("TD_LAST_NAME");
+    std::string td_qr = envStr("TD_QR");
+    c.td_qr = (td_qr == "1" || td_qr == "true" || td_qr == "yes");
     c.data_dir = envStr("PARLAY_DATA_DIR", c.data_dir);
     c.log_file = envStr("PARLAY_LOG_FILE");
     c.telegram_api_base = envStr("TELEGRAM_API_BASE", c.telegram_api_base);
@@ -102,7 +106,6 @@ std::string Config::summary() const {
     s += " sudo_ids=" + std::to_string(sudo_ids.size());
     s += " logger_id=" + (logger_id ? std::to_string(logger_id) : std::string("(unset)"));
     s += " assistant_ids=" + std::to_string(assistant_ids.size());
-    s += " session_file=" + std::string(assistant_session_file.empty() ? "unset" : "set");
     s += " allow_chats=" + std::to_string(allow_chats.size());
     s += " block_chats=" + std::to_string(block_chats.size());
     s += " api_id=" + std::string(api_id ? "set" : "unset");

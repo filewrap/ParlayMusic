@@ -20,6 +20,11 @@
 // (POST /v1/lyrics, LRCLib), live control panel (GET/POST /v1/panel,
 // remix panel.ts button ids), volume (POST /v1/volume, 0-200), loop,
 // raw-stream/radio play (http(s) URL or radio:<url>).
+// Phase 5 additions: contract loop/shuffle/autoplay/autoplay-skip
+// (POST /v1/loop|shuffle|autoplay|autoplay-skip, vc-go/vc-rust
+// semantics — loop is a 0-10 replay count, not a boolean); YouTube
+// resolve no longer degrades to a placeholder (resolvers.js: android
+// retry, then engine_unavailable).
 
 "use strict";
 
@@ -38,7 +43,13 @@ const STATE_FILE = path.join(DATA_DIR, "state.json");
 // ---------------------------------------------------------------- state ----
 // Room: { chat_id, current: Track|null, queue: QueueItem[], paused,
 //         position_sec (offset), started_at_ms, volume (0-200, remix
-//         scale: 100 = 100%), loop, muted_volume (pre-mute volume) }
+//         scale: 100 = 100%), loop (remaining replays of the current
+//         track, 0-10, 0 = off — contract vc.loop, vc-go/vc-rust
+//         semantics), shuffle (queue pop is random while on),
+//         autoplay (pick from the last track's YouTube mix on drain),
+//         history (played ids, autoplay exclusion, capped at 50),
+//         autoplay_pending (a mix pick is in flight), muted_volume
+//         (pre-mute volume) }
 const rooms = new Map();
 
 function positionSec(room) {
@@ -57,7 +68,9 @@ function nowPlaying(room) {
     position_sec: positionSec(room),
     queue: room.queue,
     volume: room.volume,
-    loop: Boolean(room.loop),
+    loop: room.loop, // integer 0-10 (contract NowPlaying.loop)
+    shuffle: Boolean(room.shuffle),
+    autoplay: Boolean(room.autoplay),
     muted: room.volume === 0 && room.muted_volume !== null && room.muted_volume !== undefined,
     voice: vs.voice,
     voice_joined: vs.joined,
@@ -76,12 +89,47 @@ function getRoom(chatId) {
       position_sec: 0,
       started_at_ms: Date.now(),
       volume: 100,
-      loop: false,
+      loop: 0,
+      shuffle: false,
+      autoplay: false,
+      history: [],
+      autoplay_pending: false,
       muted_volume: null,
     };
     rooms.set(chatId, room);
   }
   return room;
+}
+
+// Record a track id in play history (autoplay exclusion), capped at 50
+// (vc-go / TgMusicBot cap).
+function notePlayed(room, id) {
+  if (!id || room.history.includes(id)) return;
+  room.history.push(id);
+  if (room.history.length > 50) room.history.shift();
+}
+
+// Ids the autoplay picker must avoid: the last track, everything
+// already queued, and the play history.
+function autoplayExclude(room, last) {
+  const s = new Set(room.history);
+  if (last) s.add(last.id);
+  for (const it of room.queue) s.add(it.track.id);
+  return s;
+}
+
+// Pop the next queued track: index 0 normally, a random index while
+// shuffle is on (vc-go popWaitingLocked / vc-rust advance). Re-indexes
+// the remaining queue positions.
+function popNext(room) {
+  if (!room.queue.length) return null;
+  let idx = 0;
+  if (room.shuffle && room.queue.length > 1) {
+    idx = Math.floor(Math.random() * room.queue.length);
+  }
+  const [item] = room.queue.splice(idx, 1);
+  room.queue.forEach((it, i) => (it.position = i));
+  return item;
 }
 
 function saveState() {
@@ -96,7 +144,10 @@ function saveState() {
         paused: true, // restored rooms come back paused
         position_sec: positionSec(r),
         volume: r.volume,
-        loop: Boolean(r.loop),
+        loop: r.loop,
+        shuffle: Boolean(r.shuffle),
+        autoplay: Boolean(r.autoplay),
+        history: [...(r.history || [])],
       }));
     const tmp = STATE_FILE + ".tmp." + process.pid;
     fs.writeFileSync(tmp, JSON.stringify({ rooms: snapshot }, null, 2));
@@ -119,7 +170,13 @@ function loadState() {
         position_sec: s.position_sec || 0,
         started_at_ms: Date.now(),
         volume: s.volume || 100,
-        loop: Boolean(s.loop),
+        // Old state files stored loop as a boolean; Number(true) = 1
+        // replay, Number(false) = 0 — a safe migration.
+        loop: Number(s.loop) || 0,
+        shuffle: Boolean(s.shuffle),
+        autoplay: Boolean(s.autoplay),
+        history: Array.isArray(s.history) ? s.history : [],
+        autoplay_pending: false,
         muted_volume: null,
       });
     }
@@ -130,30 +187,64 @@ function loadState() {
 }
 
 // 1 s ticker: wall-clock position + auto-advance when a track ends.
-// Loop (remix session.loop) re-starts the current track instead of
-// advancing. Radio tracks have duration_sec 0 and never advance.
+// Loop (contract count 0-10, vc-go/vc-rust semantics) replays the
+// current track, decrementing the count, instead of advancing. Radio
+// tracks have duration_sec 0 and never advance; unknown-duration
+// tracks never advance either. When the queue drains with autoplay on,
+// the room goes idle at once and a YouTube mix pick is fetched
+// asynchronously (pickAutoplay); the pick only starts if the room is
+// still idle with autoplay on — a /play or /stop in the meantime wins.
+async function pickAutoplay(room, last) {
+  try {
+    const pick = await R.autoplayPick(last, autoplayExclude(room, last));
+    if (pick && room.autoplay && !room.current && room.queue.length === 0) {
+      startTrack(room, pick);
+      console.log(`[vc-ts] chat ${room.chat_id}: autoplay picked ${pick.title}`);
+    } else if (!pick) {
+      console.log(`[vc-ts] chat ${room.chat_id}: autoplay found no pick, room stays idle`);
+    }
+  } catch (e) {
+    console.log(`[vc-ts] chat ${room.chat_id}: autoplay pick failed: ${e.message}`);
+  } finally {
+    room.autoplay_pending = false;
+    saveState();
+  }
+}
+
 setInterval(() => {
   let changed = false;
   for (const room of rooms.values()) {
     if (!room.current || room.paused) continue;
     const dur = Number(room.current.duration_sec) || 0;
     if (dur > 0 && positionSec(room) >= dur) {
-      if (room.loop) {
+      if (room.loop > 0) {
+        room.loop -= 1;
         room.position_sec = 0;
         room.started_at_ms = Date.now();
         changed = true;
-        console.log(`[vc-ts] chat ${room.chat_id}: loop — restarted ${room.current.title}`);
+        console.log(`[vc-ts] chat ${room.chat_id}: loop (${room.loop} left) — restarted ${room.current.title}`);
         continue;
       }
-      const next = room.queue.shift();
-      room.current = next ? next.track : null;
+      const next = popNext(room);
+      if (next) {
+        startTrack(room, next.track);
+        changed = true;
+        console.log(`[vc-ts] chat ${room.chat_id}: auto-advanced to ${room.current.title}`);
+        continue;
+      }
+      if (room.autoplay && !room.autoplay_pending) {
+        const last = room.current;
+        room.current = null;
+        room.position_sec = 0;
+        room.autoplay_pending = true;
+        changed = true;
+        pickAutoplay(room, last); // async, fire-and-forget; clears pending
+        continue;
+      }
+      room.current = null;
       room.position_sec = 0;
-      room.started_at_ms = Date.now();
       changed = true;
-      console.log(
-        `[vc-ts] chat ${room.chat_id}: auto-advanced to ` +
-        (room.current ? room.current.title : "(end of queue)")
-      );
+      console.log(`[vc-ts] chat ${room.chat_id}: auto-advanced to (end of queue)`);
     }
   }
   if (changed) saveState();
@@ -173,21 +264,21 @@ async function resolvePlayQuery(query) {
   if (/^radio:/i.test(q)) {
     const url = q.replace(/^radio:/i, "").trim();
     if (!RAW_URL_RE.test(url)) throw Object.assign(new Error(`radio: expects a stream URL, got ${q.slice(0, 60)}`), { code: "bad_request" });
-    return { track: R.radioTrackFromUrl(url), degraded: false };
+    return { track: R.radioTrackFromUrl(url) };
   }
   if (RAW_URL_RE.test(q.trim()) && !R.extractYouTubeId(q)) {
     // Non-YouTube http(s) URL: a direct audio/radio stream.
-    return { track: R.radioTrackFromUrl(q.trim()), degraded: false };
+    return { track: R.radioTrackFromUrl(q.trim()) };
   }
   if (/^jiosaavn:/i.test(q)) {
     const term = q.replace(/^jiosaavn:/i, "").trim();
     const { results } = await R.searchJioSaavn(term, 1);
     if (!results.length) throw new R.EngineUnavailable("jiosaavn", `JioSaavn found nothing for "${term}"`);
-    return { track: results[0], degraded: false };
+    return { track: results[0] };
   }
   if (/^jsvn:/i.test(q)) {
     const id = q.replace(/^jsvn:/i, "").trim();
-    return { track: await R.resolveJioSaavnSong(id), degraded: false };
+    return { track: await R.resolveJioSaavnSong(id) };
   }
   return R.resolveYouTube(q);
 }
@@ -201,6 +292,7 @@ function startTrack(room, track) {
   room.paused = false;
   room.position_sec = 0;
   room.started_at_ms = Date.now();
+  notePlayed(room, track.id);
   // Real voice transport, fire-and-forget: playStream() runs the
   // Opus/RTP pipeline and then attempts the join; it never throws and
   // never blocks the HTTP response. The outcome lands in the per-chat
@@ -267,12 +359,16 @@ function panelAction(room, action) {
         [room.queue[i], room.queue[j]] = [room.queue[j], room.queue[i]];
       }
       room.queue.forEach((it, i) => (it.position = i));
+      // Panel shuffle is also the contract shuffle mode: later advances
+      // pop a random queue index while it is on (/v1/shuffle off clears it).
+      room.shuffle = true;
       saveState();
       return { ok: true, message: "Shuffling...", state: panelState(room) };
     }
     case "skip": {
       if (!room.current) return { ok: false, message: "Not streaming." };
-      const next = room.queue.shift();
+      room.loop = 0; // /skip resets the loop count (vc-go/vc-rust)
+      const next = popNext(room);
       if (next) startTrack(room, next.track);
       else { room.current = null; room.position_sec = 0; }
       saveState();
@@ -307,9 +403,12 @@ function panelAction(room, action) {
       saveState();
       return { ok: true, message: `Volume ${room.volume}%.`, state: panelState(room) };
     case "loop":
-      room.loop = !room.loop;
+      // Panel loop is a boolean toggle (remix); the count model caps
+      // at 10, so "on" means 10 replays — the closest the contract
+      // (vc.loop, 0-10) allows to remix's infinite loop.
+      room.loop = room.loop > 0 ? 0 : 10;
       saveState();
-      return { ok: true, message: room.loop ? "Loop on." : "Loop off.", state: panelState(room) };
+      return { ok: true, message: room.loop > 0 ? "Loop on." : "Loop off.", state: panelState(room) };
     default:
       return { ok: false, message: `unknown panel action "${action}" (shuffle|skip|pause|resume|mute|unmute|volinc|voldec|loop|update)` };
   }
@@ -451,10 +550,11 @@ const server = http.createServer(async (req, res) => {
       }
       const requestedBy = Number(body.requested_by) || 0;
       const room = getRoom(chatId);
-      const { track, degraded, error } = await resolvePlayQuery(body.query);
+      // Throws EngineUnavailable (HTTP 502) when the resolve fails —
+      // no degraded placeholder track is ever queued (Phase 5, A9).
+      const { track } = await resolvePlayQuery(body.query);
       if (!room.current) startTrack(room, track);
       else enqueue(room, track, requestedBy);
-      if (degraded) console.log(`[vc-ts] degraded resolve for chat ${chatId}: ${error || ""}`);
       saveState();
       return ok(res, { now_playing: nowPlaying(room) });
     }
@@ -479,7 +579,8 @@ const server = http.createServer(async (req, res) => {
       const chatId = requireChatId(body);
       const room = rooms.get(chatId);
       if (!room || !room.current) return fail(res, 404, "not_found", "no playback state for this chat");
-      const next = room.queue.shift();
+      room.loop = 0; // /skip resets the loop count (vc-go/vc-rust)
+      const next = popNext(room);
       if (next) startTrack(room, next.track);
       else { room.current = null; room.position_sec = 0; }
       saveState();
@@ -494,6 +595,11 @@ const server = http.createServer(async (req, res) => {
         room.queue = [];
         room.paused = false;
         room.position_sec = 0;
+        // vc-go Stop: loop and autoplay reset; shuffle is kept.
+        room.loop = 0;
+        room.autoplay = false;
+        room.history = [];
+        room.autoplay_pending = false;
         voicecall.leaveVoiceChat(chatId);
       }
       saveState();
@@ -508,6 +614,90 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(pos) || pos < 0) return fail(res, 400, "bad_request", "position_sec must be >= 0");
       room.position_sec = Math.floor(pos);
       room.started_at_ms = Date.now();
+      saveState();
+      return ok(res, { now_playing: nowPlaying(room) });
+    }
+
+    if (p === "/v1/loop") {
+      // Contract vc.loop (ParvatiMusic room.rs loop_n, vc-go SetLoop):
+      // count 0-10, remaining replays of the current track, 0 = off.
+      // The ticker decrements it per replay; /skip resets it.
+      const chatId = requireChatId(body);
+      const count = Number(body.count);
+      if (!Number.isInteger(count) || count < 0 || count > 10) {
+        return fail(res, 400, "bad_request", "count must be an integer 0-10");
+      }
+      const room = rooms.get(chatId);
+      if (!room || !room.current) return fail(res, 404, "not_found", "no playback state for this chat");
+      room.loop = count;
+      saveState();
+      return ok(res, { now_playing: nowPlaying(room) });
+    }
+
+    if (p === "/v1/shuffle") {
+      // Contract vc.shuffle: enabling shuffles the queue in place
+      // (vc-rust shuffle_queue) and makes advances pop a random queue
+      // index (vc-go popWaitingLocked); disabling keeps the order.
+      const chatId = requireChatId(body);
+      if (typeof body.enabled !== "boolean") {
+        return fail(res, 400, "bad_request", "enabled must be a boolean");
+      }
+      const room = rooms.get(chatId);
+      if (!room || !room.current) return fail(res, 404, "not_found", "no playback state for this chat");
+      if (body.enabled) {
+        for (let i = room.queue.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [room.queue[i], room.queue[j]] = [room.queue[j], room.queue[i]];
+        }
+        room.queue.forEach((it, i) => (it.position = i));
+        room.shuffle = true;
+      } else {
+        room.shuffle = false;
+      }
+      saveState();
+      return ok(res, { now_playing: nowPlaying(room) });
+    }
+
+    if (p === "/v1/autoplay") {
+      // Contract vc.autoplay: when on, the ticker picks a related
+      // track from the last track's YouTube mix once the queue drains
+      // (vc-go/vc-rust autoplay). Disabling clears the play history.
+      const chatId = requireChatId(body);
+      if (typeof body.enabled !== "boolean") {
+        return fail(res, 400, "bad_request", "enabled must be a boolean");
+      }
+      const room = rooms.get(chatId);
+      if (!room || !room.current) return fail(res, 404, "not_found", "no playback state for this chat");
+      room.autoplay = body.enabled;
+      if (!body.enabled) room.history = [];
+      saveState();
+      return ok(res, { now_playing: nowPlaying(room) });
+    }
+
+    if (p === "/v1/autoplay-skip") {
+      // Contract vc.autoplay_skip (ParvatiMusic /askip, vc-rust
+      // handle_autoplay_skip): only when autoplay is on — pick a mix
+      // track from the current track now, reset the loop count, and
+      // force-play it. 400 when autoplay is off, 502 when no mix pick
+      // is available (mix empty or YouTube gated).
+      const chatId = requireChatId(body);
+      const room = rooms.get(chatId);
+      if (!room) return fail(res, 404, "not_found", "no playback state for this chat");
+      if (!room.autoplay) return fail(res, 400, "bad_request", "autoplay is off in this chat");
+      if (!room.current) return fail(res, 404, "not_found", "no playback state for this chat");
+      const last = room.current;
+      let pick;
+      try {
+        pick = await R.autoplayPick(last, autoplayExclude(room, last));
+      } catch (e) {
+        if (e.code === "engine_unavailable") return fail(res, 502, "engine_unavailable", e.message);
+        throw e;
+      }
+      if (!pick) {
+        return fail(res, 502, "engine_unavailable", "no autoplay recommendation for the current track");
+      }
+      room.loop = 0;
+      startTrack(room, pick);
       saveState();
       return ok(res, { now_playing: nowPlaying(room) });
     }

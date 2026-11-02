@@ -26,6 +26,41 @@
       },
       "service": "downloaders"
     },
+    "download.soulseek": {
+      "from": "Navidrome music-bot src/soulseek/{client,downloader,matcher,scorer}, via slskd",
+      "method": "POST /v1/download/soulseek",
+      "request": {
+        "query": "string",
+        "artist": "string",
+        "title": "string",
+        "duration_sec": "integer",
+        "accept_lossy": "boolean",
+        "album": {
+          "artist": "string",
+          "title": "string",
+          "tracks": "array of {title, artist, duration_sec}"
+        },
+        "requested_by": "integer"
+      },
+      "response": {
+        "file_path": "string",
+        "track": "Track",
+        "oversize": "boolean",
+        "size_bytes": "integer",
+        "peer": "string",
+        "format": "string",
+        "count": "integer, album only",
+        "total": "integer, album only",
+        "failed": "array of [title, reason], album only",
+        "album_dir": "string, album only",
+        "source": "soulseek"
+      },
+      "errors": {
+        "engine_unavailable": "slskd unreachable at SLSKD_URL, or search could not run (e.g. slskd not logged in)",
+        "download_failed": "search ran but found nothing usable (honest reason in message)"
+      },
+      "service": "downloaders"
+    },
     "download.spotify": {
       "from": "Spotify-Loader bot.py",
       "method": "POST /v1/download/spotify",
@@ -143,7 +178,8 @@
       },
       "response": {
         "file_path": "string",
-        "track": "Track"
+        "track": "Track",
+        "auth": "music_u|anonymous"
       },
       "service": "netease-go"
     },
@@ -205,6 +241,27 @@
       },
       "service": "radio-js"
     },
+    "radio.status": {
+      "from": "openradiobot, radio-js src/main.js",
+      "method": "GET /v1/radio/status",
+      "response": {
+        "playing": "boolean",
+        "station": "string|null",
+        "chat_id": "ChatId"
+      },
+      "service": "radio-js"
+    },
+    "radio.stop": {
+      "from": "openradiobot, radio-js src/main.js",
+      "method": "POST /v1/radio/stop",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "stopped": "boolean"
+      },
+      "service": "radio-js"
+    },
     "search.inline": {
       "from": "lemonic handlers/inline_query.ts",
       "method": "POST /v1/inline",
@@ -254,6 +311,45 @@
       },
       "service": "share-rust"
     },
+    "spotify.auth": {
+      "from": "rustify src/spotify/auth.rs + Manager token_refresh + tick/user.rs check",
+      "method": "POST /v1/spotify/auth",
+      "request": {
+        "action": "login|callback|refresh|revoke",
+        "user_id": "integer",
+        "code": "string, callback only"
+      },
+      "response": {
+        "login": {
+          "authorized": "boolean",
+          "user_id": "integer",
+          "authorize_url": "string",
+          "note": "complete the URL in a browser, then POST action:callback with the returned code"
+        },
+        "callback": {
+          "authorized": "boolean",
+          "user_id": "integer",
+          "expires_at": "integer"
+        },
+        "refresh": {
+          "authorized": "boolean",
+          "user_id": "integer",
+          "expires_at": "integer"
+        },
+        "revoke": {
+          "authorized": "boolean",
+          "user_id": "integer",
+          "was_authorized": "boolean"
+        }
+      },
+      "errors": {
+        "503 engine_unavailable": "per-user Spotify auth needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET",
+        "404 not_found": "no stored token for this user (refresh without login)",
+        "401 unauthorized": "refresh token rejected by Spotify (invalid_grant); token dropped, login again",
+        "502 download_failed": "authorization code exchange failed (bad/expired code, or Spotify rejected the client)"
+      },
+      "service": "spotify-rust"
+    },
     "spotify.dislike": {
       "from": "rustify src/queue/* (disliked-track auto-skip)",
       "method": "POST /v1/spotify/dislike",
@@ -264,6 +360,23 @@
       },
       "response": {
         "disliked": "boolean"
+      },
+      "service": "spotify-rust"
+    },
+    "spotify.now_playing": {
+      "from": "rustify tick/user.rs check, polled currently-playing state",
+      "method": "GET /v1/spotify/now-playing?user_id=",
+      "request": {
+        "user_id": "integer"
+      },
+      "response": {
+        "playing": "boolean",
+        "user_id": "integer",
+        "track": "Track|null",
+        "checked_at": "integer",
+        "last_skip": "boolean",
+        "last_reason": "string|null",
+        "classifier_verdict": "clean|profanity|ai_generated|unknown"
       },
       "service": "spotify-rust"
     },
@@ -288,7 +401,11 @@
       },
       "response": {
         "reason": "profanity|ai-generated|disliked|null",
-        "skip": "boolean"
+        "skip": "boolean",
+        "classifier_provider": "gemini|wordlist|wordlist-fallback|none",
+        "classifier_verdict": "clean|profanity|ai_generated|unknown",
+        "classifier_confidence": "number 0..1",
+        "classifier_detail": "string (matched word / Gemini note)"
       },
       "service": "spotify-rust"
     },
@@ -312,12 +429,60 @@
       },
       "service": "spotify-rust"
     },
+    "vc.join": {
+      "from": "core-cpp TdLibVoiceCall::join (TDLib + dlopen'd ntgcalls, in-process)",
+      "method": "POST /v1/join",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "joined": "boolean",
+        "now_playing": "NowPlaying"
+      },
+      "service": "core-cpp"
+    },
+    "vc.lyrics": {
+      "from": "vc-ts src/main.js lyrics panel",
+      "method": "GET /v1/lyrics",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "lyrics": "string|null",
+        "source": "string"
+      },
+      "service": "vc-ts"
+    },
+    "vc.mute": {
+      "from": "core-cpp TdLibVoiceCall mute (TDLib + dlopen'd ntgcalls, in-process)",
+      "method": "POST /v1/mute",
+      "request": {
+        "chat_id": "ChatId",
+        "muted": "boolean"
+      },
+      "response": {
+        "muted": "boolean",
+        "now_playing": "NowPlaying"
+      },
+      "service": "core-cpp"
+    },
     "vc.now_playing": {
       "method": "GET /v1/now-playing?chat_id=",
       "response": {
         "now_playing": "NowPlaying"
       },
       "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.panel": {
+      "from": "YukkiMusic panel callbacks, vc-ts src/main.js",
+      "method": "GET /v1/panel | POST /v1/panel",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-ts"
     },
     "vc.pause": {
       "method": "POST /v1/pause",
@@ -482,6 +647,18 @@
         "token_cached": "boolean"
       },
       "service": "spotify-rust"
+    },
+    "vc.volume": {
+      "from": "vc-ts src/main.js volume control",
+      "method": "POST /v1/volume",
+      "request": {
+        "chat_id": "ChatId",
+        "volume": "integer 0..200"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-ts"
     }
   },
   "description": "Single contract for all Parlay services. HTTP + JSON. Every service: POST /v1/<action> with header X-Parlay-Token: $PARLAY_TOKEN. Health: GET /healthz -> {ok, service}. Error envelope everywhere: {ok:false, error:{code, message}}. Success: {ok:true, data:{...}}.",
@@ -557,6 +734,10 @@
           "description": "shuffle on: the next track is picked at random from the queue",
           "type": "boolean"
         },
+        "stream_url": {
+          "description": "resolved direct audio URL for the current track (e.g. yt-dlp bestaudio), when the engine knows one; absent otherwise",
+          "type": "string"
+        },
         "track": {
           "$ref": "#/types/Track"
         },
@@ -609,6 +790,10 @@
           ],
           "type": "string"
         },
+        "stream_url": {
+          "description": "resolved direct audio URL (e.g. yt-dlp bestaudio), when the resolving service knows one; absent otherwise",
+          "type": "string"
+        },
         "thumbnail": {
           "type": "string"
         },
@@ -631,5 +816,5 @@
       "type": "integer"
     }
   },
-  "version": "0.1.0-scaffold"
+  "version": "0.2.0"
 }

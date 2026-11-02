@@ -7,7 +7,6 @@ package server
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 	"strconv"
 
@@ -152,13 +151,10 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "query is required")
 		return
 	}
-	track, degraded, err := s.resolver.Resolve(r.Context(), req.Query)
+	track, err := s.resolver.Resolve(r.Context(), req.Query)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", err.Error())
+		writeErr(w, http.StatusBadGateway, "engine_unavailable", err.Error())
 		return
-	}
-	if degraded {
-		log.Printf("vc-go: chat %d play %q resolved in degraded mode", req.ChatID, req.Query)
 	}
 	room := s.mgr.Get(req.ChatID)
 	np := room.Play(*track, req.RequestedBy)

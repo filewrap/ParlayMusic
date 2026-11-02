@@ -43,9 +43,16 @@ struct TgMessage {
     std::vector<TgUser> new_chat_members;
     bool video_chat_started = false;
     bool video_chat_ended = false;
-    // Media on a reply (for /play from a reply).
+    // Media on the message itself (audio sent with a /play caption).
     bool has_media = false;
     std::string media_file_id;
+    std::string media_kind;   // audio|video|voice|video_note|document
+    std::string media_title;  // audio title / file name, when present
+    // Media on the replied-to message (for /play from a reply).
+    bool has_reply_media = false;
+    std::string reply_media_file_id;
+    std::string reply_media_kind;   // audio|video|voice|video_note|document
+    std::string reply_media_title;  // audio title / file name, when present
 };
 
 struct TgUpdate {
@@ -57,6 +64,11 @@ struct TgUpdate {
 class TelegramApi {
 public:
     explicit TelegramApi(const Config& cfg);
+    virtual ~TelegramApi() = default;
+
+    // Parse one Bot API message object. Public so tests can exercise
+    // reply-media parsing without a network round-trip.
+    static TgMessage parseMessage(const Json& j);
 
     // Long-poll getUpdates. Returns updates with update_id > offset's last
     // seen id; empty vector on timeout (normal) or on a transport error
@@ -69,19 +81,32 @@ public:
                      std::string& error_out);
     // sendMessage returning the new message id (-1 on failure). Needed
     // for clean-mode deletion scheduling (NoxBeats reply()).
-    int64_t sendMessageId(int64_t chat_id, const std::string& text,
-                          int64_t reply_to = 0);
-    int64_t sendMessageId(int64_t chat_id, const std::string& text,
-                          int64_t reply_to, std::string* error_out);
+    virtual int64_t sendMessageId(int64_t chat_id, const std::string& text,
+                                  int64_t reply_to = 0);
+    virtual int64_t sendMessageId(int64_t chat_id, const std::string& text,
+                                  int64_t reply_to, std::string* error_out);
+
+    // getFile(file_id) -> Telegram file_path ("audio/file_1.mp3"), or ""
+    // + error when the file_id is unknown to the Bot API.
+    virtual std::string getFilePath(const std::string& file_id,
+                                    std::string& error_out);
+    // Download a Telegram file by file_id into dest_dir/<file_id>.<ext>
+    // (extension from the file_path). saved_path_out receives the local
+    // path. False + error on any failure (unknown file_id, HTTP error,
+    // empty body, write failure). Bot API downloads cap at 20 MB.
+    virtual bool downloadFile(const std::string& file_id,
+                              const std::string& dest_dir,
+                              std::string& saved_path_out,
+                              std::string& error_out);
 
     // getChatMember(chat_id, user_id) -> status string ("creator",
     // "administrator", "member", "restricted", "left", "kicked") or "".
     // Used for the NoxBeats-style admin check in the dispatcher.
-    std::string getChatMemberStatus(int64_t chat_id, int64_t user_id);
+    virtual std::string getChatMemberStatus(int64_t chat_id, int64_t user_id);
 
     // getChatAdministrators -> ids of creator + administrators (NoxBeats
     // get_admins / /admincache). Empty on error.
-    std::vector<int64_t> getChatAdministrators(int64_t chat_id);
+    virtual std::vector<int64_t> getChatAdministrators(int64_t chat_id);
 
     // getChat(id or @username) -> chat id, or 0 (for /blacklist @name,
     // /channelplay @channel).
@@ -105,9 +130,9 @@ public:
 
 private:
     std::string base_;
+    std::string file_base_;  // <api_base>/file/bot<token> (getFile downloads)
     Json call(const std::string& method, const Json& params, int timeout_sec,
               std::string& error_out);
-    static TgMessage parseMessage(const Json& j);
 };
 
 }  // namespace parlay

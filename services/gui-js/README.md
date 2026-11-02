@@ -2,8 +2,11 @@
 
 From: 4nuxd/wavetune (Next.js, `app/(player)/`, `app/(root)/page.js`,
 `components/music-provider.jsx`). Now-playing, queue, search, controls.
-Talks ONLY to the core (`/api/*` in contracts/ipc.json) — never directly
-to voice or downloader services.
+Now-playing/queue proxy the core (`/api/*` in contracts/ipc.json);
+play/pause/skip/search talk directly to the VC engines (`VC_GO_URL` /
+`VC_TS_URL`, `NETEASE_URL` as a search fallback) — the old "talks ONLY
+to the core, never directly to voice" line was false (see
+`app/main.js`).
 
 ## What is actually implemented (Phase 3, 2026-11-02)
 

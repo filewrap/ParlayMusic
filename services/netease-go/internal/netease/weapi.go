@@ -134,13 +134,12 @@ func (c *Client) weapiPost(path, jsonBody string, v any) error {
 	form := url.Values{}
 	form.Set("params", params)
 	form.Set("encSecKey", encSecKey)
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/weapi"+path, strings.NewReader(form.Encode()))
+	req, err := http.NewRequest(http.MethodPost, c.base+"/weapi"+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Referer", "https://music.163.com/")
+	c.setAuthHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("netease weapi request failed: %w", err)

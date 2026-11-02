@@ -17,9 +17,49 @@ profane / AI-generated lyrics, auto-skips tracks the user disliked.
   per-user disliked-track store, persisted with the watch registry.
 - `POST /v1/spotify/skip-check` `{track:{id,title,artist}, user_id?}` →
   `{skip, reason, matched_word?, disliked_by?, lyrics_checked,
-  lyrics_available, lyrics_source}`. Decision order (rustify
-  `src/queue/track_check.rs`): disliked → profanity in title/artist →
-  profanity in LRCLib lyrics. `reason` is `profanity | disliked | null`.
+  lyrics_available, lyrics_source, classifier_provider,
+  classifier_verdict, classifier_confidence, classifier_detail}`.
+  Decision order (rustify `src/queue/track_check.rs`): disliked →
+  profanity in title/artist → profanity in LRCLib lyrics →
+  AI-generated lyrics (Gemini, confidence ≥ 0.7). `reason` is
+  `profanity | disliked | ai-generated | null`.
+- Gemini classifier (Phase 5): when `GEMINI_API_KEY` is set, lyrics
+  (or title/artist when there are no lyrics) are classified by the
+  Gemini API (`gemini-2.0-flash` by default; `GEMINI_MODEL` /
+  `GEMINI_API_BASE` override) into `clean | profanity | ai_generated |
+  unknown`, and the Gemini verdict replaces the wordlist verdict. The
+  Gemini call failing falls back to the wordlist and says so
+  (`classifier_provider:"wordlist-fallback"`). Without a key AND
+  without lyrics the verdict is honestly `unknown`
+  (`classifier_provider:"none"`) — a verdict is never fabricated.
+  AI-generated skips only at confidence ≥ 0.7 (`AI_SKIP_CONFIDENCE`);
+  below that it is reported but does not skip.
+- Per-user OAuth + polling (Phase 5, port of rustify
+  `src/spotify/auth.rs`): `POST /v1/spotify/auth`
+  `{action:login|callback|refresh|revoke, user_id, code?}` — login
+  returns the authorize URL (scopes `user-read-currently-playing
+  user-read-playback-state` only; Parlay never controls the user's
+  player), callback exchanges the code and stores the tokens,
+  refresh rotates them, revoke drops them.
+  `GET /v1/spotify/now-playing?user_id=` returns the last polled
+  state. A poller thread (every `SPOTIFY_POLL_INTERVAL_SECS`,
+  default 30; 0 disables) refreshes tokens within 120 s of expiry,
+  fetches currently-playing for every watched user with a token, and
+  runs the skip decision on track changes. `GET /v1/spotify/status`
+  now also reports `{user_tokens, watching, gemini_configured,
+  poll_interval_secs, polling}`.
+- Per-user token store (Phase 5): `spotify-user-tokens.json` holds
+  one record per user — `{user_id, nonce, ciphertext, tag,
+  expires_at}`, all hex. Encryption is AES-256-GCM (96-bit random
+  nonce per record, 128-bit tag, AAD
+  `parlay:spotify-user-token:v1:<user_id>`), hand-rolled std-only
+  (`src/crypto.rs`, verified against NIST AES-256-GCM vectors).
+  The 32-byte key is generated once from `/dev/urandom` at first
+  run and stored in `spotify-user-key` (mode 0600); there is no
+  hardcoded default key. Plaintext tokens are never on disk;
+  undecryptable records (key rotated) are skipped with a warning.
+  This is the template for any other per-user credential: same
+  scheme, same key-file discipline, per-record nonce + AAD.
 - Profanity filter: curated 54-word English list in code (the wordlist
   concept from rustify `src/profanity.rs`, which uses the rustrict trie;
   re-implemented std-only), case-insensitive, word-boundary match over
@@ -28,11 +68,16 @@ profane / AI-generated lyrics, auto-skips tracks the user disliked.
   appear in clean classics ("Imagine" — "no hell below us"; "Highway to
   Hell") and flagging those is worse than missing a mild word.
   Obfuscated spellings (l33t, spaced letters) are NOT caught.
-- Lyrics check: **real** LRCLib fetch (`https://lrclib.net/api/search`,
-  via a `curl` subprocess, 5 s cap) and profanity-checked. When LRCLib
-  is unreachable or has no lyrics, the response says
+- Lyrics check: **real** provider-chain fetch (Genius → Musixmatch →
+  LRCLib, via a `curl` subprocess, 5 s cap) and profanity-checked.
+  Genius uses the public search API (`api.genius.com/search`,
+  `GENIUS_ACCESS_TOKEN`) + a song-page scrape of the
+  `data-lyrics-container` divs; Musixmatch uses
+  `matcher.lyrics.get` (`MUSIXMATCH_API_KEY`); LRCLib needs no key.
+  When no provider is reachable or has lyrics, the response says
   `lyrics_available:false, lyrics_checked:false` and falls back to the
-  title/artist check — a lyrics verdict is never faked.
+  title/artist check — a lyrics verdict is never faked. Without the
+  keys the chain is LRCLib only.
 - `POST /v1/spotify/resolve` `{url}` — parses
   `open.spotify.com/<track|album|playlist|artist>/<id>` (query/fragment
   tolerated) and `spotify:<kind>:<id>` into `{kind, track_id, url,
@@ -60,21 +105,16 @@ profane / AI-generated lyrics, auto-skips tracks the user disliked.
   `X-Parlay-Token` auth when `PARLAY_TOKEN` is set (401 without/wrong,
   `/healthz` open).
 
-## NOT implemented — needs credentials / a classifier
+## NOT implemented — needs credentials
 
-- **Real Spotify playback monitoring.** The watch registry records
-  intent only; nothing polls the Spotify Web API for a user's
-  currently-playing track. Live monitoring needs a per-user OAuth
-  token (rustify `src/spotify/auth.rs`), then a poller that feeds the
-  currently-playing track into skip-check and issues a skip to the VC
-  engine. Without them: watch start/stop, dislikes, and skip-check all
-  still work standalone.
-- **Genius / Musixmatch lyrics** — need `GENIUS_ACCESS_TOKEN` /
-  `MUSIXMATCH_API_KEY`. Only LRCLib (no key) is wired.
-- **AI-generated-lyrics detection** — rustify flags tracks whose lyrics
-  look AI-written; there is no classifier in this service, so
-  `reason:"ai-generated"` is **never emitted**. The value stays in the
-  contract for a future detector.
+- **Genius / Musixmatch lyrics — DONE in code (Phase 5 scope update).**
+  Both providers are wired against the public APIs, env-gated by
+  `GENIUS_ACCESS_TOKEN` / `MUSIXMATCH_API_KEY`, falling back to LRCLib;
+  only the keys are missing. (This line used to say only LRCLib was
+  wired — superseded 2026-11-03.)
+- **Skip execution.** The poller decides skips and records them; no
+  code issues a skip to the VC engine yet — issuing the skip is a
+  core-cpp action outside this service.
 
 ## Run
 
@@ -85,4 +125,12 @@ PORT=8007 ./target/release/parlay-spotify
 ```
 
 Env: `PORT` (default 8007), `PARLAY_TOKEN` (unset = no auth, dev only),
-`PARLAY_DATA_DIR` (default `./data`).
+`PARLAY_DATA_DIR` (default `./data`),
+`GEMINI_API_KEY` (unset = wordlist-only classifier),
+`GEMINI_MODEL` (default `gemini-2.0-flash`),
+`GEMINI_API_BASE` (default `https://generativelanguage.googleapis.com`),
+`SPOTIFY_POLL_INTERVAL_SECS` (default 30; 0 disables polling),
+`SPOTIFY_REDIRECT_URI` (default `http://localhost:8080/callback`),
+`SPOTIFY_ACCOUNTS_URL` / `SPOTIFY_API_BASE` (test overrides for the
+stubbed Spotify endpoints; production defaults are
+`accounts.spotify.com` / `api.spotify.com`).

@@ -161,6 +161,12 @@ private:
     void onSpeed(const CommandContext& ctx);
     void onBass(const CommandContext& ctx);
     void onMute(const CommandContext& ctx);
+    void onJoin(const CommandContext& ctx);
+    // Play a replied-to (or captioned) Telegram file: download via
+    // getFile, then play through the core's in-process voice backend.
+    void playRepliedFile(const CommandContext& ctx,
+                         const std::string& file_id,
+                         const std::string& title, const std::string& kind);
     void onReplay(const CommandContext& ctx);
     void onPlayer(const CommandContext& ctx);
     void onLyrics(const CommandContext& ctx);

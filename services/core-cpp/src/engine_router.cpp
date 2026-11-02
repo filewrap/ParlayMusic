@@ -58,7 +58,11 @@ IpcResult EngineRouter::callVc(const IpcClient& ipc, int64_t chat_id,
         }
         first = false;
         last = ipc.post(baseUrl(e), action, body);
-        if (!last.unavailable()) {
+        // unavailable() covers transport errors, 5xx, engine_unavailable
+        // AND a 404 for a known contract action (this engine does not
+        // implement it — try the next engine). A 404 for an unknown
+        // action is a real not-found: it returns as-is.
+        if (!last.unavailable(action)) {
             used_engine = e;
             fell_back = (e != preferred);
             return last;

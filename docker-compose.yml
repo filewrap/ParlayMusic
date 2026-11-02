@@ -1,3 +1,44 @@
+# Parlay — docker-compose.yml
+#
+# PORT SOURCE OF TRUTH (REMAINING.md A5, fixed 2026-11-03, Phase 5 Worker E):
+# every service gets an explicit PORT here. The code defaults match these
+# values EXCEPT the four below, where compose overrides the code default
+# (the old compose mapped the port without setting PORT, so the service
+# listened on its default and was unreachable):
+#   audio-fx-rust  code default 8003 (collides with vc-rust) -> PORT 8004
+#   share-rust     code default 8004                         -> PORT 8005
+#   queue-rust     code default 8005                         -> PORT 8006
+#   downloaders    code default 8010 (collides with netease-go) -> PORT 8009
+# Core's *_URL vars point at the mapped ports (see services/core-cpp/src/
+# config.hpp defaults — they already agreed with this mapping).
+#
+# DATA DIRS (A5/A11): every stateful service gets its OWN subdir under the
+# shared parlay-data volume (PARLAY_DATA_DIR=/data/<service>). A single
+# shared /data would collide: vc-ts and radio-js both write state.json,
+# and queue/share/spotify/vc-rust all write their own JSON files.
+# Downloaders and netease-go write downloads to separate subdirs too.
+#
+# HEALTH: every HTTP service answers GET /healthz (core-cpp does NOT serve
+# HTTP yet — A2 — so it has no healthcheck). core depends_on the default-
+# profile services with condition: service_healthy; full-profile services
+# are not a core dependency (they are not started in a default `up`).
+#
+# SOULSEEK (B4): the slskd service is opt-in (profile: full). Worker D
+# wires the client; this file only provides the daemon. Per slskd's own
+# example config (phase5/slskd/slskd-bin/config/slskd.example.yml): web
+# HTTP on 5030, web HTTPS on 5031, Soulseek listen port 50300
+# (in-container only — outbound Soulseek works without publishing it;
+# inbound port-forwarding is a host/router concern, not compose's).
+# SLSKD_URL points at the web UI/API on 5030.
+#
+# Docker is NOT installed in the sandbox, so `docker compose up` has never
+# run here; this file is validated by YAML parse + a port/URL cross-check
+# (see phase5/worker-e-compose.md). Run `docker compose config` on a host
+# with Docker before trusting it end to end.
+#
+# No secrets in this file: every credential comes from .env (see
+# .env.example). Unset optional vars expand to empty via ${VAR:-}.
+
 services:
   core-cpp:
     build: ./services/core-cpp
@@ -6,8 +47,16 @@ services:
       - BOT_TOKEN=${BOT_TOKEN}
       - API_ID=${API_ID}
       - API_HASH=${API_HASH}
+      - OWNER_ID=${OWNER_ID:-}
+      - SUDO_IDS=${SUDO_IDS:-}
+      - LOGGER_ID=${LOGGER_ID:-}
+      - PARLAY_ALLOW_CHATS=${PARLAY_ALLOW_CHATS:-}
+      - PARLAY_BLOCK_CHATS=${PARLAY_BLOCK_CHATS:-}
+      - ASSISTANT_IDS=${ASSISTANT_IDS:-}
       - MONGO_URI=mongodb://mongo:27017/parlay
       - REDIS_URL=redis://redis:6379/0
+      - PORT=8080
+      - PARLAY_DATA_DIR=/data/core
       - VC_GO_URL=http://vc-go:8001
       - VC_TS_URL=http://vc-ts:8002
       - VC_RUST_URL=http://vc-rust:8003
@@ -18,120 +67,283 @@ services:
       - RADIO_URL=http://radio-js:8008
       - DOWNLOADERS_URL=http://downloaders:8009
       - NETEASE_URL=http://netease-go:8010
+      # Voice backends (names only — values stay in .env / the host):
+      # TDLib needs TD_API_ID/TD_API_HASH (default to API_ID/API_HASH in
+      # code), TD_SESSION_DIR (pre-authorized session dir), TDJSON_LIB
+      # (explicit libtdjson.so path); NTGCALLS_LIB is the explicit
+      # libntgcalls.so. The old Telethon voice bridge (VOICE_BRIDGE,
+      # ASSISTANT_SESSION_FILE) was deleted in Phase 5 — the assistant
+      # session now lives in TD_SESSION_DIR, not a Telethon file.
+      - TD_API_ID=${TD_API_ID:-}
+      - TD_API_HASH=${TD_API_HASH:-}
+      - TD_SESSION_DIR=${TD_SESSION_DIR:-}
+      - TDJSON_LIB=${TDJSON_LIB:-}
+      - NTGCALLS_LIB=${NTGCALLS_LIB:-}
+      - VOICE_RTP_SINK=${VOICE_RTP_SINK:-}
+      - TD_PHONE=${TD_PHONE:-}
+      - TD_CODE=${TD_CODE:-}
+      - TD_PASSWORD=${TD_PASSWORD:-}
     ports:
       - "8080:8080"
     depends_on:
-      - mongo
-      - redis
-      - vc-go
-      - downloaders
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vc-go:
+        condition: service_healthy
+      downloaders:
+        condition: service_healthy
     volumes:
       - parlay-data:/data
+      # TDLib session dir (host path; mount only if TD_SESSION_DIR is set
+      # on the host — the default below is a no-op placeholder, override
+      # in a compose override file, not here).
+      # - ${TD_SESSION_DIR_HOST:-./td-session}:/td-session:ro
 
   vc-go:
     build: ./services/vc-go
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8001
+      - PARLAY_DATA_DIR=/data/vc-go
       - VC_PROFILE=${VC_PROFILE:-low-ram}
       - MONGO_URI=mongodb://mongo:27017/parlay
     ports:
       - "8001:8001"
-    depends_on: [mongo]
+    depends_on:
+      mongo:
+        condition: service_healthy
     volumes:
       - parlay-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   vc-ts:
     build: ./services/vc-ts
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8002
+      - PARLAY_DATA_DIR=/data/vc-ts
+      - LEMONIC_API=${LEMONIC_API:-}
       - LEMONIC_API_KEY=${LEMONIC_API_KEY:-}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
     ports:
       - "8002:8002"
+    volumes:
+      - parlay-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   vc-rust:
     build: ./services/vc-rust
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8003
+      - PARLAY_DATA_DIR=/data/vc-rust
       - MONGO_URI=mongodb://mongo:27017/parlay
     ports:
       - "8003:8003"
-    depends_on: [mongo]
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - parlay-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8003/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   audio-fx-rust:
     build: ./services/audio-fx-rust
-    environment: [PARLAY_TOKEN=${PARLAY_TOKEN}]
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8004
+      - PARLAY_DATA_DIR=/data/audio-fx
     ports: ["8004:8004"]
     volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8004/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   share-rust:
     build: ./services/share-rust
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
-      - DATABASE_URL=sqlite:/data/share.db
+      - PORT=8005
+      - PARLAY_DATA_DIR=/data/share
+      - PARLAY_BOT_USERNAME=${PARLAY_BOT_USERNAME:-ParlayBot}
     ports: ["8005:8005"]
     volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8005/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   queue-rust:
     build: ./services/queue-rust
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+      - PORT=8006
+      - PARLAY_DATA_DIR=/data/queue
+      - PARLAY_VOTE_THRESHOLD=${PARLAY_VOTE_THRESHOLD:-3}
     ports: ["8006:8006"]
+    volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8006/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   spotify-rust:
     build: ./services/spotify-rust
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8007
+      - PARLAY_DATA_DIR=/data/spotify
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
     ports: ["8007:8007"]
+    volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8007/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   gui-js:
     build: ./services/gui-js
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=3000
       - CORE_URL=http://core-cpp:8080
+      - VC_GO_URL=http://vc-go:8001
+      - VC_TS_URL=http://vc-ts:8002
+      - NETEASE_URL=http://netease-go:8010
     ports: ["3000:3000"]
     depends_on: [core-cpp]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   radio-js:
     build: ./services/radio-js
-    environment: [PARLAY_TOKEN=${PARLAY_TOKEN}]
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8008
+      - PARLAY_DATA_DIR=/data/radio
+      - VC_GO_URL=http://vc-go:8001
+      - VC_TS_URL=http://vc-ts:8002
     ports: ["8008:8008"]
+    volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8008/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     profiles: [full]
 
   downloaders:
     build: ./services/downloaders
     environment:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8009
+      - PARLAY_DL_DIR=/data/downloads
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
       - NAVIDROME_URL=${NAVIDROME_URL:-}
       - NAVIDROME_USER=${NAVIDROME_USER:-}
-      - NAVIDROME_PASS=${NAVIDROME_PASS:-}
+      - NAVIDROME_PASSWORD=${NAVIDROME_PASSWORD:-}
+      - SLSKD_URL=http://slskd:5030
+      - SLSKD_API_KEY=${SLSKD_API_KEY:-}
     ports: ["8009:8009"]
     volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8009/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   netease-go:
     build: ./services/netease-go
-    environment: [PARLAY_TOKEN=${PARLAY_TOKEN}]
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - PORT=8010
+      - PARLAY_DL_DIR=/data/netease
     ports: ["8010:8010"]
     volumes: [parlay-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8010/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    profiles: [full]
+
+  # Soulseek daemon for the downloaders' Navidrome/Soulseek path (B4).
+  # Opt-in: only started with --profile full. No healthcheck: slskd has
+  # no stable unauthenticated health endpoint to probe.
+  slskd:
+    image: slskd/slskd:latest
+    environment:
+      - SLSKD_API_KEY=${SLSKD_API_KEY:-}
+    ports:
+      - "5030:5030"   # web UI + API (SLSKD_URL), HTTP
+      - "5031:5031"   # web UI, HTTPS
+    volumes:
+      - slskd-data:/app
     profiles: [full]
 
   mongo:
     image: mongo:7
     volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
 volumes:
   parlay-data:
   mongo-data:
+  slskd-data:

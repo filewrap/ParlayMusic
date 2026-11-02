@@ -38,9 +38,22 @@ stop/queue/seek/loop/shuffle/autoplay/autoplay-skip/now-playing`, plus
   the autoplay history (capped at 50; history cleared and playback
   stops at the cap, TgMusicBot behaviour). Only YouTube tracks autoplay.
   `POST /v1/autoplay-skip` advances like skip (loop reset).
-  `NowPlaying` now reports `loop`, `shuffle`, `autoplay`.
-- YouTube resolve via `yt-dlp -j --no-playlist` (exec, argv only, 30 s
-  timeout). Search strings use `ytsearch1:`, URLs are passed through.
+  **Stream URL** (`Track.stream_url`, A8): the resolver runs yt-dlp
+  with `-f bestaudio/best`, so the direct audio URL lands in every
+  resolved track — `GET /v1/now-playing` and queue responses carry it
+  (omitted when a track has none, e.g. an autoplay mix pick, which the
+  core resolves on demand). `NowPlaying` now reports `loop`, `shuffle`,
+  `autoplay`.
+- YouTube resolve via `yt-dlp -j -f bestaudio/best --no-playlist`
+  (exec, argv only, 30 s timeout). Search strings use `ytsearch1:`,
+  URLs are passed through. yt-dlp is discovered at startup (PATH,
+  `$YT_DLP`, then the downloaders service venv); a YouTube bot check
+  is retried once with the android player client. No degraded
+  fallback: a query yt-dlp cannot resolve is an error, served as 502
+  `engine_unavailable` so the core can fail over — never a fake track.
+  `-f bestaudio/best` matters: without a format selection yt-dlp's
+  `-j` output has no top-level `url` for multi-format videos, so
+  `stream_url` would stay empty.
 - Both profile paths are real in the queue runner: low-ram resolves on
   demand only; high-perf runs 2 prefetch workers + a 1 s advance ticker
   (verified: a 2 s track auto-advanced the room to idle).
@@ -54,9 +67,14 @@ stop/queue/seek/loop/shuffle/autoplay/autoplay-skip/now-playing`, plus
   Both backends save loop/shuffle/autoplay/history; rooms restore
   **paused** (never auto-resume audio after a restart). Verified live
   across restarts on both backends.
-- Tests: 18 (`go test ./...`): 14 queue (loop/shuffle/autoplay/
-  skip-reset/stop-reset/persist), 2 resolver, 2 store (JSON round-trip
-  + live Mongo round-trip, incl. prune). `go vet` clean.
+- Tests: 30 (`go test ./...`): 14 queue (loop/shuffle/autoplay/
+  skip-reset/stop-reset/persist), 6 resolver (venv discovery,
+  honest-error resolve, 2 live-gated: YouTube resolve + mix pick),
+  3 server (502 without yt-dlp, healthz degraded flag, live-gated
+  stream_url end-to-end), 5 types (stream_url serialization),
+  2 store (JSON round-trip + live Mongo round-trip, incl. prune).
+  `go vet` clean. Live-gated tests need `PARLAY_LIVE_TEST=1`
+  (network + yt-dlp); without it they skip (27 pass + 3 skip).
 - Bench (see `phase4/bench-go.md`): clean build 92 s, stripped binary
   9.3 MB, startup-to-healthz 0.03 s.
 
@@ -66,15 +84,14 @@ stop/queue/seek/loop/shuffle/autoplay/autoplay-skip/now-playing`, plus
   a Telegram voice chat and never feeds audio frames. That is the C++
   core's job via its `VoiceCall` interface; vc-go is the queue /
   playback-state engine. The core asks this service what is playing
-  (`/v1/now-playing`) and which stream URL to feed (`Track.stream_url`
-  once yt-dlp resolves it).
-- **yt-dlp is absent in this sandbox**, so the resolver runs in
-  degraded mode: `/healthz` reports `degraded:true, yt_dlp:false` and
-  tracks resolve by URL pattern only (`yt:<video-id>`, title = query).
-  With yt-dlp installed, resolution (title/duration/artist/thumbnail/
-  direct stream URL) works with no code change; prefetch and autoplay
-  picks only engage when yt-dlp is present. Autoplay on drain with no
-  yt-dlp simply idles the room.
+  (`/v1/now-playing`) and which stream URL to feed (`Track.stream_url`,
+  serialized on every resolved track).
+- **yt-dlp missing.** If no yt-dlp binary is found at startup
+  (`/healthz` reports `degraded:true, yt_dlp:false`), resolve returns
+  `engine_unavailable` (HTTP 502) — there is no pattern fallback any
+  more. Set `YT_DLP` or install yt-dlp (the downloaders venv is probed
+  automatically). Autoplay on drain with no yt-dlp simply idles the
+  room.
 
 ## Run
 

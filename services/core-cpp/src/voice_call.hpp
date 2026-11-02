@@ -1,28 +1,30 @@
 // voice_call.hpp — voice-call binding, rebuilt on the real refs.
 //
-// The old logging stub is gone. Three real implementations behind one
-// interface, in the order the core prefers them:
+// The voice bridge is GONE (Phase 5, user order): no voice_bridge.py,
+// no Telethon child process, no bridge server. ntgcalls is a C++
+// NATIVE LIBRARY linked into the bot process — the assistant MTProto
+// client + ntgcalls join directly in-process. Two real implementations
+// behind one interface, in the order the core prefers them:
 //
-//   1. VoiceBridge — a child process running voice_bridge.py (this
-//      directory), which uses Telethon (MTProto, the assistant user
-//      account) + ntgcalls (WebRTC) exactly like TinaMusic's
-//      TinaProtoClient::Play(): ntgcalls create_call -> local SDP offer,
-//      phone.joinGroupCall(local SDP) -> remote transport, ntgcalls
-//      connect(remote), set_stream_sources(ffmpeg shell command).
-//      This is the only path that can actually join a Telegram voice chat
-//      from this sandbox, because working ntgcalls + Telethon wheels exist
-//      here while TDLib/ntgcalls cannot be built from source (see
-//      phase4/tdlib-build.log). Needs ASSISTANT_SESSION_FILE + API_ID +
-//      API_HASH; without them it reports unavailable, honestly.
+//   1. TdLibVoiceCall — TDLib 1.8.69 (MTProto signaling: authorize ->
+//      getChat/createVideoChat -> joinVideoChat) + NtgCallsVoiceCall
+//      (WebRTC, dlopen'd libntgcalls.so). This is the only backend
+//      that can join a Telegram voice chat: the assistant session
+//      lives in TD_SESSION_DIR (TD_API_ID/TD_API_HASH), no Telethon,
+//      no Python, no child process.
 //   2. NtgCallsVoiceCall — dlopen() of a real libntgcalls.so (the
 //      anonx-cpp pattern: ./lib, /usr/local/lib, /usr/lib, plus
 //      NTGCALLS_LIB), C API from ntgcalls.h. If the .so is absent the
-//      backend reports unavailable instead of pretending.
+//      backend reports unavailable instead of pretending. It can
+//      build a local SDP offer and attach sources, but without an
+//      MTProto session it cannot join on its own — play() says so
+//      honestly.
 //   3. OpusPipeline — the real audio pipeline the refs use, proven
 //      standalone: source (file or URL via yt-dlp) -> ffmpeg -> Opus
 //      48 kHz stereo -> Ogg Opus file AND RTP packets to a UDP sink
-//      (VOICE_RTP_SINK). Used by the bridge for its ffmpeg shell command
-//      and by tests to prove Opus frames flow to a real sink.
+//      (VOICE_RTP_SINK). Used by the TDLib backend for its ffmpeg
+//      shell command and by tests to prove Opus frames flow to a real
+//      sink.
 //
 // The dispatcher still routes all playback through IPC to the vc-*
 // services; the in-process voice path exists for /userbot (assistant join)
@@ -37,6 +39,7 @@
 #include <sys/types.h>
 
 #include "config.hpp"
+#include "ntgcalls.h"  // generated 3.0.5 C header — ntg_instance* is opaque
 #include "tdlib_client.hpp"
 
 namespace parlay {
@@ -59,6 +62,11 @@ public:
                       const std::string& title, bool video = false,
                       int seek_sec = 0, double speed = 1.0,
                       int bass = 0) = 0;
+    // Join the chat's voice call without starting audio (vc.join).
+    // Default: not supported — only backends with an MTProto session
+    // can join (TDLib). Never fakes success: false + lastError() when
+    // the backend cannot join.
+    virtual bool join(int64_t /*chat_id*/) { return false; }
     virtual bool stop(int64_t chat_id) = 0;
     virtual bool pause(int64_t chat_id) = 0;
     virtual bool resume(int64_t chat_id) = 0;
@@ -136,7 +144,7 @@ public:
 
 private:
     void* handle_ = nullptr;
-    uintptr_t ntg_ = 0;
+    ntg_instance* ntg_ = nullptr;
     std::string lib_path_;
     std::string last_error_;
 };
@@ -166,46 +174,6 @@ public:
     static std::string resolveUrl(const std::string& url);
 };
 
-// VoiceBridge: the Telethon + ntgcalls Python bridge as a child process.
-// One child per chat; `play` spawns it, `stop` kills it. The bridge
-// speaks newline-delimited JSON on stdout ({"event": ...}) and exits 0 on
-// a clean stop. See voice_bridge.py.
-class VoiceBridge final : public VoiceCall {
-public:
-    explicit VoiceBridge(const Config& cfg);
-    ~VoiceBridge() override;
-    VoiceBridge(const VoiceBridge&) = delete;
-    VoiceBridge& operator=(const VoiceBridge&) = delete;
-
-    bool play(int64_t chat_id, const std::string& stream_url,
-              const std::string& title, bool video, int seek_sec,
-              double speed, int bass) override;
-    bool stop(int64_t chat_id) override;
-    bool pause(int64_t chat_id) override;
-    bool resume(int64_t chat_id) override;
-    bool mute(int64_t chat_id) override;
-    bool unmute(int64_t chat_id) override;
-    int64_t time(int64_t) override { return -1; }
-    bool available() const override;
-    std::string describe() const override;
-    const char* name() const override { return "voice-bridge"; }
-    std::string lastError() const override { return last_error_; }
-
-    // Assistant joins the chat (no audio): Telethon join via invite link.
-    // Used by /userbot. Returns false + error when no session is set.
-    bool joinChat(int64_t chat_id, const std::string& invite_link,
-                  std::string& error_out);
-
-private:
-    bool spawn(int64_t chat_id, const std::string& stream_url, bool video,
-               int seek_sec, double speed, int bass);
-    const Config& cfg_;
-    std::map<int64_t, pid_t> children_;
-    mutable std::mutex mu_;
-    std::string last_error_;
-    std::string python_;  // voice-venv python, else python3
-};
-
 // TdLibVoiceCall: TDLib 1.8.69 (MTProto signaling) + ntgcalls (WebRTC).
 // Flow (TinaMusic JoinGroupCall, with TDLib in place of Telethon):
 //   authorize (TD_API_ID/TD_API_HASH/TD_SESSION_DIR, TD_PHONE/TD_CODE/
@@ -227,6 +195,7 @@ public:
     bool play(int64_t chat_id, const std::string& stream_url,
               const std::string& title, bool video, int seek_sec,
               double speed, int bass) override;
+    bool join(int64_t chat_id) override;
     bool stop(int64_t chat_id) override;
     bool pause(int64_t chat_id) override;
     bool resume(int64_t chat_id) override;
@@ -257,9 +226,10 @@ private:
 };
 
 // Factory: TDLib when TD_API_ID + TD_API_HASH + TD_SESSION_DIR are set
-// (and libtdjson.so + libntgcalls.so load), else bridge when a session
-// file is configured, else dlopen'd ntgcalls when the .so exists, else
-// UnavailableVoiceCall with the exact reason (never a silent stub).
+// (and libtdjson.so + libntgcalls.so load), else dlopen'd ntgcalls when
+// the .so exists, else UnavailableVoiceCall with the exact reason (never
+// a silent stub). There is no bridge fallback: the voice bridge was
+// deleted in Phase 5 (user order) — ntgcalls is linked in-process.
 std::unique_ptr<VoiceCall> makeVoiceCall(const Config& cfg);
 
 }  // namespace parlay

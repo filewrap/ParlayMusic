@@ -5,15 +5,21 @@
 // Ported (re-implemented, not copied) from refs/Music163bot-Go
 // (internal/bot/handlers_{search,music,lyric}.go, internal/netease).
 // The upstream bot uses the encrypted Music163Api-Go library with an
-// optional MUSIC_U login cookie; this service uses only the public
-// anonymous endpoints, so no login or cookie is needed — and none is
-// stored. Audio recognition (handlers_recognize.go) is NOT ported yet.
+// optional MUSIC_U login cookie; this service supports the same cookie
+// (env NETEASE_MUSIC_U, read once at startup — the value is never
+// logged and is only sent to NetEase hosts). Without it the service
+// runs anonymous and the mirror fallback covers downloads. Audio
+// recognition (handlers_recognize.go) is NOT ported:
+// dropped from scope in Phase 5 (B7), it needs an external fingerprint
+// backend and the ref's flow needs login.
 //
 // Environment:
 //
-//	PORT           HTTP listen port (default 8010)
-//	PARLAY_TOKEN   X-Parlay-Token auth value; empty = allow all (warns)
-//	PARLAY_DL_DIR  download directory (default ./data)
+//	PORT            HTTP listen port (default 8010)
+//	PARLAY_TOKEN    X-Parlay-Token auth value; empty = allow all (warns)
+//	PARLAY_DL_DIR   download directory (default ./data)
+//	NETEASE_MUSIC_U optional MUSIC_U login cookie value (not a
+//	                "MUSIC_U=" pair); unset = anonymous-only
 package main
 
 import (

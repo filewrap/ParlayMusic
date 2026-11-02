@@ -146,6 +146,24 @@ func randomDeviceID() string {
 	return string(b)
 }
 
+// eapiCookie builds the Cookie header for eapi calls, following
+// utils/request.go: with a MUSIC_U login cookie it carries MUSIC_U;
+// without one it carries the constant anonymous MUSIC_A value (a public
+// constant from the open-source library, not a user credential). The
+// cookie value itself is never logged.
+func eapiCookie(musicU string) string {
+	if musicU != "" {
+		return fmt.Sprintf("deviceId=%s; appver=9.3.40; buildver=%s; resolution=1920x1080; os=Android; MUSIC_U=%s",
+			randomDeviceID(),
+			strconv.FormatInt(time.Now().Unix(), 10),
+			musicU)
+	}
+	return fmt.Sprintf("deviceId=%s; appver=9.3.40; buildver=%s; resolution=1920x1080; os=Android; MUSIC_A=%s",
+		randomDeviceID(),
+		strconv.FormatInt(time.Now().Unix(), 10),
+		defaultMusicA)
+}
+
 // eapiRequest performs one eapi call: POST the encrypted params envelope to
 // the /eapi/... URL and returns the (plaintext) JSON body. It mirrors
 // utils.CreateNewRequest + utils.ApiRequest, with the EapiRequest decrypt
@@ -158,11 +176,7 @@ func (c *Client) eapiRequest(path, rawURL, jsonBody string) ([]byte, error) {
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("User-Agent", eapiUserAgent)
-	cookie := fmt.Sprintf("deviceId=%s; appver=9.3.40; buildver=%s; resolution=1920x1080; os=Android; MUSIC_A=%s",
-		randomDeviceID(),
-		strconv.FormatInt(time.Now().Unix(), 10),
-		defaultMusicA)
-	req.Header.Set("Cookie", cookie)
+	req.Header.Set("Cookie", eapiCookie(c.musicU))
 
 	resp, err := c.http.Do(req)
 	if err != nil {

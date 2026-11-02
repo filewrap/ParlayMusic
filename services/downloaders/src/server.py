@@ -5,9 +5,11 @@ Routes (contracts/ipc.json, transport: HTTP/1.1 + JSON):
   POST /v1/download/youtube           {query, requested_by}
   POST /v1/download/spotify           {url, requested_by}
   POST /v1/download/spotify-playlist  {url, mode: zip|files, requested_by}
+  POST /v1/spotify/collection         {url} -> {api, kind, name, tracks, truncated}
   POST /v1/download/deezer            {query|url, requested_by}
   POST /v1/download/tiktok            {url, requested_by}
   POST /v1/download/navidrome         {query|url, requested_by}
+  POST /v1/download/soulseek          {query|artist+title|album, requested_by}
   POST /v1/search                     {query, source, limit}
 
 Envelopes: success {ok:true, data:{...}}; error {ok:false,
@@ -35,10 +37,12 @@ ROUTES = {
     ("POST", "/v1/download/youtube"): providers.youtube_download,
     ("POST", "/v1/download/spotify"): providers.spotify_download,
     ("POST", "/v1/download/spotify-playlist"): providers.spotify_playlist_download,
+    ("POST", "/v1/spotify/collection"): providers.spotify_collection,
     ("POST", "/v1/search"): providers.search,
     ("POST", "/v1/download/deezer"): providers.PROVIDERS["deezer"]["download"],
     ("POST", "/v1/download/tiktok"): providers.PROVIDERS["tiktok"]["download"],
     ("POST", "/v1/download/navidrome"): providers.PROVIDERS["navidrome"]["download"],
+    ("POST", "/v1/download/soulseek"): providers.PROVIDERS["soulseek"]["download"],
 }
 
 

@@ -14,8 +14,12 @@
 //! contract (`contracts/ipc.json` `vc.*`): play/pause/resume/skip/stop/
 //! seek, queue add/remove/clear/list, now-playing, per-chat state,
 //! in-memory + JSON-file persistence (`data/vc-state.json`), a 1-second
-//! auto-advance ticker, yt-dlp subprocess resolve when yt-dlp is on PATH,
-//! URL/ID pattern resolve otherwise, and — new in Phase 4 — a real
+//! auto-advance ticker, yt-dlp subprocess resolve (`ytdlp_bin()`: PATH,
+//! then the downloaders venv; android-player-client retry on YouTube's
+//! bot check) — and no pattern/placeholder fallback: a query yt-dlp
+//! cannot resolve is `engine_unavailable` (HTTP 502), never a fake
+//! track (Phase 5, A9). Unknown-duration tracks (duration_sec 0)
+//! never auto-advance; and — new in Phase 4 — a real
 //! download path (each track's audio is downloaded to a local mp3 with
 //! yt-dlp + ffmpeg before it starts, ParvatiMusic `play.rs::RealSink`),
 //! loop count (`/loop`, ParvatiMusic `room.rs::loop_n`, 0..=10),
@@ -27,7 +31,9 @@
 //! Voice transport is REAL too (see `voice.rs`): an Opus/RTP pipeline
 //! (ffmpeg -> libopus 48 kHz stereo -> Ogg Opus file + RTP packets,
 //! packet count proven by parsing the RTP file) and a TDLib-join client
-//! (ntgcalls local offer + voice_bridge.py Telethon join). In this
+//! (ntgcalls local offer; no MTProto join in-process — the old
+//! voice_bridge.py Telethon join was deleted in Phase 5, join goes
+//! through the core-cpp TDLib backend). In this
 //! sandbox the live join is blocked — no MTProto session/credentials,
 //! UDP sendto EPERM even to loopback — so now-playing `voice` reports
 //! `"opus-rtp-ready"` once the pipeline is proven, or
@@ -39,16 +45,20 @@ mod voice;
 
 use common::*;
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use voice::RealVoiceCall;
 
 const SERVICE: &str = "vc-rust";
 const STATE_FILE: &str = "vc-state.json";
-/// Placeholder length for tracks whose real duration is unknown
-/// (pattern resolve, URL resolve). The ticker auto-advances on it.
-const DEFAULT_DURATION_SEC: i64 = 180;
+/// Duration for a track whose real duration is unknown: 0. The ticker
+/// never auto-advances a 0-duration track (see `due_for_advance`) —
+/// it plays until skipped or stopped. There is deliberately no fake
+/// duration any more (A9): the old 180 s placeholder made the ticker
+/// advance a track nobody had resolved, and hid resolve failures from
+/// the core's engine fail-over.
 
 // ---------------------------------------------------------------- types ---
 
@@ -258,7 +268,9 @@ fn track_from_json(v: &Json) -> Option<Track> {
         artist: jstr(v, "artist").unwrap_or_default(),
         source: jstr(v, "source").unwrap_or_else(|| "youtube".to_string()),
         url: jstr(v, "url").unwrap_or_default(),
-        duration_sec: ji64(v, "duration_sec").unwrap_or(DEFAULT_DURATION_SEC),
+        // A persisted track without a duration has an UNKNOWN duration
+        // (0) — never a fake one. The ticker never auto-advances it.
+        duration_sec: ji64(v, "duration_sec").unwrap_or(0),
         resolved_by: jstr(v, "resolved_by").unwrap_or_else(|| "client".to_string()),
         file_path: jstr(v, "file_path"),
         downloaded: v.get("downloaded").and_then(|x| x.as_bool()).unwrap_or(false),
@@ -299,7 +311,7 @@ fn room_json(r: &Room) -> Json {
         ("paused".into(), Json::Bool(r.paused)),
         ("position_sec".into(), Json::Num(r.position_sec as f64)),
         ("volume".into(), Json::Num(r.volume as f64)),
-        ("loop_n".into(), Json::Num(r.loop_n as f64)),
+        ("loop".into(), Json::Num(r.loop_n as f64)),
         ("shuffle".into(), Json::Bool(r.shuffle)),
         ("autoplay".into(), Json::Bool(r.autoplay)),
         (
@@ -335,7 +347,7 @@ fn room_from_json(v: &Json) -> Option<Room> {
         paused: v.get("paused").and_then(|x| x.as_bool()).unwrap_or(false),
         position_sec: ji64(v, "position_sec").unwrap_or(0),
         volume: ji64(v, "volume").unwrap_or(100),
-        loop_n: ji64(v, "loop_n").unwrap_or(0),
+        loop_n: ji64(v, "loop").or_else(|| ji64(v, "loop_n")).unwrap_or(0),
         shuffle: v.get("shuffle").and_then(|x| x.as_bool()).unwrap_or(false),
         autoplay: v
             .get("autoplay")
@@ -409,8 +421,9 @@ fn load_state() -> State {
 ///
 /// Joining a Telegram voice chat needs a live MTProto session plus the
 /// ntgcalls WebRTC library. The real implementation is `RealVoiceCall`
-/// (`voice.rs`): ffmpeg Opus/RTP pipeline + ntgcalls local offer +
-/// voice_bridge.py (Telethon) join client. It reports the exact
+/// (`voice.rs`): ffmpeg Opus/RTP pipeline + ntgcalls local offer; there
+/// is no MTProto join client in-process (voice_bridge.py was deleted in
+/// Phase 5 — join goes through the core-cpp TDLib backend). It reports the exact
 /// failure when the backend is unavailable (no session/credentials,
 /// UDP EPERM) and never claims `joined:true` without a real join.
 /// Playback state still advances on the ticker; the queue flow works
@@ -428,13 +441,323 @@ static VOICE: LazyLock<RealVoiceCall> = LazyLock::new(RealVoiceCall::new);
 
 // ------------------------------------------------------------ resolve ---
 
-fn fnv_hex(s: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+/// Run yt-dlp `-j` for one target (a watch URL or a `ytsearch1:`
+/// query) and return the parsed info object, or None. Uses
+/// `ytdlp_bin()` (PATH, then the downloaders venv) so resolve works
+/// wherever the download path already works. Retries once with the
+/// android player client when YouTube answers its bot check — the
+/// same retry as `download_audio` and the downloaders service; no
+/// cookies or credentials.
+///
+/// `-j` (not `--dump-single-json`): for a search it prints one JSON
+/// object per line (JSONL), each a real video; `--dump-single-json`
+/// on a search returns a playlist wrapper whose `id` is the query
+/// string and which has no duration — the old code read that wrapper
+/// and masked the missing duration with the fake 180. The first
+/// object is taken either way.
+fn ytdlp_info(target: &str) -> Option<Json> {
+    let ytdlp = ytdlp_bin()?;
+    let run = |extra: &[&str]| -> Option<std::process::Output> {
+        let mut cmd = Command::new("timeout");
+        cmd.arg("20")
+            .arg(&ytdlp)
+            .arg("-j")
+            .arg("--no-playlist")
+            .arg("--no-warnings");
+        for e in extra {
+            cmd.arg(e);
+        }
+        cmd.arg(target);
+        cmd.output().ok()
+    };
+    let mut out = run(&[])?;
+    if !out.status.success() && is_bot_check(&String::from_utf8_lossy(&out.stderr)) {
+        if let Some(retry) = run(&["--extractor-args", "youtube:player_client=android"]) {
+            out = retry;
+        }
     }
-    format!("{:016x}", h)
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim();
+    if let Some(v) = parse_json(text) {
+        return Some(v);
+    }
+    parse_json(text.lines().next()?.trim())
+}
+
+/// Real metadata resolve for a YouTube watch URL (real title,
+/// uploader, duration, stream URL — never a placeholder).
+fn resolve_youtube_url(url: &str, id: &str) -> Option<Track> {
+    let v = ytdlp_info(url)?;
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or(id)
+        .to_string();
+    let artist = v
+        .get("uploader")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    // No duration in the info means unknown (0), never a fake value;
+    // the ticker never auto-advances such a track.
+    let duration = v
+        .get("duration")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let page_url = v
+        .get("webpage_url")
+        .and_then(|x| x.as_str())
+        .unwrap_or(url)
+        .to_string();
+    Some(Track {
+        id: id.to_string(),
+        title,
+        artist,
+        source: "youtube".to_string(),
+        url: page_url,
+        duration_sec: duration,
+        resolved_by: "yt-dlp".to_string(),
+        file_path: None,
+        downloaded: false,
+        download_failed: false,
+    })
+}
+
+/// Real metadata resolve via yt-dlp for a free-text query
+/// (`ytsearch1:<query>`); returns None when yt-dlp is missing, times
+/// out, or errors — the caller then reports engine_unavailable.
+fn resolve_via_ytdlp(query: &str) -> Option<Track> {
+    let v = ytdlp_info(&format!("ytsearch1:{}", query))?;
+    let id = v.get("id")?.as_str()?.to_string();
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or(query)
+        .to_string();
+    let artist = v
+        .get("uploader")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let duration = v
+        .get("duration")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let url = v
+        .get("webpage_url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(Track {
+        id,
+        title,
+        artist,
+        source: "youtube".to_string(),
+        url,
+        duration_sec: duration,
+        resolved_by: "yt-dlp".to_string(),
+        file_path: None,
+        downloaded: false,
+        download_failed: false,
+    })
+}
+
+// ------------------------------------------------------- Spotify API ---
+// Spotify track resolve via the Web API, client-credentials flow
+// (env-gated, Phase 5 scope update): SPOTIFY_CLIENT_ID +
+// SPOTIFY_CLIENT_SECRET are the only missing piece — without them the
+// resolve fails honestly naming the vars; with them a Spotify URL
+// resolves to real metadata (title / artists / duration_ms).
+//
+// std-only, so the API is called through the `curl` subprocess (like
+// yt-dlp): credentials and the bearer token go on stdin via
+// `--config -`, never on the argv, so the secret never shows in a
+// process listing. The access token is cached in memory until
+// expiry (same flow as vc-ts spotifySearchTracks).
+//
+// Sandbox note: the egress proxy rejects the token endpoint
+// (accounts.spotify.com/api/token -> 502 "token refresh not allowed
+// through egress proxy"), while api.spotify.com itself answers. The
+// live path therefore needs the user's host (open egress) + the
+// creds; from here only the honest-failure path is provable.
+
+/// Spotify client credentials from the environment, or None.
+fn spotify_creds() -> Option<(String, String)> {
+    let id = std::env::var("SPOTIFY_CLIENT_ID").ok()?;
+    let secret = std::env::var("SPOTIFY_CLIENT_SECRET").ok()?;
+    if id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    Some((id, secret))
+}
+
+static SPOTIFY_TOKEN: LazyLock<Mutex<Option<(String, std::time::Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Escape a value for a curl --config string ("...").
+fn curl_config_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Run curl with a config fed on stdin and return the parsed JSON
+/// body, or None on any failure (curl missing, non-zero exit,
+/// unparsable output). `config_lines` are raw `key = value` lines.
+fn curl_json(config_lines: &[String], url: &str) -> Option<Json> {
+    let mut child = Command::new("curl")
+        .arg("-s")
+        .arg("-S")
+        .arg("--max-time")
+        .arg("15")
+        .arg("--config")
+        .arg("-")
+        .arg(url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let config = config_lines.join("\n") + "\n";
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(config.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_json(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Spotify client-credentials access token, cached until expiry.
+fn spotify_client_token() -> Option<String> {
+    {
+        let guard = SPOTIFY_TOKEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((token, expires_at)) = guard.as_ref() {
+            if std::time::Instant::now() < *expires_at {
+                return Some(token.clone());
+            }
+        }
+    }
+    let (id, secret) = spotify_creds()?;
+    let v = curl_json(
+        &[
+            "request = \"POST\"".to_string(),
+            "data = \"grant_type=client_credentials\"".to_string(),
+            format!("user = {}", curl_config_quote(&format!("{}:{}", id, secret))),
+        ],
+        "https://accounts.spotify.com/api/token",
+    )?;
+    let token = v.get("access_token")?.as_str()?.to_string();
+    let expires_in = v.get("expires_in").and_then(|x| x.as_i64()).unwrap_or(3600);
+    let expires_at = std::time::Instant::now()
+        + Duration::from_secs(expires_in.saturating_sub(60).max(0) as u64);
+    let mut guard = SPOTIFY_TOKEN.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some((token.clone(), expires_at));
+    Some(token)
+}
+
+/// Pure mapping: a Spotify track object -> Track. Separated out so
+/// tests can exercise the mapping without network or credentials.
+fn spotify_track_from_json(v: &Json, id: &str) -> Option<Track> {
+    let title = v.get("name")?.as_str()?.to_string();
+    let artists = match v.get("artists") {
+        Some(Json::Arr(items)) => {
+            let names: Vec<String> = items
+                .iter()
+                .filter_map(|a| a.get("name")?.as_str().map(|s| s.to_string()))
+                .collect();
+            names.join(", ")
+        }
+        _ => String::new(),
+    };
+    let duration = v
+        .get("duration_ms")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0)
+        .max(0)
+        / 1000;
+    let url = v
+        .get("external_urls")
+        .and_then(|u| u.get("spotify"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(Track {
+        id: id.to_string(),
+        title,
+        artist: artists,
+        source: "spotify".to_string(),
+        url,
+        duration_sec: duration,
+        resolved_by: "spotify-api".to_string(),
+        file_path: None,
+        downloaded: false,
+        download_failed: false,
+    })
+}
+
+/// Resolve a Spotify track id via the Web API. Err when the creds
+/// are missing (names them), when the token exchange fails, or when
+/// the track lookup fails — all surfaced as engine_unavailable.
+fn resolve_spotify_track(id: &str) -> Result<Track, String> {
+    if spotify_creds().is_none() {
+        return Err(
+            "Spotify track cannot be resolved: SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET are not set (client-credentials flow)"
+                .to_string(),
+        );
+    }
+    let token = spotify_client_token().ok_or_else(|| {
+        "Spotify token exchange failed (accounts.spotify.com/api/token unreachable or rejected)".to_string()
+    })?;
+    let url = format!("https://api.spotify.com/v1/tracks/{}", id);
+    let v = curl_json(
+        &[format!(
+            "header = {}",
+            curl_config_quote(&format!("Authorization: Bearer {}", token))
+        )],
+        &url,
+    )
+    .ok_or_else(|| format!("Spotify track lookup failed for {}", id))?;
+    spotify_track_from_json(&v, id)
+        .ok_or_else(|| format!("Spotify returned no usable track for {}", id))
+}
+
+/// Resolve a play query to a Track.
+///
+/// Order: YouTube URL/ID (real yt-dlp resolve of the watch URL) ->
+/// Spotify URL (real Spotify Web API resolve when
+/// SPOTIFY_CLIENT_ID/SECRET are set, honest error naming them when
+/// not) -> yt-dlp subprocess (real metadata for a free-text query).
+/// There is no pattern/placeholder fallback any more (A9): a query
+/// yt-dlp cannot resolve is an Err, surfaced by the caller as
+/// `engine_unavailable` (HTTP 502) so the core can fail over to
+/// another engine — a fake track (invented title, fake 180 s
+/// duration) would sit in the queue forever and hide the failure.
+fn resolve_query(query: &str) -> Result<Track, String> {
+    let q = query.trim();
+    if let Some(id) = yt_id_from_url(q) {
+        let url = format!("https://www.youtube.com/watch?v={}", id);
+        return resolve_youtube_url(&url, &id)
+            .ok_or_else(|| format!("yt-dlp resolve failed for YouTube URL {}", url));
+    }
+    if is_yt_id(q) {
+        let url = format!("https://www.youtube.com/watch?v={}", q);
+        return resolve_youtube_url(&url, q)
+            .ok_or_else(|| format!("yt-dlp resolve failed for YouTube id {}", q));
+    }
+    if let Some(id) = spotify_id_from_url(q) {
+        return resolve_spotify_track(&id);
+    }
+    resolve_via_ytdlp(q).ok_or_else(|| {
+        format!(
+            "yt-dlp resolve failed for query {:?} (yt-dlp missing, or YouTube unreachable/gated)",
+            q
+        )
+    })
 }
 
 fn is_yt_id(s: &str) -> bool {
@@ -502,136 +825,15 @@ fn spotify_id_from_url(q: &str) -> Option<String> {
     None
 }
 
-/// Real metadata resolve via yt-dlp, when it is installed. Runs
-/// `timeout 20 yt-dlp --dump-single-json ytsearch1:<query>`; returns
-/// None when yt-dlp is missing, times out, or errors — the caller then
-/// falls back to the honest pattern resolve below.
-fn resolve_via_ytdlp(query: &str) -> Option<Track> {
-    let out = Command::new("timeout")
-        .arg("20")
-        .arg("yt-dlp")
-        .arg("--dump-single-json")
-        .arg("--no-playlist")
-        .arg("--no-warnings")
-        .arg(format!("ytsearch1:{}", query))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let v = parse_json(text.trim())?;
-    let id = v.get("id")?.as_str()?.to_string();
-    let title = v
-        .get("title")
-        .and_then(|x| x.as_str())
-        .unwrap_or(query)
-        .to_string();
-    let artist = v
-        .get("uploader")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let duration = v
-        .get("duration")
-        .and_then(|x| x.as_i64())
-        .unwrap_or(DEFAULT_DURATION_SEC)
-        .max(0);
-    let url = v
-        .get("webpage_url")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some(Track {
-        id,
-        title,
-        artist,
-        source: "youtube".to_string(),
-        url,
-        duration_sec: duration,
-        resolved_by: "yt-dlp".to_string(),
-        file_path: None,
-        downloaded: false,
-        download_failed: false,
-    })
-}
-
-/// Resolve a play query to a Track.
-///
-/// Order: YouTube URL/ID pattern -> Spotify URL pattern -> yt-dlp
-/// subprocess (real metadata) -> degraded pattern resolve. The pattern
-/// fallback is honest about itself: `resolved_by:"pattern"`, a
-/// placeholder duration, and no fake stream URL — the track still
-/// enters the queue and the ticker still advances it, so the core can
-/// exercise the full flow without a network resolver.
-fn resolve_query(query: &str) -> Track {
-    let q = query.trim();
-    if let Some(id) = yt_id_from_url(q) {
-        return Track {
-            id: id.clone(),
-            title: format!("YouTube video {}", id),
-            artist: String::new(),
-            source: "youtube".to_string(),
-            url: format!("https://www.youtube.com/watch?v={}", id),
-            duration_sec: DEFAULT_DURATION_SEC,
-            resolved_by: "url-pattern".to_string(),
-            file_path: None,
-            downloaded: false,
-            download_failed: false,
-        };
-    }
-    if is_yt_id(q) {
-        return Track {
-            id: q.to_string(),
-            title: format!("YouTube video {}", q),
-            artist: String::new(),
-            source: "youtube".to_string(),
-            url: format!("https://www.youtube.com/watch?v={}", q),
-            duration_sec: DEFAULT_DURATION_SEC,
-            resolved_by: "url-pattern".to_string(),
-            file_path: None,
-            downloaded: false,
-            download_failed: false,
-        };
-    }
-    if let Some(id) = spotify_id_from_url(q) {
-        return Track {
-            id: id.clone(),
-            title: format!("Spotify track {}", id),
-            artist: String::new(),
-            source: "spotify".to_string(),
-            url: q.to_string(),
-            duration_sec: DEFAULT_DURATION_SEC,
-            resolved_by: "url-pattern".to_string(),
-            file_path: None,
-            downloaded: false,
-            download_failed: false,
-        };
-    }
-    if let Some(t) = resolve_via_ytdlp(q) {
-        return t;
-    }
-    Track {
-        id: format!("pattern-{}", fnv_hex(q)),
-        title: q.to_string(),
-        artist: String::new(),
-        source: "youtube".to_string(),
-        url: String::new(),
-        duration_sec: DEFAULT_DURATION_SEC,
-        resolved_by: "pattern".to_string(),
-        file_path: None,
-        downloaded: false,
-        download_failed: false,
-    }
-}
-
 // ----------------------------------------------------------- download ---
 
-/// Locate the yt-dlp binary: $YTDLP_BIN, else `yt-dlp` on PATH, else the
+/// Locate the yt-dlp binary: $YT_DLP, else `yt-dlp` on PATH, else the
 /// downloaders service venv (`services/downloaders/.venv/bin/yt-dlp`,
 /// probed relative to the exe dir and the working directory).
+/// Name unified with vc-ts (`$YT_DLP`, Phase 5 Worker E) — the old
+/// $YTDLP_BIN is no longer read.
 fn ytdlp_bin() -> Option<String> {
-    if let Ok(p) = std::env::var("YTDLP_BIN") {
+    if let Ok(p) = std::env::var("YT_DLP") {
         if !p.is_empty() && std::path::Path::new(&p).exists() {
             return Some(p);
         }
@@ -876,7 +1078,7 @@ fn first_unplayed_entry(
         let duration = e
             .get("duration")
             .and_then(|x| x.as_i64())
-            .unwrap_or(DEFAULT_DURATION_SEC)
+            .unwrap_or(0)
             .max(0);
         return Some(Track {
             id: id.clone(),
@@ -940,7 +1142,7 @@ fn now_playing_json(room: &Room) -> Json {
         ),
         ("queue".into(), queue_json(&room.queue)),
         ("voice".into(), Json::Str(VOICE.voice_string(room.chat_id))),
-        ("loop_n".into(), Json::Num(room.loop_n as f64)),
+        ("loop".into(), Json::Num(room.loop_n as f64)),
         ("shuffle".into(), Json::Bool(room.shuffle)),
         ("autoplay".into(), Json::Bool(room.autoplay)),
     ])
@@ -1315,10 +1517,15 @@ fn handle(state: &Arc<Mutex<State>>, req: &Request) -> (u16, String) {
         _ => return (400, err("bad_request", "invalid JSON body")),
     };
     // /play resolves outside the state lock: resolve_query can run
-    // yt-dlp for seconds and must not block other chats.
+    // yt-dlp for seconds and must not block other chats. A failed
+    // resolve is engine_unavailable (HTTP 502) — no placeholder track
+    // is ever queued (A9).
     let pre_track = if req.path == "/v1/play" {
         match body.get("query").and_then(|v| v.as_str()) {
-            Some(q) if !q.trim().is_empty() => Some(resolve_query(q)),
+            Some(q) if !q.trim().is_empty() => match resolve_query(q) {
+                Ok(t) => Some(t),
+                Err(e) => return (502, err("engine_unavailable", &e)),
+            },
             _ => None,
         }
     } else {
@@ -1357,6 +1564,23 @@ fn handle(state: &Arc<Mutex<State>>, req: &Request) -> (u16, String) {
 /// is fetched from the last track (ParvatiMusic `monitor::advance_locked`).
 /// Downloads happen outside the state lock; state is persisted only on
 /// a track change, not every second.
+/// Pure advance decision, extracted for tests: a room only advances
+/// when its audio is ready (downloaded, or its download failed and
+/// the room keeps playing state-wise), it is not paused, and its
+/// track has a KNOWN duration (duration_sec > 0) that the position
+/// has reached. Unknown-duration tracks (duration_sec 0 — e.g. an
+/// autoplay mix entry without a duration, or a client-supplied track
+/// without one) never auto-advance: they play until skipped or
+/// stopped. (A9: no fake durations, and the ticker must not advance
+/// on an unknown duration.)
+fn due_for_advance(room: &Room) -> bool {
+    match &room.current {
+        Some(t) if t.downloaded || t.download_failed => {}
+        _ => return false,
+    }
+    !room.paused && room.duration() > 0 && room.position_sec >= room.duration()
+}
+
 fn ticker(state: Arc<Mutex<State>>) {
     loop {
         std::thread::sleep(Duration::from_secs(1));
@@ -1378,9 +1602,9 @@ fn ticker(state: Arc<Mutex<State>>) {
                 };
                 if ready && !room.paused && room.duration() > 0 {
                     room.position_sec += 1;
-                    if room.position_sec >= room.duration() {
-                        advancing.push(*chat_id);
-                    }
+                }
+                if due_for_advance(room) {
+                    advancing.push(*chat_id);
                 }
             }
             for chat_id in advancing {
@@ -1680,5 +1904,222 @@ mod tests {
         let pick = pick.unwrap();
         assert_ne!(pick.id, last.id);
         eprintln!("live autoplay pick: {} — {}", pick.id, pick.title);
+    }
+
+    // ---- Phase 5 (A9): no placeholder tracks, no fake durations ----
+
+    /// A YouTube URL resolves to real metadata (title, real duration)
+    /// or fails honestly — never a fake "YouTube video <id>" track.
+    /// Tolerant of YouTube gating the sandbox egress IP at test time:
+    /// then the error must name yt-dlp.
+    #[test]
+    fn youtube_url_resolve_is_real_or_honest_error() {
+        match resolve_query("https://www.youtube.com/watch?v=dQw4w9WgXcQ") {
+            Ok(t) => {
+                assert_eq!(t.id, "dQw4w9WgXcQ");
+                assert!(t.title.contains("Rick Astley"), "real title, got {:?}", t.title);
+                assert!(t.duration_sec > 0, "real duration, got {}", t.duration_sec);
+                assert_eq!(t.resolved_by, "yt-dlp");
+                assert_ne!(t.duration_sec, 180, "the old fake 180 s must be gone");
+            }
+            Err(e) => assert!(e.contains("yt-dlp"), "honest error names yt-dlp: {}", e),
+        }
+    }
+
+    #[test]
+    fn bare_youtube_id_resolve_is_real_or_honest_error() {
+        match resolve_query("dQw4w9WgXcQ") {
+            Ok(t) => {
+                assert_eq!(t.id, "dQw4w9WgXcQ");
+                assert!(t.duration_sec > 0);
+                assert_eq!(t.resolved_by, "yt-dlp");
+            }
+            Err(e) => assert!(e.contains("yt-dlp"), "honest error names yt-dlp: {}", e),
+        }
+    }
+
+    /// A Spotify URL has no metadata source in vc-rust: it is an
+    /// honest error, not a fake "Spotify track <id>" placeholder.
+    #[test]
+    fn spotify_url_resolve_is_engine_unavailable() {
+        let err = resolve_query("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC")
+            .expect_err("a Spotify URL must not resolve to a fake track");
+        assert!(err.contains("Spotify"), "error names Spotify: {}", err);
+    }
+
+    /// Without client credentials the Spotify error names exactly
+    /// which env vars are missing (env-gated path, Phase 5 scope
+    /// update). The vars are restored afterwards; no other test reads
+    /// them, so the brief clear window is benign.
+    #[test]
+    fn spotify_track_missing_creds_names_the_vars() {
+        let saved_id = std::env::var("SPOTIFY_CLIENT_ID").ok();
+        let saved_secret = std::env::var("SPOTIFY_CLIENT_SECRET").ok();
+        unsafe {
+            std::env::remove_var("SPOTIFY_CLIENT_ID");
+            std::env::remove_var("SPOTIFY_CLIENT_SECRET");
+        }
+        let err = resolve_query("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC")
+            .expect_err("no creds -> no resolve");
+        assert!(err.contains("SPOTIFY_CLIENT_ID"), "error names the id var: {}", err);
+        assert!(err.contains("SPOTIFY_CLIENT_SECRET"), "error names the secret var: {}", err);
+        unsafe {
+            match saved_id {
+                Some(v) => std::env::set_var("SPOTIFY_CLIENT_ID", v),
+                None => std::env::remove_var("SPOTIFY_CLIENT_ID"),
+            }
+            match saved_secret {
+                Some(v) => std::env::set_var("SPOTIFY_CLIENT_SECRET", v),
+                None => std::env::remove_var("SPOTIFY_CLIENT_SECRET"),
+            }
+        }
+    }
+
+    /// The Spotify track mapping is pure: title, comma-joined
+    /// artists, duration_ms -> seconds, spotify URL. No network.
+    #[test]
+    fn spotify_track_json_mapping() {
+        let v = parse_json(
+            r#"{"name":"Never Gonna Give You Up","artists":[{"name":"Rick Astley"}],"duration_ms":213000,"external_urls":{"spotify":"https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"}}"#,
+        )
+        .unwrap();
+        let t = spotify_track_from_json(&v, "4uLU6hMCjMI75M1A2tKUQC").expect("maps");
+        assert_eq!(t.id, "4uLU6hMCjMI75M1A2tKUQC");
+        assert_eq!(t.title, "Never Gonna Give You Up");
+        assert_eq!(t.artist, "Rick Astley");
+        assert_eq!(t.duration_sec, 213);
+        assert_eq!(t.source, "spotify");
+        assert_eq!(t.resolved_by, "spotify-api");
+        assert_eq!(t.url, "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC");
+        // Multi-artist join + missing duration -> 0 (unknown).
+        let v2 = parse_json(
+            r#"{"name":"Duet","artists":[{"name":"A"},{"name":"B"}],"external_urls":{}}"#,
+        )
+        .unwrap();
+        let t2 = spotify_track_from_json(&v2, "x").expect("maps");
+        assert_eq!(t2.artist, "A, B");
+        assert_eq!(t2.duration_sec, 0);
+    }
+
+    /// Live Spotify resolve: only runs when the creds are actually
+    /// set (user-supplied, D6). Skips otherwise — the missing-creds
+    /// path above is the provable part from here, and the sandbox
+    /// egress proxy additionally rejects the token endpoint, so the
+    /// live path needs the user's host too.
+    #[test]
+    fn live_spotify_track_resolve() {
+        if std::env::var("SPOTIFY_CLIENT_ID").is_err()
+            || std::env::var("SPOTIFY_CLIENT_SECRET").is_err()
+        {
+            eprintln!("skipping live Spotify resolve (set SPOTIFY_CLIENT_ID/SECRET)");
+            return;
+        }
+        match resolve_query("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC") {
+            Ok(t) => {
+                assert_eq!(t.id, "4uLU6hMCjMI75M1A2tKUQC");
+                assert!(t.title.contains("Rick Astley") || t.title.contains("Never Gonna Give You Up"), "real title, got {:?}", t.title);
+                assert!(t.duration_sec > 0, "real duration, got {}", t.duration_sec);
+                assert_eq!(t.source, "spotify");
+                eprintln!("live Spotify resolve OK: {} — {} ({} s)", t.id, t.title, t.duration_sec);
+            }
+            Err(e) => {
+                // Honest failure (e.g. token endpoint rejected): the
+                // error must say what failed, never fake a track.
+                assert!(e.contains("Spotify"), "error names Spotify: {}", e);
+                eprintln!("live Spotify resolve failed honestly: {}", e);
+            }
+        }
+    }
+
+    /// A free-text query never yields a pattern placeholder: either a
+    /// real yt-dlp track (real video id, real duration) or an honest
+    /// error. The id assertion is the point: `--dump-single-json` on
+    /// a search used to return the playlist wrapper whose `id` was
+    /// the query string itself.
+    #[test]
+    fn free_text_query_never_returns_a_fake_track() {
+        match resolve_query("rick astley never gonna give you up") {
+            Ok(t) => {
+                assert!(!t.id.starts_with("pattern-"), "no pattern id: {}", t.id);
+                assert_eq!(t.id, "dQw4w9WgXcQ", "first ytsearch hit, got {}", t.id);
+                assert!(t.duration_sec > 0, "real duration, got {}", t.duration_sec);
+                assert_eq!(t.resolved_by, "yt-dlp");
+            }
+            Err(e) => assert!(e.contains("yt-dlp"), "honest error names yt-dlp: {}", e),
+        }
+    }
+
+    /// The ticker decision: unknown-duration tracks never advance,
+    /// however far past their (unknown) end the position is.
+    #[test]
+    fn due_for_advance_never_fires_for_unknown_duration() {
+        let mut st = State::default();
+        let chat_id = 42;
+        let room = st.room_mut(chat_id);
+        let mut t = mk_track("x");
+        t.duration_sec = 0; // unknown duration
+        t.downloaded = true;
+        room.current = Some(t);
+        room.position_sec = 9999; // far "past the end"
+        assert!(!due_for_advance(&st.rooms[&chat_id]), "duration 0 must never advance");
+
+        // Same room with a known duration: advances at the end.
+        st.rooms.get_mut(&chat_id).unwrap().current.as_mut().unwrap().duration_sec = 180;
+        st.rooms.get_mut(&chat_id).unwrap().position_sec = 180;
+        assert!(due_for_advance(&st.rooms[&chat_id]), "known duration at end must advance");
+
+        // Paused: no advance even at the end.
+        st.rooms.get_mut(&chat_id).unwrap().paused = true;
+        assert!(!due_for_advance(&st.rooms[&chat_id]), "paused must not advance");
+        st.rooms.get_mut(&chat_id).unwrap().paused = false;
+
+        // Still downloading: no advance even at the end.
+        let cur = st.rooms.get_mut(&chat_id).unwrap().current.as_mut().unwrap();
+        cur.downloaded = false;
+        cur.download_failed = false;
+        assert!(!due_for_advance(&st.rooms[&chat_id]), "downloading must not advance");
+    }
+
+    /// A persisted track without a duration restores as unknown (0),
+    /// never the old fake 180.
+    #[test]
+    fn track_from_json_missing_duration_defaults_zero() {
+        let v = parse_json(r#"{"id":"x","title":"T","source":"youtube"}"#).unwrap();
+        let t = track_from_json(&v).expect("track parses");
+        assert_eq!(t.duration_sec, 0);
+    }
+
+    /// An autoplay mix entry without a duration yields a 0-duration
+    /// pick (unknown, never auto-advanced) — not the old fake 180.
+    #[test]
+    fn autoplay_pick_entry_without_duration_is_zero() {
+        let entries = vec![Json::Obj(vec![
+            ("id".into(), Json::Str("fresh1".into())),
+            ("title".into(), Json::Str("Fresh One".into())),
+        ])];
+        let pick = first_unplayed_entry(&entries, "last-id", &[]).expect("a pick");
+        assert_eq!(pick.id, "fresh1");
+        assert_eq!(pick.duration_sec, 0);
+    }
+
+    /// HTTP surface: /v1/play with an unresolvable query answers 502
+    /// engine_unavailable (Spotify URL) and queues nothing.
+    #[test]
+    fn handle_play_unresolvable_query_is_502_engine_unavailable() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/v1/play".to_string(),
+            query: String::new(),
+            headers: vec![],
+            body: r#"{"chat_id":4242,"query":"https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"}"#.to_string(),
+        };
+        let (status, body) = handle(&state, &req);
+        assert_eq!(status, 502, "body: {}", body);
+        assert!(body.contains("engine_unavailable"), "body: {}", body);
+        assert!(body.contains("Spotify"), "body: {}", body);
+        // Nothing was queued: the room has no playback state.
+        let st = lock(&state);
+        assert!(st.rooms.get(&4242).is_none(), "no room must be created for a failed resolve");
     }
 }

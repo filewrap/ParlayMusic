@@ -24,7 +24,7 @@ PORT=8002 PARLAY_TOKEN=<token> node src/main.js
 # see Lemonic below), LEMONIC_API (base URL, default
 # https://api.lemonic.xyz), SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET
 # (optional — Lemonic search fallback, client-credentials flow)
-# Tests: npm test  (node --test tests/run.js; 24 tests, live network)
+# Tests: npm test  (node --test tests/run.js; 32 tests, live network)
 ```
 
 ## Endpoints
@@ -34,12 +34,15 @@ PORT=8002 PARLAY_TOKEN=<token> node src/main.js
 | GET | `/healthz` | `{ok:true, service:"vc-ts", ...}` — public, no token |
 | POST | `/v1/play` | `{chat_id, query, requested_by}` — plays now, or enqueues if busy. Query: YouTube URL, free text (YouTube), `jiosaavn:<query>`, `jsvn:<id>`, raw `http(s)` audio URL or `radio:<url>` (radio lane, duration 0) |
 | POST | `/v1/pause`, `/v1/resume`, `/v1/skip`, `/v1/stop`, `/v1/seek` | `{chat_id[, position_sec]}` — seek is a contract extra (`vc.seek`) |
+| POST | `/v1/loop` | `{chat_id, count}` — 0–10 remaining replays of the current track (0 = off); the ticker decrements per replay, `/skip` resets it |
+| POST | `/v1/shuffle`, `/v1/autoplay` | `{chat_id, enabled}` — shuffle: queue shuffled on enable + random pop on advance; autoplay: YouTube mix pick when the queue drains |
+| POST | `/v1/autoplay-skip` | `{chat_id}` — autoplay must be on: forces a mix pick now, resets the loop count (400 when autoplay is off, 502 when no pick is available) |
 | POST | `/v1/volume` | `{chat_id, volume}` — 0–200 (remix scale: 100 = 100%) |
 | GET | `/v1/panel?chat_id=` | Live control panel state (remix `panel.ts`): now/next, loop, volume, queue count, buttons with `panel_*` callback_data |
 | POST | `/v1/panel` | `{chat_id, action}` — `shuffle|skip|pause|resume|mute|unmute|volinc|voldec|loop|update`; volinc/voldec step 10 (remix ±1000 on its 0–20000 scale) |
 | POST | `/v1/lyrics` | `{chat_id?, title?, artist?}` — lyrics for the now-playing track (or the given title) via keyless LRCLib; 404 when absent, never faked |
 | POST | `/v1/queue` | `{action: add\|remove\|clear\|list, chat_id, position?, track?, query?}` |
-| GET | `/v1/now-playing?chat_id=` | `{now_playing}` with `engine:"ts"`, `paused`, `position_sec`, `queue`, `volume`, `loop` |
+| GET | `/v1/now-playing?chat_id=` | `{now_playing}` with `engine:"ts"`, `paused`, `position_sec`, `queue`, `volume`, `loop` (integer 0–10), `shuffle`, `autoplay` |
 | POST | `/v1/search` | `{query, source: youtube\|jiosaavn\|lemonic\|all, limit}` — per-source status in `data.sources` |
 | POST | `/v1/lemonic/search` | `{query}` → `{results, via}` — `via` is `lemonic`, `lemonic-keyed`, or `spotify-search` |
 | POST | `/v1/lemonic/download` | `{track_id}` → downloads audio to `data/lemonic/<id>.mp3` |
@@ -84,15 +87,26 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
   404 when absent. Caveat: LRCLib intermittently 503s
   (`ServerOverloaded`), sometimes per-query ("Raabta" 503s while
   "Kesariya" returns 200); the endpoint retries once.
+- **Loop / shuffle / autoplay** (`POST /v1/loop|shuffle|autoplay|
+  autoplay-skip`, contract `vc.*`, vc-go/vc-rust semantics — Phase 5):
+  loop is a 0–10 replay count, not a boolean (the panel toggle sets
+  10/0); shuffle shuffles the queue on enable and pops a random index
+  on advance; autoplay picks from the last track's YouTube mix
+  playlist `RD<video_id>` when the queue drains (mix fetch via yt-dlp,
+  android retry on bot-check, history exclusion capped at 50) and
+  `/autoplay-skip` forces a pick now (400 when autoplay is off, 502
+  when no pick is available). `now-playing` reports `loop` (integer),
+  `shuffle`, `autoplay`. Live-tested: loop 2 → two replays then
+  advance; autoplay-skip + drain both picked real mix tracks.
 - **Live control panel** (`GET/POST /v1/panel`, remix
   `handlers/panel.ts` + `helpers/volume.ts`): now/next text, loop
   flag, volume, queue count, and the same 10 buttons with the same
   `panel_*` callback_data (`shuffle/skip/pause/resume/mute/unmute/
   voldec/volinc/loop/update`). Volume is remix's 0–200 scale;
-  volinc/voldec step 10 (= remix ±1000 on 0–20000). `loop` toggles
-  per-room loop — the ticker restarts the current track instead of
-  advancing. Shuffle reorders the queue in place (remix also
-  re-streams the shuffled head; here the current track keeps playing).
+  volinc/voldec step 10 (= remix ±1000 on 0–20000). `loop` toggles the
+  per-room loop count (10 replays on, 0 off); the ticker restarts the
+  current track instead of advancing while the count lasts. Shuffle
+  also enables shuffle mode (random advance picks).
 - **Radio lane**: a raw `http(s)` audio URL — or `radio:<url>` — plays
   as a `radio` track (`duration_sec: 0`, never auto-advances), no
   yt-dlp involved. YouTube URLs are still detected first and resolve
@@ -118,35 +132,46 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
   (verified); `X-Parlay-Token` header.
 - Queue add (by track object or query) / remove / clear / list,
   pause / resume / seek / skip / stop, bad-request and not-found
-  errors — all verified by the test suite (`npm test`, 24 tests).
+  errors — all verified by the test suite (`npm test`, 32 tests).
 - Voice transport is real (`src/voicecall.js`): ffmpeg Opus/RTP
   pipeline (251 frames / 251 RTP packets on the 5 s proof tone) +
-  ntgcalls local offer + voice-bridge join client. The live join is
-  blocked in the sandbox (no MTProto session, UDP sendto EPERM);
-  now-playing reports `voice:"opus-rtp-ready"` once the pipeline is
-  proven, or `voice:"unavailable:<exact reason>"` — see below.
+  in-process ntgcalls local offer (N-API addon `src/ntg_addon.cc`
+  dlopening the BUILT `libntgcalls.so` — C build done 2026-11-02,
+  3.0.5; `createCall` returns a real 466-byte offer; wheel-probe
+  fallback only when the .so/addon is absent) + honest join failure.
+  The 3.0.5 C API is synchronous (`ntg_create_call` returns
+  `ntg_result` directly); the addon and `createLocalOffer` were
+  rewritten to it, with stop+retry on ntgcalls -202 (a second
+  create_call for the same chat). The live join is blocked in the
+  sandbox (no MTProto client in this service since the voice bridge
+  was deleted in Phase 5, UDP sendto EPERM); now-playing reports
+  `voice:"opus-rtp-ready"` once the pipeline is proven, or
+  `voice:"unavailable:<exact reason>"` — see below.
 
 ## What is stubbed / degraded, and why
 
 - **Live voice joining is blocked in the sandbox**
   (`src/voicecall.js`). Joining a real Telegram group call needs a
-  live MTProto userbot session (`ASSISTANT_SESSION_FILE`, `API_ID`,
-  `API_HASH` — all unset here) and a UDP route to the call (sendto is
+  live MTProto userbot session and a UDP route to the call (sendto is
   EPERM even to loopback). The transport itself is real, not a stub:
   the Opus/RTP pipeline is proven live (ffmpeg encode + RTP file
-  packet count), the ntgcalls wheel builds a real local offer offline,
-  and `join()` drives the same voice_bridge.py core-cpp spawns,
-  reporting the exact failure. Playback state (queue, position,
-  auto-advance) is real; audio reaches a voice chat only after a real
-  join, which is a live-test-time check.
-- **YouTube is flaky from the sandbox**: direct video resolve works,
-  but YouTube intermittently 429s the sandbox egress IP (seen once
-  during setup). When yt-dlp fails, resolve falls back to a **degraded
-  placeholder track** (`yt:<id>` / `query:<hash>`, `duration_sec: 0`,
-  `degraded: true`) so play/queue keep working instead of failing —
-  the placeholder says so in `resolve_note`. Degraded tracks never
-  auto-advance (unknown duration). yt-dlp resolve itself takes
-  6.5–13.7 s per call (measured, network-bound).
+  packet count), the ntgcalls local offer is built in-process (N-API
+  addon over the BUILT `libntgcalls.so`, 3.0.5, wheel-probe fallback
+  only when the .so/addon is absent), and `join()`
+  fails honestly — vc-ts holds no MTProto client since the
+  voice_bridge.py Telethon child was deleted in Phase 5 (user order:
+  ntgcalls is a native library linked in-process, not a server). The
+  MTProto join now lives only in core-cpp's TdLibVoiceCall. Playback
+  state (queue, position, auto-advance) is real; audio reaches a
+  voice chat only after a real join, which is a live-test-time check.
+- **YouTube resolve fails honestly (Phase 5, A9).** yt-dlp is retried
+  once with the android player client on YouTube's bot check; if it
+  still fails (missing binary, YouTube 429), resolve returns
+  `engine_unavailable` (HTTP 502) and nothing is queued — there is no
+  degraded placeholder track any more. Proven by the broken-yt-dlp
+  test server (:18105) and the stub-yt-dlp android-retry unit test.
+  yt-dlp resolve itself takes 6.5–13.7 s per call (measured,
+  network-bound).
 - **Lemonic live API unreachable from the sandbox** — see above.
   Nothing is faked; the stub tests + honest error path are the
   verification that exists here.
@@ -161,8 +186,9 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
   (LRCLib) / radio-track resolvers.
 - `src/voicecall.js` — real voice transport: Opus/RTP pipeline +
   ntgcalls offer + voice-bridge join client (see above).
-- `tests/run.js` — 24 tests (`npm test`): live JioSaavn/LRCLib/yt-dlp
+- `tests/run.js` — 32 tests (`npm test`): live JioSaavn/LRCLib/yt-dlp
   + stub-Lemonic keyed/unauthenticated + panel/loop/radio regressions
-  + voice pipeline/offer/join proofs (offline).
+  + loop/shuffle/autoplay routes + A9 placeholder rejection +
+  android-retry unit test + voice pipeline/offer/join proofs (offline).
 - `Dockerfile` — node:24-slim + yt-dlp (compose `build:` target).
 - `PROGRESS.md` — build + verification log.

@@ -43,6 +43,10 @@ func New(dlDir, token string) (*Server, error) {
 	s.mux.HandleFunc("/v1/netease/search", s.auth(s.handleSearch))
 	s.mux.HandleFunc("/v1/netease/download", s.auth(s.handleDownload))
 	s.mux.HandleFunc("/v1/netease/lyrics", s.auth(s.handleLyrics))
+	// Contract `search.query` (B10): the generic /v1/search shape, served
+	// from the same NetEase search. `source` must be netease/all/absent —
+	// any other source is honestly refused, this service cannot search it.
+	s.mux.HandleFunc("/v1/search", s.auth(s.handleGenericSearch))
 	return s, nil
 }
 
@@ -144,6 +148,49 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"results": tracks})
 }
 
+// handleGenericSearch serves POST /v1/search — the contract `search.query`
+// shape ({query, source, limit}). It is the same NetEase search as
+// handleSearch; the only difference is the `source` gate: netease-go can
+// only search NetEase, so any other named source is refused instead of
+// returning wrong-source results.
+func (s *Server) handleGenericSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request", "POST required")
+		return
+	}
+	body, err := readBody(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "unreadable body")
+		return
+	}
+	var req struct {
+		Query  string `json:"query"`
+		Source string `json:"source"`
+		Limit  int    `json:"limit"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		writeErr(w, http.StatusBadRequest, "bad_request", "query is required")
+		return
+	}
+	source := strings.ToLower(strings.TrimSpace(req.Source))
+	if source != "" && source != "netease" && source != "all" {
+		writeErr(w, http.StatusBadRequest, "bad_request",
+			"source not served by netease-go (want netease|all)")
+		return
+	}
+	tracks, err := s.client.SearchSong(req.Query, req.Limit)
+	if err != nil {
+		log.Printf("search %q: %v", req.Query, err)
+		writeErr(w, http.StatusBadGateway, "engine_unavailable", err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"results": tracks})
+}
+
 var safeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -188,6 +235,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			"track":      track,
 			"oversize":   true,
 			"size_bytes": declaredSize,
+			"auth":       s.client.AuthMode(),
 			"note":       "over the 50 MB Bot API cap; queued for a later MTProto pass, not downloaded",
 		})
 		return
@@ -229,6 +277,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			"track":      track,
 			"oversize":   true,
 			"size_bytes": n,
+			"auth":       s.client.AuthMode(),
 			"note":       "over the 50 MB Bot API cap; queued for a later MTProto pass, not kept",
 		})
 		return
@@ -239,6 +288,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		"oversize":   false,
 		"size_bytes": n,
 		"level":      level,
+		"auth":       s.client.AuthMode(),
 	})
 }
 

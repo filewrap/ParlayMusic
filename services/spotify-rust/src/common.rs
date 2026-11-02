@@ -47,6 +47,13 @@ impl Json {
             None
         }
     }
+    pub fn as_arr(&self) -> Option<&Vec<Json>> {
+        if let Json::Arr(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
     pub fn render(&self) -> String {
         match self {
             Json::Null => "null".to_string(),

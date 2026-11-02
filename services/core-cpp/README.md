@@ -44,8 +44,10 @@ BOT_TOKEN, API_ID, API_HASH, MONGO_URI, REDIS_URL, PARLAY_TOKEN,
 VC_GO_URL, VC_TS_URL, VC_RUST_URL, FX_URL, SHARE_URL, QUEUE_URL,
 DL_URL, RADIO_URL, PORT, OWNER_ID, SUDO_IDS, LOGGER_ID,
 PARLAY_ALLOW_CHATS, PARLAY_BLOCK_CHATS,
-ASSISTANT_IDS, ASSISTANT_SESSION_FILE, NTGCALLS_LIB, VOICE_BRIDGE,
-VOICE_RTP_SINK, PARLAY_DATA_DIR, PARLAY_LOG_FILE, TELEGRAM_API_BASE,
+ASSISTANT_IDS, NTGCALLS_LIB, VOICE_RTP_SINK, TD_API_ID, TD_API_HASH,
+TD_SESSION_DIR, TDJSON_LIB, TD_PHONE, TD_CODE, TD_PASSWORD, TD_EMAIL,
+TD_EMAIL_CODE, TD_FIRST_NAME, TD_LAST_NAME, TD_QR,
+PARLAY_DATA_DIR, PARLAY_LOG_FILE, TELEGRAM_API_BASE,
 DURATION_LIMIT, QUEUE_LIMIT, SUPPORT_CHAT
 ```
 
@@ -53,8 +55,10 @@ Defaults match `docker-compose.yml` (vc-go :8001, vc-ts :8002, vc-rust
 :8003, audio-fx-rust :8004, share-rust :8005, queue-rust :8006,
 radio-js :8008, downloaders :8009). `BOT_TOKEN` and `PARLAY_TOKEN` are
 required; the process exits with a clear message if either is missing.
-`API_ID`/`API_HASH` are required only by the voice bridge (assistant
-session). Exit code 42 from `/restart` is the supervisor-restart signal.
+`API_ID`/`API_HASH` are the fallback for `TD_API_ID`/`TD_API_HASH`
+(TDLib voice backend); the Telethon voice bridge that used to need
+them was deleted in Phase 5. Exit code 42 from `/restart` is the
+supervisor-restart signal.
 
 ## Implemented (real)
 
@@ -117,25 +121,39 @@ session). Exit code 42 from `/restart` is the supervisor-restart signal.
   cache), `/engine` to switch, fallback order go→ts→rust (rotated per
   preference). A failed preferred engine is retried on the next healthy
   engine and the reply says which engine won.
-- **Voice** (`src/voice_call.*`, `voice_bridge.py`) — the refs' pipeline,
-  not a stub. Who plays: the **assistant/userbot account**, never the bot
-  account (NoxBeats `ensure_assistant`, TinaMusic `Play`). `VoiceCall`
-  interface with three backends, picked by `makeVoiceCall(cfg)`:
-  `VoiceBridge` (assistant session configured) → `NtgCallsVoiceCall`
-  (dlopen'd `libntgcalls.so`) → `UnavailableVoiceCall` (reports the exact
-  reason, never fakes success). `OpusPipeline`: yt-dlp `-g` resolve →
-  ffmpeg `-c:a libopus -b:a 128k -ar 48000 -ac 2` → Ogg Opus file
-  (verified by ffprobe packet count + duration) + optional second RTP
-  output to a UDP sink (best-effort; a blocked sink cannot lose the
-  file). `buildFfmpegCmd` is the TinaMusic/NoxBeats shape (reconnect
-  flags, `-ss`, `atempo`, lowpass bass boost, `s16le -ac 2 -ar 48000
-  pipe:1`). `voice_bridge.py` (Telethon + ntgcalls, TinaMusic `Play`
-  steps): `create_call` → offer → `set_stream_sources` → `get_call`
-  (creates the group call if none) → `JoinGroupCallRequest` with
-  `DataJSON(offer)` → `find_connection` from `UpdateGroupCallConnection`
-  → `ntg.connect(remote)`; `join-chat` joins via `@channel` or invite
-  hash. Errors are JSON (`{"ok": false, "error": "<type>"}`), never a
-  traceback, never session material.
+- **Voice** (`src/voice_call.*`, `src/tdlib_client.*`) — the refs'
+  pipeline, not a stub, and **in-process only since Phase 5**: the
+  voice bridge (`voice_bridge.py`, Telethon child process) was deleted
+  on the user's order — ntgcalls is a C++ native library linked into
+  the bot process, not a server. Who plays: the **assistant/userbot
+  account**, never the bot account (NoxBeats `ensure_assistant`,
+  TinaMusic `Play`). `VoiceCall` interface with two real backends,
+  picked by `makeVoiceCall(cfg)`: `TdLibVoiceCall` (TDLib 1.8.69
+  signaling — authorize → `getChat`/`createVideoChat` →
+  `joinVideoChat` — + dlopen'd `libntgcalls.so` for WebRTC; needs
+  `TD_API_ID`/`TD_API_HASH`/`TD_SESSION_DIR` + both `.so` files) →
+  `NtgCallsVoiceCall` (dlopen'd `libntgcalls.so`, C API from
+  `ntgcalls.h`; builds the local SDP offer and attaches sources, but
+  cannot join without an MTProto session — `play()` says so honestly)
+  → `UnavailableVoiceCall` (reports the exact reason, never fakes
+  success). `OpusPipeline`: yt-dlp `-g` resolve → ffmpeg
+  `-c:a libopus -b:a 128k -ar 48000 -ac 2` → Ogg Opus file (verified
+  by ffprobe packet count + duration) + optional second RTP output to
+  a UDP sink (best-effort; a blocked sink cannot lose the file).
+  `buildFfmpegCmd` is the TinaMusic/NoxBeats shape (reconnect flags,
+  `-ss`, `atempo`, lowpass bass boost, `s16le -ac 2 -ar 48000 pipe:1`).
+  ntgcalls C build: **DONE 2026-11-02** (`phase5/ntg-build.log`,
+  `BUILD_EXIT=0`, `refs/ntgcalls/shared-output/lib/libntgcalls.so`,
+  98 MB, 77 exported `ntg_*` symbols, ldd clean). The 3.0.5 C API
+  turned out to be SYNCHRONOUS, not the old async API the stale
+  header described — `ntg_instance_create()` / `ntg_create_call()` /
+  `ntg_connect()` return `ntg_result` directly, errors via
+  `ntg_last_error()`; all three bindings were rewritten to it.
+  `NtgCallsVoiceCall` loads the built `.so` in-process (version
+  3.0.5) and `ntg_create_call` returns a real local SDP offer
+  (476 bytes, ufrag + sha-256 fingerprint) — proven by test 8 in
+  `tests/tdlib_test.cpp` (8/8 PASS). `libpulse-dev` 16.1 installed
+  via apt afterwards (vendored headers replaced by the package).
 - **Group management** — `getChatMember` admin check gates playback
   control and `/engine` in groups; private chats are open.
   `PARLAY_ALLOW_CHATS` / `PARLAY_BLOCK_CHATS` (comma-separated chat ids)
@@ -170,21 +188,26 @@ session). Exit code 42 from `/restart` is the supervisor-restart signal.
   succeeds.
 - Voice-backend proof (`/tmp/voice_proof.cpp`): with no session and no
   `.so`, factory selects `unavailable` with the exact reason;
-  `play`/`joinChat` return false, no secrets in errors; ffmpeg command
+  `play` returns false, no secrets in errors; ffmpeg command
   shape verified (reconnect flags, s16le 48k stereo, atempo, `-ss`).
-- Bridge error path: `voice_bridge.py join-call` / `join-chat` with a
-  missing session file → exit 1, `{"ok": false, "error":
-  "FileNotFoundError"}` (no traceback).
+- Bridge error path: **deleted in Phase 5** — `voice_bridge.py` and the
+  Telethon child are gone (user order: ntgcalls is a native library
+  linked in-process). The paragraph below described the old route; it
+  is kept only as history. Join now goes through the TDLib backend
+  (`TD_SESSION_DIR` + `TDJSON_LIB`).
 - Binary smoke: no env → exit 1 in 0.00 s,
   `missing required env vars: BOT_TOKEN PARLAY_TOKEN`.
-- TDLib: clone + configure pass (needed gperf 3.1, installed via
-  azure-only apt — the cogentco mirror was too slow through the proxy);
-  full build running, log `phase4/tdlib-build.log`. ntgcalls wheel
-  3.0.5 has **no C `ntg_*` symbols** (`nm -D` shows only
-  `PyInit_ntgcalls`), so the C++ dlopen path needs a real
-  `libntgcalls.so` build; the Python bridge path (Telethon + ntgcalls
-  3.0.5, proven offline: `create_call` returns a 476-char offer) is
-  the working voice route until then.
+- TDLib: build **finished 100%** 2026-11-02 (log `phase4/tdlib-build.log`,
+  933 lines, 0 errors, `libtdjson.so.1.8.69`, 50 MB); the C++ client
+  `src/tdlib_client.{hpp,cpp}` exists and passes 26/26 checks
+  (TDLib responses + real-offer check via the built `libntgcalls.so`
+  + all 17 auth-state checks: phone / QR / code / password / email /
+  email code / registration / other-device / premium / unknown). The
+  ntgcalls wheel 3.0.5 has **no C `ntg_*` symbols** (`nm -D` shows only
+  `PyInit_ntgcalls`), so the C++ dlopen path uses the C build from
+  `refs/ntgcalls` instead (see the Voice bullet above); without
+  `TD_*` env the TDLib backend still reports `available()=false`
+  honestly and no live join is possible.
 
 ## Honest limits (not stubs — reported as limits)
 
@@ -219,6 +242,12 @@ session). Exit code 42 from `/restart` is the supervisor-restart signal.
 - **File delivery for `/download`** — the core reports the downloader's
   `file_path`; sending the audio file into chat (Bot API `sendAudio` /
   MTProto for oversize) is a follow-up.
-- **TDLib C++ client** — `src/tdlib_client` does not exist yet; the
-  TDLib build (see above) is the prerequisite. The voice bridge covers
-  the join path meanwhile.
+- **TDLib C++ client** — implemented (`src/tdlib_client.{hpp,cpp}`,
+  26/26 checks, TDLib 1.8.69 built 2026-11-02). First-time auth is
+  env-gated end to end: phone/code/password, email/email-code,
+  first registration, or QR login (`TD_QR=1`, link in
+  `otherDeviceLink()`); only an in-store Premium purchase cannot be
+  driven headless. A live join still needs a `TD_SESSION_DIR`
+  (pre-authorized, or created by the first-time flow above) +
+  `libntgcalls.so` on a host with open network; see the TDLib test
+  bullet above.

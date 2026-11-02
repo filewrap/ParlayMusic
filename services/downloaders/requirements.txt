@@ -1,4 +1,9 @@
 yt-dlp>=2024.1.7
+# pycryptodomex: AES (legacy Deezer stream URL) + Blowfish (full-track
+# decryption) for the DEEZER_ARL path in src/deezer.py. The import is
+# guarded — the service runs without it, and the ARL path then fails
+# honestly back to previews.
+pycryptodomex>=3.20
 # spotdl is OPTIONAL: when installed, Spotify downloads go through spotdl
 # (as in Spotify-Loader); otherwise the service falls back to yt-dlp
 # YouTube search matching and never fails for its absence.

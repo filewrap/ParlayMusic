@@ -1,14 +1,70 @@
 // telegram_api.cpp
 #include "telegram_api.hpp"
 
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 
 #include "http.hpp"
 
 namespace parlay {
 
+namespace {
+// One media attachment (audio/video/voice/video_note/document) on a
+// message object -> (file_id, kind, title). A message carries at most
+// one; the first kind found wins.
+bool scanMedia(const Json& j, std::string& file_id, std::string& kind,
+               std::string& title) {
+    for (const char* k : {"audio", "video", "voice", "video_note",
+                          "document"}) {
+        const Json* media = j.find(k);
+        if (!media) continue;
+        const Json* fid = media->find("file_id");
+        if (!fid || fid->asString().empty()) continue;
+        file_id = fid->asString();
+        kind = k;
+        const Json* fn = media->find("file_name");
+        if (std::string(k) == "audio") {
+            const Json* t = media->find("title");
+            const Json* p = media->find("performer");
+            if (t && !t->asString().empty())
+                title = (p && !p->asString().empty()
+                             ? p->asString() + " - "
+                             : "") +
+                        t->asString();
+            else if (fn)
+                title = fn->asString();
+            else
+                title = "Audio";
+        } else if (fn) {
+            title = fn->asString();
+        } else if (std::string(k) == "voice") {
+            title = "Voice message";
+        } else if (std::string(k) == "video_note") {
+            title = "Video message";
+        } else {
+            title = "Video";
+        }
+        return true;
+    }
+    return false;
+}
+
+// Keep only filename-safe characters (file_id / extension sanitizing).
+std::string safeName(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_')
+            out += c;
+    }
+    return out;
+}
+}  // namespace
+
 TelegramApi::TelegramApi(const Config& cfg)
-    : base_(cfg.telegram_api_base + "/bot" + cfg.bot_token) {}
+    : base_(cfg.telegram_api_base + "/bot" + cfg.bot_token),
+      file_base_(cfg.telegram_api_base + "/file/bot" + cfg.bot_token) {}
 
 Json TelegramApi::call(const std::string& method, const Json& params,
                        int timeout_sec, std::string& error_out) {
@@ -34,6 +90,80 @@ Json TelegramApi::call(const std::string& method, const Json& params,
     }
     const Json* result = parsed.find("result");
     return result ? *result : Json(nullptr);
+}
+
+std::string TelegramApi::getFilePath(const std::string& file_id,
+                                     std::string& error_out) {
+    Json params = Json::objectOf({{"file_id", Json(file_id)}});
+    Json result = call("getFile", params, 30, error_out);
+    if (result.isNull()) return "";
+    const Json* fp = result.find("file_path");
+    if (!fp || fp->asString().empty()) {
+        error_out = "getFile returned no file_path for this file_id";
+        return "";
+    }
+    return fp->asString();
+}
+
+bool TelegramApi::downloadFile(const std::string& file_id,
+                               const std::string& dest_dir,
+                               std::string& saved_path_out,
+                               std::string& error_out) {
+    std::string err;
+    std::string file_path = getFilePath(file_id, err);
+    if (file_path.empty()) {
+        error_out = "getFile failed: " + err;
+        return false;
+    }
+    // file_path comes from Telegram, but never let it escape the file
+    // endpoint: no absolute paths, no parent traversal.
+    if (file_path.front() == '/' ||
+        file_path.find("..") != std::string::npos) {
+        error_out = "getFile returned an unsafe file_path";
+        return false;
+    }
+    // Extension from the Telegram file_path, sanitized; "bin" fallback.
+    std::string ext = "bin";
+    if (auto dot = file_path.rfind('.'); dot != std::string::npos) {
+        std::string cand = safeName(file_path.substr(dot + 1));
+        if (!cand.empty() && cand.size() <= 10) ext = cand;
+    }
+    std::string safe_id = safeName(file_id);
+    if (safe_id.empty()) {
+        error_out = "file_id has no filename-safe characters";
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dest_dir, ec);
+    if (ec) {
+        error_out = "cannot create download dir " + dest_dir + ": " +
+                    ec.message();
+        return false;
+    }
+    std::string dest = dest_dir + "/" + safe_id + "." + ext;
+    HttpResult r = HttpClient::get(file_base_ + "/" + file_path, {}, 300);
+    if (!r.ok()) {
+        error_out = "file download HTTP " + std::to_string(r.status) +
+                    (r.error.empty() ? "" : ": " + r.error);
+        return false;
+    }
+    if (r.body.empty()) {
+        error_out = "file download returned no bytes";
+        return false;
+    }
+    std::ofstream out(dest, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        error_out = "cannot write " + dest;
+        return false;
+    }
+    out.write(r.body.data(), static_cast<std::streamsize>(r.body.size()));
+    out.close();
+    if (!out) {
+        error_out = "failed writing " + dest;
+        return false;
+    }
+    saved_path_out = dest;
+    return true;
 }
 
 TgMessage TelegramApi::parseMessage(const Json& j) {
@@ -63,6 +193,15 @@ TgMessage TelegramApi::parseMessage(const Json& j) {
             if (const Json* id = from->find("id"))
                 m.reply_from_id = id->asInt();
         }
+        // Media on the replied-to message (for /play from a reply):
+        // audio / video / voice / video_note / document.
+        std::string fid, kind, title;
+        if (scanMedia(*rt, fid, kind, title)) {
+            m.has_reply_media = true;
+            m.reply_media_file_id = fid;
+            m.reply_media_kind = kind;
+            m.reply_media_title = title;
+        }
     }
     if (const Json* nm = j.find("new_chat_members")) {
         for (const auto& u : nm->asArray()) {
@@ -78,15 +217,14 @@ TgMessage TelegramApi::parseMessage(const Json& j) {
     }
     if (j.find("video_chat_started")) m.video_chat_started = true;
     if (j.find("video_chat_ended")) m.video_chat_ended = true;
-    // Any media attachment on the message (audio/video/voice/document).
-    for (const char* k : {"audio", "video", "voice", "document"}) {
-        if (const Json* media = j.find(k)) {
-            if (const Json* fid = media->find("file_id")) {
-                m.has_media = true;
-                m.media_file_id = fid->asString();
-            }
-            break;
-        }
+    // Any media attachment on the message itself (audio sent with a
+    // /play caption): audio/video/voice/video_note/document.
+    std::string fid, kind, title;
+    if (scanMedia(j, fid, kind, title)) {
+        m.has_media = true;
+        m.media_file_id = fid;
+        m.media_kind = kind;
+        m.media_title = title;
     }
     return m;
 }

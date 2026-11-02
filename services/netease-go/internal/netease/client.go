@@ -5,6 +5,14 @@
 // Music163Api-Go (internal/netease/eapi.go, the library vendored by
 // refs/Music163bot-Go): AES-ECB + MD5 splice, POST to /eapi/....
 //
+// Login (env-gated, B3): when NETEASE_MUSIC_U holds a MUSIC_U login
+// cookie, every request to a music.163.com / music.126.net host carries
+// `Cookie: MUSIC_U=<value>` (and the eapi cookie carries MUSIC_U instead
+// of the anonymous MUSIC_A). Without it the service is anonymous-only
+// and the mirror fallback covers downloads. The cookie value is never
+// logged; it is only sent to NetEase hosts — never to the third-party
+// mirror (see do()).
+//
 // Endpoints used:
 //
 //	POST https://music.163.com/api/cloudsearch/pc        search (form: s, type=1, limit, offset)
@@ -23,6 +31,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -47,25 +56,79 @@ type Track struct {
 	URL         string `json:"url,omitempty"`
 }
 
-// Client talks to music.163.com anonymously.
+// Client talks to music.163.com anonymously, or logged in when
+// NETEASE_MUSIC_U is set (see New).
 type Client struct {
 	http *http.Client // API calls: 10s timeout
 	// dl is the download client: same transport, but a long timeout, because
 	// a 35 MB FLAC takes longer than the 10s API timeout to stream.
 	dl *http.Client
+	// musicU is the MUSIC_U login cookie from $NETEASE_MUSIC_U (empty =
+	// anonymous). It is only ever sent to NetEase hosts.
+	musicU string
+	// base is the API base URL (https://music.163.com). Tests override it
+	// to point at a local httptest server.
+	base string
 }
 
 // New returns a client with a short timeout and proxy-aware transport.
+// It reads $NETEASE_MUSIC_U once: a login cookie (the value is the
+// cookie itself, not a "MUSIC_U=" pair) enables the logged-in paths;
+// empty/unset means anonymous-only, which is the supported default.
 func New() *Client {
 	return &Client{
-		http: &http.Client{Timeout: requestTimout},
-		dl:   &http.Client{Timeout: 10 * time.Minute},
+		http:   &http.Client{Timeout: requestTimout},
+		dl:     &http.Client{Timeout: 10 * time.Minute},
+		musicU: strings.TrimSpace(os.Getenv("NETEASE_MUSIC_U")),
+		base:   baseURL,
+	}
+}
+
+// NewWithMusicU returns a client with an explicit MUSIC_U login cookie
+// (tests; New reads the same value from $NETEASE_MUSIC_U).
+func NewWithMusicU(u string) *Client {
+	c := New()
+	c.musicU = strings.TrimSpace(u)
+	return c
+}
+
+// AuthMode reports "music_u" when a login cookie is set, else
+// "anonymous". The download route exposes it so callers can tell
+// whether the direct URL came from a logged-in session or the
+// anonymous/mirror path.
+func (c *Client) AuthMode() string {
+	if c.musicUConfigured() {
+		return "music_u"
+	}
+	return "anonymous"
+}
+
+// musicUConfigured reports whether a login cookie is set.
+func (c *Client) musicUConfigured() bool { return c.musicU != "" }
+
+// isNetEaseHost reports whether req targets a NetEase host. The login
+// cookie is only ever sent to these hosts — never to third parties
+// (notably the gdstudio mirror, which goes through do() too).
+func isNetEaseHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "music.163.com" || host == "music.126.net" ||
+		strings.HasSuffix(host, ".music.163.com") ||
+		strings.HasSuffix(host, ".music.126.net")
+}
+
+// setAuthHeaders stamps the headers every NetEase request carries:
+// User-Agent + Referer always, and the MUSIC_U login cookie only when
+// the request targets a NetEase host (never third parties).
+func (c *Client) setAuthHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Referer", "https://music.163.com/")
+	if c.musicUConfigured() && isNetEaseHost(req.URL.Hostname()) {
+		req.Header.Set("Cookie", "MUSIC_U="+c.musicU)
 	}
 }
 
 func (c *Client) do(req *http.Request) ([]byte, error) {
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Referer", "https://music.163.com/")
+	c.setAuthHeaders(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("netease request failed: %w", err)
@@ -130,7 +193,7 @@ func (c *Client) SearchSong(query string, limit int) ([]Track, error) {
 	form.Set("type", "1")
 	form.Set("limit", strconv.Itoa(limit))
 	form.Set("offset", "0")
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/cloudsearch/pc",
+	req, err := http.NewRequest(http.MethodPost, c.base+"/api/cloudsearch/pc",
 		strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
@@ -163,7 +226,7 @@ func (c *Client) SearchSong(query string, limit int) ([]Track, error) {
 // SongDetail fetches metadata for one track id.
 func (c *Client) SongDetail(id int64) (Track, error) {
 	req, err := http.NewRequest(http.MethodGet,
-		baseURL+"/api/song/detail?ids=["+strconv.FormatInt(id, 10)+"]", nil)
+		c.base+"/api/song/detail?ids=["+strconv.FormatInt(id, 10)+"]", nil)
 	if err != nil {
 		return Track{}, err
 	}
@@ -263,7 +326,7 @@ func (c *Client) SongURLWithLevel(id int64) (string, int64, string, error) {
 		})
 		var res urlResult
 		if err := c.eapiPost("/api/song/enhance/player/url/v1",
-			baseURL+"/eapi/song/enhance/player/url/v1", string(reqJSON), &res); err != nil {
+			c.base+"/eapi/song/enhance/player/url/v1", string(reqJSON), &res); err != nil {
 			return "", 0, "", fmt.Errorf("netease song url (eapi v1, level %s): %w", level, err)
 		}
 		if res.Code != 200 {
@@ -298,7 +361,7 @@ func (c *Client) SongURLWithLevel(id int64) (string, int64, string, error) {
 	dlJSON, _ := json.Marshal(map[string]any{"id": id, "br": 999000})
 	var dl downloadURLResult
 	if err := c.eapiPost("/api/song/enhance/download/url",
-		baseURL+"/eapi/song/enhance/download/url", string(dlJSON), &dl); err == nil &&
+		c.base+"/eapi/song/enhance/download/url", string(dlJSON), &dl); err == nil &&
 		dl.Data.URL != "" {
 		return dl.Data.URL, dl.Data.Size, "download", nil
 	}
@@ -359,7 +422,7 @@ func (c *Client) mirrorURL(id int64) (string, int64, error) {
 // Lyrics fetches the (original-language) lyrics for one track id.
 func (c *Client) Lyrics(id int64) (string, error) {
 	req, err := http.NewRequest(http.MethodGet,
-		baseURL+"/api/song/lyric?id="+strconv.FormatInt(id, 10)+"&lv=-1&kv=-1&tv=-1", nil)
+		c.base+"/api/song/lyric?id="+strconv.FormatInt(id, 10)+"&lv=-1&kv=-1&tv=-1", nil)
 	if err != nil {
 		return "", err
 	}
@@ -388,11 +451,14 @@ func (c *Client) Lyrics(id int64) (string, error) {
 // Download fetches url to w, aborting once MaxBotAPIBYTES is exceeded.
 // It returns the bytes written and oversize=true when the cap was hit.
 // Uses the long-timeout download client (c.dl), not the 10s API client.
+// Logged-in downloads (direct NetEase URLs) carry the MUSIC_U cookie;
+// mirror/CDN URLs to non-NetEase hosts never do.
 func (c *Client) Download(url string, w io.Writer) (int64, bool, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return 0, false, err
 	}
+	c.setAuthHeaders(req)
 	resp, err := c.dl.Do(req)
 	if err != nil {
 		return 0, false, fmt.Errorf("netease download failed: %w", err)

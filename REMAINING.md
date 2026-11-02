@@ -481,6 +481,93 @@ Toolchains are not on default PATH: Go `~/workspace/parlay/.tools/go/bin/go`
 mongod/redis for verification and stopped them afterwards; no test
 processes left running.
 
+---
+
+## Phase 5 follow-up (Worker E, 2026-11-03) — A5/A6/C1/C3/C4, B6/B7/B9/B10
+
+### Closed by Worker E
+- **A5** — compose is now the single source of truth: explicit `PORT`
+  per service (audio-fx 8004, share 8005, queue 8006, downloaders 8009
+  override code defaults 8003/8004/8005/8010); core `*_URL` vars match;
+  `PARLAY_DATA_DIR=/data/<service>` per service (vc-ts and radio-js both
+  write `state.json`, so no shared `/data`); dead `DATABASE_URL` removed
+  (A11); `NAVIDROME_PASSWORD` everywhere (A12).
+- **A6** — all 10 missing Dockerfiles added (vc-ts/radio-js updated with
+  curl + HEALTHCHECK). Healthchecks on every HTTP service except core
+  (no HTTP server, A2); core `depends_on` with `service_healthy` for
+  mongo/redis/vc-go/downloaders. slskd service added (profile full).
+  Static validation: 222 checks pass
+  (`phase5/worker-e-compose-check.py`). **Compose-up still unverified**
+  — Docker is not installed in the sandbox.
+- **C1 (partial)** — audio-fx-rust 6/6, share-rust 5/5, queue-rust 8/8
+  tests added (were 0 each). Downloaders 26 run / 18 pass + 8 skipped
+  (+5 new collection tests). Netease-go 11/11 (+6 new server tests).
+- **C3** — root README, ARCHITECTURE.md, PORT_MAP.md §1–§3, core-cpp
+  README + PROGRESS.md, vc-rust README tail + PROGRESS.md, netease-go
+  README, PHASE4-TDLIB.md §5, gui-js README, downloaders README fixed
+  (see `phase5/worker-e-compose.md` §4 for the list).
+- **C4** — `.env.example` rewritten: 64/64 vars read in code covered,
+  0 missing; `VC_ENGINE` + `NAVIDROME_PASS` removed; `YT_DLP` unified
+  (vc-rust code changed `YTDLP_BIN` → `YT_DLP`).
+
+### Scope decisions (explicit, do not silently re-open)
+- **B6 — Beetube movie/anime/torrent: MUSIC-ONLY.** Not ported. The
+  providers depend on Beetube's external API backend + torrent clients;
+  no quick real implementation exists and an `engine_unavailable` stub
+  does not count. Recorded in ARCHITECTURE.md, PORT_MAP.md, downloaders
+  README.
+- **B7 — `netease.recognize`: DROPPED from scope.** Needs an external
+  fingerprint backend + login; no contract action exists. Recorded in
+  ARCHITECTURE.md, netease-go README + `main.go`.
+- **B9 — DONE:** `POST /v1/spotify/collection` implemented in
+  downloaders (contract shape `{api, kind, name, tracks, truncated}`,
+  metadata only, capped at 50; 5 offline tests).
+- **B10 — DONE:** `POST /v1/search` implemented in netease-go
+  (`source` must be netease/all/absent, else 400; 6 offline tests).
+- **B2 — DONE (Worker D, verified by Worker E):** Deezer ARL wired —
+  `DEEZER_ARL` + `DEEZER_FORMAT` (default MP3_320) read in
+  `services/downloaders/src/deezer.py`; previews without ARL or on ARL
+  failure; needs pycryptodomex for the ARL path. Tests
+  `tests/test_deezer_arl.py` 8/8. Soulseek client reads all 8 `SLSKD_*`
+  vars (`SLSKD_URL`/`SLSKD_HOST` default `http://slskd:5030`,
+  `SLSKD_API_KEY`, `SLSKD_API_TIMEOUT_SECS` 30,
+  `SLSKD_SEARCH_MIN_INTERVAL_SECS` 10, `SLSKD_DOWNLOAD_DIR` default
+  `$PARLAY_DL_DIR/.slskd-downloads`, `SLSKD_STALL_SECS` 120,
+  `SLSKD_DOWNLOAD_TIMEOUT` 900, `SLSKD_MAX_PEER_ATTEMPTS` 3,
+  `SLSKD_SLOW_MIN_MBPS` 0); tests `tests/test_soulseek.py` 16/16.
+  Downloaders suite now 50 run / 42 pass + 8 live-skipped, 0 fail.
+- **B3 — DONE (Worker E, scope update):** `NETEASE_MUSIC_U` login
+  wired in netease-go — `Client.musicU` + `base`, `setAuthHeaders()`
+  sends `Cookie: MUSIC_U=<value>` only to NetEase hosts (never the
+  mirror); eapi/weapi/linuxapi/downloads all covered; `eapiCookie()`
+  swaps `MUSIC_U` in for anonymous `MUSIC_A`. 9 offline tests
+  (`internal/netease/client_test.go`); netease-go suite 20/20. Only
+  the user's cookie is missing.
+- **B5 — DONE (Worker E, scope update):** Genius + Musixmatch lyrics
+  wired in spotify-rust against the PUBLIC APIs (Genius
+  `api.genius.com/search` + song-page `data-lyrics-container` scrape;
+  Musixmatch `matcher.lyrics.get`; restricted/instrumental → None).
+  Chain Genius → Musixmatch → LRCLib in `fetch_lyrics()`, wired into
+  `decide_skip` step 3. 9 offline tests; spotify-rust suite 40/40.
+  Only the keys are missing.
+- **C4 (refresh) — DONE:** `.env.example` re-verified after the scope
+  update: **77 vars read in code, 77/77 covered, 0 missing** (79
+  listed; the only 2 extras are LEGACY `VOICE_BRIDGE` /
+  `ASSISTANT_SESSION_FILE`). Added all 8 `SLSKD_*` vars,
+  `DEEZER_FORMAT`, `GENIUS_ACCESS_TOKEN`, `MUSIXMATCH_API_KEY`;
+  "(not yet read)" markers removed from `DEEZER_ARL`,
+  `NETEASE_MUSIC_U`, `SLSKD_URL`, `SLSKD_API_KEY`.
+- **C1 (final counts) —** audio-fx 6/6, share 5/5, queue 8/8,
+  downloaders 50 run / 42 pass + 8 skipped, netease-go 20/20,
+  spotify-rust 40/40, vc-rust 30/30, core-cpp build exit 0.
+
+### Opened / handed over by Worker E (not closed)
+- vc-rust not compiling (reported in the first pass) is now FIXED by
+  the bridge-kill worker: `cargo check` clean, tests 30/30.
+  (Supersedes the vc-rust item below.)
+- `ipc.json` version still `0.1.0-scaffold` (C5, Worker B owns it).
+- Compose-up on a Docker host still never run (see A6 above).
+
 ## Appendix — grep counts (worker A)
 
 218 grep lines over `services/` (excluding refs/.venv/node_modules/build/

@@ -52,6 +52,12 @@ TdLibClient::Params TdLibClient::Params::fromEnv() {
     p.phone = envStr("TD_PHONE");
     p.code = envStr("TD_CODE");
     p.password = envStr("TD_PASSWORD");
+    p.email = envStr("TD_EMAIL");
+    p.email_code = envStr("TD_EMAIL_CODE");
+    p.first_name = envStr("TD_FIRST_NAME");
+    p.last_name = envStr("TD_LAST_NAME");
+    std::string qr = envStr("TD_QR");
+    p.qr = (qr == "1" || qr == "true" || qr == "yes");
     return p;
 }
 
@@ -161,7 +167,17 @@ std::string TdLibClient::pump(double timeout_sec, bool* was_update) {
         const Json* st = parsed.find("authorization_state");
         if (st) {
             const Json* st_type = st->find("@type");
-            if (st_type) auth_state_ = st_type->asString();
+            if (st_type) {
+                auth_state_ = st_type->asString();
+                // QR login: the confirmation state carries the link
+                // the user scans on another device.
+                if (auth_state_ ==
+                    "authorizationStateWaitOtherDeviceConfirmation") {
+                    const Json* link = st->find("link");
+                    if (link && !link->asString().empty())
+                        other_device_link_ = link->asString();
+                }
+            }
         }
         if (was_update) *was_update = true;
         last_update_ = parsed;
@@ -239,28 +255,102 @@ bool TdLibClient::handleAuthState(const std::string& state,
         return true;
     }
     if (state == "authorizationStateWaitPhoneNumber") {
-        if (p.phone.empty()) {
+        if (!p.phone.empty()) {
+            Json settings = Json::objectOf({
+                {"@type", Json("phoneNumberAuthenticationSettings")},
+                {"allow_flash_call", Json(false)},
+                {"allow_missed_call", Json(false)},
+                {"is_current_phone_number", Json(false)},
+                {"has_unknown_phone_number", Json(false)},
+                {"allow_sms_retriever_api", Json(false)},
+                {"firebase_authentication_settings", Json(nullptr)},
+                {"authentication_tokens", Json(Json::Array{})},
+            });
+            Json req = Json::objectOf({
+                {"@type", Json("setAuthenticationPhoneNumber")},
+                {"phone_number", Json(p.phone)},
+                {"settings", settings},
+            });
+            send(req);
+            return true;
+        }
+        if (p.qr) {
+            // QR login instead of a phone number: TDLib answers with
+            // authorizationStateWaitOtherDeviceConfirmation carrying
+            // the link (captured in pump() -> otherDeviceLink()).
+            // The scan itself is a live-test-time human step; the
+            // request is real and was accepted offline (ok response).
+            Json req = Json::objectOf({
+                {"@type", Json("requestQrCodeAuthentication")},
+                {"other_user_ids", Json(Json::Array{})},
+            });
+            send(req);
+            return true;
+        }
+        error_out =
+            "not authorized: no credentials (TD_PHONE not set and "
+            "TD_QR not set; authorizationStateWaitPhoneNumber needs a "
+            "phone number, or TD_QR=1 for QR login)";
+        return false;
+    }
+    if (state == "authorizationStateWaitEmailAddress") {
+        if (p.email.empty()) {
             error_out =
-                "not authorized: no credentials (TD_PHONE not set; "
-                "authorizationStateWaitPhoneNumber needs a phone number)";
+                "not authorized: no credentials (TD_EMAIL not set; "
+                "authorizationStateWaitEmailAddress needs an email "
+                "address)";
             return false;
         }
-        Json settings = Json::objectOf({
-            {"@type", Json("phoneNumberAuthenticationSettings")},
-            {"allow_flash_call", Json(false)},
-            {"allow_missed_call", Json(false)},
-            {"is_current_phone_number", Json(false)},
-            {"has_unknown_phone_number", Json(false)},
-            {"allow_sms_retriever_api", Json(false)},
-            {"firebase_authentication_settings", Json(nullptr)},
-            {"authentication_tokens", Json(Json::Array{})},
-        });
         Json req = Json::objectOf({
-            {"@type", Json("setAuthenticationPhoneNumber")},
-            {"phone_number", Json(p.phone)},
-            {"settings", settings},
+            {"@type", Json("setAuthenticationEmailAddress")},
+            {"email_address", Json(p.email)},
         });
         send(req);
+        return true;
+    }
+    if (state == "authorizationStateWaitEmailCode") {
+        if (p.email_code.empty()) {
+            error_out =
+                "not authorized: no credentials (TD_EMAIL_CODE not set; "
+                "authorizationStateWaitEmailCode needs the code sent "
+                "to the email address)";
+            return false;
+        }
+        // checkAuthenticationEmailCode takes an
+        // EmailAddressAuthentication object, not a bare string.
+        Json code = Json::objectOf({
+            {"@type", Json("emailAddressAuthenticationCode")},
+            {"code", Json(p.email_code)},
+        });
+        Json req = Json::objectOf({
+            {"@type", Json("checkAuthenticationEmailCode")},
+            {"code", code},
+        });
+        send(req);
+        return true;
+    }
+    if (state == "authorizationStateWaitRegistration") {
+        if (p.first_name.empty()) {
+            error_out =
+                "not authorized: no credentials (TD_FIRST_NAME not set; "
+                "authorizationStateWaitRegistration needs a first name "
+                "to finish registering the account; TD_LAST_NAME is "
+                "optional)";
+            return false;
+        }
+        Json req = Json::objectOf({
+            {"@type", Json("registerUser")},
+            {"first_name", Json(p.first_name)},
+            {"last_name", Json(p.last_name)},
+            {"disable_notification", Json(false)},
+        });
+        send(req);
+        return true;
+    }
+    if (state == "authorizationStateWaitOtherDeviceConfirmation") {
+        // Nothing to send: the user confirms by scanning the link
+        // (otherDeviceLink()) on another device. Keep pumping until
+        // Ready or the authorize() timeout.
         return true;
     }
     if (state == "authorizationStateWaitCode") {
@@ -292,11 +382,13 @@ bool TdLibClient::handleAuthState(const std::string& state,
         return true;
     }
     if (state == "authorizationStateReady") return true;
-    // States this client cannot drive: registration, QR/other-device,
-    // email flows, premium purchase.
+    // The one state this client cannot drive headless: an in-store
+    // Premium purchase. Everything else TDLib 1.8.69 can present is
+    // handled above; an unknown future state fails honestly.
     error_out = "not authorized: unsupported authorization state " + state +
-                " (registration / QR / email flows are not implemented; "
-                "log in once with a full client and reuse TD_SESSION_DIR)";
+                " (authorizationStateWaitPremiumPurchase is an in-store "
+                "purchase and cannot be driven headless; log in once "
+                "with a full client and reuse TD_SESSION_DIR)";
     return false;
 }
 

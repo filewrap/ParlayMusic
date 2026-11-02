@@ -16,10 +16,14 @@ type Track struct {
 	Thumbnail   string `json:"thumbnail,omitempty"`
 
 	// StreamURL is the resolved direct audio URL (yt-dlp) when known.
-	// Internal to vc-go; not part of the contract, omitted when empty.
-	StreamURL string `json:"-"`
+	// Part of the contract (Track.stream_url); omitted when empty, so
+	// the core can fetch vc-go's resolved URL from /v1/now-playing and
+	// queue responses. Set by the resolver (info.URL) and by the
+	// high-perf prefetch workers.
+	StreamURL string `json:"stream_url,omitempty"`
 	// Prefetched reports whether StreamURL was resolved ahead of time by the
-	// high-perf prefetch workers (ArcMusic-style). Omitted when false.
+	// high-perf prefetch workers (ArcMusic-style). Internal to vc-go,
+	// not part of the contract; omitted from IPC payloads.
 	Prefetched bool `json:"-"`
 }
 

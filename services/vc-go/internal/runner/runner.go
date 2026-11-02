@@ -154,8 +154,8 @@ func (r *Runner) prefetchWorker(id int) {
 			if next == nil || next.StreamURL != "" {
 				continue
 			}
-			resolved, degraded, err := r.resolver.Resolve(r.ctx, next.URL)
-			if err != nil || degraded {
+			resolved, err := r.resolver.Resolve(r.ctx, next.URL)
+			if err != nil {
 				continue // leave unresolved; resolved on demand at play time
 			}
 			resolved.Prefetched = true

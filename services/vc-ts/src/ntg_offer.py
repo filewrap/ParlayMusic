@@ -8,7 +8,11 @@ This is the TinaMusic Play() step 1 (voice_binding_.CreateCall): it is
 purely local WebRTC — no MTProto, no network, no credentials. It proves
 the ntgcalls engine can build a call and produce the offer that
 phone.joinGroupCall would carry. The join itself needs the assistant
-MTProto session (see voice_bridge.py join-call) and is NOT done here.
+MTProto session (core-cpp TdLibVoiceCall, in-process) and is NOT done
+here. This probe is the fallback for the in-process N-API addon
+(services/vc-ts/src/ntg_addon.cc) when libntgcalls.so (or the addon)
+is absent; the .so is built now (phase5/ntg-build.log), so the addon
+is the live path and this probe is only the fallback.
 """
 import asyncio
 import json
