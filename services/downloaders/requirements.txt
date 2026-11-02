@@ -1,0 +1,5 @@
+yt-dlp>=2024.1.7
+# spotdl is OPTIONAL: when installed, Spotify downloads go through spotdl
+# (as in Spotify-Loader); otherwise the service falls back to yt-dlp
+# YouTube search matching and never fails for its absence.
+# spotdl>=4.2

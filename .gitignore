@@ -1,0 +1,27 @@
+# Parlay — never commit secrets or reference clones
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+config.json
+cookies.txt
+refs/
+**/node_modules/
+**/target/
+**/build/
+**/dist/
+**/.next/
+__pycache__/
+*.pyc
+/data/
+**/data/
+*.db
+*.log
+.DS_Store
+phase4/
+.tools/
+**/.venv/
+**/venv/
+*.sqlite3
+*.sqlite

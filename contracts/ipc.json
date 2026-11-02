@@ -1,0 +1,635 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "actions": {
+    "download.deezer": {
+      "method": "POST /v1/download/deezer",
+      "request": {
+        "query": "string",
+        "requested_by": "UserId"
+      },
+      "response": {
+        "file_path": "string",
+        "track": "Track"
+      },
+      "service": "downloaders"
+    },
+    "download.navidrome": {
+      "from": "music-bot-navidrome src/navidrome.py, src/soulseek/*",
+      "method": "POST /v1/download/navidrome",
+      "request": {
+        "requested_by": "UserId",
+        "url": "string"
+      },
+      "response": {
+        "imported": "boolean",
+        "track": "Track"
+      },
+      "service": "downloaders"
+    },
+    "download.spotify": {
+      "from": "Spotify-Loader bot.py",
+      "method": "POST /v1/download/spotify",
+      "request": {
+        "requested_by": "UserId",
+        "url": "string"
+      },
+      "response": {
+        "file_path": "string",
+        "track": "Track"
+      },
+      "service": "downloaders"
+    },
+    "download.spotify_playlist": {
+      "from": "Spotify-Loader bot.py",
+      "method": "POST /v1/download/spotify-playlist",
+      "request": {
+        "mode": "zip|files",
+        "requested_by": "UserId",
+        "url": "string"
+      },
+      "response": {
+        "count": "integer",
+        "file_path": "string"
+      },
+      "service": "downloaders"
+    },
+    "download.tiktok": {
+      "from": "telegram-music-bot-rust main.rs",
+      "method": "POST /v1/download/tiktok",
+      "request": {
+        "requested_by": "UserId",
+        "url": "string"
+      },
+      "response": {
+        "file_path": "string",
+        "track": "Track"
+      },
+      "service": "downloaders"
+    },
+    "download.youtube": {
+      "from": "sanila Telegram-Song-Downloader-Bot bot.py",
+      "method": "POST /v1/download/youtube",
+      "request": {
+        "query": "string",
+        "requested_by": "UserId"
+      },
+      "response": {
+        "file_path": "string",
+        "oversize": "boolean",
+        "size_bytes": "integer",
+        "track": "Track"
+      },
+      "service": "downloaders"
+    },
+    "fx.apply": {
+      "from": "telegram-music-bot-rust main.rs (FFmpeg filter chains)",
+      "method": "POST /v1/fx",
+      "request": {
+        "effect": "slow-reverb|nightcore|bass-boost|8d|original",
+        "input_path": "string",
+        "requested_by": "UserId"
+      },
+      "response": {
+        "output_path": "string"
+      },
+      "service": "audio-fx-rust"
+    },
+    "gui.now_playing": {
+      "from": "wavetune app/(player)/, components/music-provider.jsx",
+      "method": "GET /api/now-playing?chat_id=",
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "core-cpp -> gui-js"
+    },
+    "gui.queue": {
+      "method": "GET /api/queue?chat_id=",
+      "response": {
+        "queue": [
+          "QueueItem"
+        ]
+      },
+      "service": "core-cpp -> gui-js"
+    },
+    "lemonic.download": {
+      "method": "POST /v1/lemonic/download",
+      "request": {
+        "track_id": "string"
+      },
+      "response": {
+        "file_path": "string",
+        "track": "Track"
+      },
+      "service": "vc-ts"
+    },
+    "lemonic.search": {
+      "from": "lemonic modules/lemonic.ts",
+      "method": "POST /v1/lemonic/search",
+      "request": {
+        "query": "string"
+      },
+      "response": {
+        "results": [
+          "Track"
+        ]
+      },
+      "service": "vc-ts"
+    },
+    "netease.download": {
+      "from": "Music163bot-Go handlers_music.go",
+      "method": "POST /v1/netease/download",
+      "request": {
+        "track_id": "string"
+      },
+      "response": {
+        "file_path": "string",
+        "track": "Track"
+      },
+      "service": "netease-go"
+    },
+    "netease.lyrics": {
+      "from": "Music163bot-Go handlers_lyric.go",
+      "method": "POST /v1/netease/lyrics",
+      "request": {
+        "track_id": "string"
+      },
+      "response": {
+        "lyrics": "string"
+      },
+      "service": "netease-go"
+    },
+    "netease.search": {
+      "from": "Music163bot-Go handlers_search.go",
+      "method": "POST /v1/netease/search",
+      "request": {
+        "query": "string"
+      },
+      "response": {
+        "results": [
+          "Track"
+        ]
+      },
+      "service": "netease-go"
+    },
+    "queue.vote": {
+      "from": "daslui src/spotify.rs",
+      "method": "POST /v1/queue/vote",
+      "request": {
+        "track": "Track",
+        "vote": "approve|decline",
+        "voter_id": "UserId"
+      },
+      "response": {
+        "queued": "boolean"
+      },
+      "service": "queue-rust"
+    },
+    "radio.list": {
+      "from": "openradiobot index.js",
+      "method": "GET /v1/radio/stations",
+      "response": {
+        "stations": [
+          "string"
+        ]
+      },
+      "service": "radio-js"
+    },
+    "radio.start": {
+      "method": "POST /v1/radio/start",
+      "request": {
+        "chat_id": "ChatId",
+        "station": "string"
+      },
+      "response": {
+        "stream_url": "string"
+      },
+      "service": "radio-js"
+    },
+    "search.inline": {
+      "from": "lemonic handlers/inline_query.ts",
+      "method": "POST /v1/inline",
+      "request": {
+        "query": "string",
+        "user_id": "UserId"
+      },
+      "response": {
+        "results": [
+          "Track"
+        ]
+      },
+      "service": "vc-ts"
+    },
+    "search.query": {
+      "from": "lemonic modules/lemonic.ts, Music163bot-Go handlers_search.go, remix handlers/search.ts",
+      "method": "POST /v1/search",
+      "request": {
+        "limit": "integer",
+        "query": "string",
+        "source": "youtube|spotify|netease|deezer|lemonic|all"
+      },
+      "response": {
+        "results": [
+          "Track"
+        ]
+      },
+      "service": "vc-ts | downloaders | netease-go"
+    },
+    "share.create": {
+      "from": "feel-me src/main.rs, src/models.rs",
+      "method": "POST /v1/share",
+      "request": {
+        "created_by": "UserId",
+        "track": "Track"
+      },
+      "response": {
+        "link": "string",
+        "token": "string"
+      },
+      "service": "share-rust"
+    },
+    "share.resolve": {
+      "method": "GET /v1/share/:token",
+      "response": {
+        "track": "Track"
+      },
+      "service": "share-rust"
+    },
+    "spotify.dislike": {
+      "from": "rustify src/queue/* (disliked-track auto-skip)",
+      "method": "POST /v1/spotify/dislike",
+      "request": {
+        "action": "add|remove",
+        "track_id": "string",
+        "user_id": "UserId"
+      },
+      "response": {
+        "disliked": "boolean"
+      },
+      "service": "spotify-rust"
+    },
+    "spotify.resolve": {
+      "method": "POST /v1/spotify/resolve",
+      "request": {
+        "url": "string (open.spotify.com/<kind>/<id> or spotify:<kind>:<id>)"
+      },
+      "response": {
+        "kind": "track|album|playlist|artist",
+        "source": "spotify",
+        "track_id": "string",
+        "url": "string"
+      },
+      "service": "spotify-rust"
+    },
+    "spotify.skip_check": {
+      "from": "rustify src/profanity.rs, src/lyrics/*",
+      "method": "POST /v1/spotify/skip-check",
+      "request": {
+        "track": "Track"
+      },
+      "response": {
+        "reason": "profanity|ai-generated|disliked|null",
+        "skip": "boolean"
+      },
+      "service": "spotify-rust"
+    },
+    "spotify.watch": {
+      "from": "rustify src/spotify/*, src/queue/*",
+      "method": "POST /v1/spotify/watch",
+      "request": {
+        "action": "start|stop",
+        "user_id": "UserId"
+      },
+      "response": {},
+      "service": "spotify-rust"
+    },
+    "spotify.watches": {
+      "method": "GET /v1/spotify/watches",
+      "request": {},
+      "response": {
+        "watches": [
+          "UserId"
+        ]
+      },
+      "service": "spotify-rust"
+    },
+    "vc.now_playing": {
+      "method": "GET /v1/now-playing?chat_id=",
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.pause": {
+      "method": "POST /v1/pause",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.play": {
+      "from": "YukkiMusic-Go internal/core/queue.go, TGVCBot handlers/play.ts, ParvatiMusic modules/play.rs",
+      "method": "POST /v1/play",
+      "request": {
+        "chat_id": "ChatId",
+        "query": "string (title, URL or track id)",
+        "requested_by": "UserId"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.queue": {
+      "method": "POST /v1/queue",
+      "request": {
+        "action": "add|remove|clear|list",
+        "chat_id": "ChatId",
+        "position": "integer (for remove)",
+        "track": "Track (for add)"
+      },
+      "response": {
+        "queue": [
+          "QueueItem"
+        ]
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.radio": {
+      "from": "openradiobot index.js",
+      "method": "POST /v1/radio",
+      "request": {
+        "action": "start|stop",
+        "chat_id": "ChatId",
+        "station": "string"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "radio-js -> vc-*"
+    },
+    "vc.resume": {
+      "method": "POST /v1/resume",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.seek": {
+      "method": "POST /v1/seek",
+      "request": {
+        "chat_id": "ChatId",
+        "position_sec": "integer"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.skip": {
+      "method": "POST /v1/skip",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.stop": {
+      "method": "POST /v1/stop",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {},
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.loop": {
+      "from": "ParvatiMusic bot/src/modules/vc.rs handle_loop, bot/src/room.rs loop_n",
+      "method": "POST /v1/loop",
+      "request": {
+        "chat_id": "ChatId",
+        "count": "integer 0..=10"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.shuffle": {
+      "from": "ParvatiMusic bot/src/modules/vc.rs handle_shuffle, bot/src/room.rs shuffle_queue",
+      "method": "POST /v1/shuffle",
+      "request": {
+        "chat_id": "ChatId",
+        "enabled": "boolean"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.autoplay": {
+      "from": "ParvatiMusic bot/src/modules/lists.rs autoplay_handler, bot/src/monitor.rs advance_locked",
+      "method": "POST /v1/autoplay",
+      "request": {
+        "chat_id": "ChatId",
+        "enabled": "boolean"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.autoplay_skip": {
+      "from": "ParvatiMusic bot/src/modules/vc.rs handle_autoplay_skip",
+      "method": "POST /v1/autoplay-skip",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "spotify.collection": {
+      "from": "Spotify Web API (client credentials) + Spotify-Loader bot.py",
+      "method": "POST /v1/spotify/collection",
+      "request": {
+        "url": "string (open.spotify.com/<album|playlist|artist>/<id> or spotify:<kind>:<id>)"
+      },
+      "response": {
+        "api": "string",
+        "kind": "string",
+        "name": "string",
+        "tracks": [
+          "Track"
+        ],
+        "truncated": "boolean"
+      },
+      "service": "spotify-rust | downloaders"
+    },
+    "spotify.status": {
+      "method": "GET /v1/spotify/status",
+      "request": {},
+      "response": {
+        "api": "string",
+        "credentials_configured": "boolean",
+        "token_cached": "boolean"
+      },
+      "service": "spotify-rust"
+    }
+  },
+  "description": "Single contract for all Parlay services. HTTP + JSON. Every service: POST /v1/<action> with header X-Parlay-Token: $PARLAY_TOKEN. Health: GET /healthz -> {ok, service}. Error envelope everywhere: {ok:false, error:{code, message}}. Success: {ok:true, data:{...}}.",
+  "notes": [
+    "Files over the 50 MB Bot API cap: download.* returns oversize=true; the core queues them for a later MTProto pass instead of failing.",
+    "New actions are added here first, then in the service, then in the core handler."
+  ],
+  "title": "Parlay IPC contract",
+  "transport": {
+    "auth_header": "X-Parlay-Token",
+    "envelope_err": {
+      "error": {
+        "code": "string",
+        "message": "string"
+      },
+      "ok": false
+    },
+    "envelope_ok": {
+      "data": {},
+      "ok": true
+    },
+    "error_codes": [
+      "bad_request",
+      "unauthorized",
+      "not_found",
+      "engine_unavailable",
+      "download_failed",
+      "rate_limited",
+      "internal"
+    ],
+    "protocol": "HTTP/1.1 + JSON",
+    "timeout_ms": 30000
+  },
+  "types": {
+    "ChatId": {
+      "description": "Telegram chat id (negative for groups)",
+      "type": "integer"
+    },
+    "NowPlaying": {
+      "properties": {
+        "autoplay": {
+          "description": "autoplay on: a related track is picked when the queue drains",
+          "type": "boolean"
+        },
+        "chat_id": {
+          "$ref": "#/types/ChatId"
+        },
+        "engine": {
+          "enum": [
+            "go",
+            "ts",
+            "rust"
+          ],
+          "type": "string"
+        },
+        "loop": {
+          "description": "remaining replays of the current track, 0 = off (range 0-10)",
+          "type": "integer"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "position_sec": {
+          "type": "integer"
+        },
+        "queue": {
+          "items": {
+            "$ref": "#/types/QueueItem"
+          },
+          "type": "array"
+        },
+        "shuffle": {
+          "description": "shuffle on: the next track is picked at random from the queue",
+          "type": "boolean"
+        },
+        "track": {
+          "$ref": "#/types/Track"
+        },
+        "volume": {
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "QueueItem": {
+      "properties": {
+        "position": {
+          "type": "integer"
+        },
+        "requested_by": {
+          "$ref": "#/types/UserId"
+        },
+        "track": {
+          "$ref": "#/types/Track"
+        }
+      },
+      "required": [
+        "track",
+        "requested_by"
+      ],
+      "type": "object"
+    },
+    "Track": {
+      "properties": {
+        "artist": {
+          "type": "string"
+        },
+        "duration_sec": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "youtube",
+            "spotify",
+            "netease",
+            "deezer",
+            "jiosaavn",
+            "soundcloud",
+            "radio",
+            "file",
+            "lemonic"
+          ],
+          "type": "string"
+        },
+        "thumbnail": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "source"
+      ],
+      "type": "object"
+    },
+    "UserId": {
+      "description": "Telegram user id",
+      "type": "integer"
+    }
+  },
+  "version": "0.1.0-scaffold"
+}

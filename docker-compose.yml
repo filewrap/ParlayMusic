@@ -1,0 +1,137 @@
+services:
+  core-cpp:
+    build: ./services/core-cpp
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - BOT_TOKEN=${BOT_TOKEN}
+      - API_ID=${API_ID}
+      - API_HASH=${API_HASH}
+      - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
+      - VC_GO_URL=http://vc-go:8001
+      - VC_TS_URL=http://vc-ts:8002
+      - VC_RUST_URL=http://vc-rust:8003
+      - FX_URL=http://audio-fx-rust:8004
+      - SHARE_URL=http://share-rust:8005
+      - QUEUE_URL=http://queue-rust:8006
+      - SPOTIFY_URL=http://spotify-rust:8007
+      - RADIO_URL=http://radio-js:8008
+      - DOWNLOADERS_URL=http://downloaders:8009
+      - NETEASE_URL=http://netease-go:8010
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mongo
+      - redis
+      - vc-go
+      - downloaders
+    volumes:
+      - parlay-data:/data
+
+  vc-go:
+    build: ./services/vc-go
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - VC_PROFILE=${VC_PROFILE:-low-ram}
+      - MONGO_URI=mongodb://mongo:27017/parlay
+    ports:
+      - "8001:8001"
+    depends_on: [mongo]
+    volumes:
+      - parlay-data:/data
+
+  vc-ts:
+    build: ./services/vc-ts
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - LEMONIC_API_KEY=${LEMONIC_API_KEY:-}
+    ports:
+      - "8002:8002"
+    profiles: [full]
+
+  vc-rust:
+    build: ./services/vc-rust
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - MONGO_URI=mongodb://mongo:27017/parlay
+    ports:
+      - "8003:8003"
+    depends_on: [mongo]
+    profiles: [full]
+
+  audio-fx-rust:
+    build: ./services/audio-fx-rust
+    environment: [PARLAY_TOKEN=${PARLAY_TOKEN}]
+    ports: ["8004:8004"]
+    volumes: [parlay-data:/data]
+    profiles: [full]
+
+  share-rust:
+    build: ./services/share-rust
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - DATABASE_URL=sqlite:/data/share.db
+    ports: ["8005:8005"]
+    volumes: [parlay-data:/data]
+    profiles: [full]
+
+  queue-rust:
+    build: ./services/queue-rust
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+    ports: ["8006:8006"]
+    profiles: [full]
+
+  spotify-rust:
+    build: ./services/spotify-rust
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+    ports: ["8007:8007"]
+    profiles: [full]
+
+  gui-js:
+    build: ./services/gui-js
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - CORE_URL=http://core-cpp:8080
+    ports: ["3000:3000"]
+    depends_on: [core-cpp]
+    profiles: [full]
+
+  radio-js:
+    build: ./services/radio-js
+    environment: [PARLAY_TOKEN=${PARLAY_TOKEN}]
+    ports: ["8008:8008"]
+    profiles: [full]
+
+  downloaders:
+    build: ./services/downloaders
+    environment:
+      - PARLAY_TOKEN=${PARLAY_TOKEN}
+      - NAVIDROME_URL=${NAVIDROME_URL:-}
+      - NAVIDROME_USER=${NAVIDROME_USER:-}
+      - NAVIDROME_PASS=${NAVIDROME_PASS:-}
+    ports: ["8009:8009"]
+    volumes: [parlay-data:/data]
+
+  netease-go:
+    build: ./services/netease-go
+    environment: [PARLAY_TOKEN=${PARLAY_TOKEN}]
+    ports: ["8010:8010"]
+    volumes: [parlay-data:/data]
+    profiles: [full]
+
+  mongo:
+    image: mongo:7
+    volumes: [mongo-data:/data/db]
+
+  redis:
+    image: redis:7-alpine
+
+volumes:
+  parlay-data:
+  mongo-data:
