@@ -1,5 +1,5 @@
 // Package types mirrors the IPC contract in contracts/ipc.json (version
-// 0.1.0-scaffold): Track / QueueItem / NowPlaying plus the success and error
+// 0.2.0): Track / QueueItem / NowPlaying plus the success and error
 // envelopes every Parlay service speaks.
 package types
 
@@ -44,6 +44,11 @@ type NowPlaying struct {
 	Volume      int         `json:"volume"`
 	Queue       []QueueItem `json:"queue"`
 	Engine      string      `json:"engine"` // "go"
+	// StreamURL mirrors the current track's resolved direct audio URL
+	// at the top level (contract NowPlaying.stream_url), so readers
+	// need not dig into track.stream_url. Empty (idle, or the engine
+	// has not resolved one) stays omitted.
+	StreamURL string `json:"stream_url,omitempty"`
 	// Loop is the remaining replays of the current track (0 = off).
 	Loop int `json:"loop"`
 	// Shuffle reports whether the queue pop is randomised.

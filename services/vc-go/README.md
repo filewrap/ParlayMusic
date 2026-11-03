@@ -59,10 +59,13 @@ stop/queue/seek/loop/shuffle/autoplay/autoplay-skip/now-playing`, plus
   (verified: a 2 s track auto-advanced the room to idle).
 - Persistence — **MongoDB when `MONGO_URI` is set** (official driver
   `go.mongodb.org/mongo-driver/v2` v2.3.0, database `parlay`,
-  collection `vc_rooms`, one document per chat, `_id` = chat id;
-  upsert on save, stale chats pruned). A set-but-unreachable
-  `MONGO_URI` is fatal at startup — the service never silently falls
-  back. **JSON file when `MONGO_URI` is unset**
+  collection `state`, one document per room, `_id` =
+  `kv:vc:room:<chat_id>`, `v` = canonical room JSON shared with
+  vc-ts/vc-rust; upsert on save, stale chats pruned). **Redis when
+  only `REDIS_URL` is set** (`parlay:kv:vc:room:<chat_id>`, std-only
+  RESP client). A set-but-unreachable `MONGO_URI`/`REDIS_URL` is
+  fatal at startup — the service never silently falls back.
+  **JSON file when neither is set**
   (`$PARLAY_DATA_DIR/queues.json`, atomic write on every mutation).
   Both backends save loop/shuffle/autoplay/history; rooms restore
   **paused** (never auto-resume audio after a restart). Verified live

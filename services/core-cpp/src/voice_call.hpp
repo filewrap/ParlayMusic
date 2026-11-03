@@ -121,6 +121,10 @@ public:
     bool play(int64_t chat_id, const std::string& stream_url,
               const std::string& title, bool video, int seek_sec,
               double speed, int bass) override;
+    // Join needs an MTProto session: this backend can build the local
+    // offer and attach sources, but only the tdlib backend can join.
+    // Reports that honestly instead of the base class's silent false.
+    bool join(int64_t chat_id) override;
     bool stop(int64_t chat_id) override;
     bool pause(int64_t chat_id) override;
     bool resume(int64_t chat_id) override;
@@ -188,6 +192,11 @@ public:
 class TdLibVoiceCall final : public VoiceCall {
 public:
     explicit TdLibVoiceCall(const Config& cfg);
+    // Test seam: takes over a scripted TdLibClient (see
+    // tdlib_test.cpp) so the join flow is proven without a live
+    // Telegram session. The ntgcalls side stays real: the offer and
+    // the connect call come from the built libntgcalls.so.
+    TdLibVoiceCall(const Config& cfg, std::unique_ptr<TdLibClient> tdlib);
     ~TdLibVoiceCall() override = default;
     TdLibVoiceCall(const TdLibVoiceCall&) = delete;
     TdLibVoiceCall& operator=(const TdLibVoiceCall&) = delete;
@@ -218,7 +227,9 @@ private:
                               const std::string& local_offer, bool video);
 
     const Config& cfg_;
-    TdLibClient tdlib_;
+    // Owned TDLib client (unique_ptr so tests can substitute a
+    // scripted one; production always builds the real client).
+    std::unique_ptr<TdLibClient> tdlib_;
     NtgCallsVoiceCall ntg_;
     std::map<int64_t, int32_t> joined_;  // chat_id -> group_call_id
     mutable std::mutex mu_;

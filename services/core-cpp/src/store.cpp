@@ -15,6 +15,7 @@
 #include <iostream>
 
 #include "json.hpp"
+#include "scram.hpp"
 
 namespace parlay {
 namespace {
@@ -492,6 +493,16 @@ std::string elRegex(const std::string& key, const std::string& pattern) {
     putCStr(out, "");
     return out;
 }
+std::string elBinary(const std::string& key, const std::string& bytes,
+                     uint8_t subtype) {
+    std::string out;
+    out.push_back('\x05');
+    putCStr(out, key);
+    putI32(out, static_cast<int32_t>(bytes.size()));
+    out.push_back(static_cast<char>(subtype));
+    out += bytes;
+    return out;
+}
 
 namespace {
 // Walk a BSON document; invoke fn(type, key, value_offset) per element.
@@ -642,6 +653,25 @@ bool getInt32(const std::string& doc, const std::string& key, int32_t& out) {
     return found;
 }
 
+bool getBinary(const std::string& doc, const std::string& key,
+               std::string& out) {
+    bool found = false;
+    walk(doc, [&](char type, const std::string& k, size_t vpos) {
+        if (k == key && type == 0x05) {
+            if (vpos + 5 > doc.size()) return false;
+            int32_t len = 0;
+            std::memcpy(&len, doc.data() + vpos, 4);
+            if (len < 0 || vpos + 5 + static_cast<size_t>(len) > doc.size())
+                return false;
+            out = doc.substr(vpos + 5, static_cast<size_t>(len));
+            found = true;
+            return false;
+        }
+        return true;
+    });
+    return found;
+}
+
 bool getFirstArrayDoc(const std::string& doc, const std::string& key,
                       std::string& out) {
     bool found = false;
@@ -691,6 +721,33 @@ std::vector<std::string> getStringArray(const std::string& doc,
 }  // namespace bson
 
 // --- MongoDB wire protocol ---------------------------------------------------
+namespace {
+// Percent-decode (%XX) in URI userinfo / query values. Returns false on a
+// malformed escape. '+' is literal here (only query forms use it as space,
+// and MongoDB URIs do not).
+bool pctDecode(const std::string& in, std::string& out) {
+    out.clear();
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] != '%') {
+            out.push_back(in[i]);
+            continue;
+        }
+        if (i + 2 >= in.size()) return false;
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int hi = hex(in[i + 1]), lo = hex(in[i + 2]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+    }
+    return true;
+}
+}  // namespace
+
 MongoClient::~MongoClient() { close(); }
 
 void MongoClient::close() {
@@ -698,44 +755,287 @@ void MongoClient::close() {
         ::close(fd_);
         fd_ = -1;
     }
+    authenticated_ = false;
+}
+
+bool MongoClient::parseUri(const std::string& uri, MongoUri& out,
+                           std::string& error_out) {
+    const std::string prefix = "mongodb://";
+    if (uri.rfind(prefix, 0) != 0) {
+        if (uri.rfind("mongodb+srv://", 0) == 0) {
+            error_out =
+                "mongodb+srv:// URIs are not supported by the minimal "
+                "wire-protocol client (no DNS SRV lookup); use mongodb:// "
+                "with an explicit host:port";
+        } else {
+            error_out = "mongodb URI must start with mongodb://";
+        }
+        return false;
+    }
+    std::string rest = uri.substr(prefix.size());
+    out = MongoUri{};
+
+    // Query string first (it is not part of authority / path).
+    std::string query;
+    if (auto q = rest.find('?'); q != std::string::npos) {
+        query = rest.substr(q + 1);
+        rest = rest.substr(0, q);
+    }
+    // Path = database (may be empty -> default "parlay").
+    std::string dbpart;
+    if (auto slash = rest.find('/'); slash != std::string::npos) {
+        dbpart = rest.substr(slash + 1);
+        rest = rest.substr(0, slash);
+    }
+    if (!dbpart.empty() && !pctDecode(dbpart, out.db)) {
+        error_out = "bad percent-escape in mongodb database name";
+        return false;
+    }
+    // Authority: [userinfo@]host[:port]. Userinfo ends at the LAST '@'
+    // (a password may contain a percent-encoded '@', never a raw one).
+    std::string userinfo;
+    if (auto at = rest.rfind('@'); at != std::string::npos) {
+        userinfo = rest.substr(0, at);
+        rest = rest.substr(at + 1);
+    }
+    if (!userinfo.empty()) {
+        std::string user = userinfo, pass;
+        if (auto colon = userinfo.find(':'); colon != std::string::npos) {
+            user = userinfo.substr(0, colon);
+            pass = userinfo.substr(colon + 1);
+        }
+        if (!pctDecode(user, out.username) ||
+            !pctDecode(pass, out.password)) {
+            error_out = "bad percent-escape in mongodb credentials";
+            return false;
+        }
+        if (out.username.empty()) {
+            error_out = "mongodb URI has an empty username";
+            return false;
+        }
+    }
+    // Host[:port]; reject replica-set lists (comma) and empty hosts.
+    if (rest.empty()) {
+        error_out = "mongodb URI has no host";
+        return false;
+    }
+    if (rest.find(',') != std::string::npos) {
+        error_out =
+            "mongodb URIs with multiple hosts (replica sets) are not "
+            "supported by the minimal wire-protocol client";
+        return false;
+    }
+    if (rest.front() == '[') {  // IPv6 [::1]:port
+        auto close = rest.find(']');
+        if (close == std::string::npos) {
+            error_out = "malformed IPv6 host in mongodb URI";
+            return false;
+        }
+        out.host = rest.substr(1, close - 1);
+        if (close + 1 < rest.size()) {
+            if (rest[close + 1] != ':') {
+                error_out = "malformed host:port in mongodb URI";
+                return false;
+            }
+            try {
+                out.port = std::stoi(rest.substr(close + 2));
+            } catch (...) {
+                error_out = "bad port in mongodb URI";
+                return false;
+            }
+        }
+    } else if (auto colon = rest.rfind(':'); colon != std::string::npos) {
+        out.host = rest.substr(0, colon);
+        try {
+            out.port = std::stoi(rest.substr(colon + 1));
+        } catch (...) {
+            error_out = "bad port in mongodb URI";
+            return false;
+        }
+    } else {
+        out.host = rest;
+    }
+    if (out.host.empty() || out.port <= 0 || out.port > 65535) {
+        error_out = "bad host:port in mongodb URI";
+        return false;
+    }
+    // Query params: authSource, authMechanism (others ignored).
+    std::string auth_source;
+    while (!query.empty()) {
+        std::string pair = query;
+        if (auto amp = query.find('&'); amp != std::string::npos) {
+            pair = query.substr(0, amp);
+            query = query.substr(amp + 1);
+        } else {
+            query.clear();
+        }
+        std::string key = pair, value;
+        if (auto eq = pair.find('='); eq != std::string::npos) {
+            key = pair.substr(0, eq);
+            value = pair.substr(eq + 1);
+        }
+        std::string decoded;
+        if (!pctDecode(value, decoded)) {
+            error_out = "bad percent-escape in mongodb URI query";
+            return false;
+        }
+        if (key == "authSource") {
+            auth_source = decoded;
+        } else if (key == "authMechanism") {
+            scram::Mechanism m;
+            if (!scram::parseMechanism(decoded, m)) {
+                error_out = "unsupported authMechanism in mongodb URI: " +
+                            decoded +
+                            " (only SCRAM-SHA-1 / SCRAM-SHA-256)";
+                return false;
+            }
+            out.auth_mechanism = decoded;
+        }
+    }
+    // authSource default: the database in the URI, else "admin".
+    out.auth_source = !auth_source.empty()
+                          ? auth_source
+                          : (!dbpart.empty() ? out.db : "admin");
+    return true;
 }
 
 bool MongoClient::connect(const std::string& uri, std::string& error_out) {
-    std::string rest = uri;
-    const std::string prefix = "mongodb://";
-    if (rest.rfind(prefix, 0) == 0) rest = rest.substr(prefix.size());
-    if (auto at = rest.find('@'); at != std::string::npos) {
-        error_out =
-            "mongodb URIs with credentials are not supported by the minimal "
-            "wire-protocol client (needs SCRAM auth); use an unauthenticated "
-            "local URI";
-        return false;
-    }
-    if (auto slash = rest.find('/'); slash != std::string::npos) {
-        std::string dbpart = rest.substr(slash + 1);
-        if (auto q = dbpart.find('?'); q != std::string::npos)
-            dbpart = dbpart.substr(0, q);
-        if (!dbpart.empty()) db_ = dbpart;
-        rest = rest.substr(0, slash);
-    }
-    host_ = "127.0.0.1";
-    port_ = 27017;
-    if (auto colon = rest.rfind(':'); colon != std::string::npos) {
-        host_ = rest.substr(0, colon);
-        try {
-            port_ = std::stoi(rest.substr(colon + 1));
-        } catch (...) {
-        }
-    } else if (!rest.empty()) {
-        host_ = rest;
-    }
+    MongoUri parsed;
+    if (!parseUri(uri, parsed, error_out)) return false;
+    host_ = parsed.host;
+    port_ = parsed.port;
+    db_ = parsed.db;
+    username_ = parsed.username;
+    password_ = parsed.password;
+    auth_source_ = parsed.auth_source;
+    auth_mechanism_ = parsed.auth_mechanism;
+    authenticated_ = false;
     fd_ = connectTcp(host_, port_);
     if (fd_ < 0) {
         error_out = "cannot connect to mongodb at " + host_ + ":" +
                     std::to_string(port_);
         return false;
     }
+    if (!username_.empty() && !authenticate(error_out)) {
+        close();
+        return false;
+    }
     return ping();
+}
+
+// SCRAM handshake (RFC 5802 / RFC 7677) via saslStart / saslContinue.
+// Mechanism order: the URI's ?authMechanism= when set, else SCRAM-SHA-256
+// first with a fall-back to SCRAM-SHA-1 if the server reports the
+// mechanism unsupported (e.g. a user created with mechanisms
+// ["SCRAM-SHA-1"] only). A wrong password fails here with the server's
+// AuthenticationFailed error — never a silent success.
+bool MongoClient::authenticate(std::string& error_out) {
+    std::vector<scram::Mechanism> mechanisms;
+    if (!auth_mechanism_.empty()) {
+        scram::Mechanism m;
+        scram::parseMechanism(auth_mechanism_, m);
+        mechanisms.push_back(m);
+    } else {
+        mechanisms = {scram::Mechanism::kSha256, scram::Mechanism::kSha1};
+    }
+    std::string last_error;
+    for (scram::Mechanism mech : mechanisms) {
+        // MongoDB quirk: SCRAM-SHA-1 credentials are derived from
+        // hex(MD5(username + ":mongo:" + password)), not the raw password
+        // (see scram::mongoSha1Password). SCRAM-SHA-256 uses the raw
+        // password. Using the raw password for SHA-1 fails against a
+        // real mongod even though the SCRAM math itself is RFC-correct.
+        std::string eff_password =
+            mech == scram::Mechanism::kSha1
+                ? scram::mongoSha1Password(username_, password_)
+                : password_;
+        scram::Client sc(mech, username_, eff_password);
+        // saslStart: payload is BinData(0, <raw client-first bytes>).
+        std::string start = bson::doc(
+            {{ "saslStart", bson::elInt32("saslStart", 1) },
+             { "mechanism",
+               bson::elString("mechanism", scram::mechanismName(mech)) },
+             { "payload", bson::elBinary("payload", sc.clientFirst()) },
+             { "autoAuthorize", bson::elBool("autoAuthorize", true) },
+             { "options",
+               bson::elDoc("options",
+                           bson::doc({{"skipEmptyExchange",
+                                       bson::elBool("skipEmptyExchange",
+                                                    true)}})) },
+             { "$db", bson::elString("$db", auth_source_) }});
+        std::string err;
+        std::string reply = runCommandRaw(start, err);
+        if (reply.empty()) {
+            last_error = "saslStart transport failed: " + err;
+            return false;
+        }
+        double ok = 0;
+        if (!bson::getDouble(reply, "ok", ok) || ok != 1.0) {
+            std::string msg_text;
+            bson::getString(reply, "errmsg", msg_text);
+            int32_t code = 0;
+            bson::getInt32(reply, "code", code);
+            last_error = "saslStart (" +
+                         std::string(scram::mechanismName(mech)) +
+                         ") failed: " + msg_text;
+            // Fall through to the next mechanism when negotiating: any
+            // saslStart failure means this mechanism is unusable for
+            // this user on this server (no SCRAM credentials registered
+            // for it, mechanism unsupported, user not found in this
+            // authSource, ...). A genuinely wrong password fails at
+            // saslContinue, not here, so this cannot mask a bad password.
+            if (auth_mechanism_.empty() && mech != mechanisms.back())
+                continue;
+            error_out = last_error;
+            return false;
+        }
+        int32_t conversation_id = 0;
+        std::string server_first;
+        if (!bson::getInt32(reply, "conversationId", conversation_id) ||
+            !bson::getBinary(reply, "payload", server_first)) {
+            error_out = "saslStart reply missing conversationId/payload";
+            return false;
+        }
+        std::string sc_err;
+        if (!sc.serverFirst(server_first, sc_err)) {
+            error_out = "SCRAM server-first rejected: " + sc_err;
+            return false;
+        }
+        std::string cont = bson::doc(
+            {{ "saslContinue", bson::elInt32("saslContinue", 1) },
+             { "conversationId",
+               bson::elInt32("conversationId", conversation_id) },
+             { "payload", bson::elBinary("payload", sc.clientFinal()) },
+             { "$db", bson::elString("$db", auth_source_) }});
+        reply = runCommandRaw(cont, err);
+        if (reply.empty()) {
+            error_out = "saslContinue transport failed: " + err;
+            return false;
+        }
+        if (!bson::getDouble(reply, "ok", ok) || ok != 1.0) {
+            std::string msg_text;
+            bson::getString(reply, "errmsg", msg_text);
+            // Wrong password lands here (code 18, AuthenticationFailed).
+            error_out = "SCRAM authentication failed for user '" +
+                        username_ + "' (" +
+                        std::string(scram::mechanismName(mech)) +
+                        "): " + msg_text;
+            return false;
+        }
+        std::string server_final;
+        if (!bson::getBinary(reply, "payload", server_final)) {
+            error_out = "saslContinue reply missing payload";
+            return false;
+        }
+        if (!sc.serverFinal(server_final, sc_err)) {
+            error_out = "SCRAM server-final rejected: " + sc_err;
+            return false;
+        }
+        authenticated_ = true;
+        return true;
+    }
+    error_out = last_error;
+    return false;
 }
 
 bool MongoClient::sendAll(const std::string& data) {
@@ -752,8 +1052,27 @@ bool MongoClient::recvExact(char* buf, size_t n) {
     return true;
 }
 
+std::string MongoClient::command(const std::string& body_bson,
+                                 std::string& error_out) {
+    return runCommandRaw(body_bson, error_out);
+}
+
 std::string MongoClient::runCommand(const std::string& body_bson,
                                     std::string& error_out) {
+    std::string body = runCommandRaw(body_bson, error_out);
+    if (body.empty()) return "";
+    double ok = 0;
+    if (!bson::getDouble(body, "ok", ok) || ok != 1.0) {
+        std::string msg_text;
+        bson::getString(body, "errmsg", msg_text);
+        error_out = "mongodb command failed: " + msg_text;
+        return "";
+    }
+    return body;
+}
+
+std::string MongoClient::runCommandRaw(const std::string& body_bson,
+                                       std::string& error_out) {
     // OP_MSG: header(16) + flagBits(4) + section kind(1) + body doc.
     std::string msg;
     int32_t total = 16 + 4 + 1 + static_cast<int32_t>(body_bson.size());
@@ -799,13 +1118,6 @@ std::string MongoClient::runCommand(const std::string& body_bson,
     std::memcpy(&blen, body.data(), 4);
     if (blen > 0 && static_cast<size_t>(blen) <= body.size())
         body = body.substr(0, static_cast<size_t>(blen));
-    double ok = 0;
-    if (!bson::getDouble(body, "ok", ok) || ok != 1.0) {
-        std::string msg_text;
-        bson::getString(body, "errmsg", msg_text);
-        error_out = "mongodb command failed: " + msg_text;
-        return "";
-    }
     return body;
 }
 

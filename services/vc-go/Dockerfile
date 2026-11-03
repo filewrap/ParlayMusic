@@ -3,6 +3,15 @@
 # egress; go.sum pins it), slim runtime with yt-dlp so the resolver and
 # live autoplay picks work in-container (B12).
 FROM golang:1.23-bookworm AS build
+# Proxy support (Phase 7 A6): lets image builds run behind an HTTP(S)
+# proxy (apt/pip/go/cargo all honour these env vars). No-op when no
+# build args are passed. Values are build-time only, never ENV.
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG no_proxy
+ARG NO_PROXY
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -11,6 +20,15 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -o /out/parlay-vc ./cmd/parlay-vc
 
 FROM debian:bookworm-slim
+# Proxy support (Phase 7 A6): lets image builds run behind an HTTP(S)
+# proxy (apt/pip/go/cargo all honour these env vars). No-op when no
+# build args are passed. Values are build-time only, never ENV.
+ARG http_proxy
+ARG https_proxy
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG no_proxy
+ARG NO_PROXY
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl python3 python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

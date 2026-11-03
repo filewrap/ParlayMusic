@@ -58,17 +58,23 @@ verification; see `PHASE5.md` §6). Phase 6 closes the remaining
 audit gaps (see `REMAINING.md`). What is real, per service:
 
 - **core-cpp** — full command surface + permissions, engine fail-over
-  (go→ts→rust), Mongo/Redis store, TDLib 1.8.69 client (26/26 tests) +
+  (go→ts→rust), Mongo/Redis store, TDLib 1.8.69 client (44/44 tests) +
   in-process ntgcalls voice backend. Serves its own HTTP API on
   `:8080` (`GET /healthz`, `/api/now-playing`, `/api/queue` — Phase 6,
-  A2 closed), so the GUI's now-playing/queue endpoints have a real
+  A2 closed — plus `POST /v1/join`, vc.join for the vc-ts/vc-rust
+  engines, Phase 7 A1, and `POST /v1/mute`, vc.mute on core-owned
+  sessions, Phase 7 residuals), so the GUI's now-playing/queue endpoints have a real
   backend now; with no `BOT_TOKEN` the core runs HTTP-only.
 - **vc-go / vc-ts / vc-rust** — queue + playback state machines, real
   resolvers (yt-dlp), loop/shuffle/autoplay in all three engines (A3
   closed in Phase 5), Opus/RTP pipeline proven to a file in all
   three (251 frames). **No live voice join has ever happened** — audio
-  has never reached a Telegram voice chat (A1, needs a host with open
-  network + assistant session + libntgcalls.so).
+  has never reached a Telegram voice chat. The join path itself is
+  now complete in code (Phase 7, A1): vc-ts/vc-rust `join()` delegate
+  to the core's `POST /v1/join` (TDLib joinVideoChat + in-process
+  ntgcalls, proven offline against stub cores and a scripted TDLib
+  client); what is still missing is a host with open network +
+  assistant session + libntgcalls.so for the live call.
 - **downloaders** — YouTube/Spotify/Deezer/TikTok/Navidrome all real;
   Spotify collections served over HTTP (`POST /v1/spotify/collection`,
   Phase 5). Deezer is 30 s previews without an ARL cookie.

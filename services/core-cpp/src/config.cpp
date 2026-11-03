@@ -1,10 +1,23 @@
 // config.cpp
 #include "config.hpp"
 
+#include <unistd.h>
+
 #include <cstdlib>
 #include <sstream>
 
 namespace parlay {
+
+std::string exeDir() {
+    char buf[4096];
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+    std::string path(buf);
+    size_t slash = path.rfind('/');
+    if (slash == std::string::npos) return "";
+    return path.substr(0, slash);
+}
 namespace {
 
 std::string envStr(const char* name, const std::string& fallback = "") {
@@ -72,7 +85,12 @@ Config Config::fromEnv() {
     c.rtp_sink = envStr("VOICE_RTP_SINK");
     c.td_api_id = envInt("TD_API_ID", c.api_id);
     c.td_api_hash = envStr("TD_API_HASH", c.api_hash);
-    c.td_session_dir = envStr("TD_SESSION_DIR");
+    // Session dir defaults to <data_dir>/tdlib (PARLAY_DATA_DIR is
+    // read first, so the default follows a custom data dir). A host
+    // that only sets TD_API_ID/TD_API_HASH needs nothing else for
+    // the session path — the pre-authorized session dir lives there.
+    c.data_dir = envStr("PARLAY_DATA_DIR", c.data_dir);
+    c.td_session_dir = envStr("TD_SESSION_DIR", c.data_dir + "/tdlib");
     c.tdlib_lib = envStr("TDJSON_LIB");
     c.td_phone = envStr("TD_PHONE");
     c.td_code = envStr("TD_CODE");
@@ -83,7 +101,6 @@ Config Config::fromEnv() {
     c.td_last_name = envStr("TD_LAST_NAME");
     std::string td_qr = envStr("TD_QR");
     c.td_qr = (td_qr == "1" || td_qr == "true" || td_qr == "yes");
-    c.data_dir = envStr("PARLAY_DATA_DIR", c.data_dir);
     c.log_file = envStr("PARLAY_LOG_FILE");
     c.telegram_api_base = envStr("TELEGRAM_API_BASE", c.telegram_api_base);
     c.duration_limit_min = static_cast<int>(envInt("DURATION_LIMIT", c.duration_limit_min));

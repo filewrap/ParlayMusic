@@ -36,16 +36,19 @@
 //     in-process N-API addon when libntgcalls.so exists, else the
 //     ntgcalls 3.0.5 wheel probe — both purely local WebRTC, no
 //     MTProto, no network, no credentials.
-//   * The join (join): HONESTLY UNAVAILABLE in this service. The
-//     voice_bridge.py Telethon child that used to do
-//     phone.joinGroupCall was deleted in Phase 5 (user order), and
-//     Node stdlib has no MTProto client — there is no Telethon in
-//     Node. The MTProto join now lives only in core-cpp's
-//     TdLibVoiceCall (TDLib joinVideoChat + in-process ntgcalls).
-//     join() therefore always returns {ok:false, joined:false} with
-//     the exact reason; joined:true is NEVER reported without a real
-//     join. A Node MTProto client (TGVCBot/remix style grammy +
-//     tgcalls-next) would be a new dependency and is out of scope.
+//   * The join (join): DELEGATED to the core. vc-ts holds no MTProto
+//     client (the voice_bridge.py Telethon child was deleted in
+//     Phase 5, user order), so join() POSTs vc.join to the core-cpp
+//     HTTP API (POST {CORE_URL}/v1/join, contracts/ipc.json) and
+//     reports the core's answer verbatim: joined:true only when the
+//     core's TDLib backend really joined (TDLib joinVideoChat +
+//     in-process ntgcalls, TD_API_ID/TD_API_HASH/TD_SESSION_DIR),
+//     joined:false with the core's exact reason otherwise (no
+//     session/credentials, core unreachable, core 502). The engine
+//     supplies only the audio source (the Opus pipeline above); the
+//     core owns the join. A Node MTProto client (TGVCBot/remix style
+//     grammy + tgcalls-next) would be a new dependency and is out of
+//     scope — delegation is the real path, not a stopgap.
 //
 // What is BLOCKED (sandbox, proven, not worked around):
 //   * UDP sendto is EPERM even to loopback (plain-Python probe:
@@ -58,7 +61,9 @@
 //     with the wheel probe only as the fallback when the .so/addon is
 //     absent.
 //   * No MTProto session / credentials in this service, and no
-//     client to use them with — see join() above.
+//     client to use them with — the join is delegated to the core
+//     (see join() above), so a live join still needs the core's
+//     TDLib backend configured on a host with open network.
 //
 // playStream() runs the pipeline, builds the local offer as a
 // pre-flight proof, then attempts the join: the exact reason is
@@ -68,6 +73,8 @@
 
 "use strict";
 
+const http = require("node:http");
+const https = require("node:https");
 const { spawn } = require("node:child_process");
 const dgram = require("node:dgram");
 const fs = require("node:fs");
@@ -97,7 +104,7 @@ function chatState(chatId) {
 // In-process ntgcalls state: the C library (libntgcalls.so, same .so
 // core-cpp dlopens) + the N-API addon that wraps it. No bridge, no
 // Telethon, no session file — vc-ts holds no MTProto credentials and
-// no MTProto client; the join gate is reported separately by join().
+// no MTProto client; the join is delegated to the core by join().
 function ntgLibCandidates() {
   const out = [];
   if (process.env.NTGCALLS_LIB) out.push(process.env.NTGCALLS_LIB);
@@ -373,38 +380,110 @@ async function createLocalOffer(chatId) {
 }
 
 // ------------------------------------------------------------- join -------
-// The MTProto step: phone.joinGroupCall(local SDP) -> remote transport
-// -> ntgcalls connect(remote). HONESTLY UNAVAILABLE in vc-ts: the
-// voice_bridge.py Telethon child that did this was deleted in Phase 5
-// (user order — ntgcalls is a native library linked in-process, not a
-// server), and Node stdlib has no MTProto client to replace it with.
-// The join lives only in core-cpp's TdLibVoiceCall (TDLib
-// joinVideoChat + in-process ntgcalls, TD_API_ID/TD_API_HASH/
-// TD_SESSION_DIR). This function therefore always returns
-// {ok:false, joined:false} with the exact reason — never a spawned
-// process, never a faked join. `localSdp` is accepted (and its length
-// recorded) so callers can pass the pre-flight offer from
-// createLocalOffer; it is NOT sent anywhere.
-async function join(chatId, localSdp) {
+// The MTProto step, DELEGATED to the core (Phase 7, A1): vc-ts holds
+// no MTProto client — the voice_bridge.py Telethon child was deleted
+// in Phase 5 (user order) and Node stdlib has no MTProto client to
+// replace it with. join() therefore POSTs vc.join to the core-cpp
+// HTTP API (POST {CORE_URL}/v1/join, contracts/ipc.json) and reports
+// the core's answer verbatim. The core owns the join (authorize ->
+// getChat/createVideoChat -> joinVideoChat -> ntgcalls connect in
+// TdLibVoiceCall); the engine supplies only the audio source. A core
+// that answers joined:true really joined; any failure — core
+// unreachable, core 502, core 401 — is returned as joined:false
+// with the exact reason, never a faked join. `localSdp` is accepted
+// (and its length recorded) so callers can pass the pre-flight offer
+// from createLocalOffer; it is NOT sent anywhere — the core builds
+// its own offer in-process. `opts` is a test seam: {coreUrl, token}
+// override CORE_URL / PARLAY_TOKEN for one call.
+function coreUrl() {
+  const u = (process.env.CORE_URL || "http://localhost:8080").trim();
+  return u.replace(/\/+$/, "");
+}
+
+function postJson(url, body, token, timeoutMs) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch (e) {
+      return resolve({ ok: false, error: `bad core URL ${url}: ${e.message}` });
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return resolve({ ok: false, error: `unsupported core URL scheme ${parsed.protocol} (want http: or https:)` });
+    }
+    const lib = parsed.protocol === "https:" ? https : http;
+    const payload = JSON.stringify(body);
+    const req = lib.request(parsed, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+        ...(token ? { "x-parlay-token": token } : {}),
+      },
+      timeout: timeoutMs || 30000,
+    }, (res) => {
+      let data = "";
+      res.on("data", (d) => { data += d; });
+      res.on("end", () => {
+        let json = null;
+        try { json = JSON.parse(data); } catch { /* non-JSON body */ }
+        resolve({ ok: true, status: res.statusCode, json, raw: data });
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy(new Error(`core request timed out after ${timeoutMs || 30000} ms`));
+    });
+    req.on("error", (e) => {
+      resolve({ ok: false, error: String((e && e.message) || e) });
+    });
+    req.end(payload);
+  });
+}
+
+async function join(chatId, localSdp, opts) {
   const st = chatState(chatId);
   if (localSdp) st.offer_len = String(localSdp).length;
-  return {
-    ok: false,
-    joined: false,
-    error: "voice join unavailable in vc-ts: no MTProto client in-process "
-      + "(voice_bridge.py deleted Phase 5); join via the core-cpp tdlib "
-      + "backend (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + libntgcalls.so)",
-  };
+  const core = (opts && opts.coreUrl) || coreUrl();
+  const token = (opts && opts.token !== undefined)
+    ? opts.token
+    : (process.env.PARLAY_TOKEN || "");
+  const url = `${core}/v1/join`;
+  const r = await postJson(url, { chat_id: chatId }, token);
+  if (!r.ok) {
+    return {
+      ok: false,
+      joined: false,
+      error: `core unreachable at ${url} (${r.error}); set CORE_URL to `
+        + `the core-cpp HTTP URL (default http://localhost:8080)`,
+    };
+  }
+  const env = r.json;
+  if (r.status === 200 && env && env.ok && env.data && env.data.joined === true) {
+    return { ok: true, joined: true, via: "core-cpp vc.join" };
+  }
+  // The core's exact reason, verbatim (IPC envelope
+  // {ok:false,error:{code,message}}); a 200 with joined:false is
+  // the same failure, reported the same way.
+  let reason = null;
+  if (env && env.error) {
+    reason = typeof env.error === "string"
+      ? env.error
+      : (env.error.message || env.error.code || null);
+  }
+  if (!reason) reason = `core ${url} returned HTTP ${r.status}: ${String(r.raw || "").slice(0, 300)}`;
+  return { ok: false, joined: false, error: reason };
 }
 
 // ------------------------------------------------------------ play --------
 // Run the Opus/RTP pipeline for `source`, build the local ntgcalls
-// offer as a pre-flight proof, then attempt the join. The join is
-// honestly unavailable in vc-ts (no MTProto client — see join()), so
-// the result is always {streaming:false, voice:"opus-rtp-ready",
-// reason:<exact join reason>} on a good pipeline — the voice state
-// never claims joined:true. Never throws; the result (and the
-// per-chat voice state) always names the exact outcome.
+// offer as a pre-flight proof, then attempt the join — delegated to
+// the core (see join()). On a good pipeline + a real core join the
+// result is {streaming:true, voice:"live"}; on a good pipeline with
+// the core unable to join it is {streaming:false,
+// voice:"opus-rtp-ready", reason:<the core's exact reason>} — the
+// voice state never claims joined:true without the core's answer.
+// Never throws; the result (and the per-chat voice state) always
+// names the exact outcome.
 async function playStream(chatId, source) {
   const st = chatState(chatId);
   st.voice = "encoding";
@@ -424,7 +503,8 @@ async function playStream(chatId, source) {
   }
   // Pre-flight: prove in-process ntgcalls can build a call (addon, or
   // wheel probe fallback). The offer is what the MTProto join would
-  // carry — but there is no MTProto client in this service to carry it.
+  // carry — the core builds its own offer in-process for the real
+  // join; this one only proves the local media side works.
   const offer = await createLocalOffer(chatId);
   if (offer.ok) {
     st.offer_len = offer.offer_len;
@@ -438,7 +518,7 @@ async function playStream(chatId, source) {
     st.joined = true;
     st.voice = "live";
     st.reason = null;
-    return { streaming: true, voice: "live", reason: null, pipeline, remote_len: j.remote_len };
+    return { streaming: true, voice: "live", reason: null, pipeline, via: j.via };
   }
   st.joined = false;
   st.reason = j.error;
@@ -501,4 +581,6 @@ module.exports = {
   backendConfig,
   probeUdp,
   countRtpPackets,
+  coreUrl,
+  postJson,
 };

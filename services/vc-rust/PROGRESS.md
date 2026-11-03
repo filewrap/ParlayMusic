@@ -103,6 +103,12 @@ correct header -> 200; /healthz stays open without a token.
 
 ## Voice transport — real pipeline + join client (Phase 4, TDLib wiring B, 2026-11-02)
 
+> SUPERSEDED (Phase 7, A1): the `voice_bridge.py` join client described
+> below was deleted in Phase 5 (user order). The join is now delegated
+> to the core: `join()` POSTs vc.join to `{CORE_URL}/v1/join` and
+> reports the core's answer verbatim. The rest of this section (Opus/RTP
+> pipeline, local offer, proof numbers) is still accurate.
+
 - New `src/voice.rs` (`RealVoiceCall`, std-only): ffmpeg Opus/RTP
   pipeline (same shape as core-cpp OpusPipeline), SSRC-anchored RTP
   file packet counter, UDP EPERM probe, ntgcalls local offer via

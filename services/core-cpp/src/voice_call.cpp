@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include "ntgcalls.h"
@@ -164,6 +165,15 @@ std::string ntgError(const char* what, ntg_result rc) {
 NtgCallsVoiceCall::NtgCallsVoiceCall(const std::string& explicit_path) {
     std::vector<std::string> candidates;
     if (!explicit_path.empty()) candidates.push_back(explicit_path);
+    // Release layout first: lib/ next to the binary, and lib/ next
+    // to bin/ (parlay-vX.Y.Z/{bin/parlay-core, lib/libntgcalls.so}).
+    // A proper host needs nothing but the session dir + the built
+    // .so in lib/ — no NTGCALLS_LIB, no repo paths.
+    std::string exe = exeDir();
+    if (!exe.empty()) {
+        candidates.push_back(exe + "/lib/libntgcalls.so");
+        candidates.push_back(exe + "/../lib/libntgcalls.so");
+    }
     candidates.push_back("./lib/libntgcalls.so");
     candidates.push_back("../../refs/ntgcalls/shared-output/lib/libntgcalls.so");  // repo build output, when run from services/core-cpp
     candidates.push_back("/usr/local/lib/libntgcalls.so");
@@ -292,6 +302,19 @@ bool NtgCallsVoiceCall::setSources(int64_t chat_id,
         return false;
     }
     return true;
+}
+
+bool NtgCallsVoiceCall::join(int64_t /*chat_id*/) {
+    // This backend has no MTProto session: it can build the local SDP
+    // offer (createOffer) and attach sources (setSources), but the
+    // join itself — phone.joinGroupCall — needs TDLib. Say so with
+    // the exact reason instead of the base class's silent false.
+    last_error_ =
+        "no MTProto session: this backend can build a local SDP offer "
+        "and attach sources, but only the tdlib backend can join a "
+        "Telegram voice chat (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + "
+        "libtdjson.so)";
+    return false;
 }
 
 bool NtgCallsVoiceCall::play(int64_t chat_id, const std::string& stream_url,
@@ -487,24 +510,30 @@ OpusStats OpusPipeline::run(const std::string& source,
 // fed to ntgcalls connect(), exactly like the voice bridge does with
 // Telethon.
 TdLibVoiceCall::TdLibVoiceCall(const Config& cfg)
-    : cfg_(cfg), tdlib_(cfg.tdlib_lib), ntg_(cfg.ntgcalls_lib) {}
+    : cfg_(cfg),
+      tdlib_(std::make_unique<TdLibClient>(cfg.tdlib_lib)),
+      ntg_(cfg.ntgcalls_lib) {}
+
+TdLibVoiceCall::TdLibVoiceCall(const Config& cfg,
+                               std::unique_ptr<TdLibClient> tdlib)
+    : cfg_(cfg), tdlib_(std::move(tdlib)), ntg_(cfg.ntgcalls_lib) {}
 
 bool TdLibVoiceCall::available() const {
-    return tdlib_.available() && cfg_.td_api_id != 0 &&
+    return tdlib_->available() && cfg_.td_api_id != 0 &&
            !cfg_.td_api_hash.empty() && !cfg_.td_session_dir.empty() &&
            ntg_.available();
 }
 
 std::string TdLibVoiceCall::describe() const {
-    if (!tdlib_.available())
-        return "tdlib unavailable: " + tdlib_.lastError();
+    if (!tdlib_->available())
+        return "tdlib unavailable: " + tdlib_->lastError();
     if (cfg_.td_api_id == 0 || cfg_.td_api_hash.empty() ||
         cfg_.td_session_dir.empty())
         return "tdlib unavailable: TD_API_ID/TD_API_HASH/TD_SESSION_DIR "
                "not all set";
     if (!ntg_.available())
         return "tdlib unavailable: ntgcalls: " + ntg_.lastError();
-    return "tdlib via " + tdlib_.libPath() + " + ntgcalls via " +
+    return "tdlib via " + tdlib_->libPath() + " + ntgcalls via " +
            ntg_.describe();
 }
 
@@ -513,7 +542,7 @@ int32_t TdLibVoiceCall::groupCallId(int64_t chat_id) {
         {"@type", Json("getChat")},
         {"chat_id", Json(chat_id)},
     });
-    Json resp = tdlib_.call(req, 30.0);
+    Json resp = tdlib_->call(req, 30.0);
     if (resp.isNull()) {
         last_error_ = "getChat timed out for chat " +
                       std::to_string(chat_id);
@@ -544,7 +573,7 @@ int32_t TdLibVoiceCall::createVideoChat(int64_t chat_id,
         {"start_date", Json(0)},
         {"is_rtmp_stream", Json(false)},
     });
-    Json resp = tdlib_.call(req, 30.0);
+    Json resp = tdlib_->call(req, 30.0);
     if (resp.isNull()) {
         last_error_ = "createVideoChat timed out for chat " +
                       std::to_string(chat_id);
@@ -578,7 +607,7 @@ std::string TdLibVoiceCall::joinVideoChat(int32_t group_call_id,
         {"join_parameters", join_params},
         {"invite_hash", Json("")},
     });
-    Json resp = tdlib_.call(req, 30.0);
+    Json resp = tdlib_->call(req, 30.0);
     if (resp.isNull()) {
         last_error_ = "joinVideoChat timed out for group call " +
                       std::to_string(group_call_id);
@@ -616,8 +645,8 @@ bool TdLibVoiceCall::join(int64_t chat_id) {
     // ntgcalls create_call (local SDP offer) -> resolve/create the
     // video chat -> joinVideoChat -> ntgcalls connect. No setSources:
     // the call is joined silent until a track plays.
-    if (!tdlib_.authorized() && !tdlib_.authorize(60.0)) {
-        last_error_ = tdlib_.lastError();
+    if (!tdlib_->authorized() && !tdlib_->authorize(60.0)) {
+        last_error_ = tdlib_->lastError();
         return false;
     }
     std::string offer;
@@ -660,8 +689,8 @@ bool TdLibVoiceCall::play(int64_t chat_id, const std::string& stream_url,
     }
     if (!already_joined) {
         // 1. Authorize the TDLib session (honest stop without credentials).
-        if (!tdlib_.authorized() && !tdlib_.authorize(60.0)) {
-            last_error_ = tdlib_.lastError();
+        if (!tdlib_->authorized() && !tdlib_->authorize(60.0)) {
+            last_error_ = tdlib_->lastError();
             return false;
         }
         // 2. ntgcalls create_call -> local SDP offer.
@@ -711,13 +740,13 @@ bool TdLibVoiceCall::stop(int64_t chat_id) {
             joined_.erase(it);
         }
     }
-    if (gcid != 0 && tdlib_.authorized()) {
+    if (gcid != 0 && tdlib_->authorized()) {
         // Best effort: leave the group call on the signaling side.
         Json req = Json::objectOf({
             {"@type", Json("leaveGroupCall")},
             {"group_call_id", Json(static_cast<int64_t>(gcid))},
         });
-        tdlib_.call(req, 10.0);
+        tdlib_->call(req, 10.0);
     }
     return ok;
 }
@@ -751,7 +780,9 @@ std::unique_ptr<VoiceCall> makeVoiceCall(const Config& cfg) {
         reason = "tdlib configured but " + tdlib_probe.describe() +
                  "; ntgcalls: " + ntg.lastError();
     } else {
-        reason = "no TD_API_ID/TD_API_HASH/TD_SESSION_DIR (tdlib off); "
+        // TD_SESSION_DIR now defaults to <data_dir>/tdlib, so only
+        // the api id/hash can be missing here.
+        reason = "no TD_API_ID/TD_API_HASH (tdlib off); "
                  "ntgcalls: " +
                  ntg.lastError();
     }

@@ -11,7 +11,8 @@
 //   { ok:true, data:{...} }  or  { ok:false, error:{code, message} }
 // Auth: X-Parlay-Token when PARLAY_TOKEN is set; GET /healthz is public.
 // Voice transport is real — see src/voicecall.js (ffmpeg Opus/RTP
-// pipeline + ntgcalls local offer + Telethon voice-bridge join client).
+// pipeline + ntgcalls local offer + join delegated to the core-cpp
+// TDLib backend over POST {CORE_URL}/v1/join).
 // Playback state (per-chat queue, position, auto-advance) is real and
 // persisted to data/state.json (atomic write); restored rooms come back
 // paused. In this sandbox the live join is blocked (no MTProto session,
@@ -34,6 +35,13 @@ const path = require("path");
 
 const voicecall = require("./voicecall");
 const R = require("./resolvers");
+const { SharedStore } = require("./store");
+const { roomToCanonical, roomFromCanonical } = require("./canonical");
+
+// Shared durable store (A11): Mongo > Redis > JSON file. Null while
+// unconfigured (file mode) or before startup; SharedStore.open() throws
+// when a configured backend is unreachable (fatal — see store.js).
+let sharedStore = null;
 
 const PORT = Number(process.env.PORT) || 8002;
 const TOKEN = process.env.PARLAY_TOKEN || "";
@@ -60,7 +68,7 @@ function positionSec(room) {
 
 function nowPlaying(room) {
   const vs = voicecall.voiceState(room.chat_id);
-  return {
+  const np = {
     chat_id: room.chat_id,
     engine: "ts",
     track: room.current,
@@ -76,6 +84,11 @@ function nowPlaying(room) {
     voice_joined: vs.joined,
     voice_reason: vs.reason,
   };
+  // Top-level stream_url mirrors the current track's (contract
+  // NowPlaying.stream_url, A8 residual): readers need not dig into
+  // track.stream_url. Omitted when the engine has not resolved one.
+  if (room.current && room.current.stream_url) np.stream_url = room.current.stream_url;
+  return np;
 }
 
 function getRoom(chatId) {
@@ -133,6 +146,12 @@ function popNext(room) {
 }
 
 function saveState() {
+  if (sharedStore) {
+    // Async (Node has no sync sockets): ops serialise through the
+    // store queue in call order; shutdown flushes (see SIGTERM below).
+    saveStateShared().catch((e) => console.error("[vc-ts] shared state save failed:", e.message));
+    return;
+  }
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const snapshot = [...rooms.values()]
@@ -157,7 +176,41 @@ function saveState() {
   }
 }
 
-function loadState() {
+// Canonical shared-store room document (A11): see src/canonical.js.
+// roomToCanonical/roomFromCanonical live there so tests can import
+// them without booting the server.
+async function saveStateShared() {
+  const live = new Set();
+  for (const r of rooms.values()) {
+    const key = `vc:room:${r.chat_id}`;
+    if (r.current || r.queue.length) {
+      live.add(r.chat_id);
+      await sharedStore.set(key, JSON.stringify(roomToCanonical(r, positionSec(r))));
+    } else {
+      await sharedStore.del(key);
+    }
+  }
+  for (const k of await sharedStore.keys("vc:room:")) {
+    const id = Number(k.slice("vc:room:".length));
+    if (!live.has(id)) await sharedStore.del(k);
+  }
+}
+
+async function loadState() {
+  if (sharedStore) {
+    try {
+      for (const key of await sharedStore.keys("vc:room:")) {
+        const text = await sharedStore.get(key);
+        if (!text) continue;
+        const s = JSON.parse(text);
+        if (s && s.chat_id) rooms.set(s.chat_id, roomFromCanonical(s));
+      }
+      console.log(`[vc-ts] restored ${rooms.size} room(s) from shared store (${sharedStore.describe()}) (paused)`);
+    } catch (e) {
+      console.error("[vc-ts] shared state load failed:", e.message);
+    }
+    return;
+  }
   try {
     if (!fs.existsSync(STATE_FILE)) return;
     const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
@@ -515,6 +568,7 @@ const server = http.createServer(async (req, res) => {
         lemonic_mode: R.lemonicMode(),
         voice: voicecall.status(),
         rooms: rooms.size,
+        store: sharedStore ? sharedStore.backend : "file",
       });
     }
 
@@ -848,15 +902,30 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-loadState();
-server.listen(PORT, () => {
-  console.log(
-    `[vc-ts] listening on :${PORT} (yt-dlp: ${R.ytDlpAvailable() ? R.ytDlpPath() : "missing"}, ` +
-    `lemonic: ${R.lemonicConfigured() ? "configured" : "not configured"}, ` +
-    `auth: ${TOKEN ? "token required" : "open (no PARLAY_TOKEN)"}, ` +
-    `voice: ${voicecall.status().voice})`
-  );
-});
+// Startup: open the shared store first (fatal when a configured
+// backend is unreachable), restore state, then listen.
+(async () => {
+  try {
+    sharedStore = await SharedStore.open();
+  } catch (e) {
+    console.error(`[vc-ts] shared store init failed: ${e.message}`);
+    process.exit(1);
+  }
+  await loadState();
+  server.listen(PORT, () => {
+    console.log(
+      `[vc-ts] listening on :${PORT} (yt-dlp: ${R.ytDlpAvailable() ? R.ytDlpPath() : "missing"}, ` +
+        `lemonic: ${R.lemonicConfigured() ? "configured" : "not configured"}, ` +
+        `auth: ${TOKEN ? "token required" : "open (no PARLAY_TOKEN)"}, ` +
+        `voice: ${voicecall.status().voice})`
+    );
+  });
+})();
 
-process.on("SIGINT", () => { saveState(); process.exit(0); });
-process.on("SIGTERM", () => { saveState(); process.exit(0); });
+async function shutdown() {
+  saveState();
+  if (sharedStore) await sharedStore.flush();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

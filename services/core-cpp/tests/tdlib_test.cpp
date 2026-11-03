@@ -16,6 +16,19 @@
 //      confirmation, plus premium-purchase + unknown states failing
 //      honestly; authorize() with TD_* set but no phone reaches
 //      WaitPhoneNumber offline and stops on the missing TD_PHONE.
+//   7. (Phase 7, A1) Join flow with a SCRIPTED TDLib client: the mock
+//      answers only the TDLib side (getChat / createVideoChat /
+//      joinVideoChat), so the test proves the real ntg_create_call
+//      offer is carried as the joinVideoChat payload, the request
+//      shapes match td_api.tl, and the real ntg.connect is invoked
+//      with the returned remote payload — and that the join reports
+//      joined:false with the exact connect error, never a fake
+//      joined:true (the mock payload is not a real Telegram answer).
+//   8. (Phase 7, A1) Config defaults: TD_SESSION_DIR defaults to
+//      <PARLAY_DATA_DIR>/tdlib in both Config::fromEnv and
+//      TdLibClient::Params::fromEnv; libtdjson/libntgcalls resolve
+//      from lib/ next to the binary (release layout) before the repo
+//      build output.
 // Usage: ./tdlib_test
 // Exit 0 = all checks pass. Prints PASS/FAIL per check plus the exact
 // TDLib responses received.
@@ -23,7 +36,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "config.hpp"
 #include "tdlib_client.hpp"
@@ -39,6 +54,84 @@ static int failures = 0;
             ++failures;                                                     \
         }                                                                   \
     } while (0)
+
+// Scripted TDLib client (Phase 7, A1): answers ONLY the TDLib side of
+// the join. getChat / createVideoChat / joinVideoChat return canned
+// objects; every request is recorded so the test can assert the exact
+// request shapes. The ntgcalls side (local offer + connect) stays
+// real — the voice call under test loads the built libntgcalls.so.
+// The mock's remote payload is deliberately NOT a real Telegram
+// answer, so the real ntg.connect must reject it and the join must
+// report joined:false with that exact error — never a fake join.
+class FakeTdLib : public parlay::TdLibClient {
+public:
+    // getChat answers with this group_call_id (0 = no video chat yet,
+    // so the join must create one first).
+    int32_t get_chat_group_call_id = 424242;
+    // createVideoChat answers with this id.
+    int32_t create_video_chat_id = 434343;
+    // joinVideoChat answers with this remote transport payload.
+    std::string remote_payload = "mock-remote-transport-payload";
+    // When set, requests of this @type answer with an error instead.
+    std::string error_on_type;
+    std::string error_message = "mock TDLib error";
+    std::vector<parlay::Json> seen;
+
+    bool available() const override { return true; }
+    bool authorized() const override { return true; }
+    bool authorize(double) override { return true; }
+    std::string lastError() const override { return ""; }
+    parlay::Json call(const parlay::Json& req, double) override {
+        seen.push_back(req);
+        const parlay::Json* type = req.find("@type");
+        std::string t = type ? type->asString() : "";
+        if (!error_on_type.empty() && t == error_on_type) {
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("error")},
+                {"code", parlay::Json(static_cast<int64_t>(400))},
+                {"message", parlay::Json(error_message)},
+            });
+        }
+        if (t == "getChat") {
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("chat")},
+                {"id",
+                 parlay::Json(static_cast<int64_t>(-1001234567890LL))},
+                {"video_chat",
+                 parlay::Json::objectOf({
+                     {"@type", parlay::Json("videoChat")},
+                     {"group_call_id",
+                      parlay::Json(
+                          static_cast<int64_t>(get_chat_group_call_id))},
+                 })},
+            });
+        }
+        if (t == "createVideoChat") {
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("groupCallId")},
+                {"id",
+                 parlay::Json(static_cast<int64_t>(create_video_chat_id))},
+            });
+        }
+        if (t == "joinVideoChat") {
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("text")},
+                {"text", parlay::Json(remote_payload)},
+            });
+        }
+        return parlay::Json::objectOf({{"@type", parlay::Json("ok")}});
+    }
+};
+
+// First recorded request of the given @type, or nullptr.
+const parlay::Json* findReq(const std::vector<parlay::Json>& seen,
+                            const std::string& type) {
+    for (const auto& r : seen) {
+        const parlay::Json* t = r.find("@type");
+        if (t && t->asString() == type) return &r;
+    }
+    return nullptr;
+}
 
 int main() {
     // No credentials in this process: make sure the env really is empty
@@ -304,6 +397,217 @@ int main() {
         }
         std::error_code ec;
         std::filesystem::remove_all("/tmp/tdlib-test-session", ec);
+        restore();
+    }
+
+    // 7. Join flow with a scripted TDLib client (Phase 7, A1): the
+    //    mock answers only the TDLib side, so the offer and the
+    //    connect call are real. Needs the built libntgcalls.so —
+    //    skipped when it is absent, like check 5.
+    {
+        const char* env_lib = std::getenv("NTGCALLS_LIB");
+        std::string lib =
+            env_lib ? env_lib
+                    : "../../refs/ntgcalls/shared-output/lib/libntgcalls.so";
+        FILE* f = std::fopen(lib.c_str(), "rb");
+        if (!f) {
+            std::cout << "SKIP mock-join checks: " << lib << " not built\n";
+        } else {
+            std::fclose(f);
+            parlay::Config cfg;
+            cfg.td_api_id = 12345;
+            cfg.td_api_hash = "0123456789abcdef0123456789abcdef";
+            cfg.td_session_dir = "/tmp/tdlib-mock-test";
+            cfg.ntgcalls_lib = lib;
+
+            // 7a. Existing video chat: getChat -> group_call_id
+            // 424242, joinVideoChat carries the REAL local offer as
+            // its payload, then the real ntg.connect rejects the
+            // mock remote payload — join reports joined:false with
+            // the exact connect error, never a fake join.
+            {
+                auto fake = std::make_unique<FakeTdLib>();
+                FakeTdLib* fp = fake.get();
+                parlay::TdLibVoiceCall vc(cfg, std::move(fake));
+                CHECK(vc.available(),
+                      "mock-backed TdLibVoiceCall reports available");
+                bool ok = vc.join(-1001234567890LL);
+                std::cout << "mock join -> " << (ok ? "true" : "false")
+                          << " error: " << vc.lastError() << "\n";
+                CHECK(!ok,
+                      "join with a mock remote payload does not fake "
+                      "joined:true");
+                CHECK(vc.lastError().find("ntgcalls connect failed") !=
+                          std::string::npos,
+                      "join fails at the real ntg.connect with the "
+                      "mock payload");
+                const parlay::Json* get_chat =
+                    findReq(fp->seen, "getChat");
+                CHECK(get_chat != nullptr &&
+                          get_chat->find("chat_id") &&
+                          get_chat->find("chat_id")->asInt() ==
+                              -1001234567890LL,
+                      "join sends getChat for the chat");
+                const parlay::Json* join_req =
+                    findReq(fp->seen, "joinVideoChat");
+                CHECK(join_req != nullptr,
+                      "join sends joinVideoChat");
+                bool shape_ok = false;
+                std::string payload;
+                if (join_req) {
+                    const parlay::Json* gcid =
+                        join_req->find("group_call_id");
+                    const parlay::Json* part =
+                        join_req->find("participant_id");
+                    const parlay::Json* inv =
+                        join_req->find("invite_hash");
+                    const parlay::Json* jp =
+                        join_req->find("join_parameters");
+                    const parlay::Json* jp_type =
+                        jp ? jp->find("@type") : nullptr;
+                    const parlay::Json* audio_src =
+                        jp ? jp->find("audio_source_id") : nullptr;
+                    const parlay::Json* muted =
+                        jp ? jp->find("is_muted") : nullptr;
+                    const parlay::Json* video =
+                        jp ? jp->find("is_my_video_enabled") : nullptr;
+                    const parlay::Json* pl =
+                        jp ? jp->find("payload") : nullptr;
+                    if (pl) payload = pl->asString();
+                    shape_ok =
+                        gcid && gcid->asInt() == 424242 && part &&
+                        part->isNull() && inv &&
+                        inv->asString().empty() && jp_type &&
+                        jp_type->asString() ==
+                            "groupCallJoinParameters" &&
+                        audio_src && audio_src->asInt() == 0 && muted &&
+                        !muted->asBool() && video && !video->asBool() &&
+                        !payload.empty();
+                }
+                CHECK(shape_ok,
+                      "joinVideoChat request shape matches td_api.tl "
+                      "(group_call_id, null participant, empty "
+                      "invite_hash, groupCallJoinParameters)");
+                CHECK(payload.size() > 100 &&
+                          payload.find("ufrag") != std::string::npos,
+                      "joinVideoChat payload is the REAL ntgcalls "
+                      "local offer (>100 bytes, ufrag)");
+                CHECK(findReq(fp->seen, "createVideoChat") == nullptr,
+                      "existing video chat: no createVideoChat sent");
+            }
+
+            // 7b. No video chat yet (group_call_id 0): the join must
+            // create one first, then joinVideoChat with the new id.
+            {
+                auto fake = std::make_unique<FakeTdLib>();
+                fake->get_chat_group_call_id = 0;
+                FakeTdLib* fp = fake.get();
+                parlay::TdLibVoiceCall vc(cfg, std::move(fake));
+                bool ok = vc.join(-1001234567890LL);
+                CHECK(!ok &&
+                          vc.lastError().find("ntgcalls connect failed") !=
+                              std::string::npos,
+                      "join with no video chat reaches the real "
+                      "ntg.connect (after creating the chat)");
+                const parlay::Json* create_req =
+                    findReq(fp->seen, "createVideoChat");
+                CHECK(create_req != nullptr &&
+                          create_req->find("chat_id") &&
+                          create_req->find("chat_id")->asInt() ==
+                              -1001234567890LL &&
+                          create_req->find("title") &&
+                          create_req->find("title")->asString() ==
+                              "Parlay",
+                      "join with no video chat sends createVideoChat");
+                const parlay::Json* join_req =
+                    findReq(fp->seen, "joinVideoChat");
+                CHECK(join_req != nullptr &&
+                          join_req->find("group_call_id") &&
+                          join_req->find("group_call_id")->asInt() ==
+                              434343,
+                      "joinVideoChat uses the created video chat id");
+            }
+
+            // 7c. getChat error: the join stops there with the exact
+            // TDLib message; no joinVideoChat is attempted.
+            {
+                auto fake = std::make_unique<FakeTdLib>();
+                fake->error_on_type = "getChat";
+                fake->error_message = "CHAT_NOT_FOUND mock";
+                FakeTdLib* fp = fake.get();
+                parlay::TdLibVoiceCall vc(cfg, std::move(fake));
+                bool ok = vc.join(-1001234567890LL);
+                CHECK(!ok &&
+                          vc.lastError().find(
+                              "getChat failed: CHAT_NOT_FOUND mock") !=
+                              std::string::npos,
+                      "getChat error stops the join with the exact "
+                      "TDLib message");
+                CHECK(findReq(fp->seen, "joinVideoChat") == nullptr,
+                      "getChat error: no joinVideoChat attempted");
+            }
+
+            // 7d. joinVideoChat error: the join stops there with the
+            // exact TDLib message.
+            {
+                auto fake = std::make_unique<FakeTdLib>();
+                fake->error_on_type = "joinVideoChat";
+                fake->error_message = "GROUPCALL_FORBIDDEN mock";
+                FakeTdLib* fp = fake.get();
+                parlay::TdLibVoiceCall vc(cfg, std::move(fake));
+                bool ok = vc.join(-1001234567890LL);
+                CHECK(!ok &&
+                          vc.lastError().find(
+                              "joinVideoChat failed: "
+                              "GROUPCALL_FORBIDDEN mock") !=
+                              std::string::npos,
+                      "joinVideoChat error stops the join with the "
+                      "exact TDLib message");
+            }
+        }
+    }
+
+    // 8. Config defaults (Phase 7, A1): TD_SESSION_DIR defaults to
+    // <PARLAY_DATA_DIR>/tdlib in both Config::fromEnv and
+    // TdLibClient::Params::fromEnv; an explicit TD_SESSION_DIR wins.
+    {
+        const char* kVars[] = {"TD_SESSION_DIR", "PARLAY_DATA_DIR"};
+        struct Saved {
+            std::string name;
+            bool had = false;
+            std::string value;
+        };
+        std::vector<Saved> saved;
+        for (const char* v : kVars) {
+            const char* cur = std::getenv(v);
+            saved.push_back({v, cur != nullptr, cur ? cur : ""});
+        }
+        auto restore = [&]() {
+            for (const auto& s : saved) {
+                if (s.had) {
+                    setenv(s.name.c_str(), s.value.c_str(), 1);
+                } else {
+                    unsetenv(s.name.c_str());
+                }
+            }
+        };
+        unsetenv("TD_SESSION_DIR");
+        unsetenv("PARLAY_DATA_DIR");
+        parlay::Config c1 = parlay::Config::fromEnv();
+        CHECK(c1.td_session_dir == "data/tdlib",
+              "TD_SESSION_DIR defaults to data/tdlib when unset");
+        parlay::TdLibClient::Params p1 =
+            parlay::TdLibClient::Params::fromEnv();
+        CHECK(p1.session_dir == "data/tdlib",
+              "TdLibClient::Params defaults the session dir the same way");
+        setenv("PARLAY_DATA_DIR", "/tmp/parlay-data-test", 1);
+        parlay::Config c2 = parlay::Config::fromEnv();
+        CHECK(c2.td_session_dir == "/tmp/parlay-data-test/tdlib",
+              "TD_SESSION_DIR default follows a custom PARLAY_DATA_DIR");
+        setenv("TD_SESSION_DIR", "/custom/session", 1);
+        parlay::Config c3 = parlay::Config::fromEnv();
+        CHECK(c3.td_session_dir == "/custom/session",
+              "explicit TD_SESSION_DIR wins over the default");
         restore();
     }
 

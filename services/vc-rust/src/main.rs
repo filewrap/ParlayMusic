@@ -30,10 +30,10 @@
 //!
 //! Voice transport is REAL too (see `voice.rs`): an Opus/RTP pipeline
 //! (ffmpeg -> libopus 48 kHz stereo -> Ogg Opus file + RTP packets,
-//! packet count proven by parsing the RTP file) and a TDLib-join client
-//! (ntgcalls local offer; no MTProto join in-process — the old
-//! voice_bridge.py Telethon join was deleted in Phase 5, join goes
-//! through the core-cpp TDLib backend). In this
+//! packet count proven by parsing the RTP file) and a core-delegated
+//! join (ntgcalls local offer in-process; the MTProto join itself is
+//! POST {CORE_URL}/v1/join to the core-cpp TDLib backend — the old
+//! voice_bridge.py Telethon join was deleted in Phase 5). In this
 //! sandbox the live join is blocked — no MTProto session/credentials,
 //! UDP sendto EPERM even to loopback — so now-playing `voice` reports
 //! `"opus-rtp-ready"` once the pipeline is proven, or
@@ -41,6 +41,7 @@
 //! reported without a real join.
 
 mod common;
+mod store;
 mod voice;
 
 use common::*;
@@ -75,6 +76,13 @@ struct Track {
     /// Phase 3 degraded fallback, deleted in Phase 5 A9; they are never
     /// produced any more.)
     resolved_by: String,
+    /// Resolved direct audio URL (yt-dlp `-f bestaudio/best`, same as
+    /// vc-go), when the resolver produced one. Serialized as
+    /// `stream_url` (contract Track.stream_url) and mirrored at the
+    /// top level of now-playing (NowPlaying.stream_url). None when
+    /// the track came from a source with no direct URL (Spotify API
+    /// metadata, autoplay mix entries without a resolve).
+    stream_url: Option<String>,
     /// Local audio file downloaded by `download_audio` (mp3), if any.
     file_path: Option<String>,
     /// True once a local file exists. False + `download_failed` means the
@@ -234,7 +242,7 @@ fn random_below(n: usize) -> usize {
 // ------------------------------------------------------- JSON (de)code ---
 
 fn track_json(t: &Track) -> Json {
-    Json::Obj(vec![
+    let mut fields = vec![
         ("id".into(), Json::Str(t.id.clone())),
         ("title".into(), Json::Str(t.title.clone())),
         ("artist".into(), Json::Str(t.artist.clone())),
@@ -251,7 +259,14 @@ fn track_json(t: &Track) -> Json {
         ),
         ("downloaded".into(), Json::Bool(t.downloaded)),
         ("download_failed".into(), Json::Bool(t.download_failed)),
-    ])
+    ];
+    // Contract Track.stream_url: emitted only when the resolver
+    // produced a real direct audio URL (A8 residual — vc-rust
+    // previously emitted no stream_url anywhere).
+    if let Some(u) = &t.stream_url {
+        fields.push(("stream_url".into(), Json::Str(u.clone())));
+    }
+    Json::Obj(fields)
 }
 
 fn jstr(v: &Json, key: &str) -> Option<String> {
@@ -275,6 +290,7 @@ fn track_from_json(v: &Json) -> Option<Track> {
         // (0) — never a fake one. The ticker never auto-advances it.
         duration_sec: ji64(v, "duration_sec").unwrap_or(0),
         resolved_by: jstr(v, "resolved_by").unwrap_or_else(|| "client".to_string()),
+        stream_url: jstr(v, "stream_url"),
         file_path: jstr(v, "file_path"),
         downloaded: v.get("downloaded").and_then(|x| x.as_bool()).unwrap_or(false),
         download_failed: v
@@ -322,6 +338,76 @@ fn room_json(r: &Room) -> Json {
             Json::Arr(r.history.iter().map(|h| Json::Str(h.clone())).collect()),
         ),
     ])
+}
+
+/// Canonical shared-store track (A11): contract fields only — no
+/// engine-local fields (resolved_by / file_path / downloaded), so a
+/// room written by one engine never leaks another engine's local paths
+/// or resolver state into a different engine's now-playing output.
+/// stream_url IS a contract field, so it is carried when present.
+fn track_canonical_json(t: &Track) -> Json {
+    let mut fields = vec![
+        ("id".into(), Json::Str(t.id.clone())),
+        ("title".into(), Json::Str(t.title.clone())),
+        ("artist".into(), Json::Str(t.artist.clone())),
+        ("source".into(), Json::Str(t.source.clone())),
+        ("url".into(), Json::Str(t.url.clone())),
+        ("duration_sec".into(), Json::Num(t.duration_sec as f64)),
+    ];
+    if let Some(u) = &t.stream_url {
+        fields.push(("stream_url".into(), Json::Str(u.clone())));
+    }
+    Json::Obj(fields)
+}
+
+/// Canonical shared-store room document (A11), stored as the value of
+/// key `vc:room:<chat_id>`: the contract-shaped room plus the schema
+/// version and a write timestamp. The file backend keeps using
+/// room_json unchanged; only the shared backend writes this shape.
+fn room_canonical_json(r: &Room) -> Json {
+    let queue = Json::Arr(
+        r.queue
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                Json::Obj(vec![
+                    ("position".into(), Json::Num(i as f64)),
+                    ("requested_by".into(), Json::Num(item.requested_by as f64)),
+                    ("track".into(), track_canonical_json(&item.track)),
+                ])
+            })
+            .collect(),
+    );
+    Json::Obj(vec![
+        ("version".into(), Json::Num(1.0)),
+        ("chat_id".into(), Json::Num(r.chat_id as f64)),
+        (
+            "current".into(),
+            match &r.current {
+                Some(t) => track_canonical_json(t),
+                None => Json::Null,
+            },
+        ),
+        ("queue".into(), queue),
+        ("paused".into(), Json::Bool(r.paused)),
+        ("position_sec".into(), Json::Num(r.position_sec as f64)),
+        ("volume".into(), Json::Num(r.volume as f64)),
+        ("loop".into(), Json::Num(r.loop_n as f64)),
+        ("shuffle".into(), Json::Bool(r.shuffle)),
+        ("autoplay".into(), Json::Bool(r.autoplay)),
+        (
+            "history".into(),
+            Json::Arr(r.history.iter().map(|h| Json::Str(h.clone())).collect()),
+        ),
+        ("updated_at_ms".into(), Json::Num(now_ms() as f64)),
+    ])
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn room_from_json(v: &Json) -> Option<Room> {
@@ -390,13 +476,54 @@ impl State {
 }
 
 fn save_state(st: &State) {
+    if store::backend() != "file" {
+        save_state_shared(st);
+        return;
+    }
     let path = data_file(STATE_FILE);
     if let Err(e) = atomic_write(&path, &st.to_json().render()) {
         eprintln!("[vc-rust] failed to persist state to {}: {}", path.display(), e);
     }
 }
 
+/// Shared-store save (A11): one key per room, `vc:room:<chat_id>`,
+/// canonical JSON. Rooms with nothing playing and an empty queue lose
+/// their key (same rule as vc-go/vc-ts), so a stopped room never
+/// resurrects on another engine.
+fn save_state_shared(st: &State) {
+    let mut live: Vec<i64> = Vec::new();
+    for r in st.rooms.values() {
+        let key = format!("vc:room:{}", r.chat_id);
+        if r.current.is_some() || !r.queue.is_empty() {
+            live.push(r.chat_id);
+            if let Err(e) = store::set(&key, &room_canonical_json(r).render()) {
+                eprintln!("[vc-rust] shared store set {} failed: {}", key, e);
+            }
+        } else if let Err(e) = store::del(&key) {
+            eprintln!("[vc-rust] shared store del {} failed: {}", key, e);
+        }
+    }
+    // Prune keys for rooms that no longer exist at all.
+    match store::keys("vc:room:") {
+        Ok(keys) => {
+            for k in keys {
+                if let Some(id) = k.strip_prefix("vc:room:") {
+                    if let Ok(chat_id) = id.parse::<i64>() {
+                        if !live.contains(&chat_id) {
+                            let _ = store::del(&k);
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("[vc-rust] shared store keys failed: {}", e),
+    }
+}
+
 fn load_state() -> State {
+    if store::backend() != "file" {
+        return load_state_shared();
+    }
     let path = data_file(STATE_FILE);
     match std::fs::read_to_string(&path) {
         Ok(text) => match parse_json(&text) {
@@ -418,19 +545,59 @@ fn load_state() -> State {
     }
 }
 
+/// Shared-store load (A11): every `vc:room:*` key becomes a room.
+/// Restored rooms come back paused — never auto-resume audio after a
+/// restart or an engine switch (same rule as vc-go/vc-ts).
+fn load_state_shared() -> State {
+    let mut st = State::default();
+    let keys = match store::keys("vc:room:") {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[vc-rust] shared store keys failed: {}", e);
+            return st;
+        }
+    };
+    for key in keys {
+        match store::get(&key) {
+            Ok(Some(text)) => match parse_json(&text) {
+                Some(v) => {
+                    if let Some(mut room) = room_from_json(&v) {
+                        room.paused = true;
+                        st.rooms.insert(room.chat_id, room);
+                    }
+                }
+                None => eprintln!(
+                    "[vc-rust] WARNING: corrupt shared room {}, skipping",
+                    key
+                ),
+            },
+            Ok(None) => {}
+            Err(e) => eprintln!("[vc-rust] shared store get {} failed: {}", key, e),
+        }
+    }
+    eprintln!(
+        "[vc-rust] restored {} room(s) from shared store ({})",
+        st.rooms.len(),
+        store::describe()
+    );
+    st
+}
+
 // ------------------------------------------------------------- voice ---
 
 /// Voice layer seam (ParvatiMusic: `mtproto/` + `ntg/` ntgcalls).
 ///
 /// Joining a Telegram voice chat needs a live MTProto session plus the
 /// ntgcalls WebRTC library. The real implementation is `RealVoiceCall`
-/// (`voice.rs`): ffmpeg Opus/RTP pipeline + ntgcalls local offer; there
-/// is no MTProto join client in-process (voice_bridge.py was deleted in
-/// Phase 5 — join goes through the core-cpp TDLib backend). It reports the exact
-/// failure when the backend is unavailable (no session/credentials,
-/// UDP EPERM) and never claims `joined:true` without a real join.
-/// Playback state still advances on the ticker; the queue flow works
-/// with or without a live call.
+/// (`voice.rs`): ffmpeg Opus/RTP pipeline + ntgcalls local offer, and
+/// the join itself is delegated to the core-cpp TDLib backend
+/// (POST {CORE_URL}/v1/join, vc.join — the core owns the join, this
+/// engine supplies only the audio source). It reports the core's
+/// exact failure when the backend is unavailable (no
+/// session/credentials, core unreachable, UDP EPERM) and never claims
+/// `joined:true` without the core's answer. Playback state still
+/// advances on the ticker; the queue flow works with or without a
+/// live call.
 trait VoiceCall: Send + Sync {
     fn join(&self, chat_id: i64);
     fn leave(&self, chat_id: i64);
@@ -452,6 +619,10 @@ static VOICE: LazyLock<RealVoiceCall> = LazyLock::new(RealVoiceCall::new);
 /// same retry as `download_audio` and the downloaders service; no
 /// cookies or credentials.
 ///
+/// `-f bestaudio/best` matters: without a format selection the
+/// top-level "url" is absent for multi-format videos, so the resolver
+/// could never populate stream_url (vc-go's A8 fix; same here).
+///
 /// `-j` (not `--dump-single-json`): for a search it prints one JSON
 /// object per line (JSONL), each a real video; `--dump-single-json`
 /// on a search returns a playlist wrapper whose `id` is the query
@@ -465,6 +636,8 @@ fn ytdlp_info(target: &str) -> Option<Json> {
         cmd.arg("20")
             .arg(&ytdlp)
             .arg("-j")
+            .arg("-f")
+            .arg("bestaudio/best")
             .arg("--no-playlist")
             .arg("--no-warnings");
         for e in extra {
@@ -516,6 +689,14 @@ fn resolve_youtube_url(url: &str, id: &str) -> Option<Track> {
         .and_then(|x| x.as_str())
         .unwrap_or(url)
         .to_string();
+    // With `-f bestaudio/best` the info's top-level "url" IS the
+    // resolved direct audio URL (vc-go resolver, same flag); without
+    // the flag it is absent for multi-format videos.
+    let stream_url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .filter(|u| u.starts_with("https://"))
+        .map(|u| u.to_string());
     Some(Track {
         id: id.to_string(),
         title,
@@ -524,6 +705,7 @@ fn resolve_youtube_url(url: &str, id: &str) -> Option<Track> {
         url: page_url,
         duration_sec: duration,
         resolved_by: "yt-dlp".to_string(),
+        stream_url,
         file_path: None,
         downloaded: false,
         download_failed: false,
@@ -556,6 +738,11 @@ fn resolve_via_ytdlp(query: &str) -> Option<Track> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let stream_url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .filter(|u| u.starts_with("https://"))
+        .map(|u| u.to_string());
     Some(Track {
         id,
         title,
@@ -564,6 +751,7 @@ fn resolve_via_ytdlp(query: &str) -> Option<Track> {
         url,
         duration_sec: duration,
         resolved_by: "yt-dlp".to_string(),
+        stream_url,
         file_path: None,
         downloaded: false,
         download_failed: false,
@@ -697,6 +885,8 @@ fn spotify_track_from_json(v: &Json, id: &str) -> Option<Track> {
         url,
         duration_sec: duration,
         resolved_by: "spotify-api".to_string(),
+        // The Spotify API gives metadata only — no direct audio URL.
+        stream_url: None,
         file_path: None,
         downloaded: false,
         download_failed: false,
@@ -1091,6 +1281,8 @@ fn first_unplayed_entry(
             url: format!("https://www.youtube.com/watch?v={}", id),
             duration_sec: duration,
             resolved_by: "autoplay-mix".to_string(),
+            // Mix entries carry no direct URL until resolved.
+            stream_url: None,
             file_path: None,
             downloaded: false,
             download_failed: false,
@@ -1130,7 +1322,7 @@ fn lock(state: &Arc<Mutex<State>>) -> std::sync::MutexGuard<'_, State> {
 }
 
 fn now_playing_json(room: &Room) -> Json {
-    Json::Obj(vec![
+    let mut fields = vec![
         ("chat_id".into(), Json::Num(room.chat_id as f64)),
         ("engine".into(), Json::Str("rust".to_string())),
         ("paused".into(), Json::Bool(room.paused)),
@@ -1148,7 +1340,16 @@ fn now_playing_json(room: &Room) -> Json {
         ("loop".into(), Json::Num(room.loop_n as f64)),
         ("shuffle".into(), Json::Bool(room.shuffle)),
         ("autoplay".into(), Json::Bool(room.autoplay)),
-    ])
+    ];
+    // Top-level stream_url mirrors the current track's (contract
+    // NowPlaying.stream_url, A8 residual). Omitted when idle or when
+    // the track has no resolved direct URL.
+    if let Some(t) = &room.current {
+        if let Some(u) = &t.stream_url {
+            fields.push(("stream_url".into(), Json::Str(u.clone())));
+        }
+    }
+    Json::Obj(fields)
 }
 
 fn need_chat(body: &Json) -> Result<i64, (u16, String)> {
@@ -1718,6 +1919,12 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8003);
+    // Shared durable store (A11): Mongo > Redis > JSON file. A
+    // configured-but-unreachable backend is fatal — see store.rs.
+    if let Err(e) = store::init() {
+        eprintln!("[vc-rust] shared store init failed: {}", e);
+        std::process::exit(1);
+    }
     let state = Arc::new(Mutex::new(load_state()));
     let tick_state = Arc::clone(&state);
     std::thread::spawn(move || ticker(tick_state));
@@ -1742,6 +1949,7 @@ mod tests {
             url: format!("https://www.youtube.com/watch?v={}", id),
             duration_sec: 180,
             resolved_by: "test".to_string(),
+            stream_url: Some("https://example.invalid/audio.webm".to_string()),
             file_path: None,
             downloaded: true,
             download_failed: false,
@@ -1924,6 +2132,10 @@ mod tests {
                 assert!(t.duration_sec > 0, "real duration, got {}", t.duration_sec);
                 assert_eq!(t.resolved_by, "yt-dlp");
                 assert_ne!(t.duration_sec, 180, "the old fake 180 s must be gone");
+                // A8 residual: the resolver produces a real direct
+                // audio URL (yt-dlp -f bestaudio/best).
+                let u = t.stream_url.as_deref().unwrap_or("");
+                assert!(u.starts_with("https://"), "real stream_url, got {:?}", t.stream_url);
             }
             Err(e) => assert!(e.contains("yt-dlp"), "honest error names yt-dlp: {}", e),
         }
@@ -2124,5 +2336,182 @@ mod tests {
         // Nothing was queued: the room has no playback state.
         let st = lock(&state);
         assert!(st.rooms.get(&4242).is_none(), "no room must be created for a failed resolve");
+    }
+
+    // ------------------------------------------------- A11 shared store ---
+
+    /// Canonical room JSON round-trips through room_from_json with the
+    /// same tracks, order and position (the cross-engine fail-over
+    /// contract, in-process).
+    #[test]
+    fn canonical_room_round_trip() {
+        let (mut st, chat_id) = mk_room_with_queue(&["a", "b", "c"]);
+        let room = st.rooms.get_mut(&chat_id).unwrap();
+        room.position_sec = 42;
+        room.volume = 80;
+        room.loop_n = 2;
+        room.shuffle = true;
+        room.autoplay = true;
+        room.history = vec!["played-1".to_string(), "played-2".to_string()];
+        let rendered = room_canonical_json(room).render();
+        let v = parse_json(&rendered).expect("canonical JSON parses");
+        let back = room_from_json(&v).expect("canonical room parses");
+        assert_eq!(back.chat_id, chat_id);
+        assert_eq!(back.current.as_ref().unwrap().id, "current");
+        // The canonical doc carries the current track's stream_url.
+        assert_eq!(
+            back.current.as_ref().unwrap().stream_url.as_deref(),
+            Some("https://example.invalid/audio.webm")
+        );
+        assert_eq!(back.position_sec, 42);
+        assert_eq!(back.volume, 80);
+        assert_eq!(back.loop_n, 2);
+        assert!(back.shuffle);
+        assert!(back.autoplay);
+        assert_eq!(
+            back.queue.iter().map(|q| q.track.id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(back.history, vec!["played-1", "played-2"]);
+        // Schema markers are present.
+        assert!(rendered.contains("\"version\":1"), "rendered: {}", rendered);
+        assert!(rendered.contains("updated_at_ms"), "rendered: {}", rendered);
+    }
+
+    /// A8 residual: stream_url is serialized at BOTH levels — nested
+    /// under track and top-level on now-playing — and omitted at both
+    /// when the track has no resolved direct URL.
+    #[test]
+    fn stream_url_serialized_at_both_levels() {
+        let (st, chat_id) = mk_room_with_queue(&["a"]);
+        let room = st.rooms.get(&chat_id).unwrap();
+        let rendered = now_playing_json(room).render();
+        let v = parse_json(&rendered).expect("now-playing JSON parses");
+        let top = v.get("stream_url").and_then(|x| x.as_str()).unwrap_or("");
+        assert_eq!(top, "https://example.invalid/audio.webm", "top-level stream_url, got {}", rendered);
+        let track = v.get("track").expect("track present");
+        let nested = track.get("stream_url").and_then(|x| x.as_str()).unwrap_or("");
+        assert_eq!(nested, top, "nested track.stream_url must equal the top-level one");
+        // A track with no stream_url omits it at both levels.
+        let mut room2 = Room::new(99);
+        let mut t = mk_track("plain");
+        t.stream_url = None;
+        room2.current = Some(t);
+        let rendered2 = now_playing_json(&room2).render();
+        assert!(
+            !rendered2.contains("stream_url"),
+            "no stream_url anywhere when unresolved, got {}",
+            rendered2
+        );
+    }
+
+    /// track_json -> track_from_json preserves stream_url.
+    #[test]
+    fn track_json_round_trips_stream_url() {
+        let t = mk_track("rt");
+        let rendered = track_json(&t).render();
+        let v = parse_json(&rendered).expect("track JSON parses");
+        let back = track_from_json(&v).expect("track parses back");
+        assert_eq!(back.stream_url.as_deref(), Some("https://example.invalid/audio.webm"));
+        let plain = {
+            let mut p = mk_track("plain");
+            p.stream_url = None;
+            p
+        };
+        let rendered2 = track_json(&plain).render();
+        assert!(!rendered2.contains("stream_url"), "omitted when None: {}", rendered2);
+        let v2 = parse_json(&rendered2).expect("plain track JSON parses");
+        assert_eq!(track_from_json(&v2).unwrap().stream_url, None);
+    }
+
+    /// The yt-dlp resolver produces a real stream_url from the info
+    /// JSON's top-level "url" (-f bestaudio/best). Proved offline
+    /// with a stub yt-dlp script: YT_DLP is honoured by ytdlp_bin(),
+    /// and the stub returns real Rick Astley metadata, so a
+    /// concurrent live-resolve test that briefly sees the stub still
+    /// passes its own assertions (same id/title/duration).
+    #[test]
+    fn resolve_with_stub_ytdlp_produces_stream_url() {
+        let dir = std::env::temp_dir()
+            .join(format!("parlay-test-ytdlp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("yt-dlp");
+        let info = r#"{"id":"dQw4w9WgXcQ","title":"Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)","duration":213,"uploader":"Rick Astley","thumbnail":"https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg","url":"https://example.invalid/audio.webm","webpage_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}"#;
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s' '{}'\n", info))
+            .expect("write stub yt-dlp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub yt-dlp");
+        }
+        let saved = std::env::var("YT_DLP").ok();
+        unsafe {
+            std::env::set_var("YT_DLP", script.to_string_lossy().as_ref());
+        }
+        let resolved = resolve_query("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("YT_DLP", v),
+                None => std::env::remove_var("YT_DLP"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = resolved.expect("stub yt-dlp resolve must succeed");
+        assert_eq!(t.id, "dQw4w9WgXcQ");
+        assert_eq!(t.stream_url.as_deref(), Some("https://example.invalid/audio.webm"));
+        assert_eq!(t.resolved_by, "yt-dlp");
+    }
+
+    /// A canonical document written by another engine (vc-go shape:
+    /// stream_url on tracks, version + updated_at_ms) loads with the
+    /// same tracks, order and position; unknown fields are ignored.
+    #[test]
+    fn canonical_room_from_foreign_engine_doc() {
+        let doc = r#"{
+            "version": 1, "chat_id": 777,
+            "current": {"id": "yt:go-a", "title": "Go A", "artist": "A",
+                "source": "youtube", "url": "https://www.youtube.com/watch?v=go-a",
+                "stream_url": "https://rr1---sn.googlevideo.com/videoplayback?x",
+                "duration_sec": 213, "thumbnail": "https://i.ytimg.com/vi/go-a/hq.jpg"},
+            "queue": [
+                {"position": 0, "requested_by": 9, "track": {"id": "yt:go-b", "title": "Go B", "source": "youtube", "duration_sec": 172}},
+                {"position": 1, "requested_by": 9, "track": {"id": "yt:go-c", "title": "Go C", "source": "youtube", "duration_sec": 240}}
+            ],
+            "paused": false, "position_sec": 57, "volume": 100,
+            "loop": 1, "shuffle": false, "autoplay": true,
+            "history": ["yt:go-z"], "updated_at_ms": 1793000000000
+        }"#;
+        let v = parse_json(doc).expect("foreign doc parses");
+        let room = room_from_json(&v).expect("foreign room parses");
+        assert_eq!(room.chat_id, 777);
+        assert_eq!(room.current.as_ref().unwrap().id, "yt:go-a");
+        assert_eq!(room.current.as_ref().unwrap().duration_sec, 213);
+        // The foreign track's stream_url survives the load.
+        assert_eq!(
+            room.current.as_ref().unwrap().stream_url.as_deref(),
+            Some("https://rr1---sn.googlevideo.com/videoplayback?x")
+        );
+        assert_eq!(room.position_sec, 57);
+        assert_eq!(room.loop_n, 1);
+        assert!(room.autoplay);
+        assert_eq!(
+            room.queue.iter().map(|q| q.track.id.clone()).collect::<Vec<_>>(),
+            vec!["yt:go-b", "yt:go-c"]
+        );
+        assert_eq!(room.queue[0].requested_by, 9);
+        assert_eq!(room.history, vec!["yt:go-z"]);
+    }
+
+    /// The canonical track carries contract fields only — no
+    /// engine-local state (resolved_by / file_path / download flags).
+    #[test]
+    fn canonical_track_has_no_engine_local_fields() {
+        let (st, chat_id) = mk_room_with_queue(&["a"]);
+        let room = st.rooms.get(&chat_id).unwrap();
+        let rendered = room_canonical_json(room).render();
+        for leaked in ["resolved_by", "file_path", "downloaded", "download_failed"] {
+            assert!(!rendered.contains(leaked), "leaked {} in: {}", leaked, rendered);
+        }
     }
 }

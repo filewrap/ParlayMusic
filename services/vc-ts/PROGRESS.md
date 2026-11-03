@@ -164,6 +164,12 @@ flow, beetube registry).
 
 ## Voice transport — real pipeline + join client (Phase 4, TDLib wiring B, 2026-11-02)
 
+> SUPERSEDED (Phase 7, A1): the `voice_bridge.py` join client described
+> below was deleted in Phase 5 (user order). The join is now delegated
+> to the core: `join()` POSTs vc.join to `{CORE_URL}/v1/join` and
+> reports the core's answer verbatim. The rest of this section (Opus/RTP
+> pipeline, local offer, proof numbers) is still accurate.
+
 - `src/voicecall.js` rewritten (was a stub): ffmpeg Opus/RTP pipeline
   (libopus 128k 48 kHz stereo; Ogg Opus file ffprobe-verified; RTP to a
   file + SDP, packet count proven by SSRC-anchored parse), ntgcalls

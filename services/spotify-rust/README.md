@@ -10,9 +10,10 @@ profane / AI-generated lyrics, auto-skips tracks the user disliked.
 ## Implemented (real)
 
 - `POST /v1/spotify/watch` `{action:start|stop, user_id}` — in-memory
-  watch registry, persisted to `data/spotify-state.json` (atomic write,
-  restored on restart; `PARLAY_DATA_DIR` overrides the data dir).
-  `GET /v1/spotify/watches` lists watched user ids.
+  watch registry, persisted to the shared durable store (Phase 7,
+  A11: `MONGO_URI` > `REDIS_URL` > `data/spotify-state.json`, atomic
+  write, restored on restart; `PARLAY_DATA_DIR` overrides the data
+  dir). `GET /v1/spotify/watches` lists watched user ids.
 - `POST /v1/spotify/dislike` `{action:add|remove, user_id, track_id}` —
   per-user disliked-track store, persisted with the watch registry.
 - `POST /v1/spotify/skip-check` `{track:{id,title,artist}, user_id?}` →

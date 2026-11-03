@@ -20,6 +20,7 @@
 //! (falling back to the rendered track JSON when id is absent).
 
 mod common;
+mod store;
 
 use common::*;
 use std::collections::HashMap;
@@ -37,43 +38,76 @@ struct Store {
     map: HashMap<String, Entry>, // track key -> votes
     file: std::path::PathBuf,
     threshold: usize,
+    /// True when this store persists to the shared store (A11) instead
+    /// of the file. Decided once at construction (main branches on the
+    /// backend); tests that build a file store are unaffected by any
+    /// global backend the live tests initialise.
+    shared: bool,
 }
 
 impl Store {
+    /// Parse the votes-map JSON (the votes.json file content, or the
+    /// `queue:votes` shared-store value — same shape).
+    fn parse_map(text: &str) -> HashMap<String, Entry> {
+        let mut map: HashMap<String, Entry> = HashMap::new();
+        if let Some(Json::Obj(pairs)) = parse_json(text) {
+            for (key, v) in pairs {
+                let track = v.get("track").cloned().unwrap_or(Json::Null);
+                let str_list = |name: &str| -> Vec<String> {
+                    match v.get(name) {
+                        Some(Json::Arr(items)) => items
+                            .iter()
+                            .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                };
+                map.insert(
+                    key,
+                    Entry {
+                        track,
+                        approvers: str_list("approvals"),
+                        decliners: str_list("declines"),
+                    },
+                );
+            }
+        }
+        map
+    }
+
     fn load(file: std::path::PathBuf, threshold: usize) -> Self {
         let mut map: HashMap<String, Entry> = HashMap::new();
         if let Ok(text) = std::fs::read_to_string(&file) {
-            if let Some(Json::Obj(pairs)) = parse_json(&text) {
-                for (key, v) in pairs {
-                    let track = v.get("track").cloned().unwrap_or(Json::Null);
-                    let str_list = |name: &str| -> Vec<String> {
-                        match v.get(name) {
-                            Some(Json::Arr(items)) => items
-                                .iter()
-                                .filter_map(|i| i.as_str().map(|s| s.to_string()))
-                                .collect(),
-                            _ => Vec::new(),
-                        }
-                    };
-                    map.insert(
-                        key,
-                        Entry {
-                            track,
-                            approvers: str_list("approvals"),
-                            decliners: str_list("declines"),
-                        },
-                    );
-                }
-            }
+            map = Self::parse_map(&text);
         }
         Store {
             map,
             file,
             threshold,
+            shared: false,
         }
     }
 
-    fn save(&self) -> std::io::Result<()> {
+    /// Load from the shared store (A11), key `queue:votes`.
+    /// Missing/corrupt value = empty store.
+    fn load_shared(threshold: usize) -> Self {
+        let map = match store::get("queue:votes") {
+            Ok(Some(text)) => Self::parse_map(&text),
+            Ok(None) => HashMap::new(),
+            Err(e) => {
+                eprintln!("[queue-rust] shared store load failed: {}", e);
+                HashMap::new()
+            }
+        };
+        Store {
+            map,
+            file: std::path::PathBuf::new(),
+            threshold,
+            shared: true,
+        }
+    }
+
+    fn render(&self) -> String {
         let mut keys: Vec<&String> = self.map.keys().collect();
         keys.sort();
         let pairs: Vec<(String, Json)> = keys
@@ -104,7 +138,17 @@ impl Store {
                 ((*k).clone(), val)
             })
             .collect();
-        atomic_write(&self.file, &Json::Obj(pairs).render())
+        Json::Obj(pairs).render()
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        // Shared store (A11): the whole votes map is one value under
+        // key `queue:votes`. The JSON-file path below is unchanged.
+        if self.shared {
+            return store::set("queue:votes", &self.render())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        }
+        atomic_write(&self.file, &self.render())
     }
 }
 
@@ -211,10 +255,20 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let state = Arc::new(Mutex::new(Store::load(
-        data_file("votes.json"),
-        threshold,
-    )));
+    // Shared durable store (A11): Mongo > Redis > JSON file. A
+    // configured-but-unreachable backend is fatal — see store.rs.
+    if let Err(e) = store::init() {
+        eprintln!("[queue-rust] shared store init failed: {}", e);
+        std::process::exit(1);
+    }
+    let state = if store::backend() != "file" {
+        Arc::new(Mutex::new(Store::load_shared(threshold)))
+    } else {
+        Arc::new(Mutex::new(Store::load(
+            data_file("votes.json"),
+            threshold,
+        )))
+    };
 
     let handler = {
         let state = Arc::clone(&state);
@@ -376,5 +430,32 @@ mod tests {
         assert_eq!(data(&v).get("approvals").and_then(|x| x.as_i64()), Some(3));
         assert_eq!(data(&v).get("queued").and_then(|x| x.as_bool()), Some(true));
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// A11: votes written to the shared store survive a reload from a
+    /// fresh Store (write -> reload -> read round-trip). Uses whichever
+    /// of PARLAY_TEST_MONGO_URI / PARLAY_TEST_REDIS_URL is set; skipped
+    /// when neither is (Mongo wins when both are set).
+    #[test]
+    fn votes_persist_across_shared_store_reload() {
+        let mongo = std::env::var("PARLAY_TEST_MONGO_URI").unwrap_or_default();
+        let redis = std::env::var("PARLAY_TEST_REDIS_URL").unwrap_or_default();
+        if mongo.is_empty() && redis.is_empty() {
+            eprintln!("SKIP votes_persist_across_shared_store_reload (no PARLAY_TEST_*_URI)");
+            return;
+        }
+        store::init_from(&mongo, &redis).expect("shared store init");
+        assert_ne!(store::backend(), "file", "backend must be shared");
+        // Start clean, then vote twice and reload from a fresh Store.
+        store::del("queue:votes").expect("clean slate");
+        let state = Arc::new(Mutex::new(Store::load_shared(3)));
+        vote(&state, "trk-a11", "approve", "u1");
+        vote(&state, "trk-a11", "approve", "u2");
+        drop(state);
+        let reloaded = Arc::new(Mutex::new(Store::load_shared(3)));
+        let (_, v) = vote(&reloaded, "trk-a11", "approve", "u3");
+        assert_eq!(data(&v).get("approvals").and_then(|x| x.as_i64()), Some(3));
+        assert_eq!(data(&v).get("queued").and_then(|x| x.as_bool()), Some(true));
+        store::del("queue:votes").expect("cleanup");
     }
 }

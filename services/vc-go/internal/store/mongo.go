@@ -2,13 +2,20 @@
 //
 // MongoStore is the real persistence backend used when MONGO_URI is set,
 // built on the official driver (go.mongodb.org/mongo-driver/v2, already
-// in the module cache — no network fetch needed). One document per chat
-// in <db>.vc_rooms, _id = chat id, holding the queue.PersistedRoom.
+// in the module cache — no network fetch needed).
 //
-// This is a Parlay extension: no upstream VC bot caches queues in Mongo
-// (YukkiMusic/ArcMusic persist only bot/chat settings there; playback
-// state is in-memory). The JSON file store (store.go) stays as the
-// fallback and is used ONLY when MONGO_URI is unset.
+// Canonical layout (A11, shared with every other stateful service —
+// same scheme as core-cpp `Store`): database from the URI, collection
+// `state`, one document per room, {_id: "kv:vc:room:<chat_id>",
+// v: "<canonical room JSON>"} (see canonical.go). vc-ts and vc-rust
+// read and write the same documents, so a queue written by vc-go is
+// servable by another engine after fail-over. The pre-A11 layout
+// (collection `vc_rooms`, _id = chat id, {room: ...}) is superseded:
+// documents in the old collection are orphaned, not migrated — the
+// deployment is pre-live and no real queues exist there yet.
+//
+// The JSON file store (store.go) stays as the fallback and is used
+// ONLY when neither MONGO_URI nor REDIS_URL is set.
 package store
 
 import (
@@ -25,33 +32,39 @@ import (
 	"parlay/vc-go/internal/queue"
 )
 
-// mongoRoomDoc is the stored document: _id is the chat id.
-type mongoRoomDoc struct {
-	ID   int64               `bson:"_id"`
-	Room queue.PersistedRoom `bson:"room"`
+// mongoValueDoc is the stored document: _id is the canonical key.
+type mongoValueDoc struct {
+	ID    string `bson:"_id"`
+	Value string `bson:"v"`
+}
+
+// roomKey returns the canonical shared-store key for a chat's room.
+func roomKey(chatID int64) string {
+	return fmt.Sprintf("vc:room:%d", chatID)
+}
+
+func mongoKey(chatID int64) string {
+	return "kv:" + roomKey(chatID)
 }
 
 // MongoStore persists rooms to MongoDB.
 type MongoStore struct {
-	client   *mongo.Client
-	coll     *mongo.Collection
-	uri      string
-	db       string
-	collName string
+	client *mongo.Client
+	coll   *mongo.Collection
+	uri    string
+	db     string
 }
 
 // NewMongo connects to uri, pings it, and returns a store for
-// database/collection. Connection failure is an error — when MONGO_URI
-// is set the service must not silently fall back to the JSON file.
-func NewMongo(ctx context.Context, uri, database, collection string) (*MongoStore, error) {
+// database (collection is always the canonical `state`). Connection
+// failure is an error — when MONGO_URI is set the service must not
+// silently fall back to the JSON file.
+func NewMongo(ctx context.Context, uri, database string) (*MongoStore, error) {
 	if uri == "" {
 		return nil, fmt.Errorf("MONGO_URI is empty")
 	}
 	if database == "" {
 		database = "parlay"
-	}
-	if collection == "" {
-		collection = "vc_rooms"
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -64,11 +77,10 @@ func NewMongo(ctx context.Context, uri, database, collection string) (*MongoStor
 		return nil, fmt.Errorf("mongo ping: %w", err)
 	}
 	return &MongoStore{
-		client:   client,
-		coll:     client.Database(database).Collection(collection),
-		uri:      uri,
-		db:       database,
-		collName: collection,
+		client: client,
+		coll:   client.Database(database).Collection("state"),
+		uri:    uri,
+		db:     database,
 	}, nil
 }
 
@@ -76,30 +88,56 @@ func NewMongo(ctx context.Context, uri, database, collection string) (*MongoStor
 func (s *MongoStore) Describe() string {
 	u, err := url.Parse(s.uri)
 	if err != nil {
-		return "mongodb://<unparseable>/" + s.db + "." + s.collName
+		return "mongodb://<unparseable>/" + s.db + ".state"
 	}
 	u.User = nil
-	return strings.TrimSuffix(u.String(), "/") + "/" + s.db + "." + s.collName
+	return strings.TrimSuffix(u.String(), "/") + "/" + s.db + ".state"
 }
 
-// Save upserts every room and deletes documents for chats that no
-// longer have persisted state.
+// Save upserts every room (canonical JSON) and deletes documents for
+// chats that no longer have persisted state. Only keys under the
+// kv:vc:room: prefix are ever deleted — the `state` collection is
+// shared with the core's keys.
 func (s *MongoStore) Save(rooms []queue.PersistedRoom) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ids := make([]int64, 0, len(rooms))
+	ids := make([]string, 0, len(rooms))
 	for _, p := range rooms {
-		ids = append(ids, p.ChatID)
+		key := mongoKey(p.ChatID)
+		ids = append(ids, key)
 		_, err := s.coll.ReplaceOne(ctx,
-			bson.M{"_id": p.ChatID},
-			mongoRoomDoc{ID: p.ChatID, Room: p},
+			bson.M{"_id": key},
+			mongoValueDoc{ID: key, Value: CanonicalRoomJSON(p)},
 			options.Replace().SetUpsert(true))
 		if err != nil {
 			return fmt.Errorf("mongo save chat %d: %w", p.ChatID, err)
 		}
 	}
-	// Drop stale chats (rooms that went idle and are no longer saved).
-	if _, err := s.coll.DeleteMany(ctx, bson.M{"_id": bson.M{"$nin": ids}}); err != nil {
+	// Drop stale room keys (rooms that went idle and are no longer saved).
+	cur, err := s.coll.Find(ctx, bson.M{"_id": bson.M{"$regex": "^kv:vc:room:"}})
+	if err != nil {
+		return fmt.Errorf("mongo prune list: %w", err)
+	}
+	defer cur.Close(ctx)
+	for cur.Next(ctx) {
+		var doc mongoValueDoc
+		if err := cur.Decode(&doc); err != nil {
+			return fmt.Errorf("mongo prune decode: %w", err)
+		}
+		stale := true
+		for _, id := range ids {
+			if doc.ID == id {
+				stale = false
+				break
+			}
+		}
+		if stale {
+			if _, err := s.coll.DeleteOne(ctx, bson.M{"_id": doc.ID}); err != nil {
+				return fmt.Errorf("mongo prune %s: %w", doc.ID, err)
+			}
+		}
+	}
+	if err := cur.Err(); err != nil {
 		return fmt.Errorf("mongo prune: %w", err)
 	}
 	return nil
@@ -109,18 +147,22 @@ func (s *MongoStore) Save(rooms []queue.PersistedRoom) error {
 func (s *MongoStore) Load() ([]queue.PersistedRoom, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cur, err := s.coll.Find(ctx, bson.M{})
+	cur, err := s.coll.Find(ctx, bson.M{"_id": bson.M{"$regex": "^kv:vc:room:"}})
 	if err != nil {
 		return nil, fmt.Errorf("mongo load: %w", err)
 	}
 	defer cur.Close(ctx)
 	var rooms []queue.PersistedRoom
 	for cur.Next(ctx) {
-		var doc mongoRoomDoc
+		var doc mongoValueDoc
 		if err := cur.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("mongo decode: %w", err)
 		}
-		rooms = append(rooms, doc.Room)
+		p, err := ParseCanonicalRoom(doc.Value)
+		if err != nil {
+			return nil, fmt.Errorf("mongo decode %s: %w", doc.ID, err)
+		}
+		rooms = append(rooms, p)
 	}
 	if err := cur.Err(); err != nil {
 		return nil, fmt.Errorf("mongo load: %w", err)

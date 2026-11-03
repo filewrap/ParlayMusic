@@ -21,6 +21,7 @@
 //! ($PARLAY_DATA_DIR override), written atomically (tmp + rename).
 
 mod common;
+mod store;
 
 use common::*;
 use std::collections::HashMap;
@@ -31,6 +32,11 @@ const SERVICE: &str = "share-rust";
 struct Store {
     map: HashMap<String, Json>, // token -> track object
     file: std::path::PathBuf,
+    /// True when this store persists to the shared store (A11) instead
+    /// of the file. Decided once at construction; tests that build a
+    /// file store are unaffected by any global backend the live tests
+    /// initialise.
+    shared: bool,
 }
 
 impl Store {
@@ -43,14 +49,50 @@ impl Store {
                 }
             }
         }
-        Store { map, file }
+        Store {
+            map,
+            file,
+            shared: false,
+        }
     }
 
-    fn save(&self) -> std::io::Result<()> {
+    /// Load from the shared store (A11), key `share:links`. Same JSON
+    /// shape as shares.json (token -> track object).
+    fn load_shared() -> Self {
+        let mut map = HashMap::new();
+        match store::get("share:links") {
+            Ok(Some(text)) => {
+                if let Some(Json::Obj(pairs)) = parse_json(&text) {
+                    for (k, v) in pairs {
+                        map.insert(k, v);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[share-rust] shared store load failed: {}", e),
+        }
+        Store {
+            map,
+            file: std::path::PathBuf::new(),
+            shared: true,
+        }
+    }
+
+    fn render(&self) -> String {
         let mut pairs: Vec<(String, Json)> =
             self.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        atomic_write(&self.file, &Json::Obj(pairs).render())
+        Json::Obj(pairs).render()
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        // Shared store (A11): the whole token map is one value under
+        // key `share:links`. The JSON-file path below is unchanged.
+        if self.shared {
+            return store::set("share:links", &self.render())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        }
+        atomic_write(&self.file, &self.render())
     }
 }
 
@@ -118,7 +160,17 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8004);
     let bot = std::env::var("PARLAY_BOT_USERNAME").unwrap_or_else(|_| "ParlayBot".to_string());
-    let state = Arc::new(Mutex::new(Store::load(data_file("shares.json"))));
+    // Shared durable store (A11): Mongo > Redis > JSON file. A
+    // configured-but-unreachable backend is fatal — see store.rs.
+    if let Err(e) = store::init() {
+        eprintln!("[share-rust] shared store init failed: {}", e);
+        std::process::exit(1);
+    }
+    let state = if store::backend() != "file" {
+        Arc::new(Mutex::new(Store::load_shared()))
+    } else {
+        Arc::new(Mutex::new(Store::load(data_file("shares.json"))))
+    };
     let bot = Arc::new(bot);
 
     let handler = {
@@ -239,5 +291,33 @@ mod tests {
         let (st, resp) = handle(&reloaded, "ParlayBot", &req("GET", &format!("/v1/share/{}", token), ""));
         assert_eq!(st, 200, "{resp}");
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// A11: a link minted into the shared store still resolves after a
+    /// reload from a fresh Store. Uses whichever of
+    /// PARLAY_TEST_MONGO_URI / PARLAY_TEST_REDIS_URL is set; skipped
+    /// when neither is (Mongo wins when both are set).
+    #[test]
+    fn link_survives_shared_store_reload() {
+        let mongo = std::env::var("PARLAY_TEST_MONGO_URI").unwrap_or_default();
+        let redis = std::env::var("PARLAY_TEST_REDIS_URL").unwrap_or_default();
+        if mongo.is_empty() && redis.is_empty() {
+            eprintln!("SKIP link_survives_shared_store_reload (no PARLAY_TEST_*_URI)");
+            return;
+        }
+        store::init_from(&mongo, &redis).expect("shared store init");
+        assert_ne!(store::backend(), "file", "backend must be shared");
+        store::del("share:links").expect("clean slate");
+        let state = Arc::new(Mutex::new(Store::load_shared()));
+        let body = format!(r#"{{"track":{}}}"#, TRACK);
+        let (_, resp) = handle(&state, "ParlayBot", &req("POST", "/v1/share", &body));
+        let token = data_field(&resp, "token").as_str().unwrap().to_string();
+        drop(state);
+        let reloaded = Arc::new(Mutex::new(Store::load_shared()));
+        let (st, resp) = handle(&reloaded, "ParlayBot", &req("GET", &format!("/v1/share/{}", token), ""));
+        assert_eq!(st, 200, "{resp}");
+        let track = data_field(&resp, "track");
+        assert_eq!(track.get("id").and_then(|x| x.as_str()), Some("trk-1"));
+        store::del("share:links").expect("cleanup");
     }
 }

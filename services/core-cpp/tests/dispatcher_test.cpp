@@ -1,7 +1,10 @@
 // dispatcher_test.cpp — Dispatcher: /play from replied-to media, /mute,
 // /join (Phase 5, Worker B); /autoplay-skip, /broadcast errors.txt
 // (Phase 6, Worker B); /speed + /bass core-voice filter path,
-// engine honest replies, /speedtest helpers (Phase 6, Worker C).
+// engine honest replies, /speedtest helpers (Phase 6, Worker C);
+// /play through an engine attaches core audio, skip/pause/resume/
+// seek/stop keep the core stream in step, watcher follow pass
+// (Phase 7, Worker A1b).
 //
 // - TelegramApi::parseMessage: reply with audio / document / video_note
 //   file_id is captured; a reply with no media captures nothing.
@@ -16,9 +19,9 @@
 //
 // Build: g++ -std=c++20 -I src tests/dispatcher_test.cpp
 //   src/dispatcher.cpp src/telegram_api.cpp src/ipc.cpp
-//   src/engine_router.cpp src/store.cpp src/json.cpp src/config.cpp
-//   src/http.cpp src/voice_call.cpp src/tdlib_client.cpp -o
-//   /tmp/dispatcher_test -ldl && /tmp/dispatcher_test
+//   src/engine_router.cpp src/store.cpp src/scram.cpp src/json.cpp
+//   src/config.cpp src/http.cpp src/voice_call.cpp src/tdlib_client.cpp
+//   -o /tmp/dispatcher_test -ldl && /tmp/dispatcher_test
 // Exit 0 = all checks pass. No network: Telegram/IPC/voice are faked,
 // the Store uses its JSON file backend in a temp dir.
 #include <cstdio>
@@ -140,10 +143,26 @@ public:
     // Scripted autoplay-skip answer (Phase 6): empty = success with a
     // canned mix pick; non-empty = fail with this message (bad_request).
     mutable std::string autoplay_skip_error;
+    // Scripted autoplay-skip success payload (Phase 7, A1b): when
+    // set, the canned pick below is replaced by this JSON (used to
+    // give the pick a stream_url for the core re-attach test).
+    mutable std::string autoplay_skip_response;
+    // Scripted engine answers (Phase 7, A1b): empty = fall through
+    // to the 404 below. Each is a full response body
+    // ({"now_playing": ...}) returned verbatim on success.
+    mutable std::string play_response;
+    mutable std::string skip_response;
+    mutable std::string pause_response;
+    mutable std::string resume_response;
     // Scripted playback state (Phase 6, B11 speed/bass engine path):
     // when true, GET now-playing returns a playing track and POST
     // seek succeeds; when false (default) the engines know nothing.
     mutable bool np_ok = false;
+    // Scripted now-playing track (Phase 7, A1b follow tests): the id /
+    // stream URL / position the GET now-playing answer reports.
+    mutable std::string np_track_id = "t1";
+    mutable std::string np_stream_url = "https://example.invalid/audio.webm";
+    mutable int64_t np_position = 30;
     parlay::IpcResult post(const std::string& base_url,
                            const std::string& action, const parlay::Json& body,
                            int timeout_sec = 30) const override {
@@ -158,11 +177,41 @@ public:
                 R"({"now_playing":{"track":{"title":"T","duration_sec":200},"position_sec":30,"paused":false}})");
             return r;
         }
+        if (action == "play" && !play_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(play_response);
+            return r;
+        }
+        if (action == "skip" && !skip_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(skip_response);
+            return r;
+        }
+        if (action == "pause" && !pause_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(pause_response);
+            return r;
+        }
+        if (action == "resume" && !resume_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(resume_response);
+            return r;
+        }
         if (action == "autoplay-skip") {
             if (!autoplay_skip_error.empty()) {
                 r.http_status = 400;
                 r.error_code = "bad_request";
                 r.error_message = autoplay_skip_error;
+                return r;
+            }
+            if (!autoplay_skip_response.empty()) {
+                r.ok = true;
+                r.http_status = 200;
+                r.data = parlay::Json::parse(autoplay_skip_response);
                 return r;
             }
             r.ok = true;
@@ -187,7 +236,12 @@ public:
             r.ok = true;
             r.http_status = 200;
             r.data = parlay::Json::parse(
-                R"({"now_playing":{"track":{"title":"T","duration_sec":200},"position_sec":30,"paused":false}})");
+                "{\"now_playing\":{\"track\":{\"id\":\"" + np_track_id +
+                "\",\"title\":\"T\",\"duration_sec\":200,\"stream_url\":\"" +
+                np_stream_url +
+                "\"},\"stream_url\":\"" + np_stream_url +
+                "\",\"position_sec\":" + std::to_string(np_position) +
+                ",\"paused\":false}}");
             return r;
         }
         // no now-playing state in this fake
@@ -207,6 +261,7 @@ class FakeVoice : public parlay::VoiceCall {
 public:
     bool avail = true;
     bool play_ok = true, join_ok = true, mute_ok = true, unmute_ok = true;
+    bool pause_ok = true, resume_ok = true;
     std::string fail_reason = "fake voice failure";
     struct PlayCall {
         int64_t chat;
@@ -218,7 +273,7 @@ public:
         int bass = 0;
     };
     std::vector<PlayCall> plays;
-    std::vector<int64_t> joins, mutes, unmutes, stops;
+    std::vector<int64_t> joins, mutes, unmutes, stops, pauses, resumes;
     // Scripted position for time() (Phase 6, B11): -1 = unknown.
     int64_t time_value = -1;
     bool play(int64_t chat_id, const std::string& stream_url,
@@ -245,11 +300,19 @@ public:
         return true;
     }
     bool pause(int64_t chat_id) override {
-        (void)chat_id;
+        pauses.push_back(chat_id);
+        if (!pause_ok) {
+            last_error_ = fail_reason;
+            return false;
+        }
         return true;
     }
     bool resume(int64_t chat_id) override {
-        (void)chat_id;
+        resumes.push_back(chat_id);
+        if (!resume_ok) {
+            last_error_ = fail_reason;
+            return false;
+        }
         return true;
     }
     bool mute(int64_t chat_id) override {
@@ -807,6 +870,412 @@ int main() {
                   fields["core_title"] == "Artist - Song" &&
                   fields["voice_owner"] == "core",
               "play replied file: core source recorded for later /speed+/bass");
+    }
+
+    // --- I. /play through an engine attaches core audio (Phase 7, A1b) --
+    // The stub engine answers vc.play with a resolved track carrying
+    // stream_url (top-level + track-level, A8). The dispatcher must
+    // hand that URL to the core voice backend — the engine's own
+    // "play" never reaches a call — and record the session as
+    // core-owned. A failed attach stops the engine again and reports
+    // the exact error instead of a "Now playing" lie. Skip /
+    // autoplay-skip / pause / resume / seek / stop / the watcher
+    // follow pass keep the core stream in step the same way.
+    const std::string play_np =
+        R"({"now_playing":{"track":{"id":"t1","title":"Test Song","artist":"Test Artist","duration_sec":200,"stream_url":"https://example.invalid/audio.webm"},"stream_url":"https://example.invalid/audio.webm","position_sec":0,"paused":false}})";
+    const std::string skip_np =
+        R"({"now_playing":{"track":{"id":"t2","title":"Next Song","artist":"Next Artist","duration_sec":180,"stream_url":"https://example.invalid/next.webm"},"position_sec":0,"paused":false}})";
+    auto has_post = [](const Rig& rig, const std::string& action) {
+        for (const auto& p : rig.ipc.posts)
+            if (p.find("|" + action) != std::string::npos) return true;
+        return false;
+    };
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.d.handleMessage(makeMsg(-1051, 111, "/play Test Song"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/audio.webm" &&
+                  rig.voice.plays[0].title == "Test Song" &&
+                  !rig.voice.plays[0].video &&
+                  rig.voice.plays[0].seek_sec == 0 &&
+                  rig.voice.plays[0].speed == 1.0 &&
+                  rig.voice.plays[0].bass == 0,
+              "play query: core voice plays the engine-resolved stream_url");
+        CHECK(has_post(rig, "play"),
+              "play query: vc.play issued to the engine first");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Now playing") &&
+                  contains(rig.tg.replies[0], "Test Song"),
+              "play query: Now playing reply");
+        auto fields = rig.store.hgetall("chat:-1051");
+        CHECK(fields["voice_owner"] == "core" &&
+                  fields["core_source"] ==
+                      "https://example.invalid/audio.webm" &&
+                  fields["core_title"] == "Test Song" &&
+                  fields["core_track_id"] == "t1" &&
+                  fields["core_follow"] == "1",
+              "play query: session recorded as core-owned with source + track id");
+        auto c = rig.store.get("call:-1051");
+        CHECK(c && *c == "1", "play query: call marked active");
+    }
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.store.hset("chat:-1052", "speed", "1.5");
+        rig.store.hset("chat:-1052", "bass", "40");
+        rig.d.handleMessage(makeMsg(-1052, 111, "/play Test Song"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].speed == 1.5 &&
+                  rig.voice.plays[0].bass == 40,
+              "play query: stored speed/bass passed to core voice");
+    }
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.voice.play_ok = false;
+        rig.voice.fail_reason = "tdlib not authorized";
+        rig.d.handleMessage(makeMsg(-1053, 111, "/play Test Song"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "Could not play in the voice chat") &&
+                  contains(rig.tg.replies[0], "tdlib not authorized") &&
+                  !contains(rig.tg.replies[0], "Now playing"),
+              "play query, attach fails: honest error, no fake Now playing");
+        CHECK(has_post(rig, "stop"),
+              "play query, attach fails: engine playback stopped again");
+        auto c = rig.store.get("call:-1053");
+        CHECK(!c || *c != "1",
+              "play query, attach fails: call not marked active");
+        auto v = rig.store.hget("chat:-1053", "voice_owner");
+        CHECK(!v || v->empty(),
+              "play query, attach fails: no voice owner recorded");
+    }
+    {
+        Rig rig;
+        rig.ipc.play_response =
+            R"({"now_playing":{"track":{"id":"t9","title":"No URL Song","duration_sec":200},"position_sec":0,"paused":false}})";
+        rig.d.handleMessage(makeMsg(-1054, 111, "/play No URL Song"));
+        CHECK(rig.voice.plays.empty(),
+              "play query, no stream_url: core voice never called");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "Could not play in the voice chat") &&
+                  contains(rig.tg.replies[0], "no stream_url"),
+              "play query, no stream_url: honest error naming the missing URL");
+        CHECK(has_post(rig, "stop"),
+              "play query, no stream_url: engine playback stopped again");
+    }
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.d.handleMessage(makeMsg(-1055, 111, "/vplay Test Song"));
+        CHECK(rig.voice.plays.size() == 1 && rig.voice.plays[0].video,
+              "vplay: core voice plays with video");
+        auto v = rig.store.hget("chat:-1055", "core_video");
+        CHECK(v && *v == "1", "vplay: video flag recorded");
+    }
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.d.handleMessage(makeMsg(-1068, 111, "/playforce Test Song"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/audio.webm",
+              "playforce: replacement track attached to core voice");
+        CHECK(has_post(rig, "stop"),
+              "playforce: old engine playback stopped first");
+    }
+    {
+        Rig rig;
+        rig.ipc.skip_response = skip_np;
+        rig.store.set("call:-1056", "1");
+        rig.store.hset("chat:-1056", "voice_owner", "core");
+        rig.store.hset("chat:-1056", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1056", "core_title", "Test Song");
+        rig.store.hset("chat:-1056", "core_video", "0");
+        rig.store.hset("chat:-1056", "core_track_id", "t1");
+        rig.store.hset("chat:-1056", "core_follow", "1");
+        rig.d.handleMessage(makeMsg(-1056, 111, "/skip"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/next.webm" &&
+                  rig.voice.plays[0].title == "Next Song",
+              "skip: new track's stream_url re-attached to core voice");
+        auto fields = rig.store.hgetall("chat:-1056");
+        CHECK(fields["core_source"] ==
+                      "https://example.invalid/next.webm" &&
+                  fields["core_track_id"] == "t2",
+              "skip: recorded source + track id updated to the new track");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Skipped") &&
+                  contains(rig.tg.replies[0], "Next Song"),
+              "skip: new track reported");
+    }
+    {
+        Rig rig;
+        rig.ipc.skip_response =
+            R"({"now_playing":{"track":null,"queue":[],"position_sec":0,"paused":false}})";
+        rig.store.set("call:-1057", "1");
+        rig.store.hset("chat:-1057", "voice_owner", "core");
+        rig.store.hset("chat:-1057", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1057", "core_title", "Test Song");
+        rig.store.hset("chat:-1057", "core_follow", "1");
+        rig.d.handleMessage(makeMsg(-1057, 111, "/skip"));
+        CHECK(!rig.voice.stops.empty() && rig.voice.stops[0] == -1057,
+              "skip to empty queue: core voice stopped");
+        auto c = rig.store.get("call:-1057");
+        CHECK(!c || *c != "1", "skip to empty queue: call inactive");
+        auto v = rig.store.hget("chat:-1057", "core_source");
+        CHECK(!v || v->empty(),
+              "skip to empty queue: core source cleared");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "queue is now empty"),
+              "skip to empty queue: honest reply");
+    }
+    {
+        Rig rig;
+        rig.ipc.autoplay_skip_response =
+            R"({"now_playing":{"track":{"id":"m1","title":"Mix Pick","artist":"Mix Artist","duration_sec":200,"stream_url":"https://example.invalid/mix.webm"},"position_sec":0,"paused":false}})";
+        rig.store.set("call:-1069", "1");
+        rig.store.hset("chat:-1069", "voice_owner", "core");
+        rig.store.hset("chat:-1069", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1069", "core_title", "Test Song");
+        rig.store.hset("chat:-1069", "core_track_id", "t1");
+        rig.store.hset("chat:-1069", "core_follow", "1");
+        rig.d.handleMessage(makeMsg(-1069, 111, "/autoplay-skip"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/mix.webm",
+              "autoplay-skip: picked track's stream_url re-attached");
+    }
+    {
+        Rig rig;
+        rig.ipc.pause_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
+        rig.store.set("call:-1058", "1");
+        rig.store.hset("chat:-1058", "voice_owner", "core");
+        rig.store.hset("chat:-1058", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1058", "core_title", "Test Song");
+        rig.d.handleMessage(makeMsg(-1058, 111, "/pause"));
+        CHECK(rig.voice.pauses.size() == 1 && rig.voice.pauses[0] == -1058,
+              "pause core session: backend pause() called");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Paused"),
+              "pause core session: Paused reply");
+    }
+    {
+        // Fresh Rig: the dispatcher rate-limits to 1 cmd/s per chat,
+        // so a second command in the same Rig right after /pause is
+        // silently dropped. The store is shared, so the seeded
+        // core-streaming session survives.
+        Rig rig;
+        rig.ipc.resume_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":false}})";
+        rig.store.set("call:-1058", "1");
+        rig.store.hset("chat:-1058", "voice_owner", "core");
+        rig.store.hset("chat:-1058", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1058", "core_title", "Test Song");
+        rig.d.handleMessage(makeMsg(-1058, 111, "/resume"));
+        CHECK(rig.voice.resumes.size() == 1 &&
+                  rig.voice.resumes[0] == -1058,
+              "resume core session: backend resume() called");
+    }
+    {
+        Rig rig;
+        rig.ipc.pause_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
+        rig.store.set("call:-1059", "1");
+        rig.store.hset("chat:-1059", "voice_owner", "core");
+        rig.store.hset("chat:-1059", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1059", "core_title", "Test Song");
+        rig.voice.pause_ok = false;
+        rig.voice.fail_reason = "ntgcalls pause failed";
+        rig.d.handleMessage(makeMsg(-1059, 111, "/pause"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Paused") &&
+                  contains(rig.tg.replies[0], "could not pause") &&
+                  contains(rig.tg.replies[0], "ntgcalls pause failed"),
+              "pause core backend fails: honest note, no silent claim");
+    }
+    {
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.store.set("call:-1060", "1");
+        rig.store.hset("chat:-1060", "voice_owner", "core");
+        rig.store.hset("chat:-1060", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1060", "core_title", "Test Song");
+        rig.store.hset("chat:-1060", "core_video", "0");
+        rig.d.handleMessage(makeMsg(-1060, 111, "/seek 10"));
+        CHECK(has_post(rig, "seek"),
+              "seek core session: engine seek issued");
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/audio.webm" &&
+                  rig.voice.plays[0].seek_sec == 40,
+              "seek core session: core voice re-attached at 40s");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Seeked forward to 0:40"),
+              "seek core session: seek reply");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1061", "1");
+        rig.store.hset("chat:-1061", "voice_owner", "core");
+        rig.store.hset("chat:-1061", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1061", "core_title", "Test Song");
+        rig.store.hset("chat:-1061", "core_track_id", "t1");
+        rig.store.hset("chat:-1061", "core_follow", "1");
+        rig.d.handleMessage(makeMsg(-1061, 111, "/stop"));
+        CHECK(!rig.voice.stops.empty(),
+              "stop core session: backend stop() called");
+        auto fields = rig.store.hgetall("chat:-1061");
+        CHECK(fields["voice_owner"].empty() &&
+                  fields["core_source"].empty() &&
+                  fields["core_track_id"].empty(),
+              "stop core session: core-stream fields cleared");
+    }
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.store.set("playlist:111",
+                      R"([{"title":"Test Song","artist":"Test Artist"},{"title":"Second Song","artist":"Other"}])");
+        rig.d.handleMessage(makeMsg(-1067, 111, "/playplaylist"));
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/audio.webm",
+              "playplaylist: first track attached to core voice");
+        CHECK(has_post(rig, "queue"),
+              "playplaylist: remaining tracks queued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Playing your playlist"),
+              "playplaylist: playlist reply");
+    }
+    // --- J. watchCoreFollow: engine-internal auto-advance -------------
+    // The follow pass runs over store keys("call:"), which the Rig
+    // instances share — wipe the dir first (broadcast-test pattern)
+    // so stale sessions from earlier blocks cannot interfere.
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.ipc.np_position = 5;
+        rig.store.set("call:-1062", "1");
+        rig.store.hset("chat:-1062", "voice_owner", "core");
+        rig.store.hset("chat:-1062", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1062", "core_title", "Test Song");
+        rig.store.hset("chat:-1062", "core_track_id", "t1");
+        rig.store.hset("chat:-1062", "core_pos", "150");
+        rig.store.hset("chat:-1062", "core_follow", "1");
+        rig.d.watchCoreFollow();
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/next.webm" &&
+                  rig.voice.plays[0].seek_sec == 5,
+              "follow: engine advance to t2 re-attached at 5s");
+        auto v = rig.store.hget("chat:-1062", "core_track_id");
+        CHECK(v && *v == "t2",
+              "follow: recorded track id updated to t2");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t1";
+        rig.ipc.np_stream_url = "https://example.invalid/audio.webm";
+        rig.ipc.np_position = 35;
+        rig.store.set("call:-1063", "1");
+        rig.store.hset("chat:-1063", "voice_owner", "core");
+        rig.store.hset("chat:-1063", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1063", "core_title", "Test Song");
+        rig.store.hset("chat:-1063", "core_track_id", "t1");
+        rig.store.hset("chat:-1063", "core_pos", "30");
+        rig.store.hset("chat:-1063", "core_follow", "1");
+        rig.d.watchCoreFollow();
+        CHECK(rig.voice.plays.empty(),
+              "follow: same track, position forward — no re-attach");
+        auto v = rig.store.hget("chat:-1063", "core_pos");
+        CHECK(v && *v == "35",
+              "follow: position scratch updated to 35");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t1";
+        rig.ipc.np_stream_url = "https://example.invalid/audio.webm";
+        rig.ipc.np_position = 8;
+        rig.store.set("call:-1064", "1");
+        rig.store.hset("chat:-1064", "voice_owner", "core");
+        rig.store.hset("chat:-1064", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1064", "core_title", "Test Song");
+        rig.store.hset("chat:-1064", "core_track_id", "t1");
+        rig.store.hset("chat:-1064", "core_pos", "150");
+        rig.store.hset("chat:-1064", "core_follow", "1");
+        rig.d.watchCoreFollow();
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].seek_sec == 8,
+              "follow: same id, position jumped back — loop copy re-attached at 8s");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.ipc.np_position = 5;
+        rig.voice.play_ok = false;
+        rig.voice.fail_reason = "tdlib not authorized";
+        rig.store.set("call:-1065", "1");
+        rig.store.hset("chat:-1065", "voice_owner", "core");
+        rig.store.hset("chat:-1065", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1065", "core_title", "Test Song");
+        rig.store.hset("chat:-1065", "core_track_id", "t1");
+        rig.store.hset("chat:-1065", "core_pos", "150");
+        rig.store.hset("chat:-1065", "core_follow", "1");
+        rig.d.watchCoreFollow();
+        CHECK(rig.voice.plays.size() == 1 &&
+                  rig.voice.plays[0].url ==
+                      "https://example.invalid/next.webm",
+              "follow failure: re-attach was attempted with the new URL");
+        CHECK(!rig.voice.stops.empty(),
+              "follow failure: core voice stopped");
+        auto c = rig.store.get("call:-1065");
+        CHECK(!c || *c != "1", "follow failure: call not active");
+        CHECK(has_post(rig, "stop"),
+              "follow failure: engine playback stopped");
+    }
+    {
+        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.ipc.np_position = 5;
+        rig.store.set("call:-1066", "1");
+        rig.store.hset("chat:-1066", "voice_owner", "core");
+        rig.store.hset("chat:-1066", "core_source", "/tmp/song.ogg");
+        rig.store.hset("chat:-1066", "core_title", "Song");
+        rig.store.hset("chat:-1066", "core_track_id", "");
+        rig.store.hset("chat:-1066", "core_follow", "0");
+        rig.d.watchCoreFollow();
+        CHECK(rig.voice.plays.empty(),
+              "follow: replied-file session (core_follow 0) never re-attached");
     }
 
     // --- H. /speedtest pure helpers (Phase 6, B11) ------------------------

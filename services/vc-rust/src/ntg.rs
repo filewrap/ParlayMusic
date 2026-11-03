@@ -18,9 +18,9 @@
 //! needs it; when the .so is absent `NtgLib::load()` returns the exact
 //! dlopen failure and the caller falls back to the ntgcalls-wheel
 //! probe (`src/ntg_offer.py`) for the local offer — the media side
-//! stays honest, and the MTProto join stays impossible in this service
+//! stays honest, and the MTProto join is delegated to the core
 //! (see voice.rs: no MTProto client in Rust stdlib; the join lives in
-//! core-cpp's TdLibVoiceCall).
+//! core-cpp's TdLibVoiceCall, reached over POST {CORE_URL}/v1/join).
 //!
 //! API shape: ntgcalls 3.0.5 is SYNCHRONOUS (generated header
 //! refs/ntgcalls/shared-output/include/ntgcalls.h). Every call returns

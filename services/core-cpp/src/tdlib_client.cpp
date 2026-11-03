@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <vector>
 
+#include "config.hpp"
+
 namespace parlay {
 namespace {
 
@@ -30,8 +32,10 @@ int64_t envInt(const char* name, int64_t fallback = 0) {
     }
 }
 
-// Default libtdjson.so: the phase4 build output (verified 2026-11-02:
-// libtdjson.so.1.8.69, 50,166,944 B, all deps resolvable per ldd).
+// Default libtdjson.so: the repo phase4 build output (verified
+// 2026-11-02: libtdjson.so.1.8.69, 50,166,944 B, all deps resolvable
+// per ldd). Dev fallback only — the release layout (lib/ next to the
+// binary) is tried first in the constructor.
 const char* kDefaultLib =
     "/home/hatch/workspace/parlay/phase4/tdlib-src/build/libtdjson.so";
 
@@ -48,7 +52,10 @@ TdLibClient::Params TdLibClient::Params::fromEnv() {
     Params p;
     p.api_id = envInt("TD_API_ID", envInt("API_ID"));
     p.api_hash = envStr("TD_API_HASH", envStr("API_HASH"));
-    p.session_dir = envStr("TD_SESSION_DIR");
+    // Same default as Config::fromEnv: <PARLAY_DATA_DIR>/tdlib.
+    p.session_dir = envStr(
+        "TD_SESSION_DIR",
+        envStr("PARLAY_DATA_DIR", "data") + "/tdlib");
     p.phone = envStr("TD_PHONE");
     p.code = envStr("TD_CODE");
     p.password = envStr("TD_PASSWORD");
@@ -66,6 +73,17 @@ TdLibClient::TdLibClient(const std::string& explicit_lib) {
     if (!explicit_lib.empty()) candidates.push_back(explicit_lib);
     std::string env_lib = envStr("TDJSON_LIB");
     if (!env_lib.empty()) candidates.push_back(env_lib);
+    // Release layout first: lib/ next to the binary, and lib/ next
+    // to bin/ (parlay-vX.Y.Z/{bin/parlay-core, lib/libtdjson.so*}).
+    // A proper host needs nothing but the session dir + the built
+    // .so in lib/ — no TDJSON_LIB, no repo paths.
+    std::string exe = exeDir();
+    if (!exe.empty()) {
+        candidates.push_back(exe + "/lib/libtdjson.so");
+        candidates.push_back(exe + "/lib/libtdjson.so.1.8.69");
+        candidates.push_back(exe + "/../lib/libtdjson.so");
+        candidates.push_back(exe + "/../lib/libtdjson.so.1.8.69");
+    }
     candidates.push_back(kDefaultLib);
     candidates.push_back("libtdjson.so");
     for (const auto& path : candidates) {

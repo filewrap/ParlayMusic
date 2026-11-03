@@ -35,16 +35,21 @@
 //!     in-process via the FFI module when libntgcalls.so exists, else
 //!     the wheel probe — both purely local WebRTC, no MTProto, no
 //!     network, no credentials.
-//!   * The join (`join`): HONESTLY UNAVAILABLE in this service. The
-//!     voice_bridge.py Telethon child that used to do
-//!     phone.joinGroupCall was deleted in Phase 5 (user order), and
-//!     Rust stdlib has no MTProto client — there is no Telethon in
-//!     Rust. The MTProto join now lives only in core-cpp's
-//!     TdLibVoiceCall (TDLib joinVideoChat + in-process ntgcalls).
-//!     join() therefore always returns Err with the exact reason;
-//!     `joined:true` is NEVER reported without a real join. A Rust
-//!     MTProto client (ParvatiMusic-style `mtproto/`) would be a new
-//!     subsystem and is out of scope.
+//!   * The join (`join`): DELEGATED to the core (Phase 7, A1). vc-rust
+//!     holds no MTProto client — the voice_bridge.py Telethon child
+//!     was deleted in Phase 5 (user order) — so join() POSTs vc.join
+//!     to the core-cpp HTTP API (POST {CORE_URL}/v1/join,
+//!     contracts/ipc.json) and reports the core's answer verbatim:
+//!     Ok only when the core's TDLib backend really joined (TDLib
+//!     joinVideoChat + in-process ntgcalls,
+//!     TD_API_ID/TD_API_HASH/TD_SESSION_DIR), Err with the core's
+//!     exact reason otherwise (no session/credentials, core
+//!     unreachable, core 502). The engine supplies only the audio
+//!     source (the Opus pipeline above); the core owns the join.
+//!     `joined:true` is NEVER reported without the core's answer. A
+//!     Rust MTProto client (ParvatiMusic-style `mtproto/`) would be
+//!     a new subsystem and is out of scope — delegation is the real
+//!     path, not a stopgap.
 //!
 //! What is BLOCKED (sandbox, proven, not worked around):
 //!   * UDP sendto is EPERM even to loopback (`probe_udp`: io error 1,
@@ -57,7 +62,9 @@
 //!     the FFI, with the wheel probe only as the fallback when the
 //!     .so is absent.
 //!   * No MTProto session / credentials in this service, and no
-//!     client to use them with — see join() above.
+//!     client to use them with — the join is delegated to the core
+//!     (see join() above), so a live join still needs the core's
+//!     TDLib backend configured on a host with open network.
 //!
 //! `RealVoiceCall` implements the `VoiceCall` trait in main.rs.
 //! `play_stream` runs the pipeline, builds the local offer as a
@@ -75,6 +82,8 @@ use super::{parse_json, Track, VoiceCall};
 use crate::data_file;
 use ntg::NtgLib;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -528,9 +537,15 @@ pub struct BackendConfig {
     pub missing: Vec<String>,
     // Resolved libntgcalls.so path ("" when none found). The media
     // side only: even a fully-configured lib does NOT make join()
-    // possible — there is no MTProto client in this service.
+    // possible in-process — there is no MTProto client in this
+    // service, so the join is delegated to the core (core_url below).
     pub lib: String,
     pub offer_fallback: String,
+    // Core delegation (Phase 7, A1): the core-cpp HTTP base URL for
+    // vc.join (CORE_URL, default http://localhost:8080) and the IPC
+    // token sent as X-Parlay-Token (PARLAY_TOKEN, "" = none).
+    pub core_url: String,
+    pub token: String,
 }
 
 impl BackendConfig {
@@ -545,10 +560,27 @@ impl BackendConfig {
             )
         }
     }
+
+    // Test seams: point the delegation at a stub core / set the IPC
+    // token for one call. Test-only by design (production reads the
+    // env in backend_config_from_env).
+    #[cfg(test)]
+    pub fn with_core_url(mut self, url: &str) -> BackendConfig {
+        self.core_url = url.to_string();
+        self
+    }
+
+    // Test seam: set the IPC token for one call.
+    #[cfg(test)]
+    pub fn with_token(mut self, token: &str) -> BackendConfig {
+        self.token = token.to_string();
+        self
+    }
 }
 
 /// Pure config check (env-independent so tests can exercise it without
-/// touching process env).
+/// touching process env). core_url/token take their defaults here;
+/// backend_config_from_env() fills them from the environment.
 pub fn backend_config_from(ntgcalls_lib: Option<String>) -> BackendConfig {
     let mut missing = Vec::new();
     let lib = ntgcalls_lib.unwrap_or_default();
@@ -565,6 +597,8 @@ pub fn backend_config_from(ntgcalls_lib: Option<String>) -> BackendConfig {
         missing,
         lib,
         offer_fallback,
+        core_url: "http://localhost:8080".to_string(),
+        token: String::new(),
     }
 }
 
@@ -573,7 +607,16 @@ pub fn backend_config_from_env() -> BackendConfig {
         .ok()
         .filter(|v| !v.is_empty())
         .or_else(NtgLib::first_existing);
-    backend_config_from(lib)
+    let mut cfg = backend_config_from(lib);
+    if let Ok(u) = std::env::var("CORE_URL") {
+        if !u.trim().is_empty() {
+            cfg.core_url = u.trim().to_string();
+        }
+    }
+    if let Ok(t) = std::env::var("PARLAY_TOKEN") {
+        cfg.token = t;
+    }
+    cfg
 }
 
 fn voice_python() -> String {
@@ -667,15 +710,95 @@ pub fn create_local_offer(chat_id: i64) -> Result<String, String> {
 }
 
 // ------------------------------------------------------------- join -------
-// The MTProto step: phone.joinGroupCall(local SDP) -> remote transport
-// -> ntgcalls connect(remote). HONESTLY UNAVAILABLE in vc-rust: the
-// voice_bridge.py Telethon child that did this was deleted in Phase 5
-// (user order — ntgcalls is a native library linked in-process, not a
-// server), and Rust stdlib has no MTProto client to replace it with.
-// The join lives only in core-cpp's TdLibVoiceCall (TDLib
-// joinVideoChat + in-process ntgcalls, TD_API_ID/TD_API_HASH/
-// TD_SESSION_DIR). This function therefore always returns Err with
-// the exact reason — never a spawned process, never a faked join.
+// Minimal std-only HTTP POST client for the core delegation (no curl
+// dependency on this path — the core is a local HTTP service).
+// Returns (status, body) or an error string. http:// only: the core
+// URL is always local (localhost or core-cpp:8080); https is refused
+// honestly rather than silently downgraded.
+fn post_json_to_core(
+    core_url: &str,
+    path: &str,
+    body: &str,
+    token: &str,
+) -> Result<(u16, String), String> {
+    let base = core_url.trim_end_matches('/');
+    let url = format!("{}{}", base, path);
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        format!("unsupported core URL scheme (want http://): {}", core_url)
+    })?;
+    let (hostport, req_path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match hostport.rfind(':') {
+        Some(i) => {
+            let p: u16 = hostport[i + 1..]
+                .parse()
+                .map_err(|_| format!("bad core URL port in {}", core_url))?;
+            (&hostport[..i], p)
+        }
+        None => (hostport, 80),
+    };
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve core host {}: {}", host, e))?
+        .next()
+        .ok_or_else(|| format!("cannot resolve core host {}", host))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("connect to {} failed: {}", addr, e))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .ok();
+    let mut req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        req_path,
+        hostport,
+        body.len()
+    );
+    if !token.is_empty() {
+        req.push_str(&format!("X-Parlay-Token: {}\r\n", token));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("write to core failed: {}", e))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("read from core failed: {}", e))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, resp_body) = match text.split_once("\r\n\r\n") {
+        Some((h, b)) => (h, b.to_string()),
+        None => {
+            return Err("core returned a malformed HTTP response".to_string())
+        }
+    };
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            "core returned a malformed HTTP status line".to_string()
+        })?;
+    Ok((status, resp_body))
+}
+
+// The MTProto step, DELEGATED to the core (Phase 7, A1): vc-rust
+// holds no MTProto client — the voice_bridge.py Telethon child was
+// deleted in Phase 5 (user order) — so join() POSTs vc.join to the
+// core-cpp HTTP API (POST {CORE_URL}/v1/join, contracts/ipc.json)
+// and reports the core's answer verbatim. The core owns the join
+// (authorize -> getChat/createVideoChat -> joinVideoChat -> ntgcalls
+// connect in TdLibVoiceCall); this engine supplies only the audio
+// source. Ok only when the core answers joined:true; Err with the
+// core's exact reason otherwise (no session/credentials, core
+// unreachable, core 502). The Ok payload is (remote_len, offer_len):
+// the core does not expose the remote transport length, so
+// remote_len is 0 (unknown) and the caller logs the delegation.
 // The arguments are kept (offer pre-flight proof + opus source) so
 // the call shape survives for the day a Rust MTProto client exists.
 pub fn join(chat_id: i64, local_sdp: &str, opus_file: Option<&str>) -> Result<(usize, usize), String> {
@@ -686,14 +809,56 @@ pub fn join_with_config(
     chat_id: i64,
     local_sdp: &str,
     _opus_file: Option<&str>,
-    _cfg: &BackendConfig,
+    cfg: &BackendConfig,
 ) -> Result<(usize, usize), String> {
-    let _ = chat_id;
-    let _ = local_sdp;
-    Err("voice join unavailable in vc-rust: no MTProto client in-process \
-         (voice_bridge.py deleted Phase 5); join via the core-cpp tdlib \
-         backend (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + libntgcalls.so)"
-        .to_string())
+    let core = cfg.core_url.trim_end_matches('/');
+    let body = format!("{{\"chat_id\":{}}}", chat_id);
+    let (status, resp) = match post_json_to_core(core, "/v1/join", &body, &cfg.token) {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(format!(
+                "core unreachable at {}/v1/join ({}); set CORE_URL to the core-cpp HTTP URL (default http://localhost:8080)",
+                core, e
+            ));
+        }
+    };
+    let parsed = parse_json(&resp);
+    if status == 200 {
+        if let Some(v) = parsed.as_ref() {
+            if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                if let Some(data) = v.get("data") {
+                    if data
+                        .get("joined")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return Ok((0, local_sdp.len()));
+                    }
+                }
+            }
+        }
+    }
+    // The core's exact reason, verbatim (IPC envelope
+    // {ok:false,error:{code,message}}); a 200 with joined:false is
+    // the same failure, reported the same way.
+    let mut reason: Option<String> = None;
+    if let Some(v) = parsed.as_ref() {
+        if let Some(e) = v.get("error") {
+            if let Some(m) = e.get("message").and_then(|x| x.as_str()) {
+                reason = Some(m.to_string());
+            } else if let Some(m) = e.as_str() {
+                reason = Some(m.to_string());
+            }
+        }
+    }
+    Err(reason.unwrap_or_else(|| {
+        format!(
+            "core {}/v1/join returned HTTP {}: {}",
+            core,
+            status,
+            resp.chars().take(300).collect::<String>()
+        )
+    }))
 }
 
 // ---------------------------------------------------------- per-chat ------
@@ -754,10 +919,11 @@ impl RealVoiceCall {
     /// Attempt the MTProto join for a chat and record the outcome.
     /// Returns true only on a real join. Pre-flight: prove in-process
     /// ntgcalls can build a call (create_local_offer — FFI, or wheel
-    /// probe fallback) and record the offer length; the join itself is
-    /// honestly unavailable in this service (no MTProto client —
-    /// see join()), so the outcome is always "not joined" with the
-    /// exact reason until a Rust MTProto client exists.
+    /// probe fallback) and record the offer length; the join itself
+    /// is delegated to the core (see join()), so the outcome is the
+    /// core's answer — joined only when the core's TDLib backend
+    /// really joined, otherwise "not joined" with the core's exact
+    /// reason.
     fn attempt_join(&self, chat_id: i64) -> bool {
         let opus_file = {
             let st = self.state_mut();
@@ -765,11 +931,12 @@ impl RealVoiceCall {
                 .and_then(|c| c.pipeline.as_ref())
                 .map(|p| p.opus_file.clone())
         };
-        match create_local_offer(chat_id) {
+        let offer = match create_local_offer(chat_id) {
             Ok(offer) => {
                 let mut st = self.state_mut();
                 let c = st.entry(chat_id).or_insert_with(ChatVoice::fresh);
                 c.offer_len = Some(offer.len());
+                offer
             }
             Err(e) => {
                 let mut st = self.state_mut();
@@ -779,8 +946,11 @@ impl RealVoiceCall {
                 eprintln!("[voice] chat {} offer failed: {}", chat_id, e);
                 return false;
             }
-        }
-        match join(chat_id, "", opus_file.as_deref()) {
+        };
+        // The pre-flight offer is passed through so the join result
+        // can report its length (join() itself never sends it — the
+        // core builds its own offer in-process for the real join).
+        match join(chat_id, &offer, opus_file.as_deref()) {
             Ok((remote_len, offer_len)) => {
                 let mut st = self.state_mut();
                 let c = st.entry(chat_id).or_insert_with(ChatVoice::fresh);
@@ -788,10 +958,20 @@ impl RealVoiceCall {
                 c.joined = true;
                 c.voice = "live".to_string();
                 c.reason = None;
-                eprintln!(
-                    "[voice] chat {} joined (remote transport {} bytes)",
-                    chat_id, remote_len
-                );
+                if remote_len > 0 {
+                    eprintln!(
+                        "[voice] chat {} joined (remote transport {} bytes)",
+                        chat_id, remote_len
+                    );
+                } else {
+                    // The core join endpoint does not expose the
+                    // remote transport length; the delegation is the
+                    // proof, not a byte count.
+                    eprintln!(
+                        "[voice] chat {} joined via core vc.join (offer {} bytes)",
+                        chat_id, offer_len
+                    );
+                }
                 true
             }
             Err(e) => {
@@ -914,6 +1094,7 @@ impl Default for RealVoiceCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn make_tone_5s(path: &Path) {
         let (code, _, err) = run_cmd(
@@ -941,6 +1122,155 @@ mod tests {
         let d = std::env::temp_dir().join(format!("parlay-vc-rust-voice-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    fn tone_track(tag: &str) -> Track {
+        let dir = work_dir(tag);
+        let tone = dir.join("tone5.wav");
+        make_tone_5s(&tone);
+        Track {
+            id: "tone5".to_string(),
+            title: "Test tone".to_string(),
+            artist: "Test".to_string(),
+            source: "file".to_string(),
+            url: String::new(),
+            duration_sec: 5,
+            resolved_by: "test".to_string(),
+            // A local file has no direct audio URL.
+            stream_url: None,
+            file_path: Some(tone.to_string_lossy().to_string()),
+            downloaded: true,
+            download_failed: false,
+        }
+    }
+
+    // Stub core for the vc.join delegation proofs: a TcpListener on
+    // an ephemeral port that records requests and answers POST
+    // /v1/join from a scripted (status, body). Runs on a detached
+    // thread; the test reads the recorded requests after the call.
+    struct StubCore {
+        url: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn start_stub_core(status: u16, body: &str) -> StubCore {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub core");
+        let port = listener.local_addr().expect("stub core port").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_thread = Arc::clone(&seen);
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut s = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                // Read the head, then the body per Content-Length
+                // (the client keeps the socket open for the reply,
+                // so read_to_end would deadlock).
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut head_done = false;
+                while !head_done {
+                    match s.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                                head_done = true;
+                                let head =
+                                    String::from_utf8_lossy(&buf[..pos]).to_string();
+                                let mut content_length = 0usize;
+                                for line in head.lines() {
+                                    if let Some(v) = line
+                                        .to_lowercase()
+                                        .strip_prefix("content-length:")
+                                    {
+                                        content_length =
+                                            v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                                let have = buf.len() - (pos + 4);
+                                let mut need =
+                                    content_length.saturating_sub(have);
+                                while need > 0 {
+                                    match s.read(&mut chunk) {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            buf.extend_from_slice(&chunk[..n]);
+                                            need = need.saturating_sub(n);
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                {
+                    let mut seen =
+                        seen_thread.lock().unwrap_or_else(|e| e.into_inner());
+                    seen.push(String::from_utf8_lossy(&buf).to_string());
+                }
+                let resp = format!(
+                    "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        StubCore {
+            url: format!("http://127.0.0.1:{}", port),
+            seen,
+        }
+    }
+
+    // Save/restore CORE_URL + PARLAY_TOKEN around a play_stream call
+    // (same discipline as the main.rs spotify tests). Only the voice
+    // tests read these vars; no other test in this binary does.
+    //
+    // The two play_stream tests below MUST hold CORE_ENV_LOCK while
+    // the env is swapped: env vars are process-global and the test
+    // harness runs tests on parallel threads, so without the lock one
+    // test's play_stream could read the other test's CORE_URL and
+    // report "live" (or "core unreachable") for the wrong stub.
+    // (Found as a flaky 2-failure full-suite run: each test passes
+    // alone, both fail together when the swap windows overlap.)
+    static CORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SavedCoreEnv {
+        core_url: Option<String>,
+        token: Option<String>,
+    }
+
+    fn set_core_env(url: &str, token: &str) -> SavedCoreEnv {
+        let saved = SavedCoreEnv {
+            core_url: std::env::var("CORE_URL").ok(),
+            token: std::env::var("PARLAY_TOKEN").ok(),
+        };
+        std::env::set_var("CORE_URL", url);
+        std::env::set_var("PARLAY_TOKEN", token);
+        saved
+    }
+
+    fn restore_core_env(saved: SavedCoreEnv) {
+        match saved.core_url {
+            Some(v) => std::env::set_var("CORE_URL", v),
+            None => std::env::remove_var("CORE_URL"),
+        }
+        match saved.token {
+            Some(v) => std::env::set_var("PARLAY_TOKEN", v),
+            None => std::env::remove_var("PARLAY_TOKEN"),
+        }
     }
 
     #[test]
@@ -1024,30 +1354,63 @@ mod tests {
     }
 
     #[test]
-    fn join_fails_honestly_no_mtproto_client() {
-        // Env-independent path: join_with_config must fail with the
-        // no-MTProto-client reason before any process is spawned —
-        // vc-rust holds no MTProto client since the bridge was deleted.
-        let cfg = backend_config_from(None);
-        let err = join_with_config(-1004243, "", None, &cfg)
-            .expect_err("join must fail without an MTProto client");
-        eprintln!("join error: {}", err);
-        assert!(err.contains("no MTProto client"), "{}", err);
-        assert!(err.contains("voice_bridge.py deleted"), "{}", err);
-        assert!(err.contains("tdlib"), "{}", err);
+    fn join_delegates_to_core_stub_answers_joined() {
+        // The engine calls POST {CORE_URL}/v1/join and reports the
+        // core's answer. The stub is the core in this test: it
+        // records the exact request and answers joined:true.
+        let stub = start_stub_core(
+            200,
+            r#"{"ok":true,"data":{"joined":true,"chat_id":-1004243,"now_playing":null}}"#,
+        );
+        let cfg = backend_config_from(None)
+            .with_core_url(&stub.url)
+            .with_token("test-token");
+        let (remote_len, offer_len) =
+            join_with_config(-1004243, "dummy-offer", None, &cfg)
+                .expect("join must succeed when the core answers joined:true");
+        assert_eq!(remote_len, 0, "core does not expose the remote length");
+        assert_eq!(offer_len, "dummy-offer".len());
+        let seen = stub.seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 1, "exactly one core call: {:?}", seen);
+        let req = &seen[0];
+        assert!(req.starts_with("POST /v1/join HTTP/1.1"), "{}", req);
+        assert!(req.contains("X-Parlay-Token: test-token"), "{}", req);
+        assert!(req.contains("\"chat_id\":-1004243"), "{}", req);
     }
 
     #[test]
-    fn join_still_fails_when_ntg_lib_is_configured() {
+    fn join_reports_core_502_reason_verbatim() {
         // Media vs signaling are separate gates: even with a lib path
-        // configured, join() cannot phone.joinGroupCall — there is no
-        // MTProto client in this service.
-        let cfg = backend_config_from(Some("/tmp".to_string()));
+        // configured, the join goes to the core — and the core's exact
+        // reason is what the caller sees.
+        let stub = start_stub_core(
+            502,
+            r#"{"ok":false,"error":{"code":"engine_unavailable","message":"tdlib unavailable: no TD_API_ID/TD_API_HASH"}}"#,
+        );
+        let cfg = backend_config_from(Some("/tmp".to_string()))
+            .with_core_url(&stub.url)
+            .with_token("test-token");
         assert!(cfg.ok, "{}", cfg.describe());
         let err = join_with_config(-1004243, "dummy-offer", None, &cfg)
-            .expect_err("join must fail even with ntgcalls configured");
-        eprintln!("join with lib configured: {}", err);
-        assert!(err.contains("no MTProto client"), "{}", err);
+            .expect_err("join must fail when the core 502s");
+        assert_eq!(
+            err, "tdlib unavailable: no TD_API_ID/TD_API_HASH",
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn join_core_down_fails_honestly_naming_core_url() {
+        // Port 9 is the discard port: nothing listens, connect is refused.
+        let cfg = backend_config_from(None)
+            .with_core_url("http://127.0.0.1:9")
+            .with_token("test-token");
+        let err = join_with_config(-1004243, "dummy-offer", None, &cfg)
+            .expect_err("join must fail when the core is down");
+        eprintln!("join core-down error: {}", err);
+        assert!(err.contains("core unreachable"), "{}", err);
+        assert!(err.contains("CORE_URL"), "{}", err);
     }
 
     #[test]
@@ -1060,26 +1423,16 @@ mod tests {
 
     #[test]
     fn play_stream_reports_real_voice_state_never_joined() {
+        // Core down (CORE_URL at a closed port): the pipeline proves
+        // itself, the join fails with the core's exact reason, and
+        // the voice state never claims joined:true.
+        let _env_guard = CORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = set_core_env("http://127.0.0.1:9", "test-token");
         let vc = RealVoiceCall::new();
-        let track = Track {
-            id: "tone5".to_string(),
-            title: "Test tone".to_string(),
-            artist: "Test".to_string(),
-            source: "file".to_string(),
-            url: String::new(),
-            duration_sec: 5,
-            resolved_by: "test".to_string(),
-            file_path: Some({
-                let dir = work_dir("play");
-                let tone = dir.join("tone5.wav");
-                make_tone_5s(&tone);
-                tone.to_string_lossy().to_string()
-            }),
-            downloaded: true,
-            download_failed: false,
-        };
+        let track = tone_track("play");
         vc.play_stream(-1004243, &track);
         let detail = vc.voice_detail(-1004243).expect("voice state recorded");
+        restore_core_env(saved);
         eprintln!(
             "play_stream voice={} joined={} reason={:?} frames={:?} rtp={:?} offer_len={:?}",
             detail.voice,
@@ -1091,7 +1444,7 @@ mod tests {
         );
         assert_eq!(detail.voice, "opus-rtp-ready");
         assert!(!detail.joined, "never joined:true without a real join");
-        assert!(detail.reason.as_deref().unwrap_or("").contains("no MTProto client"));
+        assert!(detail.reason.as_deref().unwrap_or("").contains("core unreachable"));
         // Pre-flight offer was built (FFI, or wheel probe fallback).
         let offer_len = detail.offer_len.expect("offer_len recorded");
         assert!(offer_len > 100, "offer_len {}", offer_len);
@@ -1105,5 +1458,40 @@ mod tests {
         assert_eq!(vc.voice_string(-1004243), "opus-rtp-ready");
         vc.stop(-1004243);
         assert_eq!(vc.voice_string(-1004243), "unavailable:stopped");
+    }
+
+    #[test]
+    fn play_stream_with_stub_core_joins() {
+        // play_stream reads CORE_URL/PARLAY_TOKEN from the env; the
+        // stub core answers joined:true, so the voice state must
+        // then be live. joined:true here comes only from the core's
+        // answer — the stub is the core in this test.
+        let _env_guard = CORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = start_stub_core(
+            200,
+            r#"{"ok":true,"data":{"joined":true,"chat_id":-1004243,"now_playing":null}}"#,
+        );
+        let saved = set_core_env(&stub.url, "test-token");
+        let vc = RealVoiceCall::new();
+        let track = tone_track("play-core");
+        vc.play_stream(-1004243, &track);
+        let detail = vc.voice_detail(-1004243).expect("voice state recorded");
+        restore_core_env(saved);
+        eprintln!(
+            "play_stream (stub core) voice={} joined={} reason={:?} offer_len={:?}",
+            detail.voice, detail.joined, detail.reason, detail.offer_len
+        );
+        assert_eq!(detail.voice, "live");
+        assert!(detail.joined, "joined:true only because the core answered it");
+        assert_eq!(detail.reason, None);
+        let offer_len = detail.offer_len.expect("offer_len recorded");
+        assert!(offer_len > 100, "offer_len {}", offer_len);
+        let p = detail.pipeline.expect("pipeline stats recorded");
+        assert_eq!(p.frames, 251);
+        assert_eq!(p.rtp_packets, 251);
+        let seen = stub.seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen.len(), 1, "one core join call for the play: {:?}", seen);
+        assert!(seen[0].starts_with("POST /v1/join HTTP/1.1"), "{}", seen[0]);
+        assert!(seen[0].contains("\"chat_id\":-1004243"), "{}", seen[0]);
     }
 }

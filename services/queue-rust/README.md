@@ -15,7 +15,8 @@ the Spotify playback queue. `queue.vote` IPC.
     (`$PARLAY_VOTE_THRESHOLD`, default 3).
 - `GET /healthz` → `{ok:true, service, data:{service, status:"ok"}}`.
 - JSON envelopes per `contracts/ipc.json`.
-- Persistence: in-memory map + `./data/votes.json`
+- Persistence: in-memory map + shared durable store (Phase 7, A11:
+  `MONGO_URI` > `REDIS_URL` > `./data/votes.json`, key `queue:votes`)
   (`$PARLAY_DATA_DIR` override), atomic write (tmp + rename),
   reloaded on startup. Verified across a restart.
   Tracks are keyed by `track.id` (falls back to the rendered track

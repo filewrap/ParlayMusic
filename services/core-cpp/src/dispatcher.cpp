@@ -366,7 +366,10 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
     if (msg.video_chat_started || msg.video_chat_ended) {
         // Auto-end: a voice chat ending kills the session (tools.cpp).
         setCallActive(msg.chat.id, false);
-        setChatField(msg.chat.id, "voice_owner", "");
+        clearCoreStream(msg.chat.id);
+        // Also stop the core backend's own session: the call is gone,
+        // so a recorded core source must not keep streaming into it.
+        voice_.stop(msg.chat.id);
         Engine used;
         bool fb = false;
         vcCall({msg, "stop", "", false}, "stop",
@@ -639,11 +642,107 @@ bool Dispatcher::applyCoreFilter(const CommandContext& ctx, double speed,
         reply(ctx, "Could not apply the filter: " + why);
         return true;
     }
+    setChatField(chat, "core_pos", std::to_string(seek));
     reply(ctx, done_msg + " (core voice re-attached" +
                    (seek > 0 ? " at " + fmtSeconds(seek)
                              : " from the start (position unknown)") +
                    " with the filter applied).");
     return true;
+}
+
+// --- core-stream attach (Phase 7, A1b) --------------------------------------
+// The engines resolve tracks but cannot put audio in a call: their
+// ntgcalls instances never join (no MTProto client in-process —
+// vc-ts/vc-rust delegate the join itself to the core, and vc-go has no
+// audio path at all). The core's TdLibVoiceCall::play is the only
+// join-if-needed + attach path, so every engine-resolved play is
+// attached here. voice_owner="core" means the core backend holds the
+// call AND streams its audio — for engine sessions as well as
+// replied-file ones — which is what makes /mute, /speed and /bass
+// work on them through the existing core-owned branches.
+
+std::string Dispatcher::engineTrackSource(const Json& np,
+                                          const std::string& fallback) {
+    const Json* top = np.find("stream_url");
+    if (top && !top->asString().empty()) return top->asString();
+    const Json* track = np.find("track");
+    if (track) {
+        const Json* u = track->find("stream_url");
+        if (u && !u->asString().empty()) return u->asString();
+    }
+    return fallback;
+}
+
+bool Dispatcher::attachEngineAudio(int64_t chat, const Json& np, bool video,
+                                   int seek_sec,
+                                   const std::string& fallback_source,
+                                   std::string& error) {
+    std::string source = engineTrackSource(np, fallback_source);
+    if (source.empty()) {
+        error = "the engine resolved the track but gave no playable "
+                "audio URL (no stream_url in its now_playing)";
+        return false;
+    }
+    const Json* track = np.find("track");
+    std::string title =
+        track && track->find("title") ? track->find("title")->asString()
+                                      : "Track";
+    std::string track_id =
+        track && track->find("id") ? track->find("id")->asString() : "";
+    // voice_.play joins first when the backend is not already in the
+    // call (TdLibVoiceCall::play: authorize -> offer -> joinVideoChat
+    // -> connect -> setSources); on a live call it only re-attaches
+    // the source. The chat's stored speed/bass apply, as on the
+    // replied-file path.
+    if (!voice_.play(chat, source, title, video, seek_sec,
+                     chatSpeedField(chat), chatIntField(chat, "bass", 0))) {
+        error = voice_.lastError();
+        if (error.empty()) error = voice_.describe();
+        return false;
+    }
+    setChatField(chat, "core_source", source);
+    setChatField(chat, "core_title", title);
+    setChatField(chat, "core_video", video ? "1" : "0");
+    setChatField(chat, "core_track_id", track_id);
+    setChatField(chat, "core_pos", std::to_string(seek_sec));
+    setChatField(chat, "core_follow", "1");
+    setChatField(chat, "voice_owner", "core");
+    setCallActive(chat, true);
+    return true;
+}
+
+bool Dispatcher::reattachCoreAudio(int64_t chat, int seek_sec,
+                                   std::string& error) {
+    std::string source = chatField(chat, "core_source", "");
+    if (source.empty()) {
+        error = "no core source recorded for this chat";
+        return false;
+    }
+    std::string title = chatField(chat, "core_title", "Track");
+    bool video = chatField(chat, "core_video", "0") == "1";
+    if (!voice_.play(chat, source, title, video, seek_sec,
+                     chatSpeedField(chat), chatIntField(chat, "bass", 0))) {
+        error = voice_.lastError();
+        if (error.empty()) error = voice_.describe();
+        return false;
+    }
+    setChatField(chat, "core_pos", std::to_string(seek_sec));
+    return true;
+}
+
+void Dispatcher::clearCoreStream(int64_t chat) {
+    setChatField(chat, "voice_owner", "");
+    setChatField(chat, "core_source", "");
+    setChatField(chat, "core_title", "");
+    setChatField(chat, "core_video", "0");
+    setChatField(chat, "core_track_id", "");
+    setChatField(chat, "core_pos", "0");
+    setChatField(chat, "core_follow", "0");
+}
+
+bool Dispatcher::coreStreaming(int64_t chat) {
+    return chatField(chat, "voice_owner", "") == "core" && callActive(chat) &&
+           !chatField(chat, "core_source", "").empty();
 }
 
 bool Dispatcher::isAuthUser(int64_t chat_id, int64_t user_id) const {
@@ -798,6 +897,72 @@ bool Dispatcher::apiQueueList(int64_t chat_id, Json& queue_out,
     return true;
 }
 
+// HTTP API seam: vc.join (POST /v1/join). The vc-ts / vc-rust engines
+// call this from their join() — they hold no MTProto client, so the
+// core's TDLib backend owns the join (authorize -> createOffer ->
+// getChat/createVideoChat -> joinVideoChat -> ntg.connect, in
+// TdLibVoiceCall::join). Same join as /join, minus the Telegram
+// permission check and reply: the caller is an engine on the IPC
+// network, already authenticated by the X-Parlay-Token header.
+bool Dispatcher::joinVoice(int64_t chat_id, std::string& error) {
+    // Already in a call (core session from an earlier /join, or an
+    // engine session already playing here): nothing to join.
+    if (callActive(chat_id)) return true;
+    if (!voice_.available()) {
+        error = voice_.describe();
+        return false;
+    }
+    if (!voice_.join(chat_id)) {
+        error = voice_.lastError();
+        if (error.empty()) error = voice_.describe();
+        return false;
+    }
+    setChatField(chat_id, "voice_owner", "core");
+    setCallActive(chat_id, true);
+    return true;
+}
+
+// HTTP API seam: vc.mute (POST /v1/mute). Same mute as /mute, minus
+// the Telegram permission check and reply: the caller is an engine
+// on the IPC network, already authenticated by the X-Parlay-Token
+// header. The "already muted/unmuted" short-circuit of /mute is NOT
+// reproduced here — the endpoint reports the requested state after a
+// real backend mute/unmute (or an honest error), so a repeated mute
+// is a success, not a refusal.
+bool Dispatcher::muteVoice(int64_t chat_id, bool mute,
+                           std::string& error) {
+    // Mute reaches the voice session the core backend itself holds
+    // (/join, replied-file playback, and — since Phase 7 A1b — every
+    // engine play attached via attachEngineAudio) through the
+    // backend's mute() / unmute() — not a stored flag. A session
+    // still owned by a vc engine (stale / pre-fix state, never
+    // core-attached) cannot be muted from the core: the engines hold
+    // the call, so claiming otherwise would be a fake success.
+    std::string owner = chatField(chat_id, "voice_owner", "");
+    if (owner != "core") {
+        Json np, track;
+        if (nowPlaying(chat_id, np, track) || callActive(chat_id)) {
+            error = "the " +
+                    (owner.empty() ? std::string("engine") : owner) +
+                    " session is playing this chat; the core cannot "
+                    "mute it — mute works only on sessions the core "
+                    "voice backend holds (/join, replied-file "
+                    "playback)";
+            return false;
+        }
+        error = "Nothing is playing.";
+        return false;
+    }
+    bool ok = mute ? voice_.mute(chat_id) : voice_.unmute(chat_id);
+    if (!ok) {
+        error = voice_.lastError();
+        if (error.empty()) error = voice_.describe();
+        return false;
+    }
+    setChatField(chat_id, "muted", mute ? "1" : "0");
+    return true;
+}
+
 void Dispatcher::setCallActive(int64_t chat_id, bool active) {
     if (active)
         store_.set("call:" + std::to_string(chat_id), "1");
@@ -895,6 +1060,7 @@ void Dispatcher::backgroundLoop() {
         if (bg_stop_) break;
         sweepClean();
         watchLoopAutoplay();
+        watchCoreFollow();
     }
 }
 
@@ -967,10 +1133,93 @@ void Dispatcher::watchLoopAutoplay() {
         CommandContext fake;
         fake.message.chat.id = chat;
         IpcResult pr = vcCall(fake, "play", play, used, fb);
-        if (pr.ok) {
-            setChatField(chat, "last_track",
-                         pick->find("title") ? pick->find("title")->asString()
-                                             : "");
+        if (!pr.ok) continue;
+        // The engine resolved the pick — attach its audio to the core
+        // voice backend (see attachEngineAudio): without this the
+        // autoplay pick plays state-only and the call stays silent.
+        const Json* pick_np = pr.data.find("now_playing");
+        std::string err;
+        if (!attachEngineAudio(chat, pick_np ? *pick_np : pr.data, false, 0,
+                               "", err)) {
+            std::cerr << "[autoplay] chat " << chat
+                      << ": could not attach autoplay pick: " << err << "\n";
+            Engine u2;
+            bool fb2 = false;
+            vcCall(fake, "stop",
+                   Json::objectOf({{"chat_id", Json(chat)}}), u2, fb2);
+            voice_.stop(chat);
+            clearCoreStream(chat);
+            setCallActive(chat, false);
+            continue;
+        }
+        setChatField(chat, "last_track",
+                     pick->find("title") ? pick->find("title")->asString()
+                                         : "");
+    }
+}
+
+// Follow engine-internal auto-advance (Phase 7, A1b). The vc engines
+// advance their own state machine on a 1 s ticker when a track ends
+// (vc-go Room.DueForAdvance/Advance, vc-ts / vc-rust tickers) — the
+// core is never told, and its ntgcalls session is the only one
+// actually in the call. So every 5 s the watcher asks each
+// core-streaming chat what the engine is playing now and re-attaches
+// when it moved on: a different track id, or the same id with the
+// position jumped backwards (a /loop copy replaying, or a replay —
+// the copies share the track id). The re-attach seeks to the
+// engine's current position, so a track that ended 3 s ago resumes
+// ~3 s in, not from the start. Only engine sessions attached via
+// attachEngineAudio (core_follow=1) are followed: a replied-file
+// session leaves the engine's stale room reporting its old track,
+// and following that would clobber the replied file's audio.
+// On re-attach failure the session is stopped cleanly (engine stop
+// + core stop + state cleared) and the failure is logged: a silent
+// call with a "playing" engine is worse than a stopped one.
+void Dispatcher::watchCoreFollow() {
+    auto calls = store_.keys("call:");
+    for (const auto& key : calls) {
+        if (bg_stop_) return;
+        std::string chat_s = key.substr(std::string("call:").size());
+        int64_t chat = 0;
+        try {
+            chat = std::stoll(chat_s);
+        } catch (...) {
+            continue;
+        }
+        if (!coreStreaming(chat)) continue;
+        if (chatField(chat, "core_follow", "0") != "1") continue;
+        Json np, track;
+        if (!nowPlaying(chat, np, track)) continue;
+        std::string cur_id =
+            track.find("id") ? track.find("id")->asString() : "";
+        int64_t cur_pos =
+            np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
+        std::string last_id = chatField(chat, "core_track_id", "");
+        int64_t last_pos = chatIntField(chat, "core_pos", 0);
+        bool advanced = !last_id.empty() && cur_id != last_id;
+        bool replayed = cur_pos + 5 < last_pos;
+        if (!advanced && !replayed) {
+            setChatField(chat, "core_pos", std::to_string(cur_pos));
+            continue;
+        }
+        bool video = chatField(chat, "core_video", "0") == "1";
+        std::string err;
+        if (!attachEngineAudio(chat, np, video, static_cast<int>(cur_pos),
+                               "", err)) {
+            std::cerr << "[core-follow] chat " << chat
+                      << ": engine advanced but the core could not "
+                         "re-attach: "
+                      << err << "\n";
+            CommandContext fake;
+            fake.message.chat.id = chat;
+            Engine used;
+            bool fb = false;
+            vcCall(fake, "stop",
+                   Json::objectOf({{"chat_id", Json(chat)}}), used, fb);
+            voice_.stop(chat);
+            clearCoreStream(chat);
+            setCallActive(chat, false);
+            continue;
         }
     }
 }
@@ -1127,14 +1376,35 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
                            " minute limit.");
             return;
         }
-        setChatField(vcTarget(ctx), "last_track",
+    }
+    // The engine's play is state only — its audio never reaches the
+    // call (Phase 7, A1b). Attach the resolved track to the core's own
+    // voice backend now: on attach failure the engine's playback is
+    // stopped again and the exact error is reported, instead of a
+    // "Now playing" reply over a silent call.
+    int64_t chat = vcTarget(ctx);
+    std::string err;
+    if (!attachEngineAudio(chat, now, video, 0, "", err)) {
+        Engine u2;
+        bool fb2 = false;
+        vcCall(ctx, "stop", Json::objectOf({{"chat_id", Json(chat)}}), u2,
+               fb2);
+        // Silence any stale core stream (e.g. a force-replay whose new
+        // track could not attach): the old audio must not keep playing
+        // under the new track's name.
+        voice_.stop(chat);
+        clearCoreStream(chat);
+        setCallActive(chat, false);
+        reply(ctx, "Could not play in the voice chat: " + err);
+        return;
+    }
+    if (track) {
+        setChatField(chat, "last_track",
                      track->find("title") ? track->find("title")->asString() : "");
     }
-    setCallActive(vcTarget(ctx), true);
-    setChatField(vcTarget(ctx), "voice_owner", engineName(used));
-    if (chatField(vcTarget(ctx), "logger_on", "") == "1" ||
+    if (chatField(chat, "logger_on", "") == "1" ||
         store_.get("logger_on") == std::optional<std::string>("1"))
-        logToLogger("Play in " + std::to_string(vcTarget(ctx)) + ": " +
+        logToLogger("Play in " + std::to_string(chat) + ": " +
                     (track && track->find("title")
                          ? track->find("title")->asString()
                          : query));
@@ -1142,7 +1412,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     if (fell_back)
         text += "(fell back to engine " + std::string(engineName(used)) +
                 " — your preferred engine is unavailable)\n";
-    if (chatIntField(vcTarget(ctx), "muted", 0))
+    if (chatIntField(chat, "muted", 0))
         text += "(muted — use /unmute)\n";
     reply(ctx, text);
     deleteCommandMessage(ctx);
@@ -1182,6 +1452,12 @@ void Dispatcher::playRepliedFile(const CommandContext& ctx,
     setChatField(chat, "core_source", saved);
     setChatField(chat, "core_title", track_title);
     setChatField(chat, "core_video", video ? "1" : "0");
+    // Not an engine session: no engine track to follow, so the
+    // watcher must not re-attach the engine's stale room over this
+    // file (see watchCoreFollow).
+    setChatField(chat, "core_track_id", "");
+    setChatField(chat, "core_pos", "0");
+    setChatField(chat, "core_follow", "0");
     setCallActive(chat, true);
     reply(ctx, "▶ Now playing " + track_title +
                    " (replied file, via core voice).");
@@ -1203,7 +1479,16 @@ void Dispatcher::onPause(const CommandContext& ctx) {
         return;
     }
     const Json* np = r.data.find("now_playing");
-    reply(ctx, fmtNowPlaying(np ? *np : r.data, "⏸ Paused"));
+    std::string text = fmtNowPlaying(np ? *np : r.data, "⏸ Paused");
+    // The engine's pause is state only — the audio itself is on the
+    // core backend, so pause that too when this chat is core-streaming.
+    if (coreStreaming(vcTarget(ctx)) && !voice_.pause(vcTarget(ctx))) {
+        std::string why = voice_.lastError();
+        if (why.empty()) why = voice_.describe();
+        text += "Note: the core voice backend could not pause: " + why +
+                " — the call may keep playing.\n";
+    }
+    reply(ctx, text);
 }
 
 void Dispatcher::onResume(const CommandContext& ctx) {
@@ -1221,7 +1506,16 @@ void Dispatcher::onResume(const CommandContext& ctx) {
         return;
     }
     const Json* np = r.data.find("now_playing");
-    reply(ctx, fmtNowPlaying(np ? *np : r.data, "▶ Resumed"));
+    std::string text = fmtNowPlaying(np ? *np : r.data, "▶ Resumed");
+    // Mirror of onPause: resume the core backend as well when it is
+    // the one streaming this chat.
+    if (coreStreaming(vcTarget(ctx)) && !voice_.resume(vcTarget(ctx))) {
+        std::string why = voice_.lastError();
+        if (why.empty()) why = voice_.describe();
+        text += "Note: the core voice backend could not resume: " + why +
+                " — the call may stay silent.\n";
+    }
+    reply(ctx, text);
 }
 
 void Dispatcher::onSkip(const CommandContext& ctx) {
@@ -1239,9 +1533,35 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
         return;
     }
     const Json* np = r.data.find("now_playing");
-    if (np && np->find("track")) {
+    const Json* track = np ? np->find("track") : nullptr;
+    if (np && track && !track->isNull()) {
+        // The engine moved to a new track — its audio is on the core
+        // backend, so re-attach the new track's stream_url. On
+        // failure the stale stream is stopped (the old track's audio
+        // must not keep playing under the new track's name) and the
+        // failure is reported honestly; the engine keeps the new
+        // track as current, so the user can /play or /skip again.
+        int64_t chat = vcTarget(ctx);
+        if (coreStreaming(chat)) {
+            bool video = chatField(chat, "core_video", "0") == "1";
+            std::string err;
+            if (!attachEngineAudio(chat, *np, video, 0, "", err)) {
+                voice_.stop(chat);
+                clearCoreStream(chat);
+                reply(ctx, fmtNowPlaying(*np, "⏭ Skipped — now playing") +
+                               "Note: the core voice backend could not "
+                               "attach the new track's audio: " +
+                               err + " — the call is silent.\n");
+                return;
+            }
+        }
         reply(ctx, fmtNowPlaying(*np, "⏭ Skipped — now playing"));
     } else {
+        // Queue empty: the core's stream of the skipped track must
+        // end too, or its ffmpeg source keeps playing to the end of
+        // the file after the engine already stopped.
+        voice_.stop(vcTarget(ctx));
+        clearCoreStream(vcTarget(ctx));
         setCallActive(vcTarget(ctx), false);
         reply(ctx, "⏭ Skipped — the queue is now empty.");
     }
@@ -1269,9 +1589,29 @@ void Dispatcher::onAutoplaySkip(const CommandContext& ctx) {
         return;
     }
     const Json* np = r.data.find("now_playing");
-    if (np && np->find("track")) {
+    const Json* track = np ? np->find("track") : nullptr;
+    if (np && track && !track->isNull()) {
+        // Same re-attach as onSkip: the picked track's audio lives on
+        // the core backend, not in the engine.
+        int64_t chat = vcTarget(ctx);
+        if (coreStreaming(chat)) {
+            bool video = chatField(chat, "core_video", "0") == "1";
+            std::string err;
+            if (!attachEngineAudio(chat, *np, video, 0, "", err)) {
+                voice_.stop(chat);
+                clearCoreStream(chat);
+                reply(ctx,
+                      fmtNowPlaying(*np, "⏭ Autoplay skipped — now playing") +
+                          "Note: the core voice backend could not attach "
+                          "the new track's audio: " +
+                          err + " — the call is silent.\n");
+                return;
+            }
+        }
         reply(ctx, fmtNowPlaying(*np, "⏭ Autoplay skipped — now playing"));
     } else {
+        voice_.stop(vcTarget(ctx));
+        clearCoreStream(vcTarget(ctx));
         setCallActive(vcTarget(ctx), false);
         reply(ctx, "⏭ Autoplay skipped — the queue is now empty.");
     }
@@ -1285,11 +1625,13 @@ void Dispatcher::onStop(const CommandContext& ctx) {
     bool fell_back = false;
     IpcResult r = vcCall(ctx, "stop", body, used, fell_back);
     setCallActive(vcTarget(ctx), false);
-    setChatField(vcTarget(ctx), "voice_owner", "");
     // Also stop a session the core voice backend itself holds
-    // (replied-file playback, /join): /stop must end that too.
+    // (replied-file playback, /join, or any engine track attached via
+    // attachEngineAudio): /stop must end that too, and its recorded
+    // source must not survive for a later /speed or follow pass.
     // Best effort — false when the backend holds no call here.
     voice_.stop(vcTarget(ctx));
+    clearCoreStream(vcTarget(ctx));
     setChatField(vcTarget(ctx), "loop", "0");
     setChatField(vcTarget(ctx), "speed", "1.0");
     setChatField(vcTarget(ctx), "bass", "0");
@@ -1467,9 +1809,23 @@ void Dispatcher::onSeek(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    reply(ctx, std::string("Seeked ") +
-                   (ctx.command == "seekback" ? "backward" : "forward") +
-                   " to " + fmtSeconds(target) + ".");
+    std::string text = std::string("Seeked ") +
+                       (ctx.command == "seekback" ? "backward" : "forward") +
+                       " to " + fmtSeconds(target) + ".";
+    // The engine's seek moves its own position state only — the audio
+    // is on the core backend, so re-attach the recorded source at the
+    // new position when this chat is core-streaming.
+    if (coreStreaming(vcTarget(ctx))) {
+        std::string err;
+        if (!reattachCoreAudio(vcTarget(ctx), static_cast<int>(target),
+                               err)) {
+            text += " (But the core voice backend could not re-attach "
+                    "there: " +
+                    err + " — the call may still be playing the old "
+                          "position.)";
+        }
+    }
+    reply(ctx, text);
 }
 
 void Dispatcher::onClear(const CommandContext& ctx) {
@@ -1745,7 +2101,19 @@ void Dispatcher::onJump(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    reply(ctx, "Jumped to " + fmtSeconds(to) + ".");
+    std::string text = "Jumped to " + fmtSeconds(to) + ".";
+    // Same core re-attach as onSeek: the engine's seek moves state
+    // only, the audio is on the core backend.
+    if (coreStreaming(vcTarget(ctx))) {
+        std::string err;
+        if (!reattachCoreAudio(vcTarget(ctx), to, err)) {
+            text += " (But the core voice backend could not re-attach "
+                    "there: " +
+                    err + " — the call may still be playing the old "
+                          "position.)";
+        }
+    }
+    reply(ctx, text);
 }
 
 void Dispatcher::onSpeed(const CommandContext& ctx) {
@@ -1793,15 +2161,18 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         reply(ctx, "Playback is paused.");
         return;
     }
-    // Engine-owned session (NoxBeats play_media restart shape):
-    // restart the stream at the same position. Honest limit
-    // (REMAINING.md B11): NO vc engine applies the value — vc-go
-    // keeps queue state only and never touches audio, and vc-ts /
-    // vc-rust run their ffmpeg pipeline once per track and never
-    // re-encode on seek, so the seek-restart below only moves the
-    // position. The value is stored (what /pos and /speed report)
-    // and takes effect on core-voice playback; the reply says so
-    // instead of claiming the speed was set.
+    // No core source recorded (stale / pre-fix session, or a session
+    // whose attach failed): the engine seek-restart below only moves
+    // the position. Honest limit (REMAINING.md B11): NO vc engine
+    // applies the value — vc-go keeps queue state only and never
+    // touches audio, and vc-ts / vc-rust run their ffmpeg pipeline
+    // once per track and never re-encode on seek. Sessions attached
+    // through the core (voice_owner "core", including engine plays
+    // since Phase 7 A1b) never reach this branch — applyCoreFilter
+    // above applies the filter for real. The value is stored (what
+    // /pos and /speed report) and takes effect on core-voice
+    // playback; the reply says so instead of claiming the speed was
+    // set.
     int64_t pos =
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     Json body = Json::objectOf({
@@ -1859,8 +2230,11 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         reply(ctx, "Playback is paused.");
         return;
     }
-    // Engine-owned session: same honest limit as /speed — the seek
-    // below only moves the position; no engine applies the value.
+    // No core source recorded (stale / pre-fix session): same honest
+    // limit as /speed — the seek below only moves the position; no
+    // engine applies the value. Sessions attached through the core
+    // (including engine plays since Phase 7 A1b) never reach this
+    // branch — applyCoreFilter above applies the bass for real.
     int64_t pos =
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     Json body = Json::objectOf({
@@ -1890,36 +2264,19 @@ void Dispatcher::onMute(const CommandContext& ctx) {
         reply(ctx, mute ? "Already muted." : "Already unmuted.");
         return;
     }
-    // Mute reaches the voice session the core backend itself holds
-    // (/join, replied-file playback) through the backend's mute() /
-    // unmute() — not a stored flag. A session owned by a vc engine
-    // cannot be muted from the core: the engines expose no vc.mute
-    // action, so claiming otherwise would be a fake success.
-    std::string owner = chatField(chat, "voice_owner", "");
-    if (owner != "core") {
-        Json np, track;
-        if (nowPlaying(chat, np, track) || callActive(chat)) {
-            reply(ctx, "The " +
-                           (owner.empty() ? std::string("engine") : owner) +
-                           " session is playing this chat; the core cannot "
-                           "mute it — the voice engines expose no vc.mute "
-                           "action yet. Mute works on sessions the core "
-                           "voice backend holds (/join, replied-file "
-                           "playback).");
-            return;
+    // The backend work lives in muteVoice (shared with POST /v1/mute).
+    // Its "Nothing is playing." error is the reply verbatim, matching
+    // the old wording; any other failure is "Could not mute: <reason>".
+    std::string err;
+    if (!muteVoice(chat, mute, err)) {
+        if (err == "Nothing is playing.") {
+            reply(ctx, err);
+        } else {
+            reply(ctx, std::string("Could not ") +
+                           (mute ? "mute: " : "unmute: ") + err);
         }
-        reply(ctx, "Nothing is playing.");
         return;
     }
-    bool ok = mute ? voice_.mute(chat) : voice_.unmute(chat);
-    if (!ok) {
-        std::string why = voice_.lastError();
-        if (why.empty()) why = voice_.describe();
-        reply(ctx, std::string("Could not ") +
-                       (mute ? "mute: " : "unmute: ") + why);
-        return;
-    }
-    setChatField(chat, "muted", mute ? "1" : "0");
     reply(ctx, mute ? "Muted." : "Unmuted.");
 }
 
@@ -1970,7 +2327,19 @@ void Dispatcher::onReplay(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    reply(ctx, "Replaying from the start.");
+    std::string text = "Replaying from the start.";
+    // Same core re-attach as onSeek: the engine's seek moves state
+    // only, the audio is on the core backend.
+    if (coreStreaming(vcTarget(ctx))) {
+        std::string err;
+        if (!reattachCoreAudio(vcTarget(ctx), 1, err)) {
+            text += " (But the core voice backend could not re-attach "
+                    "at the start: " +
+                    err + " — the call may keep playing from the old "
+                          "position.)";
+        }
+    }
+    reply(ctx, text);
 }
 
 void Dispatcher::onPlayer(const CommandContext& ctx) {
@@ -2187,8 +2556,25 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
         replyError(ctx, pr);
         return;
     }
-    setCallActive(vcTarget(ctx), true);
-    setChatField(vcTarget(ctx), "voice_owner", engineName(used));
+    // Attach the radio audio to the core voice backend (see onPlay):
+    // the engine's play is state only. The station's own stream URL
+    // is the fallback when the engine's now_playing carries no
+    // stream_url of its own.
+    const Json* np = pr.data.find("now_playing");
+    Json now = np ? *np : pr.data;
+    std::string err;
+    if (!attachEngineAudio(vcTarget(ctx), now, false, 0, url->asString(),
+                           err)) {
+        Engine u2;
+        bool fb2 = false;
+        vcCall(ctx, "stop",
+               Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}), u2, fb2);
+        voice_.stop(vcTarget(ctx));
+        clearCoreStream(vcTarget(ctx));
+        setCallActive(vcTarget(ctx), false);
+        reply(ctx, "Could not play the radio in the voice chat: " + err);
+        return;
+    }
     reply(ctx, "📻 Radio: " + station + " is now playing in the voice chat.");
 }
 
@@ -2442,8 +2828,23 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    setCallActive(vcTarget(ctx), true);
-    setChatField(vcTarget(ctx), "voice_owner", engineName(used));
+    // Attach the first track to the core voice backend (see onPlay):
+    // without this the playlist plays state-only and the call stays
+    // silent. On failure nothing is queued and the error is honest.
+    const Json* np = r.data.find("now_playing");
+    Json now = np ? *np : r.data;
+    std::string err;
+    if (!attachEngineAudio(vcTarget(ctx), now, false, 0, "", err)) {
+        Engine u2;
+        bool fb2 = false;
+        vcCall(ctx, "stop",
+               Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}), u2, fb2);
+        voice_.stop(vcTarget(ctx));
+        clearCoreStream(vcTarget(ctx));
+        setCallActive(vcTarget(ctx), false);
+        reply(ctx, "Could not play your playlist in the voice chat: " + err);
+        return;
+    }
     int queued = 0;
     for (size_t i = 1; i < tracks.size(); ++i) {
         Json add = Json::objectOf({

@@ -57,6 +57,20 @@ struct DispatcherProvider : parlay::VcStateProvider {
         }
         return dispatcher->apiQueueList(chat_id, out, err);
     }
+    bool joinVoice(int64_t chat_id, std::string& err) override {
+        if (!dispatcher) {
+            err = "telegram stack not started";
+            return false;
+        }
+        return dispatcher->joinVoice(chat_id, err);
+    }
+    bool muteVoice(int64_t chat_id, bool muted, std::string& err) override {
+        if (!dispatcher) {
+            err = "telegram stack not started";
+            return false;
+        }
+        return dispatcher->muteVoice(chat_id, muted, err);
+    }
 };
 
 void waitForSignal() {
@@ -75,7 +89,7 @@ int main() {
     // failure is loud — /healthz and /api/* are the GUI's only window
     // into the core.
     DispatcherProvider provider;
-    parlay::CoreApi api(provider);
+    parlay::CoreApi api(provider, cfg.parlay_token);
     parlay::HttpServer http(cfg.port, [&](const parlay::HttpRequest& req) {
         return api.handle(req);
     });

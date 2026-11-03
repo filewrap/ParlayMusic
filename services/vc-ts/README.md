@@ -54,9 +54,11 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
 
 ## What is real (verified 2026-11-02, see PROGRESS.md)
 
-- Per-chat queue/playback state in memory + JSON persistence to
+- Per-chat queue/playback state in memory + shared durable store
+  (Phase 7, A11): `MONGO_URI` > `REDIS_URL` > JSON persistence to
   `data/state.json` (atomic tmp+rename write); rooms restore **paused**
-  after a restart (verified).
+  after a restart (verified). A queue written here is readable by
+  vc-go/vc-rust after fail-over (canonical `vc:room:<chat_id>`).
 - 1 s ticker: wall-clock position + auto-advance to the next queued
   track when a track's known duration elapses (verified: seek to 212 s
   of a 213 s track → next track playing 3 s later).
@@ -138,15 +140,18 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
   in-process ntgcalls local offer (N-API addon `src/ntg_addon.cc`
   dlopening the BUILT `libntgcalls.so` — C build done 2026-11-02,
   3.0.5; `createCall` returns a real 466-byte offer; wheel-probe
-  fallback only when the .so/addon is absent) + honest join failure.
+  fallback only when the .so/addon is absent) + join delegated to
+  the core (Phase 7, A1: `join()` POSTs vc.join to
+  `{CORE_URL}/v1/join` and reports the core's answer verbatim —
+  joined:true only when the core's TDLib backend really joined).
   The 3.0.5 C API is synchronous (`ntg_create_call` returns
   `ntg_result` directly); the addon and `createLocalOffer` were
   rewritten to it, with stop+retry on ntgcalls -202 (a second
   create_call for the same chat). The live join is blocked in the
-  sandbox (no MTProto client in this service since the voice bridge
-  was deleted in Phase 5, UDP sendto EPERM); now-playing reports
-  `voice:"opus-rtp-ready"` once the pipeline is proven, or
-  `voice:"unavailable:<exact reason>"` — see below.
+  sandbox (no core TDLib backend configured here — no
+  TD_API_ID/TD_API_HASH/TD_SESSION_DIR, UDP sendto EPERM);
+  now-playing reports `voice:"opus-rtp-ready"` once the pipeline is
+  proven, or `voice:"unavailable:<exact reason>"` — see below.
 
 ## What is stubbed / degraded, and why
 
@@ -157,13 +162,16 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
   the Opus/RTP pipeline is proven live (ffmpeg encode + RTP file
   packet count), the ntgcalls local offer is built in-process (N-API
   addon over the BUILT `libntgcalls.so`, 3.0.5, wheel-probe fallback
-  only when the .so/addon is absent), and `join()`
-  fails honestly — vc-ts holds no MTProto client since the
-  voice_bridge.py Telethon child was deleted in Phase 5 (user order:
-  ntgcalls is a native library linked in-process, not a server). The
-  MTProto join now lives only in core-cpp's TdLibVoiceCall. Playback
-  state (queue, position, auto-advance) is real; audio reaches a
-  voice chat only after a real join, which is a live-test-time check.
+  only when the .so/addon is absent), and `join()` delegates to the
+  core — vc-ts holds no MTProto client (the voice_bridge.py
+  Telethon child was deleted in Phase 5, user order: ntgcalls is a
+  native library linked in-process, not a server), so the join is
+  POST `{CORE_URL}/v1/join` to the core-cpp TDLib backend
+  (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + libtdjson.so). The core
+  owns the join; this engine supplies only the audio source.
+  Playback state (queue, position, auto-advance) is real; audio
+  reaches a voice chat only after a real join, which is a
+  live-test-time check.
 - **YouTube resolve fails honestly (Phase 5, A9).** yt-dlp is retried
   once with the android player client on YouTube's bot check; if it
   still fails (missing binary, YouTube 429), resolve returns
@@ -185,9 +193,8 @@ All responses are `{ok:true, data}` or `{ok:false, error:{code, message}}`
 - `src/resolvers.js` — YouTube (yt-dlp) / JioSaavn / Lemonic / lyrics
   (LRCLib) / radio-track resolvers.
 - `src/voicecall.js` — real voice transport: Opus/RTP pipeline +
-  ntgcalls offer + honest join failure (no MTProto client in-process
-  since the voice bridge was deleted in Phase 5; join via the
-  core-cpp TDLib backend — see above).
+  ntgcalls offer + join delegated to the core-cpp TDLib backend
+  (POST `{CORE_URL}/v1/join`, Phase 7 A1 — see above).
 - `tests/run.js` — 32 tests (`npm test`): live JioSaavn/LRCLib/yt-dlp
   + stub-Lemonic keyed/unauthenticated + panel/loop/radio regressions
   + loop/shuffle/autoplay routes + A9 placeholder rejection +

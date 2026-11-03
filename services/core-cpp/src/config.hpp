@@ -11,6 +11,12 @@
 
 namespace parlay {
 
+// Directory holding the running executable (release layout: bin/
+// next to lib/), "" when it cannot be determined. The voice backends
+// resolve libtdjson.so / libntgcalls.so relative to it, so a release
+// install needs no explicit lib paths.
+std::string exeDir();
+
 struct Config {
     // Telegram Bot API (required to run).
     std::string bot_token;    // BOT_TOKEN
@@ -50,14 +56,23 @@ struct Config {
     // lives in TD_SESSION_DIR (TDLib); there is no Telethon session
     // file and no voice bridge any more (Phase 5: deleted).
     std::set<int64_t> assistant_ids;         // ASSISTANT_IDS, comma-sep
-    std::string ntgcalls_lib;                // NTGCALLS_LIB (explicit libntgcalls.so path)
+    // NTGCALLS_LIB (explicit libntgcalls.so path). Empty = the dlopen
+    // search in voice_call.cpp (release lib/ next to the binary first).
+    std::string ntgcalls_lib;
     std::string rtp_sink;                    // VOICE_RTP_SINK host:port for Opus pipeline proof
 
     // TDLib voice backend (names only — values stay in the environment).
     int64_t td_api_id = 0;          // TD_API_ID (falls back to API_ID)
     std::string td_api_hash;        // TD_API_HASH (falls back to API_HASH)
-    std::string td_session_dir;     // TD_SESSION_DIR (TDLib database dir)
-    std::string tdlib_lib;          // TDJSON_LIB (explicit libtdjson.so path)
+    // TD_SESSION_DIR (TDLib database dir). Defaults to
+    // <PARLAY_DATA_DIR>/tdlib when unset, so a host that only sets
+    // TD_API_ID/TD_API_HASH and drops a pre-authorized session dir
+    // there needs nothing else for the session path.
+    std::string td_session_dir;
+    // TDJSON_LIB (explicit libtdjson.so path). Empty = the dlopen
+    // search in tdlib_client.cpp (release lib/ next to the binary,
+    // then the repo phase4 build output).
+    std::string tdlib_lib;
     std::string td_phone;           // TD_PHONE (login phone, if auth needed)
     std::string td_code;            // TD_CODE (login code, if auth needed)
     std::string td_password;        // TD_PASSWORD (2FA password, if auth needed)

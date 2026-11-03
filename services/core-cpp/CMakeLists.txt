@@ -10,6 +10,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # goes through the system curl CLI via popen (src/http.*), Redis speaks
 # RESP over a raw socket and MongoDB speaks the OP_MSG wire protocol
 # (src/store.cpp) — both hand-rolled, both tested against real servers.
+# SCRAM-SHA-1/256 auth (src/scram.cpp) is likewise self-contained: SHA-1,
+# SHA-256, HMAC and PBKDF2 are implemented in-tree, no OpenSSL needed.
 # ntgcalls is dlopen'd at runtime when present (src/voice_call.cpp).
 # TDLib 1.8.69 is likewise dlopen'd (src/tdlib_client.cpp, libtdjson.so
 # from the phase4 build by default); the binary still runs without it.
@@ -29,6 +31,7 @@ add_executable(parlay-core
     src/ipc.cpp
     src/engine_router.cpp
     src/store.cpp
+    src/scram.cpp
     src/tdlib_client.cpp
     src/voice_call.cpp
     src/dispatcher.cpp

@@ -85,7 +85,17 @@ supervisor-restart signal.
   is non-empty). No state / no engine reachable →
   `404 {"ok":false,"error":"no playback state"}` — never demo/fake
   data. Flat JSON, not the IPC envelope (see `contracts/README.md`).
-  The server starts before any token check: with no `BOT_TOKEN` the
+  `POST /v1/join` is the exception: vc.join (contracts/ipc.json) for
+  the vc-ts / vc-rust engines, which hold no MTProto client — the
+  core's TDLib backend owns the join (authorize → createOffer →
+  getChat/createVideoChat → joinVideoChat → ntg.connect), IPC
+  envelope throughout, `X-Parlay-Token` required when a token is
+  configured, `502 engine_unavailable` + the exact reason when the
+  backend cannot join. `POST /v1/mute` is the same shape for vc.mute
+  (`{"chat_id","muted"}` → `{"muted","chat_id","now_playing"}`,
+  "muted" defaults to true): the core backend mutes/unmutes only
+  sessions it holds; engine-owned sessions and nothing-playing fail
+  honestly with 502. The server starts before any token check: with no `BOT_TOKEN` the
   core runs HTTP-only and the API can still proxy real engine state.
 - **Command dispatcher** (`src/dispatcher.*`, 3,199 lines) — the full
   NoxBeats inventory from `Bad/cmd/register.hpp`, with the same route
@@ -163,7 +173,8 @@ supervisor-restart signal.
   `TD_API_ID`/`TD_API_HASH`/`TD_SESSION_DIR` + both `.so` files) →
   `NtgCallsVoiceCall` (dlopen'd `libntgcalls.so`, C API from
   `ntgcalls.h`; builds the local SDP offer and attaches sources, but
-  cannot join without an MTProto session — `play()` says so honestly)
+  cannot join without an MTProto session — `join()`/`play()` say so
+  honestly with the exact reason)
   → `UnavailableVoiceCall` (reports the exact reason, never fakes
   success). `OpusPipeline`: yt-dlp `-g` resolve → ffmpeg
   `-c:a libopus -b:a 128k -ar 48000 -ac 2` → Ogg Opus file (verified
@@ -181,7 +192,7 @@ supervisor-restart signal.
   `NtgCallsVoiceCall` loads the built `.so` in-process (version
   3.0.5) and `ntg_create_call` returns a real local SDP offer
   (476 bytes, ufrag + sha-256 fingerprint) — proven by test 8 in
-  `tests/tdlib_test.cpp` (8/8 PASS). `libpulse-dev` 16.1 installed
+  `tests/tdlib_test.cpp` (44/44 PASS). `libpulse-dev` 16.1 installed
   via apt afterwards (vendored headers replaced by the package).
 - **Group management** — `getChatMember` admin check gates playback
   control and `/engine` in groups; private chats are open.
@@ -204,9 +215,26 @@ supervisor-restart signal.
   ping/set/get/sadd/smembers/hset/hget/hgetall/keys/del; Store over
   Mongo: kv/set/hash/keys/cache; Store over file + persistence across
   instances). Rebuild + run:
-  `g++ -std=c++20 -I src tests/store_test.cpp src/store.cpp src/json.cpp
-  src/config.cpp -o /tmp/store_test && /tmp/store_test
+  `g++ -std=c++20 -I src tests/store_test.cpp src/store.cpp src/scram.cpp
+  src/json.cpp src/config.cpp -o /tmp/store_test && /tmp/store_test
   "mongodb://127.0.0.1:27017/parlay_test" "redis://127.0.0.1:6399/0"`.
+- `tests/scram_test.cpp` — **67/67 PASS** (Phase 7, A7): SCRAM-SHA-1/256
+  auth in the hand-rolled Mongo client vs a REAL auth-enabled mongod
+  8.0.4 on 127.0.0.1:27098 (dummy users only). Crypto primitives vs
+  RFC vectors (SHA-1/SHA-256/HMAC/PBKDF2 incl. RFC 6070, MD5, base64);
+  SCRAM message construction vs the RFC 5802 (SHA-1) and RFC 7677
+  (SHA-256) worked examples; URI parsing (credentials, percent-decoding,
+  authSource default, authMechanism, rejections); live SHA-256 connect +
+  CRUD, forced `?authMechanism=SCRAM-SHA-256`, SHA-1-only user via
+  automatic negotiation + forced `SCRAM-SHA-1`, wrong-password honest
+  failure (`Authentication failed`), `?authSource=admin`, Store over
+  authenticated Mongo, and no-auth URI still working (plain mongod
+  :27097). Rebuild + run:
+  `g++ -std=c++20 -I src tests/scram_test.cpp src/store.cpp src/scram.cpp
+  src/json.cpp src/config.cpp -o /tmp/scram_test && /tmp/scram_test`
+  (defaults point at the scratch mongods; live sections SKIP when they
+  are not running). Setup: `phase7/mongo_setup_users.cpp` + the commands
+  in `phase7/worker-a7-scram.md`.
 - `tests/router_test.cpp` — **20/20 PASS** (fail-over on 5xx / transport
   errors / `engine_unavailable` / 404-for-known-action).
   `tests/dispatcher_test.cpp` — **81/81 PASS** (47 Phase 5 + 6 Phase 6
@@ -221,7 +249,7 @@ supervisor-restart signal.
   plays, speedMbps + formatSpeedtest. Rebuild + run:
   `g++ -std=c++20 -I src tests/dispatcher_test.cpp src/dispatcher.cpp
   src/telegram_api.cpp src/ipc.cpp src/engine_router.cpp src/store.cpp
-  src/json.cpp src/config.cpp src/http.cpp src/voice_call.cpp
+  src/scram.cpp src/json.cpp src/config.cpp src/http.cpp src/voice_call.cpp
   src/tdlib_client.cpp -o /tmp/dispatcher_test -ldl && /tmp/dispatcher_test`.
 - Opus pipeline proof (`/tmp/opus_proof.cpp`, `/tmp/rtp_recv.py`): 5 s
   440 Hz tone → **251 Opus frames, 83,736 bytes, 5.0065 s** (ffprobe).
@@ -240,9 +268,19 @@ supervisor-restart signal.
   linked in-process). The paragraph below described the old route; it
   is kept only as history. Join now goes through the TDLib backend
   (`TD_SESSION_DIR` + `TDJSON_LIB`).
-- **HTTP API** (`tests/http_api_test.cpp`, Phase 6 A2) — **37/37 PASS**:
+- **HTTP API** (`tests/http_api_test.cpp`, Phase 6 A2; vc.join in
+  Phase 7, A1; vc.mute in Phase 7 residuals) — **71/71 PASS**:
   CoreApi routing with a scripted provider (healthz, now-playing /
-  queue success + honest 404/400/405, queue-list fallback); the server
+  queue success + honest 404/400/405, queue-list fallback); POST
+  /v1/join routing (200 joined:true + now_playing, 502 with the exact
+  backend reason, 400 bad bodies, 405 non-POST, 401 token gate) and
+  the full stack over a real Dispatcher with an unavailable voice
+  backend (502, exact reason); POST /v1/mute routing (200 muted +
+  now_playing, unmute + muted-default-true, 502 with the exact
+  reason, 400 bad bodies incl. non-boolean "muted", 405 non-POST,
+  401 token gate) and the full stack over a real Dispatcher
+  (nothing playing -> 502 "Nothing is playing.", engine-owned
+  session -> honest refusal); the server
   over a real socket on an ephemeral port (curl-CLI client); the
   Dispatcher proxying a stub VC engine on 127.0.0.1 (canned IPC
   envelopes) end to end; plus the Worker C stop-race check (25
@@ -274,10 +312,13 @@ supervisor-restart signal.
   (`yt:smoke1`) on both endpoints.
 - TDLib: build **finished 100%** 2026-11-02 (log `phase4/tdlib-build.log`,
   933 lines, 0 errors, `libtdjson.so.1.8.69`, 50 MB); the C++ client
-  `src/tdlib_client.{hpp,cpp}` exists and passes 26/26 checks
+  `src/tdlib_client.{hpp,cpp}` exists and passes 44/44 checks
   (TDLib responses + real-offer check via the built `libntgcalls.so`
   + all 17 auth-state checks: phone / QR / code / password / email /
-  email code / registration / other-device / premium / unknown). The
+  email code / registration / other-device / premium / unknown, +
+  Phase 7 A1: the join flow against a scripted TDLib client — real
+  offer carried as the joinVideoChat payload, exact request shapes,
+  real ntg.connect wiring — and the TD_SESSION_DIR default).
   ntgcalls wheel 3.0.5 has **no C `ntg_*` symbols** (`nm -D` shows only
   `PyInit_ntgcalls`), so the C++ dlopen path uses the C build from
   `refs/ntgcalls` instead (see the Voice bullet above); without

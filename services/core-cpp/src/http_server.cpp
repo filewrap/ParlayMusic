@@ -16,8 +16,8 @@
 namespace parlay {
 namespace {
 
-// 64 KiB cap on the request head: the API is GET-only and its query
-// strings are short; anything bigger is a 400, not a buffer.
+// 64 KiB cap on the request head: the API's query strings are short
+// and its one POST body is small; anything bigger is a 400, not a buffer.
 constexpr size_t kMaxHeadBytes = 64 * 1024;
 constexpr int kReadTimeoutSec = 5;
 
@@ -187,11 +187,11 @@ void HttpServer::handleConnection(int fd) {
         return;
     }
 
-    // The API is GET-only, but a client may still send a body (e.g. a
-    // stray POST). Read it into req.body before responding: closing a
-    // socket with unread bytes in the receive buffer makes the kernel
-    // send RST, which can destroy the response the client is waiting
-    // for. Bodies over 1 MiB are refused rather than read.
+    // POST /v1/join carries a small JSON body. Read it into req.body
+    // before responding: closing a socket with unread bytes in the
+    // receive buffer makes the kernel send RST, which can destroy the
+    // response the client is waiting for. Bodies over 1 MiB are
+    // refused rather than read.
     size_t head_end = head.find("\r\n\r\n") + 4;
     size_t content_length = 0;
     {

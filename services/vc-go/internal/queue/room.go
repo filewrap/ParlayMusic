@@ -118,6 +118,10 @@ func (r *Room) snapshotLocked() types.NowPlaying {
 	if r.current != nil {
 		t := *r.current
 		np.Track = &t
+		// Top-level stream_url mirrors the current track's (A8
+		// residual: the contract's NowPlaying.stream_url was never
+		// emitted — only the nested track.stream_url was).
+		np.StreamURL = t.StreamURL
 	}
 	for i, item := range r.waiting {
 		item.Position = i

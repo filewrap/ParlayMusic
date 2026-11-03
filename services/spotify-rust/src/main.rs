@@ -62,6 +62,7 @@ mod auth;
 mod classifier;
 mod common;
 mod crypto;
+mod store;
 
 use common::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -208,6 +209,14 @@ impl State {
 }
 
 fn save_state(st: &State) {
+    // Shared store (A11): the whole state is one value under key
+    // `spotify:state`. The JSON-file path below is unchanged.
+    if store::backend() != "file" {
+        if let Err(e) = store::set("spotify:state", &st.to_json().render()) {
+            eprintln!("[spotify-rust] shared store set failed: {}", e);
+        }
+        return;
+    }
     let path = data_file(STATE_FILE);
     if let Err(e) = atomic_write(&path, &st.to_json().render()) {
         eprintln!(
@@ -219,6 +228,32 @@ fn save_state(st: &State) {
 }
 
 fn load_state() -> State {
+    // Shared store (A11): same JSON shape as spotify-state.json.
+    if store::backend() != "file" {
+        return match store::get("spotify:state") {
+            Ok(Some(text)) => match parse_json(&text) {
+                Some(v) => {
+                    let st = State::from_json(&v);
+                    eprintln!(
+                        "[spotify-rust] restored {} watch(es), {} dislike list(s) from shared store ({})",
+                        st.watches.len(),
+                        st.dislikes.len(),
+                        store::describe()
+                    );
+                    st
+                }
+                None => {
+                    eprintln!("[spotify-rust] WARNING: corrupt shared state, starting empty");
+                    State::default()
+                }
+            },
+            Ok(None) => State::default(),
+            Err(e) => {
+                eprintln!("[spotify-rust] shared store load failed: {}", e);
+                State::default()
+            }
+        };
+    }
     let path = data_file(STATE_FILE);
     match std::fs::read_to_string(&path) {
         Ok(text) => match parse_json(&text) {
@@ -1734,6 +1769,12 @@ fn main() {
         std::env::var("PARLAY_DATA_DIR").unwrap_or_else(|_| "data".to_string()),
     );
     let _ = std::fs::create_dir_all(&data_dir);
+    // Shared durable store (A11): Mongo > Redis > JSON file. A
+    // configured-but-unreachable backend is fatal — see store.rs.
+    if let Err(e) = store::init() {
+        eprintln!("[spotify-rust] shared store init failed: {}", e);
+        std::process::exit(1);
+    }
     let poll_interval_secs: u64 = std::env::var("SPOTIFY_POLL_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())

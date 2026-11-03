@@ -1,13 +1,14 @@
 // http_server.hpp — minimal std-only HTTP/1.1 server (Phase 6, A2).
 //
 // No new dependencies: POSIX sockets + std::thread. Serves the core's
-// GUI-facing API (GET /healthz, GET /api/now-playing, GET /api/queue)
-// on its own thread so the Telegram long-poll loop is never blocked.
+// API (GET /healthz, GET /api/now-playing, GET /api/queue, POST
+// /v1/join — vc.join for the vc-ts / vc-rust engines) on its own
+// thread so the Telegram long-poll loop is never blocked.
 // The request handler is injected (see core_api.hpp) so the server
 // itself knows nothing about engines or playback state.
 //
-// Only GET is served: request bodies are never read (the API is
-// read-only) and the connection is closed after each response.
+// Request bodies are read (up to 1 MiB) because POST /v1/join needs
+// one; the connection is closed after each response.
 #pragma once
 
 #include <atomic>
@@ -26,9 +27,9 @@ struct HttpRequest {
     // stubs need this to assert a multipart boundary or an upload
     // content-type; the core API itself ignores headers.
     std::map<std::string, std::string> headers;
-    // Raw request body (up to 1 MiB; empty for GET). The core API is
-    // GET-only and ignores it, but handlers such as test stubs may
-    // need it (e.g. a stub engine answering POST /v1/queue per chat).
+    // Raw request body (up to 1 MiB; empty for GET). POST /v1/join
+    // reads it ({"chat_id": ...}); test stubs may need it too (e.g. a
+    // stub engine answering POST /v1/queue per chat).
     std::string body;
 };
 

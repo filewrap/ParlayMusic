@@ -8,10 +8,16 @@
 //	VC_PROFILE      low-ram | high-perf (default low-ram)
 //	PARLAY_DATA_DIR queue persistence directory (default ./data)
 //	MONGO_URI       when set, queues persist to MongoDB (database
-//	                parlay, collection vc_rooms) via the official driver;
-//	                when unset, the JSON file in PARLAY_DATA_DIR is used.
-//	                A set-but-unreachable MONGO_URI is fatal at startup:
-//	                the service never silently falls back to JSON.
+//	                parlay, collection state, canonical keys
+//	                kv:vc:room:<chat_id> — shared with vc-ts/vc-rust,
+//	                see internal/store/canonical.go); when unset but
+//	                REDIS_URL is set, queues persist to Redis
+//	                (parlay:kv:vc:room:<chat_id>); when neither is set,
+//	                the JSON file in PARLAY_DATA_DIR is used. A
+//	                set-but-unreachable MONGO_URI/REDIS_URL is fatal at
+//	                startup: the service never silently falls back to
+//	                JSON (that would split-brain the queue across
+//	                engines).
 //
 // Voice joining is NOT done here: the C++ core owns the ntgcalls voice
 // connection through its VoiceCall interface. This service owns queue and
@@ -68,30 +74,44 @@ func main() {
 	log.Printf("profile: %s (prefetchers=%d, buffer=%dKB)",
 		cfg.Profile, cfg.Prefetchers, cfg.BufferKB)
 
-	// Persistence backend: MongoDB when MONGO_URI is set (fatal if it
-	// cannot be reached), JSON file otherwise.
+	// Persistence backend (A11): MongoDB when MONGO_URI is set, Redis
+	// when only REDIS_URL is set (both fatal if unreachable), JSON file
+	// otherwise. Same priority and key scheme as every other stateful
+	// service (see internal/store/canonical.go).
 	type persistBackend interface {
 		Save([]queue.PersistedRoom) error
 		Load() ([]queue.PersistedRoom, error)
 		Describe() string
 	}
 	var st persistBackend
-	var mongoStore *store.MongoStore
+	var closer func()
 	if mongoURI := os.Getenv("MONGO_URI"); mongoURI != "" {
-		ms, err := store.NewMongo(context.Background(), mongoURI, "parlay", "vc_rooms")
+		ms, err := store.NewMongo(context.Background(), mongoURI, "parlay")
 		if err != nil {
 			log.Fatalf("store: mongo: %v", err)
 		}
-		mongoStore = ms
 		st = ms
+		closer = func() {
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel2()
+			_ = ms.Close(ctx2)
+		}
 		log.Printf("store: MongoDB persistence at %s", ms.Describe())
+	} else if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		rs, err := store.NewRedis(context.Background(), redisURL)
+		if err != nil {
+			log.Fatalf("store: redis: %v", err)
+		}
+		st = rs
+		closer = func() { _ = rs.Close() }
+		log.Printf("store: Redis persistence at %s", rs.Describe())
 	} else {
 		js, err := store.New(dataDir)
 		if err != nil {
 			log.Fatalf("store: %v", err)
 		}
 		st = js
-		log.Printf("store: JSON persistence at %s (MONGO_URI unset)", js.Describe())
+		log.Printf("store: JSON persistence at %s (MONGO_URI and REDIS_URL unset)", js.Describe())
 	}
 
 	var mu sync.Mutex
@@ -146,10 +166,8 @@ func main() {
 		log.Printf("shutting down")
 		run.Stop()
 		save() // final persist before exit
-		if mongoStore != nil {
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel2()
-			_ = mongoStore.Close(ctx2)
+		if closer != nil {
+			closer()
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

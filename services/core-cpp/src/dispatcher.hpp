@@ -62,6 +62,29 @@ public:
     bool apiNowPlaying(int64_t chat_id, Json& np_out, std::string& error);
     // The engine's queue list (POST /v1/queue action=list).
     bool apiQueueList(int64_t chat_id, Json& queue_out, std::string& error);
+    // vc.join (POST /v1/join): join the chat's voice call on the
+    // core's TDLib backend. True only after a real join (or when the
+    // chat is already in a call); false + error when the backend
+    // cannot join. Called by the vc-ts / vc-rust engines, which hold
+    // no MTProto client of their own.
+    bool joinVoice(int64_t chat_id, std::string& error);
+    // vc.mute (POST /v1/mute): mute (mute=true) or unmute the chat's
+    // voice call on the core's TDLib backend. Same mute as /mute,
+    // minus the Telegram permission check and reply. False + error
+    // on a session the core does not hold (a stale/pre-fix
+    // engine-owned session — since Phase 7 A1b, engine plays are
+    // core-attached, so /mute reaches them through the backend), when
+    // nothing is playing, or when the backend mute/unmute fails. True
+    // only after a real backend mute/unmute.
+    bool muteVoice(int64_t chat_id, bool mute, std::string& error);
+
+    // One core-stream follow pass (background-loop step, public so
+    // tests can drive it synchronously): when a vc engine advances
+    // its own state machine to a new track, re-attach the new
+    // track's audio to the core voice backend. See the .cpp for the
+    // full note. No reply channel — failures are logged to stderr
+    // and the session is stopped cleanly.
+    void watchCoreFollow();
 
     // Pure /speedtest helpers (no I/O; unit-tested in
     // dispatcher_test.cpp): Mbps from a byte count + elapsed seconds,
@@ -119,13 +142,59 @@ private:
     // audio is on the core voice backend (voice_owner == "core"), the
     // stored speed/bass ARE applied — the source is re-attached at the
     // current position with the new filter values (buildFfmpegCmd
-    // atempo/bass). Returns true when it handled the command (core
-    // session, including the nothing-playing / no-source honest
-    // replies); false when the session belongs to a vc engine, and
-    // the caller falls through to the engine seek-restart, which
-    // moves the position but cannot apply the filter.
+    // atempo/bass). Since Phase 7 A1b that covers engine sessions too:
+    // attachEngineAudio records engine-resolved tracks as core-owned,
+    // so /speed + /bass apply to them as well. Returns true when it
+    // handled the command (core session, including the nothing-playing
+    // / no-source honest replies); false when the session belongs to
+    // a vc engine that was never core-attached (stale / pre-fix
+    // state), and the caller falls through to the engine seek-restart,
+    // which moves the position but cannot apply the filter.
     bool applyCoreFilter(const CommandContext& ctx, double speed, int bass,
                          const std::string& done_msg);
+    // Core-stream attach (Phase 7, A1b): the core streams
+    // engine-resolved audio through its own ntgcalls session — the
+    // only session that can actually be in the call. The engine's
+    // "play" is state only (its ntgcalls instance never joins: no
+    // MTProto client in-process), so after a vc.play succeeds the
+    // dispatcher attaches the resolved track here, or the call stays
+    // silent behind a "Now playing" lie.
+    //
+    // The playable source for an engine-resolved track: the top-level
+    // now_playing.stream_url (A8) first, then track.stream_url. A
+    // caller-known URL (the /radio stream URL) may be passed as a
+    // fallback. Empty when the engine gave the core nothing to play:
+    // no local file path is usable here — the engines deliberately
+    // strip file_path from IPC (engine-local; vc-rust's leak check),
+    // and a path on an engine host is not a path on the core host
+    // under compose.
+    static std::string engineTrackSource(const Json& np,
+                                         const std::string& fallback = "");
+    // Attach an engine-resolved track to the core voice backend:
+    // voice_.play(chat, source, title, video, seek, speed, bass) with
+    // the chat's stored speed/bass. On success records voice_owner =
+    // "core" + core_source/core_title/core_video/core_track_id/
+    // core_pos + core_follow=1 + call active, and returns true. On
+    // failure returns false + error (no source, or the backend
+    // refused); the caller stops the engine playback and reports the
+    // error honestly — nothing is marked playing.
+    bool attachEngineAudio(int64_t chat, const Json& np, bool video,
+                           int seek_sec, const std::string& fallback_source,
+                           std::string& error);
+    // Re-attach the recorded core source at a new position (seek /
+    // jump / replay follow-up): voice_.play with the stored source,
+    // title, video flag and the chat's stored speed/bass. False +
+    // error when nothing is recorded or the backend refuses.
+    bool reattachCoreAudio(int64_t chat, int seek_sec, std::string& error);
+    // Clear every core-stream field for a chat (stop / call end /
+    // attach failure): voice_owner, core_source, core_title,
+    // core_video, core_track_id, core_pos, core_follow.
+    void clearCoreStream(int64_t chat);
+    // True when the core voice backend is the one streaming this chat:
+    // voice_owner "core" + call active + a recorded core_source.
+    // Covers replied-file sessions and engine sessions attached via
+    // attachEngineAudio alike.
+    bool coreStreaming(int64_t chat);
     bool isAuthUser(int64_t chat_id, int64_t user_id) const;
     // Effective voice-chat target: linked channel when via_channel.
     int64_t vcTarget(const CommandContext& ctx) const;

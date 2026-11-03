@@ -86,6 +86,21 @@ private:
 };
 
 // --- MongoDB (wire protocol, OP_MSG + minimal BSON) -----------------------
+// Parsed mongodb:// URI. Credentials are SCRAM-authenticated (RFC 5802 /
+// RFC 7677) against auth_source, which defaults to the database in the
+// URI and then to "admin" (the driver default).
+struct MongoUri {
+    std::string host = "127.0.0.1";
+    int port = 27017;
+    std::string db = "parlay";
+    std::string username;  // empty = no authentication
+    std::string password;
+    std::string auth_source;  // resolved by parseUri, never empty on success
+    // "" = negotiate (try SCRAM-SHA-256, fall back to SCRAM-SHA-1),
+    // else "SCRAM-SHA-1" or "SCRAM-SHA-256" (from ?authMechanism=).
+    std::string auth_mechanism;
+};
+
 class MongoClient {
 public:
     MongoClient() = default;
@@ -93,10 +108,22 @@ public:
     MongoClient(const MongoClient&) = delete;
     MongoClient& operator=(const MongoClient&) = delete;
 
-    // uri: mongodb://host[:port]/db  (no auth; local/docker compose form)
+    // Parses a mongodb:// URI (single host; mongodb+srv:// and replica
+    // sets are rejected with a clear error). Percent-decodes userinfo.
+    // Query params honoured: authSource, authMechanism.
+    static bool parseUri(const std::string& uri, MongoUri& out,
+                         std::string& error_out);
+
+    // uri: mongodb://[user:pass@]host[:port][/db][?authSource=..]
+    // Credentials trigger a SCRAM handshake after TCP connect.
     bool connect(const std::string& uri, std::string& error_out);
     bool ping();
     void close();
+
+    // One raw OP_MSG command round trip; returns the reply body even
+    // when ok != 1 (empty + error_out only on transport failure).
+    // Useful for admin commands (e.g. createUser) and the SCRAM exchange.
+    std::string command(const std::string& body_bson, std::string& error_out);
 
     // Documents in collection `state`: {_id: <key>, v: <string>}.
     bool findValue(const std::string& key, std::string& value_out);
@@ -106,12 +133,22 @@ public:
     std::vector<std::string> keysWithPrefix(const std::string& prefix);
 
     const std::string& dbName() const { return db_; }
+    const std::string& authSource() const { return auth_source_; }
+    bool authenticated() const { return authenticated_; }
 
 private:
     // One OP_MSG command round trip. Returns the parsed body document as a
     // raw BSON byte string (empty on error, error_out filled).
     std::string runCommand(const std::string& body_bson,
                            std::string& error_out);
+    // Same, but returns the body even when the server reports ok != 1
+    // (empty + error_out only on transport/protocol failure). Used by
+    // runCommand and by the SCRAM exchange, which must read error replies.
+    std::string runCommandRaw(const std::string& body_bson,
+                              std::string& error_out);
+    // SCRAM handshake (RFC 5802 / RFC 7677) against auth_source_.
+    // Negotiates the mechanism when auth_mechanism_ is empty.
+    bool authenticate(std::string& error_out);
     bool sendAll(const std::string& data);
     bool recvExact(char* buf, size_t n);
 
@@ -119,6 +156,11 @@ private:
     std::string host_ = "127.0.0.1";
     int port_ = 27017;
     std::string db_ = "parlay";
+    std::string username_;
+    std::string password_;
+    std::string auth_source_ = "admin";
+    std::string auth_mechanism_;  // "" = negotiate
+    bool authenticated_ = false;
     int32_t request_id_ = 1;
 };
 
@@ -139,6 +181,9 @@ std::string elArray(const std::string& key,
 std::string elArrayOfDocs(const std::string& key,
                           const std::vector<std::string>& docs);
 std::string elRegex(const std::string& key, const std::string& pattern);
+// Binary element (type 0x05); subtype 0 = generic (used for SASL payloads).
+std::string elBinary(const std::string& key, const std::string& bytes,
+                     uint8_t subtype = 0);
 
 // Field readers over a BSON document (raw bytes). Returns false if absent
 // or of the wrong type.
@@ -146,6 +191,9 @@ bool getString(const std::string& doc, const std::string& key,
                std::string& out);
 bool getDouble(const std::string& doc, const std::string& key, double& out);
 bool getInt32(const std::string& doc, const std::string& key, int32_t& out);
+// Binary element (type 0x05): raw bytes out (subtype ignored).
+bool getBinary(const std::string& doc, const std::string& key,
+               std::string& out);
 // First document of an array field, raw BSON bytes.
 bool getFirstArrayDoc(const std::string& doc, const std::string& key,
                       std::string& out);

@@ -40,16 +40,23 @@ namespace parlay {
 
 class TdLibClient {
 public:
-    // dlopen candidates, in order: TDJSON_LIB, then the phase4 build
-    // output, then a bare libtdjson.so on the loader path.
+    // dlopen candidates, in order: TDJSON_LIB, then lib/ next to the
+    // binary and lib/ next to the release bin/ (the release tarball
+    // layout), then the repo phase4 build output, then a bare
+    // libtdjson.so on the loader path.
     explicit TdLibClient(const std::string& explicit_lib = "");
-    ~TdLibClient();
+    virtual ~TdLibClient();
     TdLibClient(const TdLibClient&) = delete;
     TdLibClient& operator=(const TdLibClient&) = delete;
 
-    bool available() const { return client_ != nullptr; }
+    // Virtual seam: tests substitute a scripted client (see
+    // tdlib_test.cpp) so the join flow — getChat / createVideoChat /
+    // joinVideoChat request shapes + the ntgcalls connect wiring —
+    // is proven without a live Telegram session. The mock answers
+    // only the TDLib side; the offer and the connect call are real.
+    virtual bool available() const { return client_ != nullptr; }
     std::string libPath() const { return lib_path_; }
-    std::string lastError() const { return last_error_; }
+    virtual std::string lastError() const { return last_error_; }
 
     // Raw JSON pipe. receive() returns "" on timeout.
     void send(const std::string& json);
@@ -67,14 +74,18 @@ public:
     // "@extra" id. Returns the response Json (type "error" on failure)
     // or Json() (null) on timeout. Updates (updateAuthorizationState
     // etc.) seen while waiting are stashed in last_update_.
-    Json call(const Json& req, double timeout_sec = 30.0);
+    // Virtual: see the seam note above.
+    virtual Json call(const Json& req, double timeout_sec = 30.0);
     // Last update object received while pumping (may be null).
     const Json& lastUpdate() const { return last_update_; }
 
     // Authorization state, as last seen in an updateAuthorizationState
     // update (or getAuthorizationState). Empty until the first update.
     std::string authState() const { return auth_state_; }
-    bool authorized() const { return auth_state_ == "authorizationStateReady"; }
+    // Virtual: see the seam note above.
+    virtual bool authorized() const {
+        return auth_state_ == "authorizationStateReady";
+    }
 
     // Drive the auth state machine to Ready using env credentials:
     //   TD_API_ID, TD_API_HASH, TD_SESSION_DIR (always required),
@@ -87,8 +98,8 @@ public:
     // ("not authorized: no credentials ..."), when TDLib reports an
     // error, or when timeout_sec elapses without reaching Ready.
     // An already-authorized session directory reaches Ready with no
-    // phone/code/password at all.
-    bool authorize(double timeout_sec = 60.0);
+    // phone/code/password at all. Virtual: see the seam note above.
+    virtual bool authorize(double timeout_sec = 60.0);
 
     // QR login link, captured from the authorization_state object
     // when TDLib reports authorizationStateWaitOtherDeviceConfirmation
@@ -115,7 +126,11 @@ public:
     struct Params {
         int64_t api_id = 0;          // TD_API_ID
         std::string api_hash;        // TD_API_HASH
-        std::string session_dir;     // TD_SESSION_DIR (TDLib db + files)
+        // TD_SESSION_DIR (TDLib db + files). Defaults to
+        // <PARLAY_DATA_DIR>/tdlib when unset (same default as
+        // Config::fromEnv), so a host needs nothing but the session
+        // dir itself for the path.
+        std::string session_dir;
         std::string phone;           // TD_PHONE
         std::string code;            // TD_CODE
         std::string password;        // TD_PASSWORD

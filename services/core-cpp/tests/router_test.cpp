@@ -7,7 +7,7 @@
 //
 // Build: g++ -std=c++20 -I src tests/router_test.cpp src/engine_router.cpp
 //   src/ipc.cpp src/http.cpp src/json.cpp src/config.cpp src/store.cpp
-//   -o /tmp/router_test && /tmp/router_test
+//   src/scram.cpp -o /tmp/router_test && /tmp/router_test
 // Exit 0 = all checks pass.
 #include <cstdio>
 #include <iostream>

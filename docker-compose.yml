@@ -116,10 +116,13 @@ services:
       - PARLAY_DATA_DIR=/data/vc-go
       - VC_PROFILE=${VC_PROFILE:-low-ram}
       - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
     ports:
       - "8001:8001"
     depends_on:
       mongo:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       - parlay-data:/data
@@ -136,12 +139,20 @@ services:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
       - PORT=8002
       - PARLAY_DATA_DIR=/data/vc-ts
+      - CORE_URL=http://core-cpp:8080
+      - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
       - LEMONIC_API=${LEMONIC_API:-}
       - LEMONIC_API_KEY=${LEMONIC_API_KEY:-}
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
     ports:
       - "8002:8002"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - parlay-data:/data
     healthcheck:
@@ -158,11 +169,15 @@ services:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
       - PORT=8003
       - PARLAY_DATA_DIR=/data/vc-rust
+      - CORE_URL=http://core-cpp:8080
       - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
     ports:
       - "8003:8003"
     depends_on:
       mongo:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       - parlay-data:/data
@@ -196,8 +211,15 @@ services:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
       - PORT=8005
       - PARLAY_DATA_DIR=/data/share
+      - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
       - PARLAY_BOT_USERNAME=${PARLAY_BOT_USERNAME:-ParlayBot}
     ports: ["8005:8005"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes: [parlay-data:/data]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8005/healthz"]
@@ -213,8 +235,15 @@ services:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
       - PORT=8006
       - PARLAY_DATA_DIR=/data/queue
+      - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
       - PARLAY_VOTE_THRESHOLD=${PARLAY_VOTE_THRESHOLD:-3}
     ports: ["8006:8006"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes: [parlay-data:/data]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8006/healthz"]
@@ -230,9 +259,16 @@ services:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
       - PORT=8007
       - PARLAY_DATA_DIR=/data/spotify
+      - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
     ports: ["8007:8007"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes: [parlay-data:/data]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8007/healthz"]
@@ -267,9 +303,16 @@ services:
       - PARLAY_TOKEN=${PARLAY_TOKEN}
       - PORT=8008
       - PARLAY_DATA_DIR=/data/radio
+      - MONGO_URI=mongodb://mongo:27017/parlay
+      - REDIS_URL=redis://redis:6379/0
       - VC_GO_URL=http://vc-go:8001
       - VC_TS_URL=http://vc-ts:8002
     ports: ["8008:8008"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes: [parlay-data:/data]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8008/healthz"]
@@ -343,6 +386,10 @@ services:
 
   redis:
     image: redis:7-alpine
+    # AOF persistence: the Redis fallback is durable across redis
+    # restarts too (shared store, A11).
+    command: redis-server --appendonly yes
+    volumes: [redis-data:/data]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -353,4 +400,5 @@ services:
 volumes:
   parlay-data:
   mongo-data:
+  redis-data:
   slskd-data:

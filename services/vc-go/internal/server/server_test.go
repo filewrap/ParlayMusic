@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -75,6 +76,49 @@ func TestHealthzReportsDegradedWithoutYtDlp(t *testing.T) {
 	}
 }
 
+// Offline: /v1/play with a stub yt-dlp carries the resolved
+// stream_url at BOTH levels (A8 residual): nested track.stream_url
+// and top-level NowPlaying.stream_url — on the play response and on
+// a later GET /v1/now-playing.
+func TestPlayWithStubYtDlpCarriesStreamURLBothLevels(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "yt-dlp")
+	const info = `{"id":"dQw4w9WgXcQ","title":"Never Gonna Give You Up","duration":213,` +
+		`"uploader":"Rick Astley","thumbnail":"https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",` +
+		`"url":"https://example.invalid/audio.webm",` +
+		`"webpage_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+info+"'\n"), 0o755); err != nil {
+		t.Fatalf("write stub yt-dlp: %v", err)
+	}
+	s := newTestServer(t, &resolver.Resolver{YtDlp: script})
+	code, body := post(t, s, "/v1/play",
+		`{"chat_id": 4244, "query": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%v)", code, body)
+	}
+	data, _ := body["data"].(map[string]any)
+	np, _ := data["now_playing"].(map[string]any)
+	if np["stream_url"] != "https://example.invalid/audio.webm" {
+		t.Fatalf("play response must carry top-level stream_url, got %v", np)
+	}
+	track, _ := np["track"].(map[string]any)
+	if track["stream_url"] != "https://example.invalid/audio.webm" {
+		t.Fatalf("play response must carry nested track.stream_url, got %v", track)
+	}
+	code, body = get(t, s, "/v1/now-playing?chat_id=4244")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 on now-playing, got %d (%v)", code, body)
+	}
+	data, _ = body["data"].(map[string]any)
+	np, _ = data["now_playing"].(map[string]any)
+	if np["stream_url"] != "https://example.invalid/audio.webm" {
+		t.Fatalf("GET now-playing must carry top-level stream_url, got %v", np)
+	}
+	track, _ = np["track"].(map[string]any)
+	if track["stream_url"] != "https://example.invalid/audio.webm" {
+		t.Fatalf("GET now-playing must carry nested track.stream_url, got %v", track)
+	}
+}
+
 // Live: /v1/play resolves a real YouTube track and the now-playing
 // payload carries its stream_url end to end (A8). Gated on
 // PARLAY_LIVE_TEST=1 (needs network + yt-dlp); tolerant of YouTube
@@ -104,6 +148,9 @@ func TestPlayLiveYouTubeCarriesStreamURL(t *testing.T) {
 	if !strings.HasPrefix(streamURL, "https://") {
 		t.Fatalf("now-playing must carry the resolved stream_url, got %v", track)
 	}
+	if np["stream_url"] != streamURL {
+		t.Fatalf("top-level stream_url must mirror track.stream_url, got %v", np)
+	}
 	code, body = get(t, s, "/v1/now-playing?chat_id=4243")
 	if code != http.StatusOK {
 		t.Fatalf("expected 200 on now-playing, got %d (%v)", code, body)
@@ -114,5 +161,8 @@ func TestPlayLiveYouTubeCarriesStreamURL(t *testing.T) {
 	streamURL, _ = track["stream_url"].(string)
 	if !strings.HasPrefix(streamURL, "https://") {
 		t.Fatalf("GET now-playing must carry stream_url, got %v", track)
+	}
+	if np["stream_url"] != streamURL {
+		t.Fatalf("GET now-playing top-level stream_url must mirror track.stream_url, got %v", np)
 	}
 }

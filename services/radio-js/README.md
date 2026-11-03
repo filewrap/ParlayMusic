@@ -59,7 +59,8 @@ start; the result is reported as `reachable:true/false` with the probed
   playlist entries — not a claim about the live broadcast) advances
   every 180 s in now-playing state, mirroring openradiobot's
   queue-keeps-playing loop.
-- Active radios persist to `data/state.json` (atomic write) and are
+- Active radios persist to the shared durable store (Phase 7, A11:
+  `MONGO_URI` > `REDIS_URL` > `data/state.json`, atomic write) and are
   restored on restart. Restored radios are **not** re-handed-off to
   a VC engine (the engine keeps its own persisted room; re-playing
   could double-queue a stream) — `vc_handoff` stays null until a

@@ -15,9 +15,11 @@ Same `vc.*` IPC as vc-go/vc-ts; the core falls back here when Go/TS fail.
   `X-Parlay-Token` auth when `PARLAY_TOKEN` is set (401 without/wrong,
   `/healthz` open).
 - Per-chat rooms: current track, queue, paused flag, `position_sec`,
-  volume. In-memory + JSON-file persistence (`data/vc-state.json`,
-  atomic write, restored on restart; `PARLAY_DATA_DIR` overrides the
-  data dir).
+  volume. In-memory + shared durable store (Phase 7, A11): `MONGO_URI`
+  > `REDIS_URL` > JSON-file persistence (`data/vc-state.json`, atomic
+  write, restored on restart; `PARLAY_DATA_DIR` overrides the data
+  dir). Rooms are stored under canonical `vc:room:<chat_id>`, so a
+  queue written by vc-go/vc-ts is servable here after fail-over.
 - 1-second auto-advance ticker: position advances while playing; at
   track end the next queued track starts, or the room goes idle.
   Unknown-duration tracks (`duration_sec: 0`) never auto-advance —
@@ -91,21 +93,24 @@ Same `vc.*` IPC as vc-go/vc-ts; the core falls back here when Go/TS fail.
   proof tone). `play_stream` runs it, then attempts the join; now-playing
   reports `voice:"opus-rtp-ready"` once proven, or
   `voice:"unavailable:<exact reason>"` otherwise.
-- **Join is honestly unavailable in this service** (`src/voice.rs`
-  `join`): the local offer is built in-process (FFI module `ntg.rs`
-  dlopening the BUILT `libntgcalls.so` — C build done 2026-11-02,
-  3.0.5; `create_offer` returns a real 476-byte offer; wheel-probe
-  fallback only when the .so is absent), but vc-rust holds no MTProto
-  client since the voice_bridge.py Telethon child was deleted in
-  Phase 5 (user order: ntgcalls is a native library linked
-  in-process, not a server). The 3.0.5 C API is synchronous
+- **Join is delegated to the core** (`src/voice.rs` `join`,
+  Phase 7, A1): the local offer is built in-process (FFI module
+  `ntg.rs` dlopening the BUILT `libntgcalls.so` — C build done
+  2026-11-02, 3.0.5; `create_offer` returns a real 476-byte offer;
+  wheel-probe fallback only when the .so is absent), and the join
+  itself is POST `{CORE_URL}/v1/join` to the core-cpp TDLib backend
+  (vc.join, contracts/ipc.json) — vc-rust holds no MTProto client
+  (the voice_bridge.py Telethon child was deleted in Phase 5, user
+  order: ntgcalls is a native library linked in-process, not a
+  server), so the core owns the join and this engine supplies only
+  the audio source. The 3.0.5 C API is synchronous
   (`ntg_create_call` returns `ntg_result` directly); the FFI module
   and `create_local_offer` were rewritten to it, with stop+retry on
-  ntgcalls -202. The MTProto join now lives only in core-cpp's
-  TdLibVoiceCall. Blocked in the sandbox: no MTProto client and UDP
+  ntgcalls -202. Blocked in the sandbox: no core TDLib backend
+  configured here (no TD_API_ID/TD_API_HASH/TD_SESSION_DIR) and UDP
   sendto is EPERM even to loopback, so RTP is proven to a file, never
-  to a live receiver. `joined:true` is never reported without a real
-  join; the live join is a live-test-time check.
+  to a live receiver. `joined:true` is never reported without the
+  core's answer; the live join is a live-test-time check.
 
 ## Known gaps (not implemented — not stubs)
 

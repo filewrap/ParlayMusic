@@ -35,6 +35,12 @@ const path = require("path");
 const { execFile } = require("child_process");
 
 const { STATIONS, findStation } = require("./stations");
+const { SharedStore } = require("./store");
+
+// Shared durable store (A11): Mongo > Redis > JSON file. Null while
+// unconfigured (file mode) or before startup; SharedStore.open() throws
+// when a configured backend is unreachable (fatal — see store.js).
+let sharedStore = null;
 
 const PORT = Number(process.env.PORT) || 8008;
 const TOKEN = process.env.PARLAY_TOKEN || "";
@@ -158,45 +164,74 @@ async function probeAllStations() {
 //   reachable, playlist_index, playlist_started_at_ms, listeners }
 const radios = new Map();
 
-function saveState() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const snapshot = [...radios.values()].map((r) => ({
+function stateSnapshot() {
+  return {
+    radios: [...radios.values()].map((r) => ({
       chat_id: r.chat_id,
       station_id: r.station_id,
       started_at_ms: r.started_at_ms,
       playlist_index: r.playlist_index,
-    }));
+    })),
+  };
+}
+
+function saveState() {
+  if (sharedStore) {
+    // Async (Node has no sync sockets): op serialises through the
+    // store queue; shutdown flushes (see SIGTERM below).
+    sharedStore
+      .set("radio:state", JSON.stringify(stateSnapshot()))
+      .catch((e) => console.error("[radio-js] shared state save failed:", e.message));
+    return;
+  }
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
     const tmp = STATE_FILE + ".tmp." + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify({ radios: snapshot }, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(stateSnapshot(), null, 2));
     fs.renameSync(tmp, STATE_FILE);
   } catch (e) {
     console.error("[radio-js] state save failed:", e.message);
   }
 }
 
-function loadState() {
+function restoreRadios(data) {
+  for (const s of data.radios || []) {
+    const station = findStation(s.station_id);
+    if (!station) continue;
+    radios.set(s.chat_id, {
+      chat_id: s.chat_id,
+      station_id: station.id,
+      stream_url: station.stream_url,
+      started_at_ms: s.started_at_ms || Date.now(),
+      reachable: (stationProbe.get(station.id) || {}).reachable ?? null,
+      playlist_index: s.playlist_index || 0,
+      playlist_started_at_ms: Date.now(),
+      listeners: 0,
+      // Restored radios are NOT re-handed-off: the VC engine keeps
+      // its own persisted room, and re-playing here could double
+      // queue a stream. vc_handoff stays null until a fresh start.
+      vc_handoff: null,
+    });
+  }
+}
+
+async function loadState() {
+  if (sharedStore) {
+    try {
+      const text = await sharedStore.get("radio:state");
+      if (text) {
+        restoreRadios(JSON.parse(text));
+        console.log(`[radio-js] restored ${radios.size} active radio(s) from shared store (${sharedStore.describe()})`);
+      }
+    } catch (e) {
+      console.error("[radio-js] shared state load failed:", e.message);
+    }
+    return;
+  }
   try {
     if (!fs.existsSync(STATE_FILE)) return;
     const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    for (const s of data.radios || []) {
-      const station = findStation(s.station_id);
-      if (!station) continue;
-      radios.set(s.chat_id, {
-        chat_id: s.chat_id,
-        station_id: station.id,
-        stream_url: station.stream_url,
-        started_at_ms: s.started_at_ms || Date.now(),
-        reachable: (stationProbe.get(station.id) || {}).reachable ?? null,
-        playlist_index: s.playlist_index || 0,
-        playlist_started_at_ms: Date.now(),
-        listeners: 0,
-        // Restored radios are NOT re-handed-off: the VC engine keeps
-        // its own persisted room, and re-playing here could double
-        // queue a stream. vc_handoff stays null until a fresh start.
-        vc_handoff: null,
-      });
-    }
+    restoreRadios(data);
     console.log(`[radio-js] restored ${radios.size} active radio(s) from ${STATE_FILE}`);
   } catch (e) {
     console.error("[radio-js] state load failed:", e.message);
@@ -346,6 +381,7 @@ const server = http.createServer(async (req, res) => {
         ffprobe: ffprobePath || null,
         stations: STATIONS.length,
         active_radios: radios.size,
+        store: sharedStore ? sharedStore.backend : "file",
         vc_go: VC_GO_URL || null,
         vc_ts: VC_TS_URL || null,
       });
@@ -420,7 +456,13 @@ const server = http.createServer(async (req, res) => {
 
 (async () => {
   await probeAllStations();
-  loadState();
+  try {
+    sharedStore = await SharedStore.open();
+  } catch (e) {
+    console.error(`[radio-js] shared store init failed: ${e.message}`);
+    process.exit(1);
+  }
+  await loadState();
   server.listen(PORT, () => {
     console.log(
       `[radio-js] listening on :${PORT} (ffprobe: ${ffprobePath || "missing"}, ` +
@@ -430,5 +472,10 @@ const server = http.createServer(async (req, res) => {
   });
 })();
 
-process.on("SIGINT", () => { saveState(); process.exit(0); });
-process.on("SIGTERM", () => { saveState(); process.exit(0); });
+async function shutdown() {
+  saveState();
+  if (sharedStore) await sharedStore.flush();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

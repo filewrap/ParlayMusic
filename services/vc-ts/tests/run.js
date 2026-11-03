@@ -175,13 +175,44 @@ test("parseDuration handles seconds, m:ss, h:mm:ss (regression: '4:28' was 0)", 
 });
 
 // ------------------------------------------------------- voice transport --
-// Real Opus/RTP pipeline + in-process ntgcalls offer + honest join
-// failure (src/voicecall.js). All offline: the tone is generated
-// locally, the offer comes from the ntgcalls addon (or the wheel probe
-// fallback until libntgcalls.so is built), and the join fails honestly
-// — vc-ts has no MTProto client since the bridge was deleted.
+// Real Opus/RTP pipeline + in-process ntgcalls offer + join DELEGATED
+// to the core (src/voicecall.js, Phase 7 A1). All offline: the tone
+// is generated locally, the offer comes from the ntgcalls addon (or
+// the wheel probe fallback until libntgcalls.so is built), and the
+// join is proven against a stub core on 127.0.0.1:18110 that answers
+// POST /v1/join — the engine calls the core, the core returns the
+// join result. No test here fakes joined:true: the stub is the core
+// in the test, and the core-down case proves the honest failure.
 const TONE = path.join(BASE, "tone5.wav");
 const VOICE_CHAT = -1004243; // throwaway chat id for the voice proofs
+const STUB_CORE_PORT = 18110;
+const STUB_CORE_URL = `http://127.0.0.1:${STUB_CORE_PORT}`;
+
+// Stub core for the vc.join delegation proofs: records every request
+// (method, path, token header, parsed body) and answers POST /v1/join
+// from a scripted behaviour ({status, json}).
+function startStubCore(behaviour) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => { body += d; });
+    req.on("end", () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body); } catch { /* keep null */ }
+      seen.push({ method: req.method, path: req.url, token: req.headers["x-parlay-token"] || null, body: parsed, raw: body });
+      const answer = behaviour(req, parsed);
+      res.writeHead(answer.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(answer.json));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(STUB_CORE_PORT, "127.0.0.1", () => resolve({ server, seen }));
+  });
+}
+
+function stopStubCore(stub) {
+  return new Promise((resolve) => stub.server.close(() => resolve()));
+}
 
 test("voice: opus pipeline proves frames + RTP packets on a local tone", async () => {
   const p = await voicecall.opusPipeline(TONE, { workDir: path.join(BASE, "voice") });
@@ -209,17 +240,27 @@ test("voice: ntgcalls create_call produces a real local offer offline", async ()
   assert.ok(typeof o.via === "string" && o.via.length > 0, JSON.stringify(o));
 });
 
-test("voice: join fails honestly — no MTProto client in vc-ts (bridge deleted)", async () => {
-  // The voice_bridge.py Telethon child is deleted (Phase 5); Node
-  // stdlib has no MTProto client, so join() cannot phone.joinGroupCall.
-  // It must fail with the exact reason + the tdlib-backend route, and
-  // never report joined:true.
-  const j = await voicecall.join(VOICE_CHAT, "dummy-offer");
-  assert.equal(j.ok, false);
-  assert.equal(j.joined, false);
-  assert.ok(j.error.includes("no MTProto client"), j.error);
-  assert.ok(j.error.includes("voice_bridge.py deleted"), j.error);
-  assert.ok(j.error.includes("tdlib"), j.error);
+test("voice: join delegates to the core — stub core answers joined:true", async () => {
+  // The engine calls POST {CORE_URL}/v1/join and reports the core's
+  // answer. The stub is the core in this test: it records the exact
+  // request (method, path, token, chat_id) and answers joined:true.
+  const stub = await startStubCore(() => ({
+    status: 200,
+    json: { ok: true, data: { joined: true, chat_id: VOICE_CHAT, now_playing: null } },
+  }));
+  try {
+    const j = await voicecall.join(VOICE_CHAT, "dummy-offer", { coreUrl: STUB_CORE_URL, token: "test-token" });
+    assert.equal(j.ok, true, JSON.stringify(j));
+    assert.equal(j.joined, true, "joined:true comes from the core's answer");
+    assert.equal(j.via, "core-cpp vc.join");
+    assert.equal(stub.seen.length, 1, "exactly one core call");
+    assert.equal(stub.seen[0].method, "POST");
+    assert.equal(stub.seen[0].path, "/v1/join");
+    assert.equal(stub.seen[0].token, "test-token", "IPC token forwarded");
+    assert.deepEqual(stub.seen[0].body, { chat_id: VOICE_CHAT });
+  } finally {
+    await stopStubCore(stub);
+  }
   // backendConfig now describes the in-process ntgcalls media state,
   // not bridge credentials. The addon loads exactly when the built
   // libntgcalls.so exists (phase5/ntg-build.log) — it is built now,
@@ -232,17 +273,89 @@ test("voice: join fails honestly — no MTProto client in vc-ts (bridge deleted)
   assert.equal(cfg.addonLoaded, soBuilt, `addonLoaded ${cfg.addonLoaded} vs .so built ${soBuilt}`);
 });
 
-test("voice: playStream on a local tone reports opus-rtp-ready + exact join reason, never joined:true", async () => {
-  const r = await voicecall.playStream(VOICE_CHAT, TONE);
-  assert.equal(r.streaming, false, "no live call, so nothing streams");
-  assert.equal(r.voice, "opus-rtp-ready");
-  assert.equal(r.pipeline.frames, 251);
-  assert.equal(r.pipeline.rtp_packets, 251);
-  assert.ok(r.reason.includes("no MTProto client"), r.reason);
-  const st = voicecall.voiceState(VOICE_CHAT);
-  assert.equal(st.voice, "opus-rtp-ready");
-  assert.equal(st.joined, false);
-  assert.ok(st.offer_len > 100, `pre-flight offer recorded, len ${st.offer_len}`);
+test("voice: join reports the core's 502 reason verbatim, never joined:true", async () => {
+  const stub = await startStubCore(() => ({
+    status: 502,
+    json: { ok: false, error: { code: "engine_unavailable", message: "tdlib unavailable: no TD_API_ID/TD_API_HASH" } },
+  }));
+  try {
+    const j = await voicecall.join(VOICE_CHAT, "dummy-offer", { coreUrl: STUB_CORE_URL, token: "test-token" });
+    assert.equal(j.ok, false);
+    assert.equal(j.joined, false);
+    assert.equal(j.error, "tdlib unavailable: no TD_API_ID/TD_API_HASH", j.error);
+  } finally {
+    await stopStubCore(stub);
+  }
+});
+
+test("voice: join with the core down fails honestly naming CORE_URL", async () => {
+  // Port 9 is the discard port: nothing listens, connect is refused.
+  const j = await voicecall.join(VOICE_CHAT, "dummy-offer", { coreUrl: "http://127.0.0.1:9", token: "test-token" });
+  assert.equal(j.ok, false);
+  assert.equal(j.joined, false);
+  assert.ok(j.error.includes("core unreachable"), j.error);
+  assert.ok(j.error.includes("CORE_URL"), j.error);
+});
+
+test("voice: playStream with a stub core joins for real (delegation)", async () => {
+  // playStream reads CORE_URL / PARLAY_TOKEN from the env (the child
+  // servers are already spawned, so this only affects this in-process
+  // call). The stub core answers joined:true; the voice state must
+  // then be live.
+  const stub = await startStubCore(() => ({
+    status: 200,
+    json: { ok: true, data: { joined: true, chat_id: VOICE_CHAT, now_playing: null } },
+  }));
+  const savedCore = process.env.CORE_URL;
+  const savedToken = process.env.PARLAY_TOKEN;
+  process.env.CORE_URL = STUB_CORE_URL;
+  process.env.PARLAY_TOKEN = "test-token";
+  try {
+    const r = await voicecall.playStream(VOICE_CHAT, TONE);
+    assert.equal(r.streaming, true, JSON.stringify(r));
+    assert.equal(r.voice, "live");
+    assert.equal(r.pipeline.frames, 251);
+    assert.equal(r.pipeline.rtp_packets, 251);
+    assert.equal(r.via, "core-cpp vc.join");
+    const st = voicecall.voiceState(VOICE_CHAT);
+    assert.equal(st.voice, "live");
+    assert.equal(st.joined, true, "joined:true only because the core answered it");
+    assert.ok(st.offer_len > 100, `pre-flight offer recorded, len ${st.offer_len}`);
+    assert.equal(stub.seen.length, 1, "one core join call for the play");
+    assert.deepEqual(stub.seen[0].body, { chat_id: VOICE_CHAT });
+  } finally {
+    if (savedCore === undefined) delete process.env.CORE_URL;
+    else process.env.CORE_URL = savedCore;
+    if (savedToken === undefined) delete process.env.PARLAY_TOKEN;
+    else process.env.PARLAY_TOKEN = savedToken;
+    await stopStubCore(stub);
+    // Leave the chat un-joined for the next voice test.
+    voicecall.leaveVoiceChat(VOICE_CHAT);
+  }
+});
+
+test("voice: playStream with the core down reports opus-rtp-ready + the core reason, never joined:true", async () => {
+  const savedCore = process.env.CORE_URL;
+  const savedToken = process.env.PARLAY_TOKEN;
+  process.env.CORE_URL = "http://127.0.0.1:9";
+  process.env.PARLAY_TOKEN = "test-token";
+  try {
+    const r = await voicecall.playStream(VOICE_CHAT, TONE);
+    assert.equal(r.streaming, false, "no live call, so nothing streams");
+    assert.equal(r.voice, "opus-rtp-ready");
+    assert.equal(r.pipeline.frames, 251);
+    assert.equal(r.pipeline.rtp_packets, 251);
+    assert.ok(r.reason.includes("core unreachable"), r.reason);
+    const st = voicecall.voiceState(VOICE_CHAT);
+    assert.equal(st.voice, "opus-rtp-ready");
+    assert.equal(st.joined, false);
+    assert.ok(st.offer_len > 100, `pre-flight offer recorded, len ${st.offer_len}`);
+  } finally {
+    if (savedCore === undefined) delete process.env.CORE_URL;
+    else process.env.CORE_URL = savedCore;
+    if (savedToken === undefined) delete process.env.PARLAY_TOKEN;
+    else process.env.PARLAY_TOKEN = savedToken;
+  }
 });
 
 test("voice: now-playing surfaces the real voice state (string, joined false)", async () => {
@@ -287,13 +400,17 @@ test("jiosaavn search returns REAL durations (live jsvn-tgvc)", async () => {
   assert.equal(first.duration_source, "song-lookup");
 });
 
-test("jsvn: id resolve returns real duration + stream_url", async () => {
+test("jsvn: id resolve returns real duration + stream_url (both levels)", async () => {
   const r = await req(18102, "POST", "/v1/play", { chat_id: CHAT, query: "jsvn:rjkrTnma" });
   assert.equal(r.status, 200, JSON.stringify(r.json));
-  const t = r.json.data.now_playing.track;
+  const np = r.json.data.now_playing;
+  const t = np.track;
   assert.equal(t.id, "jsvn:rjkrTnma");
   assert.equal(t.duration_sec, 268);
   assert.ok(t.stream_url);
+  // A8 residual: the contract's top-level NowPlaying.stream_url must
+  // mirror the nested track.stream_url.
+  assert.equal(np.stream_url, t.stream_url, "top-level stream_url must mirror track.stream_url");
 });
 
 test("auto-advance fires for a jiosaavn track (seek to end -> next)", async () => {

@@ -1,1050 +1,146 @@
-# Parlay — REMAINING.md (stub-free audit)
-
-Date: 2026-11-03. Auditor (subagent), audit-only: read + grep + re-ran builds/tests.
-No service code modified, nothing pushed, no tokens requested. Live Telegram
-tests are ASIDE per the user — they are listed only in (E) and nowhere else.
-
-Method: read PHASE2.md, PHASE3.md, PHASE4.md, PHASE4-TDLIB.md, PORT_MAP.md,
-DEEP_READ.md, COMMANDS.md, BENCHMARKS.md, ARCHITECTURE.md, contracts/ipc.json
-(41 actions), docker-compose.yml, README.md; grep of services/ (excluding
-refs/, .venv, node_modules, build/target dirs, phase4/tdlib-src) for stub,
-TODO, FIXME, XXX, HACK, NotImplemented, unimplemented, engine_unavailable,
-placeholder, dummy, mock, pass-through; three parallel workers (A grep+docs,
-B builds+tests, C contract+cross-cutting+TDLib) with full reports in
-`audit/worker-{a,b,c}-*.md` and raw logs in `audit/logs/`.
-
-## Audit verdict (one paragraph)
-
-The code is in much better shape than the docs say: all 12 services build
-clean (0 build failures), 146 tests pass / 0 fail / 8 skipped on re-run, and
-there are zero TODO/FIXME/HACK/mocks in the tree. The one project-level
-blocker is that **no audio has ever reached a Telegram voice chat** — the
-Opus/RTP pipeline is proven to a file in all three engines, but the live join
-has never happened and cannot happen from this sandbox. The next-biggest
-cluster is wiring, not code: docker-compose cannot build (10 missing
-Dockerfiles) and 4 services listen on the wrong ports under compose, and the
-core serves no HTTP so the GUI's now-playing/queue endpoints have no backend.
-The third cluster is documentation drift: root README still says "scaffold
-only", ARCHITECTURE.md describes a stack that was never built (grammy /
-tgcalls / Next.js / ntgcalls / Soulseek / shared Mongo+Redis state), and
-several service READMEs contradict their own implemented sections.
-
-Two corrections to prior reports, verified by the auditor:
-- Worker C claimed `phase4/tdlib-build.log` is 7 lines and not the TDLib
-  build log. Wrong file: the 7-line log is `~/workspace/parlay/tdlib-build.log`
-  (ntgcalls wheel extraction). The real build log is
-  `phase4/tdlib-build.log`: 933 lines, 0 `error:` lines, ends
-  `[100%] Built target run_all_tests`. TDLib 1.8.69 build SUCCEEDED.
-- PHASE4-TDLIB.md §5.5 "NetEase download still `engine_unavailable`" is
-  stale. PHASE4 is right: the mirror fallback is in code
-  (`netease-go/internal/netease/client.go:336-360`, `SongURLWithLevel` step 6)
-  and PHASE4 reports 3 ffprobe-verified live FLAC downloads. Caveat: no
-  automated live NetEase test exists in the tree (only `crypto_test.go`).
-
-Verified-good (not gaps, for the record): all 12 services build, 146 tests
-pass; `download.*` 6/6, `netease.*` 3/3, `spotify.*` 7/7, `vc.radio`,
-`radio.list/start`, `fx.apply`, `queue.vote`, `share.*`, `lemonic.*`,
-`search.inline` all implemented; core-cpp `store_test` is now 40/40 with DBs
-up (supersedes the old 30/2); `libtdjson.so.1.8.69` exists (50,166,944 B).
-
----
-
-## (A) Stub-free blockers — still stubbed/faked, must be replaced with real code
-
-### A1. No live voice join anywhere — audio never reaches a voice chat
-- Evidence: `services/vc-ts/src/voicecall.js:399` (`opus-file-only:<reason>`),
-  `services/vc-rust/src/voice.rs:957`, `services/core-cpp/src/voice_call.cpp:488-489`
-  (`rtp_ok=0`). All three report `voice_joined:false` honestly. Opus/RTP
-  pipeline proven to a file in all three (251 frames / 251 RTP packets,
-  83,736 B, 5.0065 s); local ntgcalls offer (456–476 chars) proven offline.
-- What blocks it here: no assistant session, no direct TCP to Telegram DCs
-  (proxy-only egress), UDP `sendto` EPERM even to loopback (proven in
-  Python/Node/Rust + ffmpeg), `libntgcalls.so` (C) absent — only the Python
-  extension exists (`phase4/ntg-extract/ntgcalls.cpython-312-*.so`,
-  135,970,920 B). `TdLibVoiceCall::available()` is therefore always false
-  here (it requires both `.so`s).
-- What done looks like: a host with open network + assistant session +
-  a built `libntgcalls.so`, one `/play` through the TDLib backend (or the
-  Telethon bridge) with a real `joined:true` and audible audio in the call.
-  Building `libntgcalls.so` itself is the first sub-step (no C build has
-  been attempted yet — only the Python wheel was extracted).
-
-### A2. `gui.now_playing` / `gui.queue` have no real backend
-- Evidence: `contracts/ipc.json` lists both as `core-cpp → gui-js`, but
-  core-cpp has no HTTP server at all (zero `/api/` hits in
-  `services/core-cpp/src/`; `services/core-cpp/src/config.hpp:40`:
-  `port = 8080 // GUI /api surface, future`). gui-js
-  `app/main.js:459-492` proxies to `CORE_URL` and falls back to hardcoded
-  demo state (`note: "core unreachable or CORE_URL unset — serving local
-  demo state"`, queue `source:"local-demo"`).
-- What done looks like: core-cpp serves `GET /api/now-playing` and
-  `GET /api/queue` (real engine state via IPC), gui-js never serves demo
-  data when a core is configured.
-
-### A3. vc-ts is missing 4 contract actions; core fail-over does not catch it
-- Evidence: `vc.loop`, `vc.shuffle`, `vc.autoplay`, `vc.autoplay_skip`
-  exist in vc-go (`internal/server/server.go:43-46`) and vc-rust
-  (`src/main.rs:1339-1342`) but vc-ts `src/main.js` has no such routes
-  (only panel toggles, `main.js:263-264,309-312`); unknown route → `404
-  not_found` (`main.js:652`). Core `engine_router.cpp` retries only on
-  `unavailable()` (`ipc.hpp:24-27`: transport error, HTTP ≥500, or
-  `engine_unavailable`) — a 404 is not unavailable, so the core returns
-  the 404 without trying the next engine. Default engine is Go, so this
-  bites only ts-engine chats.
-- What done looks like: the 4 routes implemented in vc-ts, plus the core
-  treating a 404 for a known contract action as a fail-over trigger (or
-  the router knowing per-engine capability).
-
-### A4. `vc.join` and `vc.mute` exist nowhere in the contract or IPC
-- Evidence: no `vc.join`/`vc.mute` key in `contracts/ipc.json`, no
-  `/v1/join` or `/v1/mute` route in any service. Mute is a core-cpp flag
-  only (`dispatcher.cpp:1666-1678`, stored per chat, reported by `/pos`);
-  `voice_call.hpp:65-66` declares `mute()/unmute()` on the voice backend
-  but nothing reaches it over IPC. Join lives only inside voice backends
-  (TDLib `joinVideoChat`, bridge `join-call`).
-- What done looks like: both actions added to `contracts/ipc.json` first
-  (contract-first rule), then implemented in at least one VC engine and
-  wired in the core dispatcher (`/mute`, `/join`).
-
-### A5. Compose port mismatches — 4 services unreachable under compose
-- Evidence: compose sets no `PORT` env anywhere, so code defaults apply:
-  audio-fx-rust listens 8003 (`src/main.rs:163`) but compose maps 8004;
-  share-rust 8004 (`src/main.rs:61`) vs 8005; queue-rust 8005
-  (`src/main.rs:123`) vs 8006; downloaders 8010 (`src/server.py:47`) vs
-  8009. audio-fx and vc-rust both default to 8003 (collision). Core
-  `FX_URL`/`SHARE_URL`/`QUEUE_URL`/`DL_URL` point at the mapped ports.
-- What done looks like: one source of truth — either set `PORT` in
-  compose for each service or change code defaults to the mapped ports —
-  and a compose smoke test proving core→each service IPC answers.
-
-### A6. docker-compose cannot build as written; never run end-to-end
-- Evidence: only 2 Dockerfiles exist (`services/radio-js/Dockerfile`,
-  `services/vc-ts/Dockerfile`); missing for core-cpp, vc-go, vc-rust,
-  audio-fx-rust, share-rust, queue-rust, spotify-rust, gui-js,
-  downloaders, netease-go. `docker compose up --build` fails on the
-  first missing Dockerfile. Docker is not installed in the sandbox, so
-  compose has never run here; no `.env`, logs, or images exist. Default
-  profile starts only core-cpp, vc-go, downloaders, mongo, redis — the
-  other 7 services need `--profile full`, while the core's FX/Share/
-  Queue/Spotify/Radio/NetEase URLs point at services that are not
-  running. No healthchecks; core `depends_on` has no
-  `condition: service_healthy`; core's `PARLAY_DATA_DIR` defaults to
-  relative `data` while compose mounts `parlay-data:/data` (volume
-  unused unless cwd is `/`); no `TDJSON_LIB`/`NTGCALLS_LIB`/assistant-
-  session vars in compose at all.
-- What done looks like: a Dockerfile per service, `docker compose config`
-  clean, and one `docker compose up` on a host with Docker proving
-  healthz on every mapped port.
-
-### A7. Mongo SCRAM auth not implemented (core-cpp)
-- Evidence: `services/core-cpp/src/store.cpp:709` — "mongodb URIs with
-  credentials are not supported by the minimal [client]"; authenticated
-  URIs rejected. Non-blocking under current no-auth compose, blocking
-  for any auth-required Mongo (incl. Atlas/managed).
-- What done looks like: SCRAM-SHA-1/256 in the hand-rolled Mongo wire
-  client, tested against an auth-enabled mongod.
-
-### A8. vc-go `StreamURL` never serialized over IPC
-- Evidence: `services/vc-go/internal/types/types.go:20` —
-  `StreamURL string \`json:"-"\`` ("Internal to vc-go; not part of the
-  contract"). No `stream_url` in `server.go` output, so the core cannot
-  fetch vc-go's resolved direct audio URL despite vc-go's README saying
-  it can.
-- What done looks like: `stream_url` in the `Track`/`NowPlaying` IPC
-  payload (and in `contracts/ipc.json` types), or the README corrected
-  and the gui `/api/stream-url` flow documented as vc-ts-only.
-
-### A9. Degraded placeholder tracks (partial fidelity, not full stub)
-- Evidence: `services/vc-ts/src/resolvers.js:125,136,149` — yt-dlp
-  failure → placeholder track (`yt:<id>` / `query:<hash>`,
-  `duration_sec: 0`, `degraded: true`, `resolve_note` says so); never
-  auto-advances, no real metadata. `services/vc-rust/src/main.rs:49,564`
-  — placeholder 180 s duration for unknown-duration tracks; ticker
-  advances state-wise instead of stalling.
-- What done looks like: no placeholder path in normal operation — a
-  failed resolve surfaces `engine_unavailable` (or retries with the
-  android client, as downloaders already do) instead of a fake track;
-  if a placeholder is kept as a last resort, it must carry a real
-  duration or be excluded from auto-advance timing.
-
-### A10. TDLib first-time auth flows not implemented
-- Evidence: `services/core-cpp/src/tdlib_client.cpp:298` —
-  "(registration / QR / email flows are not implemented …)". Auth needs
-  phone/code/password via env; a pre-authorized session dir is required.
-- What done looks like: either QR/login-code interactive flow in the
-  TDLib client, or documented support for importing a pre-authorized
-  session dir (and the compose/docs path for it).
-
-### A11. No shared durable store across engines
-- Evidence: core-cpp = real Mongo → Redis → JSON file; vc-go = real
-  Mongo driver when `MONGO_URI` set, else JSON. All other stateful
-  services JSON-file only: vc-rust (`data/vc-state.json`), vc-ts
-  (`data/state.json`), queue-rust (`data/votes.json`), share-rust
-  (`data/shares.json`), spotify-rust (`data/spotify-state.json`),
-  radio-js (`data/state.json`). A queue in vc-go/Mongo is invisible to
-  vc-ts/vc-rust JSON files and vice versa — engine fail-over loses
-  queue state. share-rust's compose `DATABASE_URL=sqlite:/data/share.db`
-  is dead config (zero sqlite hits in the service).
-- What done looks like: one shared store (Mongo/Redis) used by all
-  stateful services, or an explicit documented decision that queues do
-  not survive engine switches — with the dead sqlite var removed.
-
-### A12. `NAVIDROME_PASS` vs `NAVIDROME_PASSWORD` name bug
-- Evidence: `.env.example:20` and `docker-compose.yml:117` set
-  `NAVIDROME_PASS`; code reads `NAVIDROME_PASSWORD`
-  (`services/downloaders/src/navidrome.py:40-45`). Compose therefore
-  never passes the password; Navidrome auth silently fails.
-- What done looks like: one name everywhere (code + example + compose),
-  verified by a Navidrome call with the compose env.
-
----
-
-## (B) Working-code gaps — real features from the 21 refs never ported at all
-
-### B1. Per-user Spotify playback monitoring (watch) is intent-only
-- Evidence: `services/spotify-rust/src/main.rs:105-113,283-287` —
-  `spotify.watch` only records intent in a registry; "this service has
-  no user tokens … No per-user playback state: that still needs a user
-  OAuth token". No OAuth/refresh-token code anywhere. rustify's
-  `auth.rs` was never ported.
-- What done looks like: per-user OAuth flow + token refresh + real
-  currently-playing polling, or the watch action removed from the
-  contract as unimplemented.
-
-### B2. Deezer full tracks (need ARL cookie) — previews only
-- Evidence: `services/downloaders/src/deezer.py:14-19,41,118-129` —
-  30 s `track.preview` MP3 from the public API; `_PREVIEW_NOTE` says
-  so. No `ARL` string anywhere in `services/downloaders/`.
-- What done looks like: ARL-cookie full-track download (env-gated),
-  or the downloader honestly advertising preview-only (it already does
-  in the note — the gap is the feature, not the honesty).
-
-### B3. NetEase direct URLs need `MUSIC_U` login — not implemented/read
-- Evidence: mirror fallback works (see verdict); direct encrypted routes
-  return `url:null` server-side. No `MUSIC_U` env read in netease-go;
-  the cookie is only mentioned in comments (`eapi.go:16-18`,
-  `client.go:245`).
-- What done looks like: `MUSIC_U` cookie support in netease-go, or an
-  explicit decision that mirror-only is the supported path.
-
-### B4. Navidrome Soulseek path — zero code
-- Evidence: grep `soulseek`/`slskd` = zero hits in
-  `services/downloaders/src/*.py`. Only the Navidrome HTTP API path
-  exists. The ref (`music-bot-navidrome`) has a full
-  `src/soulseek/{client,downloader,matcher,scorer}.py` that was never
-  ported.
-- What done looks like: slskd-backed Soulseek fetch (needs a slskd
-  daemon), or the README dropping the Soulseek claim.
-
-### B5. Genius / Musixmatch lyrics keys — named in a comment only
-- Evidence: `services/spotify-rust/src/main.rs:41-42` (doc comment
-  only, never read). Lyrics fall back to LRCLib (keyless) only.
-- What done looks like: real Genius/Musixmatch clients (env-gated) or
-  the comment removed.
-
-### B6. Beetube non-music providers never ported
-- Evidence: `services/downloaders/src/providers.py` registers exactly
-  five providers (youtube/spotify/deezer/tiktok/navidrome). Beetube's
-  `providers/{movie,anime,torrent}.js` + EDM have no Parlay equivalent.
-- What done looks like: movie/anime/torrent provider handlers in
-  downloaders, or an explicit music-only scope decision.
-
-### B7. NetEase audio recognition never ported
-- Evidence: ref `Music163bot-Go` has `handlers_recognize.go`; contract
-  has only `netease.search/download/lyrics`. No recognition endpoint
-  in netease-go.
-- What done looks like: `netease.recognize` action + handler, or
-  dropped from scope.
-
-### B8. Lemonic live API never verified
-- Evidence: vc-ts Lemonic works unauthenticated-first with a Bearer
-  header when a key is set, but the live API is unreachable from the
-  sandbox (PHASE4); verification used a local stub API + the dead-API
-  error path only. No live Lemonic search/download has ever succeeded.
-- What done looks like: one live Lemonic call succeeding from a host
-  with open egress (or a key, if the API ever requires one).
-
-### B9. `spotify.collection` in downloaders is internal-only, not HTTP
-- Evidence: `services/downloaders/src/providers.py:69` →
-  `spotify.py:345 download_spotify_collection` exists as a function;
-  no `/v1/spotify/collection` route in `server.py`. Contract lists
-  "spotify-rust | downloaders" — only spotify-rust serves it over HTTP.
-- What done looks like: the downloaders route added, or the contract
-  corrected to spotify-rust only.
-
-### B10. `search.query` — netease-go has no `/v1/search`
-- Evidence: contract lists netease-go as a `search.query` service, but
-  netease-go exposes only `/v1/netease/search`. vc-ts and downloaders
-  serve `/v1/search`; netease-go does not.
-- What done looks like: the route added, or the contract corrected.
-
-### B11. Core honest limits (all verified in code — feature gaps, not stubs)
-- `/mute` downstream: flag-only, no `vc.mute` action (see A4).
-  `services/core-cpp/src/dispatcher.cpp:1666-1678`.
-- `/speed` / `/bass`: seek-restart + stored value; VC services are
-  never told the speed/bass value.
-  `dispatcher.cpp:1553-1660`.
-- `/play` from replied-to media: refuses with a file_id hand-off
-  message. `dispatcher.cpp:946-953`.
-- `/lang`: English-only; non-`en` refused, choice not stored.
-  `dispatcher.cpp:2227-2246`.
-- `/broadcast` failures inline, no `errors.txt` attachment
-  (core has no sendDocument yet). `dispatcher.cpp:2677-2744`.
-- `/speedtest`: download-only (Cloudflare down probe; upload skipped).
-  `dispatcher.cpp:2811-2836`.
-- What done looks like: each of the six implemented for real (or kept
-  as documented limits — they are already honestly reported; the gap
-  is the missing feature, and COMMANDS.md §"Not yet" lists four of
-  them).
-
-### B12. vc-go live autoplay picks need yt-dlp (unit-tested only)
-- Evidence: PHASE4 — `resolver.Related` returns nil without yt-dlp in
-  the sandbox, so a drained room idles; the pick path is unit-tested
-  with an injected picker only.
-- What done looks like: yt-dlp wired into vc-go's resolver (it exists
-  at `services/downloaders/.venv/bin/yt-dlp`) and one live autoplay
-  pick observed.
-
----
-
-## (C) Correctness / quality
-
-### C1. Test coverage holes (builds pass, but coverage is thin)
-- audio-fx-rust, share-rust, queue-rust: **0 tests defined** each
-  (`cargo test` runs 0 tests). Build passes; nothing verifies the
-  endpoints. What done looks like: at least smoke tests per endpoint
-  (fx output file, share create/resolve round-trip, vote threshold).
-- spotify-rust 8/8 is partly hollow: 2 "live" tests early-return as
-  no-ops without `SPOTIFY_CLIENT_ID/SECRET` (not counted as skipped by
-  the harness). Real exercised tests without creds: 6.
-- downloaders: 21 discovered, 13 passed, **8 skipped** (live-gated
-  `PARLAY_LIVE_TEST=1`: YouTube, Deezer, TikTok, Spotify API,
-  Navidrome). Live coverage never runs without a deliberate flag.
-- netease-go: 5/5, all crypto round-trips only. No live NetEase tests;
-  the "works live" claim rests on PHASE4's manual run, not a
-  re-runnable test.
-- Totals on re-run (worker B, 2026-11-03): **146 passed / 0 failed /
-  8 skipped** across 12 services. Per-service: core-cpp 47 (tdlib 7/7
-  + store 40/40), vc-go 18/18, vc-ts 24/24, vc-rust 17/17,
-  spotify-rust 8/8 (see caveat), gui-js 7/7, radio-js 7/7 (startup
-  probe 5/6 stations — KEXP unreachable, honestly reported),
-  downloaders 13+8 skipped, netease-go 5/5.
-
-### C2. Build warnings and slow builds
-- core-cpp: 8 warnings, all libstdc++ `-Wmaybe-uninitialized` false
-  positives inside `std::variant`/`std::map` internals when copying
-  `parlay::Json` — none in service code, but they are real compiler
-  output on every clean build (43 s clean).
-- vc-go clean build 92.4 s (Mongo driver compile; warm 8.1 s),
-  stripped binary 9.3 MB. Slowest clean build in the tree; no
-  incremental-build cache is documented.
-- TDLib one-off build: ~56 min, 518 MB of artifacts in
-  `phase4/tdlib-src/build/` — not part of any service build, but any
-  fresh checkout that needs it pays the cost again (no prebuilt
-  artifact is published in the tree).
-- All other services: 0 warnings. TS/JS have no build step.
-
-### C3. Documentation drift (runtime is fine; the docs mislead)
-- Root `README.md`: "Status: **Scaffold only.** The service
-  directories contain original stubs" — false since Phases 2–4.
-  Quick-start is not followable: `docker compose up --build` breaks
-  (no Docker in sandbox; 10 missing Dockerfiles), gui-js `npm install
-  && npm run dev` is misleading (no dependencies, no Next.js —
-  `dev` = `node app/main.js`), no port map, no run commands for 8
-  services, `cp .env.example .env` silently wrong (see C4).
-- `ARCHITECTURE.md`: aspirational stack, several claims false against
-  code — "vc-go (Go, ntgcalls)", "vc-ts (TS, grammy)", "vc-rust
-  (Rust, ntgcalls)", "gui-js (Next.js Mini App)", "MongoDB + Redis
-  (shared state: queues, auth, shares)". Grep: zero grammy/tgcalls/
-  Next.js/slskd hits in `services/` code. "The C++ core never
-  downloads, never streams" is now false in the narrow voice sense
-  (core owns the Opus pipeline + voice bridge).
-- `services/core-cpp/README.md`: "TDLib C++ client — `src/tdlib_client`
-  does not exist yet" (false — it exists, 7/7 tests); "TDLib build
-  running" (finished 100%); "Defaults match docker-compose.yml
-  (audio-fx :8004, share :8005, queue :8006, downloaders :8009)"
-  (false for all four — see A5).
-- `services/core-cpp/PROGRESS.md`: Phase 2 snapshot never updated —
-  "voice … logging stub", "`LoggingVoiceCall` stub",
-  "MongoDB/Redis — env vars read, not connected", "vc-*/downloader
-  services are stubs". All superseded.
-- `services/vc-rust/README.md` tail: "No loop/shuffle/autoplay yet"
-  and "`yt-dlp` is not installed … pattern-only" — both directly
-  contradicted by the same file's Implemented section. `PROGRESS.md`
-  L94–99 repeats the stale stub block above its own supersession note.
-- `services/netease-go/README.md` "Known live limitation": download
-  "honestly returns `engine_unavailable`", "No weapi-encrypted
-  requests", "No end-to-end download test" — all false since Phase 4.
-  Same wrong claim repeated in `PHASE4-TDLIB.md` §5.5.
-- `PHASE2.md` / `PHASE3.md` "still stubbed" sections are partly stale
-  (superseded by Phase 4 + TDLib wiring). `PORT_MAP.md` §3: "services/
-  contains only original stubs" — stale; its license section is also
-  stale relative to the built tree (note: per the user's order, do not
-  re-raise licensing as a task — listed here only as docs drift).
-- `contracts/ipc.json` still stamped `version: "0.1.0-scaffold"`
-  although it now carries 41 actions.
-- Extra endpoints not in the contract (docs/contract drift, both
-  ways): vc-ts `/v1/panel`, `/v1/volume`, `/v1/lyrics`; radio-js
-  `/v1/radio/status`, `/v1/radio/stop`; gui-js `/api/search`,
-  `/api/stream-url`, `/api/audio`, `/api/play|pause|skip` — the last
-  group talks directly to `VC_GO_URL`/`VC_TS_URL`, contradicting
-  gui-js README's "Talks ONLY to the core … never directly to voice".
-
-### C4. `.env.example` covers ~12 of ~60 vars actually read
-- In the example but dead/wrong: `VC_ENGINE` (zero hits anywhere in
-  code/compose/docs); `NAVIDROME_PASS` (code reads
-  `NAVIDROME_PASSWORD` — see A12).
-- Read in code but missing from the example (grouped): core-cpp 36 vars
-  (`VC_GO_URL, VC_TS_URL, VC_RUST_URL, FX_URL, SHARE_URL, QUEUE_URL,
-  SPOTIFY_URL, DL_URL, RADIO_URL, NETEASE_URL, PORT, OWNER_ID,
-  SUDO_IDS, LOGGER_ID, PARLAY_ALLOW_CHATS, PARLAY_BLOCK_CHATS,
-  ASSISTANT_IDS, ASSISTANT_SESSION_FILE, NTGCALLS_LIB, VOICE_BRIDGE,
-  VOICE_RTP_SINK, TD_API_ID, TD_API_HASH, TD_SESSION_DIR, TDJSON_LIB,
-  TD_PHONE, TD_CODE, TD_PASSWORD, PARLAY_DATA_DIR, PARLAY_LOG_FILE,
-  TELEGRAM_API_BASE, DURATION_LIMIT, QUEUE_LIMIT, SUPPORT_CHAT`);
-  vc-ts `LEMONIC_API`, `YT_DLP`; vc-rust `YTDLP_BIN` (different name
-  from vc-ts's `YT_DLP`); downloaders `PARLAY_DL_DIR`,
-  `PARLAY_SPOTIFY_MAX_MATCH_SEC`, `NAVIDROME_PASSWORD`; netease-go
-  `PARLAY_DL_DIR`; queue-rust `PARLAY_VOTE_THRESHOLD`; share-rust
-  `PARLAY_BOT_USERNAME`; `PARLAY_DATA_DIR`, `PARLAY_TOKEN`, `PORT` per
-  service; radio-js/gui-js service URLs.
-- Named but never read: `GENIUS_ACCESS_TOKEN`, `MUSIXMATCH_API_KEY`
-  (doc comment only).
-- What done looks like: `.env.example` listing every var the code
-  reads (with a one-line comment each), dead vars removed, the
-  `YT_DLP`/`YTDLP_BIN` naming unified.
-
-### C5. `ipc.json` version + contract hygiene
-- Version string `0.1.0-scaffold` (see C3). New actions are added
-  here first per the contract note, but the extra endpoints in C3
-  were never added — the contract is behind the code in both
-  directions (missing implementations in A2–A4, unlisted endpoints
-  in C3).
-
----
-
-## (D) Needs-user-input — only the user can supply these (names only, no values)
-
-| # | What | Why it blocks | Where it is read |
-|---|---|---|---|
-| D1 | Repo URL (where Parlay should live on GitHub) | Nothing can be pushed until this exists | — |
-| D2 | `BOT_TOKEN` | Core cannot start / no Telegram surface at all | core-cpp |
-| D3 | `API_ID` / `API_HASH` | Bot API + TDLib + bridge auth | core-cpp, vc-ts, vc-rust |
-| D4 | Assistant session — `ASSISTANT_SESSION_FILE` (Telethon session) or `TD_SESSION_DIR` + `TD_PHONE`/`TD_CODE`/`TD_PASSWORD` (TDLib first auth) | The assistant/userbot holds the VC session (DEEP_READ headline); without it no voice join is possible by design | core-cpp voice bridge / TDLib client |
-| D5 | `OWNER_ID` / `SUDO_IDS` | Owner/sudo permission model has no owner configured | core-cpp |
-| D6 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | Spotify metadata/collections/search; 2 spotify-rust live tests are no-ops without them | spotify-rust, downloaders, vc-ts |
-| D7 | `LEMONIC_API_KEY` | Optional — Lemonic works unauthenticated first; key only adds a Bearer header | vc-ts |
-| D8 | Deezer ARL cookie | Full Deezer tracks (previews only without it) | downloaders (not yet read — see B2) |
-| D9 | NetEase `MUSIC_U` login cookie | Direct NetEase URLs (mirror fallback works without it) | netease-go (not yet read — see B3) |
-| D10 | Navidrome `NAVIDROME_URL` / `NAVIDROME_USER` / `NAVIDROME_PASSWORD` | Navidrome downloads; also needs the A12 name fix first | downloaders |
-| D11 | `GENIUS_ACCESS_TOKEN` / `MUSIXMATCH_API_KEY` | Genius/Musixmatch lyrics (LRCLib works without) | spotify-rust (not yet read — see B5) |
-| D12 | MongoDB/Redis credentials (only if auth is enabled) | Core SCRAM auth is unimplemented (A7), so auth-enabled Mongo cannot be used even with creds | core-cpp store |
-| D13 | `PARLAY_TOKEN` (shared IPC token) | Must match across all 12 services; currently each service defaults independently | all services |
-
----
-
-## (E) Explicitly out of scope for now — live Telegram tests only
-
-Per the user's instruction, live tests are aside. Not counted as
-remaining work, not attempted in this audit:
-
-- E1. Live voice join + audible audio in a real group call (any engine).
-- E2. `/play` in a real group, through the core, end to end.
-- E3. Fail-over drill: kill vc-go mid-play, prove vc-ts/vc-rust take over.
-- E4. Live Lemonic search/download, live Spotify API calls, live NetEase
-  download re-proven by an automated test (manual PHASE4 run only).
-- E5. Live Deezer full-track / Soulseek / per-user Spotify watch checks
-  (all need user creds from (D) anyway).
-
----
-
-## Appendix — per-service build/test snapshot (re-run 2026-11-03, worker B)
-
-| Service | Build | Tests pass / fail / skip | Warnings |
-|---|---|---|---|
-| core-cpp | cmake exit 0 (clean 43 s) | 47 / 0 / 0 (tdlib 7/7, store 40/40) | 8 (libstdc++ false positives) |
-| vc-go | go vet+build exit 0 | 18 / 0 / 0 (incl. live Mongo round-trip) | 0 |
-| vc-ts | n/a (stdlib Node) | 24 / 0 / 0 | 0 |
-| vc-rust | cargo test --release | 17 / 0 / 0 | 0 |
-| audio-fx-rust | cargo build exit 0 | 0 tests defined | 0 |
-| share-rust | cargo build exit 0 | 0 tests defined | 0 |
-| queue-rust | cargo build exit 0 | 0 tests defined | 0 |
-| spotify-rust | cargo test exit 0 | 8 / 0 / 0 (2 are creds-gated no-ops) | 0 |
-| gui-js | n/a | 7 / 0 / 0 | 0 |
-| radio-js | n/a | 7 / 0 / 0 (probe 5/6 stations, KEXP down) | 0 |
-| downloaders | n/a (.venv Python) | 13 / 0 / 8 skipped (live-gated) | 0 |
-| netease-go | go vet+build exit 0 | 5 / 0 / 0 (crypto only) | 0 |
-| **Total** | **0 build failures** | **146 / 0 / 8** | **8** |
-
-Toolchains are not on default PATH: Go `~/workspace/parlay/.tools/go/bin/go`
-(1.23.0), cargo `~/.cargo/bin/cargo` (1.99.1). Worker B started the Phase 4
-mongod/redis for verification and stopped them afterwards; no test
-processes left running.
-
----
-
-## Phase 6 follow-up (Worker A, 2026-11-03) — A2
-
-- **A2 — CLOSED.** core-cpp now serves its GUI HTTP API
-  (`src/http_server.*` std-only sockets on its own thread,
-  `src/core_api.*`): `GET /healthz`, `GET /api/now-playing` and
-  `GET /api/queue` (real engine state via `Dispatcher::apiNowPlaying` /
-  `apiQueueList`, same vcGet fail-over as the Telegram commands;
-  no state → `404 {"ok":false,"error":"no playback state"}`).
-  The core starts its HTTP server even with no `BOT_TOKEN`
-  (HTTP-only mode, no polling; verified with a fully empty env on
-  default `:8080`). gui-js never serves demo data when `CORE_URL` is
-  set (dead core → `{"ok":false,"error":"core unreachable"}`; core
-  errors pass through verbatim); demo state is dev-only
-  (`CORE_URL` unset, labelled `local-demo`). No `ipc.json` change
-  (these are core HTTP endpoints, not IPC actions — noted in
-  `contracts/README.md`). Core Dockerfile + compose gained a
-  `/healthz` healthcheck. Tests: core-cpp `http_api_test` 36/36
-  (incl. a stub-engine proxy proof), gui-js 11/11 (was 7); live
-  smoke core `:18080` + vc-go `:18001` + gui `:18030` proxied a real
-  queued track end to end.
-
-## Phase 6 follow-up (Worker B, 2026-11-03) — stub re-audit + docs drift
-
-Worker B ran in parallel with Worker A (A2) in the same tree; the
-grep counts below moved during the run because Worker A's new files
-landed mid-audit (see "Concurrent work" at the end). No push, no live
-Telegram test, no credentials, Mongo aside, English only.
-
-### (b) fixes — real code
-
-- **`/autoplay-skip` / `/askip` command did not exist (COMMANDS.md
-  listed it, the route table did not).** Contract `vc.autoplay_skip`
-  (`POST /v1/autoplay-skip`) exists in all three VC engines and all
-  three answer `{now_playing}` on success — the core simply never
-  routed a command to it. FIXED: route `{"autoplay-skip", "askip"}`
-  + `Dispatcher::onAutoplaySkip` (mirrors `onSkip`: `canManageVc` +
-  `callActive` gates, `vcCall "autoplay-skip"`, honest `replyError`
-  on the engine's 400 "autoplay is off" / 502 "no autoplay
-  recommendation") + channel alias `caskip` + help line, in
-  `services/core-cpp/src/dispatcher.{hpp,cpp}`. Tests: 6 new checks
-  in `tests/dispatcher_test.cpp` (success issues the call + reports
-  the pick, `/askip` alias, nothing-playing × 2, engine-400 honest
-  error); `dispatcher_test` now 53/53 (was 47/47). The `/volume` row next to
-  it in COMMANDS.md was the opposite error — listed but never routed
-  anywhere (zero `volume` hits in the dispatcher): removed from the
-  table, recorded under "Not yet" as vc-ts-IPC-only.
-- **`.env.example` missed 2 vars the code reads** (Phase 5 claimed
-  80/82, 0 missing — wrong): `MAX_BIT_DEPTH` /
-  `MAX_SAMPLE_RATE_HZ`, read via the `_env_int()` helper in
-  `services/downloaders/src/soulseek/scorer.py:49-50`. Added under
-  the Soulseek section. Re-sweep method (direct reads + `envOr` /
-  `_env_int` helpers + `_ARL_ENV`/`_FORMAT_ENV` constants): **84
-  vars read in code, 84 listed, 0 missing, 0 dead.** Also fixed the
-  header comment, which still claimed the 2 LEGACY vars
-  (`VOICE_BRIDGE` / `ASSISTANT_SESSION_FILE`) were listed below —
-  they were removed in Phase 5; none remain.
-
-### (b) fixes — docs drift (code wins in every case)
-
-- Root `README.md`: "146 tests pass … Phase 5 is closing the wiring
-  gaps" → 361 tests (Phase 5 §6), Phase 6; "vc-ts has panel toggles
-  only — A3" removed (A3 closed Phase 5); "core has no HTTP server"
-  → serves `/healthz` + `/api/*` on `:8080` (Worker A, A2);
-  "`.env.example` … (~60 vars)" → 84.
-- `services/core-cpp/README.md`: "Honest limits" still claimed
-  `/mute` is flag-only and replied-media `/play` unimplemented —
-  both closed in Phase 5; moved to Implemented (mute calls the real
-  backend on core-owned sessions; `/play` auto-takes the `file_id`).
-  Removed the self-contradictory "Not yet — TDLib C++ client —
-  implemented" bullet; fixed the Telethon wording in the voice-join
-  limit; added spotify :8007 / netease :8010 to the compose-defaults
-  line; recorded `router_test` 20/20 + `dispatcher_test` 53/53.
-- `COMMANDS.md`: header date + channel-command count 34 → 35
-  (`caskip` added, Phase 6 — counted in `dispatcher.cpp`); `/volume`
-  row removed (see above).
-- `PORT_MAP.md` §2: "Go service owns ntgcalls voice" → vc-go owns
-  queue/state only, the core owns voice; "low-ram: single ntgcalls
-  instance" → no ntgcalls in vc-go at all. §3: Soulseek "not in
-  downloaders code, wiring in progress" → DONE in Phase 5
-  (`src/soulseek/*`, live-unproven pending a Soulseek account);
-  per-user Spotify watch "intent-only" → DONE in Phase 5
-  (`spotify-rust/src/auth.rs` + `crypto.rs`, creds only missing).
-- `contracts/README.md`: core fail-over rule now names the Phase 5
-  404-for-known-action trigger (unknown-action 404s stay 404).
-- `ARCHITECTURE.md`: "the GUI reads now-playing from Redis via the
-  core" → reads it from the core's HTTP API (`GET /api/now-playing`,
-  Phase 6 A2); Redis only mirrors it inside the core.
-- `services/vc-ts/README.md`: "Files" line still said `voicecall.js`
-  has a "voice-bridge join client" — the bridge was deleted in
-  Phase 5; now "honest join failure".
-- `services/vc-rust/README.md`: "Stubbed (out of scope)" heading
-  mislabelled a missing feature (no cancel-download path) → "Known
-  gaps (not implemented — not stubs)".
-- `services/spotify-rust/README.md`: a DONE item (Genius/Musixmatch
-  wired, Phase 5) sat under "NOT implemented" → split into
-  "Wired, key-gated" vs "NOT implemented" (skip execution only).
-- `services/netease-go/README.md`: a DONE item (`MUSIC_U` login)
-  sat under "Still stubbed" → moved out; only QR login remains
-  unimplemented there.
-- `services/vc-rust/src/main.rs:73` (doc comment): `resolved_by`
-  listed `"pattern"` / `"url-pattern"` as possible values — neither
-  is produced any more (Phase 5 A9); corrected to the real set
-  (`"yt-dlp"` / `"spotify-api"` / `"autoplay-mix"` / `"client"`).
-- Stale "Still stubbed / Real vs stubbed" sections in the Phase 3
-  PROGRESS logs, each now carrying a SUPERSEDED note naming what
-  changed (old bullets kept as history): `netease-go` (MUSIC_U,
-  weapi/linuxapi, mirror download), `downloaders` (deezer/tiktok/
-  navidrome real since Phase 4), `vc-ts` (real voice transport,
-  JioSaavn durations, lyrics/panel, placeholders deleted),
-  `vc-go` (degraded resolver deleted, Mongo real, yt-dlp verified),
-  `gui-js` (in-browser playback real since Phase 4). Wording-only
-  fixes: `vc-rust` PROGRESS "STUBBED: voice join" → "BLOCKED
-  (host-gated, not a stub)"; `radio-js` PROGRESS "voice path is
-  itself stubbed" → same correction.
-- NOT touched (already accurate): `downloaders/README.md`,
-  `audio-fx-rust` / `share-rust` / `queue-rust` READMEs + PROGRESS,
-  `spotify-rust/PROGRESS.md` (dated Phase 3 log), `vc-go/README.md`,
-  `vc-ts/README.md` (except the Files line above),
-  `gui-js/README.md` (Worker A updated it for A2).
-
-### (c) confirmations — key-gated paths fail honestly, naming the var
-
-Verified in code + covered by the existing suites (no keys exist
-here; nothing was run against a live provider):
-
-- Deezer without `DEEZER_ARL` → 30 s preview with an honest note;
-  ARL failure → preview fallback (`downloaders/src/deezer.py`,
-  `tests/test_deezer_arl.py` 8/8).
-- NetEase without `NETEASE_MUSIC_U` → `auth: anonymous`, mirror
-  fallback (`netease-go`, 9 cookie tests; response exposes `auth`).
-- Genius/Musixmatch without keys → LRCLib only
-  (`spotify-rust`, chain Genius → Musixmatch → LRCLib).
-- Gemini without `GEMINI_API_KEY` → wordlist classifier, verdict
-  says so (`spotify-rust/src/classifier.rs`, stub-server tests).
-- Spotify creds missing → 503 `engine_unavailable` naming
-  `SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`
-  (`spotify-rust/src/main.rs:1303,1389`); per-user auth without
-  creds → 503 naming the vars + `SPOTIFY_REDIRECT_URI`.
-- Lemonic without a key → unauthenticated-first, Bearer only when
-  `LEMONIC_API_KEY` is set (`vc-ts`, stub-API tests).
-- Soulseek/slskd down or not logged in → `engine_unavailable`
-  naming `SLSKD_URL` (`downloaders`, `tests/test_soulseek.py` 16/16).
-- TDLib without `TD_*` → backend `available()=false` with the exact
-  reason, never a fake join (`core-cpp`, `tdlib_test` 26/26).
-- yt-dlp missing → 502 `engine_unavailable` in vc-go/vc-ts/vc-rust,
-  nothing queued (A9; no degraded placeholder anywhere — verified:
-  `DEFAULT_DURATION_SEC` / `degradedTrack` zero hits in code).
-
-### Still stubbed / remaining (key-gated + host-gated only)
-
-- **A1 live voice join** — unchanged: no live join has ever happened
-  (Opus/RTP proven to a file in all three engines; `libntgcalls.so`
-  built; join needs a host + assistant session + open network).
-- **A2 — CLOSED by Worker A** (see the section above; verified live
-  by Worker B only as far as `:18080` `/healthz` → `{"ok":true}` and
-  `/api/now-playing` 400/404 honest errors — the full proxy proof is
-  Worker A's `http_api_test` 36/36 + live smoke).
-- **A5/A6 compose-up** — still never run (no Docker in the sandbox);
-  Worker A only added the core healthcheck.
-- **A7 Mongo SCRAM, A11 shared store** — aside per user decision.
-- **B1/B2/B3/B5/B8** — key-gated only (Spotify OAuth creds, Deezer
-  ARL, NetEase MUSIC_U, Genius/Musixmatch keys, Lemonic live API).
-- **B4 Soulseek live search/download** — needs a Soulseek account
-  (username + password, user-supplied only).
-- **B6/B7** — scope decisions, unchanged (music-only; recognize
-  dropped).
-- **B11 core honest limits** — `/speed`/`/bass` now APPLIED on
-  core-voice sessions (replied files; `applyCoreFilter` re-attaches
-  the recorded source with atempo/lowpass at the current position)
-  and honestly saved-not-applied on engine sessions — no vc engine
-  can take the filter (vc-go has no audio path; vc-ts/vc-rust run
-  fixed ffmpeg pipelines with no `-af`; applying it there needs a
-  new audio-filter subsystem, not a core change — see the Phase 6
-  Worker C section at the end of this file for per-engine evidence).
-  `/broadcast` errors file and `/speedtest` upload are DONE by
-  Worker C (see that section; live upload number unproven from the
-  sandbox — POST bodies stall at the egress proxy). `/mute` and
-  replied-media `/play` are DONE (see above); `/autoplay-skip` is
-  DONE by this worker. `/lang` is English-only per user decision,
-  not a gap.
-- **C1 thin coverage** — unchanged (spotify-rust 2 creds-gated
-  no-op tests, netease-go crypto-only + no automated live download
-  test, downloaders 8 live-skipped).
-- **C2** — core-cpp 8 libstdc++ warnings, vc-go slow clean build,
-  TDLib one-off build cost — unchanged.
-- **Demo state** — gui-js serves labelled `local-demo` state ONLY
-  when `CORE_URL` is unset (dev-only, Worker A); the only other
-  "demo" hits in code are the public Navidrome demo URL in doc
-  comments and the Soulseek scorer's `"demo"` version-penalty
-  keyword (a real metadata heuristic, not demo data).
-
-### Grep counts (same command as the audit appendix)
-
-- Before (start of this worker, 2026-11-03): **530 lines** —
-  stub 178, `engine_unavailable` 119, demo 86, fake 75,
-  placeholder 22, mock 22, dummy 5, hardcoded 3, XXX 2
-  (1 mkstemp template, false positive). TODO 0, FIXME 0, HACK 0,
-  NotImplemented 0, unimplemented 0, pass-through 0.
-- After (end of this worker): **593 lines** — stub 212,
-  `engine_unavailable` 120, demo 114, fake 85, placeholder 23,
-  mock 22, dummy 5, hardcoded 3, XXX 2. The +63 is new code, not
-  new stubs: Worker A's A2 files (`http_api_test.cpp` stub-engine
-  tests, `http_server.hpp`/`core_api.hpp` comments, gui-js demo
-  gating + tests) and this worker's own additions (4 dispatcher
-  tests, `onAutoplaySkip` comments, SUPERSEDED notes quoting the
-  old stub language). Every added non-test hit was classified above
-  or is Worker A's (legitimate: stub test engines, "never demo/fake
-  data" comments).
-
-### Concurrent work (read before merging)
-
-Three Phase 6 workers shared this tree during this run. Worker A
-(A2) and Worker B (this audit) both edited `README.md`,
-`contracts/README.md`, `services/core-cpp/README.md`,
-`services/core-cpp/src/dispatcher.cpp` and `REMAINING.md` — the
-diffs interleave cleanly (different sections) except
-`dispatcher.cpp`, where Worker A added `apiNowPlaying` /
-`apiQueueList` and Worker B added `onAutoplaySkip` (both present,
-full core build + `dispatcher_test` 53/53 pass). A third worker
-was rebuilding `parlay-core` in `services/core-cpp/build/` at
-~21:34 UTC while this report was written; the binary was briefly
-absent mid-rebuild — that is the rebuild, not a breakage. Do not
-re-run the "before" grep against a later tree and expect 530.
-
-## Phase 5 follow-up (Worker E, 2026-11-03) — A5/A6/C1/C3/C4, B6/B7/B9/B10
-
-### Closed by Worker E
-- **A5** — compose is now the single source of truth: explicit `PORT`
-  per service (audio-fx 8004, share 8005, queue 8006, downloaders 8009
-  override code defaults 8003/8004/8005/8010); core `*_URL` vars match;
-  `PARLAY_DATA_DIR=/data/<service>` per service (vc-ts and radio-js both
-  write `state.json`, so no shared `/data`); dead `DATABASE_URL` removed
-  (A11); `NAVIDROME_PASSWORD` everywhere (A12).
-- **A6** — all 10 missing Dockerfiles added (vc-ts/radio-js updated with
-  curl + HEALTHCHECK). Healthchecks on every HTTP service except core
-  (no HTTP server, A2); core `depends_on` with `service_healthy` for
-  mongo/redis/vc-go/downloaders. slskd service added (profile full).
-  Static validation: 222 checks pass
-  (`phase5/worker-e-compose-check.py`). **Compose-up still unverified**
-  — Docker is not installed in the sandbox.
-- **C1 (partial)** — audio-fx-rust 6/6, share-rust 5/5, queue-rust 8/8
-  tests added (were 0 each). Downloaders 26 run / 18 pass + 8 skipped
-  (+5 new collection tests). Netease-go 11/11 (+6 new server tests).
-- **C3** — root README, ARCHITECTURE.md, PORT_MAP.md §1–§3, core-cpp
-  README + PROGRESS.md, vc-rust README tail + PROGRESS.md, netease-go
-  README, PHASE4-TDLIB.md §5, gui-js README, downloaders README fixed
-  (see `phase5/worker-e-compose.md` §4 for the list).
-- **C4** — `.env.example` rewritten: 64/64 vars read in code covered,
-  0 missing; `VC_ENGINE` + `NAVIDROME_PASS` removed; `YT_DLP` unified
-  (vc-rust code changed `YTDLP_BIN` → `YT_DLP`).
-
-### Scope decisions (explicit, do not silently re-open)
-- **B6 — Beetube movie/anime/torrent: MUSIC-ONLY.** Not ported. The
-  providers depend on Beetube's external API backend + torrent clients;
-  no quick real implementation exists and an `engine_unavailable` stub
-  does not count. Recorded in ARCHITECTURE.md, PORT_MAP.md, downloaders
-  README.
-- **B7 — `netease.recognize`: DROPPED from scope.** Needs an external
-  fingerprint backend + login; no contract action exists. Recorded in
-  ARCHITECTURE.md, netease-go README + `main.go`.
-- **B9 — DONE:** `POST /v1/spotify/collection` implemented in
-  downloaders (contract shape `{api, kind, name, tracks, truncated}`,
-  metadata only, capped at 50; 5 offline tests).
-- **B10 — DONE:** `POST /v1/search` implemented in netease-go
-  (`source` must be netease/all/absent, else 400; 6 offline tests).
-- **B2 — DONE (Worker D, verified by Worker E):** Deezer ARL wired —
-  `DEEZER_ARL` + `DEEZER_FORMAT` (default MP3_320) read in
-  `services/downloaders/src/deezer.py`; previews without ARL or on ARL
-  failure; needs pycryptodomex for the ARL path. Tests
-  `tests/test_deezer_arl.py` 8/8. Soulseek client reads all 8 `SLSKD_*`
-  vars (`SLSKD_URL`/`SLSKD_HOST` default `http://slskd:5030`,
-  `SLSKD_API_KEY`, `SLSKD_API_TIMEOUT_SECS` 30,
-  `SLSKD_SEARCH_MIN_INTERVAL_SECS` 10, `SLSKD_DOWNLOAD_DIR` default
-  `$PARLAY_DL_DIR/.slskd-downloads`, `SLSKD_STALL_SECS` 120,
-  `SLSKD_DOWNLOAD_TIMEOUT` 900, `SLSKD_MAX_PEER_ATTEMPTS` 3,
-  `SLSKD_SLOW_MIN_MBPS` 0); tests `tests/test_soulseek.py` 16/16.
-  Downloaders suite now 50 run / 42 pass + 8 live-skipped, 0 fail.
-- **B3 — DONE (Worker E, scope update):** `NETEASE_MUSIC_U` login
-  wired in netease-go — `Client.musicU` + `base`, `setAuthHeaders()`
-  sends `Cookie: MUSIC_U=<value>` only to NetEase hosts (never the
-  mirror); eapi/weapi/linuxapi/downloads all covered; `eapiCookie()`
-  swaps `MUSIC_U` in for anonymous `MUSIC_A`. 9 offline tests
-  (`internal/netease/client_test.go`); netease-go suite 20/20. Only
-  the user's cookie is missing.
-- **B5 — DONE (Worker E, scope update):** Genius + Musixmatch lyrics
-  wired in spotify-rust against the PUBLIC APIs (Genius
-  `api.genius.com/search` + song-page `data-lyrics-container` scrape;
-  Musixmatch `matcher.lyrics.get`; restricted/instrumental → None).
-  Chain Genius → Musixmatch → LRCLib in `fetch_lyrics()`, wired into
-  `decide_skip` step 3. 9 offline tests; spotify-rust suite 40/40.
-  Only the keys are missing.
-- **C4 (refresh) — DONE:** `.env.example` re-verified after the scope
-  update: **77 vars read in code, 77/77 covered, 0 missing** (79
-  listed; the only 2 extras are LEGACY `VOICE_BRIDGE` /
-  `ASSISTANT_SESSION_FILE`). Added all 8 `SLSKD_*` vars,
-  `DEEZER_FORMAT`, `GENIUS_ACCESS_TOKEN`, `MUSIXMATCH_API_KEY`;
-  "(not yet read)" markers removed from `DEEZER_ARL`,
-  `NETEASE_MUSIC_U`, `SLSKD_URL`, `SLSKD_API_KEY`.
-- **C1 (final counts) —** audio-fx 6/6, share 5/5, queue 8/8,
-  downloaders 50 run / 42 pass + 8 skipped, netease-go 20/20,
-  spotify-rust 40/40, vc-rust 30/30, core-cpp build exit 0.
-
-### Opened / handed over by Worker E (not closed)
-- vc-rust not compiling (reported in the first pass) is now FIXED by
-  the bridge-kill worker: `cargo check` clean, tests 30/30.
-  (Supersedes the vc-rust item below.)
-- `ipc.json` version still `0.1.0-scaffold` (C5, Worker B owns it).
-- Compose-up on a Docker host still never run (see A6 above).
-
-## Appendix — grep counts (worker A)
-
-218 grep lines over `services/` (excluding refs/.venv/node_modules/build/
-target/phase4/tdlib-src): stub 129, `engine_unavailable` 64, placeholder
-10, "not implemented" 10, passthrough 5, dummy 4, NotImplemented 1,
-"not supported" 1, XXX 1 (false positive: mkstemp template
-`core-cpp/src/http.cpp:44`). TODO 0, FIXME 0, HACK 0, mock 0,
-unimplemented 0. Split: doc-only 113, test files 51, non-test non-doc
-code 59 — of which 34 are the legitimate `engine_unavailable` error
-code, 6 are degraded placeholders (A9), and the rest are comments,
-test-only code, or false positives.
-
-## Phase 6 follow-up (Worker C, 2026-11-03) — full verification + B11
-## (broadcast + speedtest upload DONE, /speed+/bass recorded) + core
-## shutdown abort found + fixed
-
-No push, no live Telegram test, no credentials, Mongo aside, English
-only. Work log + smoke script/results: `phase6/` (gitignored).
-
-### (1) Full verification — every suite rebuilt + re-run fresh
-
-| Suite | Result |
+# Parlay — REMAINING.md (source of truth)
+
+Date: 2026-11-03. Rewritten by the Phase 7 coordinator after re-verifying
+every Section A item against the current tree (rebuilds + full test runs
++ combined smoke + fresh stub grep). This file contains ONLY what truly
+remains. Everything else from the original audit is closed and is NOT
+listed here — the per-item history lives in PHASE7.md.
+
+Method: 7 workers (verification, A1 join, A1b audio, A6 compose, A7
+SCRAM, A11 shared store, residuals) with reports in `phase7/` (gitignored);
+coordinator re-ran every suite itself (see Appendix). No live Telegram
+join was attempted from the sandbox; the user is live-testing on their
+own host right now and that test is the remaining proof for A1.
+
+## Verification totals (coordinator re-runs, 2026-11-03)
+
+**717 passed / 0 failed / 13 skipped** across 12 services. Combined
+smoke **12/12** `/healthz` 200. Stub grep: **0 real stubs** in non-test
+code (0 TODO / FIXME / HACK / NotImplemented, case-sensitive; XXX is
+only the mkstemp template in `core-cpp/src/http.cpp:109`; the remaining
+"stub"/"placeholder"/"dummy"/"mock" hits are removal comments, test-only
+stub cores/engines, and test credentials).
+
+| Service | Tests pass / fail / skip |
 |---|---|
-| core-cpp `router_test` | 20/20 |
-| core-cpp `dispatcher_test` | 63/63 (53 + 10 new broadcast checks) |
-| core-cpp `http_api_test` | 37/37 (36 + 1 stop-race check) |
-| core-cpp `tdlib_test` | 26/26 (incl. real 466 B ntgcalls offer) |
-| core-cpp `store_test` (live mongo+redis) | 40/40 |
-| core-cpp `telegram_api_test` (new) | 24/24 |
-| vc-go `go vet` + `go build` + `go test ./...` | 27 pass + 3 live-skipped, 0 fail |
-| vc-ts `npm test` | 32/32 |
-| vc-rust `cargo test --release --offline` | 31/31 |
-| spotify-rust `cargo test --release --offline` | 40/40 |
-| audio-fx-rust / share-rust / queue-rust | 6/6, 5/5, 8/8 |
-| downloaders `unittest discover` | 50 run: 42 pass + 8 live-skipped, 0 fail |
-| netease-go `go vet` + `go build` + `go test ./...` | 23/23 |
-| gui-js / radio-js `npm test` | 11/11, 7/7 |
-| **Total** | **442 passed / 0 failed / 11 skipped** |
+| core-cpp dispatcher / router / http_api / tdlib / telegram_api / store / scram | 128 / 20 / 71 / 44 / 24 / 40 / 67 — 394 / 0 / 0 |
+| vc-go | 30 / 0 / 5 (3 live YouTube + 2 store-gated; the 3 live pass with `PARLAY_LIVE_TEST=1`) |
+| vc-ts | 52 / 0 / 0 |
+| vc-rust | 50 / 0 / 0 |
+| spotify-rust | 51 / 0 / 0 |
+| audio-fx-rust / share-rust / queue-rust | 6 / 17 / 20 / 0 / 0 |
+| downloaders | 42 / 0 / 8 (live-gated) |
+| netease-go | 23 / 0 / 0 |
+| gui-js / radio-js | 11 / 21 / 0 / 0 |
 
-Phase 5 was 361/0/11; the +81 is http_api 36 (Worker A) +
-dispatcher +6 (Worker B) + gui +4 (Worker A) + this worker's
-telegram_api 24 + dispatcher +10 + http_api +1. Clean core build:
-exit 0, 8 warnings (same libstdc++ `-Wmaybe-uninitialized` false
-positives as before, none in service code).
+Toolchains are not on default PATH: Go `~/workspace/parlay/.tools/go/bin/go`,
+cargo `~/.cargo/bin/cargo`. Mongo 8.0.4 is `.tools/mongodb/bin/mongod`
+(the 7.0.14 binary in `.tools/mongo/bin/` cannot open 8.0.4 dbpaths —
+exit 62); `tdlib_test` prints 44 PASS only when run from
+`services/core-cpp` (CWD-relative `.so` resolution), 28 from elsewhere.
 
-Notes from the run:
-- `tdlib_test` prints 26 PASS only when run from
-  `services/core-cpp`: the real-offer checks resolve
-  `../../refs/ntgcalls/shared-output/lib/libntgcalls.so` relative to
-  the working directory (from `/tmp` it prints 24 PASS + `SKIP
-  real-offer check`, exit 0 either way). The `.so` exists
-  (98,121,040 B); the 24-vs-26 difference is CWD, not a regression.
-- The Phase 4 mongod/redis were killed mid-run by a `/tmp` wipe
-  (tmpfs hit 98% — the re-extracted mongo tree filled it). They were
-  restarted for verification (mongod binary copied to
-  `.tools/mongo/bin/mongod`, fresh dbpath `phase6-mongo-data/` in the
-  workspace, redis `:6399` from the Phase 4 build) and STOPPED at the
-  end of this run, per the task: **mongo + redis are down now**.
-  Restart with the same commands if another worker needs
-  `store_test`. `/tmp` is unreliable here (wiped once, 512 MB) —
-  build/test artifacts for this run live in `phase6/` + `/tmp/
-  parlay-phase6/` (small files only).
-- vc-rust fresh release build emits **2 dead-code warnings**
-  (pre-existing, Phase 5 code, not this worker's):
-  `BackendConfig` fields `ok`/`missing`/`lib`/`offer_fallback`
-  never read + `describe()` never used (`src/voice.rs:526-537`).
-  Tests still 31/31.
+---
 
-### (2) Combined live smoke: 12/12 healthz 200
+## (A) What remains — Section A
 
-All 12 services started on their compose ports with empty env (no
-`BOT_TOKEN` — core HTTP-only) and answered `GET /healthz` 200
-(`phase6/smoke.sh`, results `phase6/smoke-results.txt`):
+### A1. Live voice join — code complete, live proof pending (user testing now)
+- What is DONE in code: the join is core-owned — `POST /v1/join` →
+  `Dispatcher::joinVoice` → TDLib backend (`authorize → getChat /
+  createVideoChat → joinVideoChat → ntg.connect`); vc-ts/vc-rust
+  delegate their joins to the core over IPC and never claim a join
+  they cannot do; `TD_SESSION_DIR` defaults under the data dir and
+  `TDJSON_LIB`/`NTGCALLS_LIB` resolve from `lib/` next to the binary.
+  The core streams engine-resolved audio through its own ntgcalls
+  session (`attachEngineAudio()` in `dispatcher.cpp`: `/play`,
+  `/playforce`, `/playplaylist`, `/radio`, autoplay picks; skip /
+  pause / resume / seek / stop kept in step; a 5 s watcher follows
+  engine-internal auto-advance). Attach failure stops the engine
+  playback and replies the exact error — never a "Now playing" lie.
+  Offline proof: tdlib 44/44, http_api 71/71, dispatcher 128/128
+  (stub engine returning known `stream_url`s), vc-ts 52/52, vc-rust
+  50/50. `libntgcalls.so` 3.0.5 built, `libtdjson.so` 1.8.69 built.
+- What still needs PROOF (host + session-gated, not a code gap): one
+  `/play` with audible audio in a real group call; track 2 of a queue
+  audible too (watcher follow); `/skip` switching audio cleanly;
+  `/pause` / `/seek` / `/speed` / `/bass` acting on the audible
+  stream; `/play` with the backend down replying the honest error.
+  Needs a host with open network + a pre-authorized assistant session
+  (phone/QR first-auth or a session dir) + the built `.so`s in `lib/`.
+  The sandbox cannot prove this: UDP `sendto` is EPERM even to
+  loopback and there is no direct TCP to Telegram DCs (proven again
+  in Phase 6).
 
-- core-cpp `:8080` → `{"ok":true}`
-- vc-go `:8001` → `{"ok":true,"data":{"buffer_kb":256,"degraded":true,"engine":"go","profile":"low-ram","yt_dlp":false,...}}`
-- vc-ts `:8002` → `{"ok":true,"service":"vc-ts","engine":"ts","yt_dlp":true,...,"voice":{"joined":false,"chats":0,...}}`
-- vc-rust `:8003` → `{"ok":true,"service":"vc-rust","data":{"service":"vc-rust","status":"ok"}}`
-- audio-fx-rust `:8004`, share-rust `:8005`, queue-rust `:8006`,
-  spotify-rust `:8007` → same `{"ok":true,...,"status":"ok"}` shape
-- radio-js `:8008` → `{"ok":true,"service":"radio-js","stations":6,"active_radios":0,...}` (startup probe: all 6 stations unreachable from the sandbox, honestly reported; healthz still 200)
-- downloaders `:8009` → `{"ok": true, "service": "downloaders"}`
-- netease-go `:8010` → `{"ok":true,"service":"netease-go"}`
-- gui-js `:3000` → `{"ok":true,"service":"gui-js"}`
+### A6. `docker compose up` — never run (host-gated, proven impossible here)
+- What is DONE: all 12 Dockerfiles exist (proxy `ARG`s added in
+  Phase 7); `docker compose config` is clean; core + all services
+  have healthchecks; compose is the single source of truth for ports.
+  Proven instead: a native sweep with the exact compose env (dummy
+  creds, Dockerfile CMDs, real mongo/redis/slskd) answers `GET
+  /healthz` 200 on all 12 services (see `phase7/` sweep results).
+- What still needs PROOF: one `docker compose --profile full up
+  --build` + healthz sweep on a real Docker host. The sandbox cannot
+  do it — proven, not assumed: every container start fails in runc
+  with `setns: operation not permitted` (plain run, `--userns=host`,
+  and a full rootless attempt all fail identically); the sandbox sets
+  `NoNewPrivs: 1` on all processes, so no OCI runtime path can start
+  a container here. Evidence in `phase7/worker-a6-compose.md`.
 
-No service failed to start or answer; no stray processes left
-(radio-js station probe + spotify-rust fresh token-key generation
-both happened inside the smoke temp dir, nothing persisted to the
-repo). Core teardown takes ~2 s (TDLib `close()` pump), so the
-smoke script now waits 5 s after SIGTERM before SIGKILL — a 1 s
-grace SIGKILLed the core mid-teardown and lost its buffered
-`parlay-core: shutting down.` line.
+---
 
-### (3) Core shutdown abort — FOUND by the smoke, FIXED
+## (B) Key-gated only — code complete and env-gated, only the key is missing
 
-- Symptom: every `SIGTERM` aborted parlay-core (exit 134, glibc
-  `*** bit out of range 0 - FD_SETSIZE on fd_set ***`). Found
-  because the first smoke run's core log ended with that line.
-- Root cause: `HttpServer::stop()` closed the listen socket and
-  stored -1 in `listen_fd_` while the accept thread was between
-  `select()` returning and `FD_ISSET(listen_fd_)` — the
-  `shutdown()` wakes `select()`, the main thread closes the fd and
-  stores -1, the accept thread then evaluates `FD_ISSET(-1)`.
-  Our code's only `FD_SET`/`FD_ISSET` use is this loop
-  (`src/http_server.cpp`); the TDLib log lines next to the abort
-  were a red herring (the probe client tears down at startup).
-- Fix: `listen_fd_` is now `std::atomic<int>`; the accept loop
-  snapshots it once per iteration and uses only the snapshot for
-  `FD_SET`/`FD_ISSET`/`select`/`accept`; `stop()` exchanges -1.
-  A closed fd now surfaces as `select`/`accept` EBADF, which breaks
-  the loop. Files: `services/core-cpp/src/http_server.{hpp,cpp}`.
-- Proof: old binary 8/8 SIGTERMs → exit 134; fixed binary 8/8 →
-  exit 0 with `parlay-core: shutting down.` Under `strace` the old
-  binary exited 0 once (timing-sensitive — the race needs the main
-  thread to win the close/store before the woken accept thread
-  runs). Regression test added (`tests/http_api_test.cpp`,
-  25 start/serve/stop cycles) — honest caveat, written in the test
-  comment: it exercises the exact failing shape but did NOT
-  reproduce the abort against the old code (250+ cycles pass; in a
-  bare test process the woken accept thread wins, in the real core
-  the main thread won 8/8). The binary-level 8/8 loop is the proof,
-  not the test.
+No code work remains on these; each fails honestly naming the exact
+env var when the key is absent, and works when it is set. Tests use
+stubbed providers (no real keys exist here).
 
-### (4) B11 — `/broadcast` errors file: DONE
+| What | Missing | Where it is read |
+|---|---|---|
+| Deezer full tracks (previews only without) | `DEEZER_ARL` (+ optional `DEEZER_FORMAT`) | `services/downloaders/src/deezer.py` |
+| NetEase direct URLs (mirror fallback works) | `NETEASE_MUSIC_U` | `services/netease-go` |
+| Genius / Musixmatch lyrics (LRCLib works) | `GENIUS_ACCESS_TOKEN` / `MUSIXMATCH_API_KEY` | `services/spotify-rust` |
+| AI classifier (wordlist fallback works) | `GEMINI_API_KEY` | `services/spotify-rust/src/classifier.rs` |
+| Per-user Spotify watch / OAuth | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` (+ `SPOTIFY_REDIRECT_URI`) | `services/spotify-rust/src/auth.rs` |
+| Lemonic live API (unauthenticated-first works) | `LEMONIC_API_KEY` (optional) | `services/vc-ts` |
+| Soulseek live search/download (slskd daemon runs) | Soulseek username + password | `services/downloaders/src/soulseek/*` (via `SLSKD_*`) |
+| Bot owner / sudo model | `OWNER_ID` / `SUDO_IDS` (still unset) | `services/core-cpp` |
+| Shared IPC token | `PARLAY_TOKEN` (still unset; each service defaults independently) | all services |
 
-- Real `sendDocument` in core-cpp `telegram_api`
-  (`src/telegram_api.{hpp,cpp}`): Bot API `sendDocument` as
-  multipart/form-data via the new
-  `HttpClient::postMultipart` (`src/http.{hpp,cpp}` — boundary
-  generated per call, verified absent from every value; the
-  filename is sanitized to `[A-Za-z0-9._-]` so a hostile name
-  cannot smuggle a path or a forged part). Returns the new message
-  id, -1 + error on `ok:false` / HTTP error.
-- `onBroadcast` (`src/dispatcher.cpp`) now sends the failure list
-  as an `errors.txt` attachment with a `Broadcast failures (N
-  chats):` caption; if the upload itself fails it falls back to the
-  inline truncated list (with the upload error named) instead of
-  silently losing the ids. `forwardMessage`/`copyMessage` made
-  virtual so dispatcher tests can script fan-out outcomes.
-- Tests: new `tests/telegram_api_test.cpp` **24/24** (stub-server
-  proof of the multipart body: boundary, chat_id/caption fields,
-  `errors.txt` part, exact file bytes; hostile-filename
-  sanitizing; ok:false + HTTP 500 honest failures; `postRaw`
-  512 KiB binary body byte-exact; `postJson` still
-  `application/json`); `dispatcher_test` **63/63** (+10: attachment
-  sent with only the failed id, all-delivered sends nothing,
-  upload-failure inline fallback, no-reply usage error).
-- `COMMANDS.md` + core-cpp README "Honest limits" updated.
+---
 
-### (5) B11 — `/speedtest` upload: DONE (with sandbox evidence)
+## (C) Known limitations — not stubs, not blockers
 
-- Real upload probe in `onSpeedtest` (`src/dispatcher.cpp`): 8 MB
-  POST to `https://speed.cloudflare.com/__up` via the new
-  `HttpClient::postRaw` (`src/http.{hpp,cpp}` — raw body with an
-  explicit Content-Type through the same temp-file curl path as
-  `postJson`), timed separately, reported as `Upload: X Mbps`
-  next to the download number. An upload failure is reported
-  honestly (`Upload probe failed (HTTP …)`) instead of failing the
-  whole test.
-- Mechanism proof: `telegram_api_test` postRaw check (see §4).
-  Live evidence from the sandbox (curl, same endpoints/bytes as
-  the code): download probe **works** — 25 MB in 7.36 s (~27
-  Mbps); upload probe **times out** — 60 s, 0 bytes received.
-  The sandbox egress stalls large POSTs to
-  `speed.cloudflare.com`, so a sandbox `/speedtest` reports the
-  download number plus an honest upload failure. A real upload
-  number needs a host with open egress.
-- `COMMANDS.md` + core-cpp README updated.
+- Mongo client: `mongodb+srv://` URIs and replica sets are rejected
+  (single-host client only); no SASLprep (exact for ASCII passwords);
+  no channel binding. SCRAM-SHA-1/256 itself is fully implemented in
+  core-cpp, all 4 Rust `store.rs` copies, and both Node `store.js`
+  copies, proven against live auth mongods.
+- Thin live coverage (by design, live-gated): downloaders 8 tests
+  skipped without `PARLAY_LIVE_TEST=1`; netease-go has no automated
+  live download test (manual Phase 4 run only); spotify-rust has 2
+  creds-gated no-op live tests.
+- Build cost (not correctness): core-cpp 8 libstdc++
+  `-Wmaybe-uninitialized` false positives on every clean build
+  (~43 s); vc-rust 1 dead-code warning (`BsonValue::Int`); vc-go
+  clean build ~92 s (Mongo driver compile; warm ~8 s); TDLib is a
+  ~56 min one-off build (prebuilt `.so` ships in the release
+  tarball instead).
 
-### (6) B11 — `/speed` + `/bass`: NOT DONE (last non-key gap)
+---
 
-Deliberately not half-implemented: the task's bar is a contract
-action carrying speed/bass to the engines + an ffmpeg
-atempo/bass filter applied in the play pipeline of at least the
-default engine vc-go. vc-go has **no audio pipeline at all**, so
-that bar cannot be met as specified. What exists, what is missing,
-and what "done" needs — all verified by reading the code, not by
-assumption:
+## Appendix — per-service build/test snapshot (coordinator re-run 2026-11-03)
 
-- Contract (`contracts/ipc.json` v0.2.0): `vc.seek` request is
-  `{chat_id, position_sec}` only; `vc.play` is `{chat_id, query,
-  requested_by}`; `NowPlaying` has no speed/bass fields; zero
-  `speed`/`bass` hits in the file (the one hit is
-  `fx.apply`'s `effect: ...|bass-boost|...`, a different feature).
-- Dispatcher (`services/core-cpp/src/dispatcher.cpp:1694-1800`,
-  `onSpeed`/`onBass`): stores the value per chat, then calls
-  `vcCall "seek" {chat_id, position_sec}` — the engines are never
-  told the value. The old comment claiming "the atempo filter
-  itself is applied by engines that support it" was false and has
-  been corrected in place; the reply text (`Speed set to 1.5x
-  (stream restarted at the current position)`) still over-claims
-  for engine sessions — the restart happens, the filter does not.
-- vc-go (default engine): `handleSeek` → `room.SeekTo(position)`
-  only; `handlePlay` resolves + queues; **zero ffmpeg hits** in
-  `services/vc-go/` — it is queue/state only by design. A filter
-  in vc-go means building an audio pipeline there first, not a
-  wiring fix.
-- vc-ts: `/v1/seek` sets `room.position_sec` only
-  (`src/main.js:609-618`); `opusPipeline(source, opts)`
-  (`src/voicecall.js:254-330`) runs ffmpeg once per track at
-  playStream time (fire-and-forget) with a fixed
-  `-map 0:a -c:a libopus` chain — no `-af`, no atempo/bass
-  anywhere in the file; there is no cancel/replace handle to
-  re-run it on seek.
-- vc-rust: `handle_seek` sets `position_sec` only
-  (`src/main.rs:1288-1318`); `opus_pipeline`
-  (`src/voice.rs:322`) is the same fixed ffmpeg chain, no `-af`.
-- Core voice (the one place a filter already exists):
-  `buildFfmpegCmd(src, seek_sec, speed, bass, video)`
-  (`services/core-cpp/src/voice_call.cpp:53-96`) already builds
-  `-af "atempo=X"` and a bass term, and `VoiceCall::play()` already
-  carries `speed`/`bass` parameters — but the dispatcher never
-  passes the stored values: `playRepliedFile` calls
-  `voice_.play(chat, saved, title, video)` with the defaults
-  (`dispatcher.cpp`, replied-file path). Two honesty notes on that
-  filter: the bass term is `lowpass=f=150,volume=1+bass/100` — a
-  crude approximation that lowpasses the whole signal (kills
-  treble); a real boost is ffmpeg's `bass=g=<dB>` filter.
-- What done looks like, in order: (1) contract — add optional
-  `speed` (number, 0.5–2.0) + `bass` (int, 0–100) to `vc.seek`
-  (or a new `vc.speed`/`vc.bass` action) + `speed`/`bass` on
-  `NowPlaying`; (2) vc-ts/vc-rust — thread speed/bass into
-  `opusPipeline`/`opus_pipeline` ffmpeg args
-  (`-af atempo=…[,bass=g=…]`), re-run the pipeline on seek (needs
-  a cancel/replace handle — `playStream` is fire-and-forget
-  today), store + report them in now-playing; (3) vc-go —
-  decide explicitly: either it stays state-only and `/speed` on
-  go-engine chats reports honestly that the filter does not
-  apply, or it gains an audio pipeline (a new subsystem, not a
-  wiring fix); (4) dispatcher — pass speed/bass in the seek body
-  and pass the stored values in `playRepliedFile`; (5) tests —
-  stub-engine proof the seek body carries the values,
-  ffmpeg-command proof the filter is applied, ffprobe duration
-  proof for atempo (a 10 s tone at 1.5x probes ~6.7 s). Audible
-  proof needs a live voice join (A1) anyway.
-- `/lang` is English-only per user decision — NOT a gap, left alone.
-
-### (7) Files changed by Worker C
-
-- `services/core-cpp/src/http.{hpp,cpp}` — `postRaw`,
-  `postMultipart`, `runWithContentType` refactor.
-- `services/core-cpp/src/http_server.{hpp,cpp}` — shutdown-race
-  fix (atomic fd snapshot) + `HttpRequest.headers` map.
-- `services/core-cpp/src/telegram_api.{hpp,cpp}` — real
-  `sendDocument`; `forwardMessage`/`copyMessage` virtual.
-- `services/core-cpp/src/dispatcher.cpp` — broadcast
-  `errors.txt`, speedtest upload probe, corrected /speed comment.
-- `services/core-cpp/tests/telegram_api_test.cpp` (new, 24/24),
-  `tests/dispatcher_test.cpp` (+10 broadcast),
-  `tests/http_api_test.cpp` (+1 stop-race).
-- `services/core-cpp/README.md` (counts + limits),
-  `COMMANDS.md` (broadcast/speedtest rows + Not-yet),
-  `REMAINING.md` (this section).
-- `phase6/smoke.sh`, `phase6/smoke-results.txt` (12/12 evidence).
-- `.tools/mongo/bin/mongod` (binary copy out of /tmp so a tmpfs
-  wipe cannot take it), `phase6-mongo-data/` (fresh mongod dbpath).
+| Service | Build | Tests pass / fail / skip |
+|---|---|---|
+| core-cpp | cmake exit 0 | 394 / 0 / 0 (dispatcher 128, router 20, http_api 71, tdlib 44, telegram_api 24, store 40 vs live mongod 8.0.4 + redis, scram 67 vs live auth + plain mongods) |
+| vc-go | go vet+build exit 0 | 30 / 0 / 5 (3 live YouTube tests pass with `PARLAY_LIVE_TEST=1`; 2 store tests need `MONGO_URI`/`REDIS_URL`) |
+| vc-ts | n/a (stdlib Node) | 52 / 0 / 0 |
+| vc-rust | cargo test --release --offline | 50 / 0 / 0 |
+| spotify-rust | cargo test --release --offline | 51 / 0 / 0 |
+| audio-fx-rust | cargo build --release --offline | 6 / 0 / 0 |
+| share-rust | cargo build --release --offline | 17 / 0 / 0 |
+| queue-rust | cargo build --release --offline | 20 / 0 / 0 |
+| downloaders | n/a (.venv Python) | 42 / 0 / 8 (live-gated) |
+| netease-go | go vet+build exit 0 | 23 / 0 / 0 |
+| gui-js | n/a | 11 / 0 / 0 |
+| radio-js | n/a | 21 / 0 / 0 |
+| **Total** | **0 build failures** | **717 / 0 / 13** |
