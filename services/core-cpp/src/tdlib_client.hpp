@@ -76,9 +76,9 @@ enum class SessionKind { Assistant, Bot };
 class TdLibClient {
 public:
     // Build-time link: the explicit_lib argument is retained for source
-    // compatibility (voice_call.cpp passes cfg.tdlib_lib) but is now
-    // IGNORED — the library is linked at build time, and TDJSON_LIB no
-    // longer selects a library. libPath() reports the linked SONAME.
+    // compatibility but is now IGNORED — the library is linked at
+    // build time, and no env var or config key selects a library.
+    // libPath() reports the linked SONAME.
     explicit TdLibClient(const std::string& explicit_lib = "");
     // Build a client for one half of the dual session.
     explicit TdLibClient(SessionKind kind);

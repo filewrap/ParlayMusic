@@ -1,17 +1,34 @@
 #!/usr/bin/env bash
-# Parlay — native launcher (no Docker). Starts every service in
-# dependency order, waits for each GET /healthz (30 s), and prints a
-# status table. Logs go to logs/<service>.log, PIDs to run/<service>.pid.
+# Parlay — native launcher (no Docker). Starts the 2-process engine in
+# dependency order and prints a status table. Logs go to logs/<name>.log,
+# PIDs to run/<name>.pid.
+#
+#   backend  Go unified backend (services/backend-go/cmd/backend):
+#            owns playback/queue/vote/share/Spotify/settings/radio state
+#            in the embedded bbolt store (data/parlay.db) and answers
+#            the core over the persistent UDS socket
+#            data/parlay-backend.sock. It spawns the persistent yt-dlp
+#            daemon itself at boot (scripts/yt_dlp_worker.py on the
+#            scripts/yt-dlp-venv python) — there is no separate yt-dlp
+#            process to start. Readiness = socket file present + PID alive.
+#   core     C++ core (services/core-cpp/build/parlay-core): dual TDLib
+#            sessions (bot in data/tdlib-bot, assistant in data/tdlib),
+#            HTTP API on :8080 (GET /healthz). Starts LAST, after the
+#            backend socket is up — the core connects to it at startup.
+#   slskd    optional Soulseek daemon on :5030 (opt-in, see below).
+#
+# There are no other services: no inter-service HTTP, no Mongo/Redis,
+# no per-service ports 8001-8010/3000. The backend has no HTTP port.
 #
 # Layouts: works from an extracted release tarball (bin/*) AND from a
-# repo checkout (services/*/build or target/release, go run fallback).
-# The core starts LAST, after all engines are up.
+# repo checkout (services/core-cpp/build, services/backend-go built
+# on demand with the Go toolchain when no binary is present yet).
 #
 # Usage: ./start.sh
-#   Refuses to start if BOT_TOKEN is missing or if any service is
+#   Refuses to start if BOT_TOKEN is missing or if any process is
 #   already running (run ./stop.sh first). Exits non-zero if a required
-#   service fails its health check — the others keep running, and the
-#   report names the failed ones.
+#   process fails its readiness check — the others keep running, and
+#   the report names the failed ones.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,22 +36,16 @@ cd "$ROOT"
 
 if [ -x "$ROOT/bin/parlay-core" ]; then LAYOUT="tarball"; else LAYOUT="repo"; fi
 
-# name|port|required|health-path  — start order is dependency order.
+# name|kind — start order is dependency order. kind "socket" waits for
+# the UDS socket file; kind "http" waits for GET /healthz on PORT.
 SERVICES=(
-    "slskd|5030|optional|/"
-    "downloaders|8009|required|/healthz"
-    "netease|8010|required|/healthz"
-    "spotify|8007|required|/healthz"
-    "vc-go|8001|required|/healthz"
-    "vc-ts|8002|required|/healthz"
-    "vc-rust|8003|required|/healthz"
-    "audio-fx|8004|required|/healthz"
-    "share|8005|required|/healthz"
-    "queue|8006|required|/healthz"
-    "radio|8008|required|/healthz"
-    "gui|3000|required|/healthz"
-    "core|8080|required|/healthz"
+    "backend|socket"
+    "core|http"
+    "slskd|http"
 )
+BACKEND_SOCK="$ROOT/data/parlay-backend.sock"
+CORE_PORT="${PORT:-8080}"
+SLSKD_PORT=5030
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -46,35 +57,10 @@ chmod 600 "$ROOT/.env" 2>/dev/null || true
 # shellcheck disable=SC1091
 set -a; . "$ROOT/.env"; set +a
 [ -n "${BOT_TOKEN:-}" ] || die "BOT_TOKEN is missing from .env — set it (./install.sh can create .env) and re-run ./start.sh."
-[ -n "${PARLAY_TOKEN:-}" ] && export PARLAY_TOKEN || say "warning: PARLAY_TOKEN is empty — IPC auth is OFF (dev only)."
+[ -n "${PARLAY_TOKEN:-}" ] && export PARLAY_TOKEN || say "warning: PARLAY_TOKEN is empty — the core will warn at startup (engine calls go out unauthenticated)."
 
-mkdir -p "$ROOT/run" "$ROOT/logs" "$ROOT/data"
-export PATH="$ROOT/bin:$ROOT/.venv/bin:$PATH"
-
-# Mongo/Redis are optional: JSON-file stores are the default while Mongo
-# stays aside. A set-but-unreachable MONGO_URI is fatal for vc-go (its
-# README documents this), so only pass these URIs through when the
-# server actually answers; otherwise the services fall back to files.
-probe_uri() { # uri default_port -> 0 = reachable
-    local uri="$1" defport="$2" hostport host port
-    hostport="${uri#*://}"; hostport="${hostport%%/*}"
-    host="${hostport%%:*}"; port="${hostport##*:}"
-    [ "$host" = "$hostport" ] && port="$defport"
-    [ -n "$host" ] || return 1
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 3 bash -c "( exec 3<>\"/dev/tcp/$host/$port\" )" 2>/dev/null
-    else
-        ( exec 3<>"/dev/tcp/$host/$port" ) 2>/dev/null
-    fi
-}
-if [ -n "${MONGO_URI:-}" ]; then
-    if probe_uri "$MONGO_URI" 27017; then say "mongo reachable — using MONGO_URI.";
-    else say "warning: MONGO_URI is set but mongo is unreachable — starting with JSON-file stores (MONGO_URI ignored for this run)."; unset MONGO_URI; fi
-fi
-if [ -n "${REDIS_URL:-}" ]; then
-    if probe_uri "$REDIS_URL" 6379; then say "redis reachable — using REDIS_URL.";
-    else say "warning: REDIS_URL is set but redis is unreachable — starting without redis (REDIS_URL ignored for this run)."; unset REDIS_URL; fi
-fi
+mkdir -p "$ROOT/run" "$ROOT/logs" "$ROOT/data" "$ROOT/data/downloads"
+export PATH="$ROOT/bin:$PATH"
 
 # ---------------------------------------------------------------- double-start
 RUNNING=()
@@ -90,7 +76,16 @@ if [ "${#RUNNING[@]}" -gt 0 ]; then
     die "Parlay is already running: ${RUNNING[*]} — run ./stop.sh first."
 fi
 
-# ---------------------------------------------------------------- health
+# ---------------------------------------------------------------- readiness
+wait_socket() { # socket-path timeout_secs pid
+    local sock="$1" timeout="${2:-60}" pid="${3:-}" i
+    for ((i = 0; i < timeout; i++)); do
+        [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 1  # died: stop waiting
+        [ -S "$sock" ] && return 0
+        sleep 1
+    done
+    return 1
+}
 wait_health() { # name port path timeout_secs any-http-code(0/1) pid
     local name="$1" port="$2" path="$3" timeout="${4:-30}" any="${5:-0}" pid="${6:-}" i code
     for ((i = 0; i < timeout; i++)); do
@@ -108,102 +103,49 @@ wait_health() { # name port path timeout_secs any-http-code(0/1) pid
 print_row() { printf '%-12s %-6s %-8s %s\n' "$1" "$2" "$3" "$4"; }
 
 # ---------------------------------------------------------------- resolve
-# Sets CMD (array), WORKDIR, ENVS (array of KEY=val) for a service.
+# Sets CMD (array), WORKDIR, ENVS (array of KEY=val) for a process.
 GO_BIN=""
-if command -v go >/dev/null 2>&1; then GO_BIN="$(command -v go)"
-elif [ -x "$ROOT/.tools/go/bin/go" ]; then GO_BIN="$ROOT/.tools/go/bin/go"; fi
+if [ -x "$ROOT/.tools/go/bin/go" ]; then GO_BIN="$ROOT/.tools/go/bin/go";
+elif command -v go >/dev/null 2>&1; then GO_BIN="$(command -v go)"; fi
 
 resolve_service() { # name
     local name="$1" bin=""
     CMD=(); ENVS=(); WORKDIR="$ROOT"
     case "$name" in
-        core)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-core";
-            else bin="$ROOT/services/core-cpp/build/parlay-core"; fi
-            [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }
-            CMD=("$bin")
-            ENVS+=("VC_GO_URL=http://127.0.0.1:8001" "VC_TS_URL=http://127.0.0.1:8002"
-                   "VC_RUST_URL=http://127.0.0.1:8003" "FX_URL=http://127.0.0.1:8004"
-                   "SHARE_URL=http://127.0.0.1:8005" "QUEUE_URL=http://127.0.0.1:8006"
-                   "SPOTIFY_URL=http://127.0.0.1:8007" "RADIO_URL=http://127.0.0.1:8008"
-                   "DL_URL=http://127.0.0.1:8009" "DOWNLOADERS_URL=http://127.0.0.1:8009"
-                   "NETEASE_URL=http://127.0.0.1:8010")
+        backend)
+            # The backend finds the yt-dlp venv + worker script by
+            # walking up from its working directory
+            # (scripts/yt-dlp-venv/bin/python, scripts/yt_dlp_worker.py),
+            # so it MUST run with CWD=$ROOT in both layouts. Its UDS
+            # socket + bbolt store live under PARLAY_DATA_DIR.
+            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-backend";
+            elif [ -x "$ROOT/bin/parlay-backend" ]; then bin="$ROOT/bin/parlay-backend"; fi
+            if [ -n "$bin" ]; then [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }; CMD=("$bin");
+            elif [ -n "$GO_BIN" ]; then
+                say "building backend (no binary yet — one-time, cgo + ntgcalls)…"
+                ( cd "$ROOT/services/backend-go" && "$GO_BIN" build -trimpath -o "$ROOT/bin/parlay-backend" ./cmd/backend ) \
+                    || { echo "MISSING:backend build failed (see above)"; return 1; }
+                CMD=("$ROOT/bin/parlay-backend")
+            else echo "MISSING:go (no parlay-backend binary and no Go toolchain)"; return 1; fi
+            ENVS+=("PARLAY_DATA_DIR=$ROOT/data")
+            # The backend binary's baked rpath points at the repo's
+            # refs/ntgcalls dir; in the tarball layout libntgcalls.so
+            # lives in lib/ instead, so put lib/ first on the search.
             if [ -d "$ROOT/lib" ]; then
                 ENVS+=("LD_LIBRARY_PATH=$ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
             fi
-            [ -n "${TDJSON_LIB:-}" ] || [ -f "$ROOT/lib/libtdjson.so.1.8.69" ] \
-                && ENVS+=("TDJSON_LIB=${TDJSON_LIB:-$ROOT/lib/libtdjson.so.1.8.69}")
-            [ -n "${NTGCALLS_LIB:-}" ] || [ -f "$ROOT/lib/libntgcalls.so" ] \
-                && ENVS+=("NTGCALLS_LIB=${NTGCALLS_LIB:-$ROOT/lib/libntgcalls.so}")
             ;;
-        vc-go)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-vc-go";
-            elif [ -x "$ROOT/services/vc-go/parlay-vc" ]; then bin="$ROOT/services/vc-go/parlay-vc"; fi
-            if [ -n "$bin" ]; then [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }; CMD=("$bin");
-            elif [ -n "$GO_BIN" ]; then CMD=("$GO_BIN" "run" "./cmd/parlay-vc"); WORKDIR="$ROOT/services/vc-go";
-            else echo "MISSING:go (no vc-go binary and no Go toolchain)"; return 1; fi
-            ;;
-        netease)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-netease";
-            elif [ -x "$ROOT/services/netease-go/parlay-netease" ]; then bin="$ROOT/services/netease-go/parlay-netease"; fi
-            if [ -n "$bin" ]; then [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }; CMD=("$bin");
-            elif [ -n "$GO_BIN" ]; then CMD=("$GO_BIN" "run" "./cmd/parlay-netease"); WORKDIR="$ROOT/services/netease-go";
-            else echo "MISSING:go (no netease binary and no Go toolchain)"; return 1; fi
-            ENVS+=("PARLAY_DL_DIR=$ROOT/data/netease")
-            ;;
-        vc-rust)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-vc-rust";
-            else bin="$ROOT/services/vc-rust/target/release/parlay-vc-rust"; fi
-            [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }
+        core)
+            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-core";
+            else bin="$ROOT/services/core-cpp/build/parlay-core"; fi
+            [ -x "$bin" ] || { echo "MISSING:$bin (repo checkout: build it first — cmake -S services/core-cpp -B services/core-cpp/build -DCMAKE_BUILD_TYPE=Release && cmake --build services/core-cpp/build)"; return 1; }
             CMD=("$bin")
-            ;;
-        audio-fx)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-audio-fx";
-            else bin="$ROOT/services/audio-fx-rust/target/release/parlay-audio-fx"; fi
-            [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }
-            CMD=("$bin")
-            ;;
-        share)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-share";
-            else bin="$ROOT/services/share-rust/target/release/parlay-share"; fi
-            [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }
-            CMD=("$bin")
-            ;;
-        queue)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-queue";
-            else bin="$ROOT/services/queue-rust/target/release/parlay-queue"; fi
-            [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }
-            CMD=("$bin")
-            ;;
-        spotify)
-            if [ "$LAYOUT" = "tarball" ]; then bin="$ROOT/bin/parlay-spotify";
-            else bin="$ROOT/services/spotify-rust/target/release/parlay-spotify"; fi
-            [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }
-            CMD=("$bin")
-            ;;
-        vc-ts)
-            [ -f "$ROOT/services/vc-ts/src/main.js" ] || { echo "MISSING:$ROOT/services/vc-ts/src/main.js"; return 1; }
-            CMD=("node" "$ROOT/services/vc-ts/src/main.js")
-            if [ -x "$ROOT/bin/yt-dlp" ]; then ENVS+=("YT_DLP=$ROOT/bin/yt-dlp");
-            elif [ -x "$ROOT/.venv/bin/yt-dlp" ]; then ENVS+=("YT_DLP=$ROOT/.venv/bin/yt-dlp"); fi
-            ;;
-        radio)
-            [ -f "$ROOT/services/radio-js/src/main.js" ] || { echo "MISSING:$ROOT/services/radio-js/src/main.js"; return 1; }
-            CMD=("node" "$ROOT/services/radio-js/src/main.js")
-            ENVS+=("VC_GO_URL=http://127.0.0.1:8001" "VC_TS_URL=http://127.0.0.1:8002")
-            ;;
-        gui)
-            [ -f "$ROOT/services/gui-js/app/main.js" ] || { echo "MISSING:$ROOT/services/gui-js/app/main.js"; return 1; }
-            CMD=("node" "$ROOT/services/gui-js/app/main.js")
-            ENVS+=("CORE_URL=http://127.0.0.1:8080" "VC_GO_URL=http://127.0.0.1:8001"
-                   "VC_TS_URL=http://127.0.0.1:8002" "NETEASE_URL=http://127.0.0.1:8010")
-            ;;
-        downloaders)
-            [ -f "$ROOT/services/downloaders/src/main.py" ] || { echo "MISSING:$ROOT/services/downloaders/src/main.py"; return 1; }
-            if [ -x "$ROOT/.venv/bin/python" ]; then CMD=("$ROOT/.venv/bin/python" "-m" "src.main");
-            else CMD=("python3" "-m" "src.main"); say "warning: no .venv — downloaders run on system python3."; fi
-            WORKDIR="$ROOT/services/downloaders"
-            ENVS+=("PARLAY_DL_DIR=$ROOT/data/downloads" "SLSKD_URL=http://127.0.0.1:5030")
+            # libtdjson is linked at build time; the binary's RUNPATH
+            # already covers lib/ next to bin/ in the tarball layout.
+            # TDLib session dirs default to $PARLAY_DATA_DIR/tdlib-bot
+            # (bot) and $PARLAY_DATA_DIR/tdlib (assistant); the core
+            # creates them mode 0700 itself.
+            ENVS+=("PARLAY_DATA_DIR=$ROOT/data")
             ;;
         slskd)
             if [ -x "$ROOT/bin/slskd" ]; then bin="$ROOT/bin/slskd";
@@ -222,41 +164,65 @@ slskd_enabled() {
 }
 
 # ---------------------------------------------------------------- start loop
-say "Parlay ${LAYOUT} layout at $ROOT — starting services…"
+say "Parlay ${LAYOUT} layout at $ROOT — starting the engine…"
 echo ""
 print_row "SERVICE" "PORT" "STATUS" "DETAIL"
 FAILED=()
 STARTED=()
 
 for entry in "${SERVICES[@]}"; do
-    IFS='|' read -r name port required health <<< "$entry"
+    IFS='|' read -r name kind <<< "$entry"
     if [ "$name" = "slskd" ] && ! slskd_enabled; then
-        print_row "slskd" "5030" "SKIPPED" "opt-in, needs Soulseek account (SLSKD_ENABLED=1 + SLSKD_SLSK_USERNAME/PASSWORD in .env)"
+        print_row "slskd" "$SLSKD_PORT" "SKIPPED" "opt-in, needs Soulseek account (SLSKD_ENABLED=1 + SLSKD_SLSK_USERNAME/PASSWORD in .env)"
         continue
     fi
-    mkdir -p "$ROOT/data/$name"
+    [ "$name" = "slskd" ] && mkdir -p "$ROOT/data/slskd"
     if ! resolve_service "$name" >"$ROOT/run/.resolve.out" 2>&1; then
         missing="$(cat "$ROOT/run/.resolve.out" 2>/dev/null || true)"
         rm -f "$ROOT/run/.resolve.out"
-        print_row "$name" "$port" "FAIL" "missing: ${missing#MISSING:}"
+        print_row "$name" "-" "FAIL" "missing: ${missing#MISSING:}"
         FAILED+=("$name (missing: ${missing#MISSING:})")
         continue
     fi
     rm -f "$ROOT/run/.resolve.out"
     log="$ROOT/logs/$name.log"
     pidf="$ROOT/run/$name.pid"
-    ( cd "$WORKDIR" && exec env "PORT=$port" "PARLAY_DATA_DIR=$ROOT/data/$name" "${ENVS[@]}" "${CMD[@]}" ) >>"$log" 2>&1 &
+    ( cd "$WORKDIR" && exec env "${ENVS[@]}" "${CMD[@]}" ) >>"$log" 2>&1 &
     echo $! > "$pidf"
-    any=0; [ "$name" = "slskd" ] && any=1   # slskd has no /healthz; any HTTP response counts
-    if wait_health "$name" "$port" "$health" 30 "$any" "$(cat "$pidf")"; then
-        print_row "$name" "$port" "OK" "pid $(cat "$pidf") — http://127.0.0.1:$port$health"
-        STARTED+=("$name")
+    pid="$(cat "$pidf")"
+    if [ "$kind" = "socket" ]; then
+        # The backend warms the yt-dlp daemon (up to 30 s) before it
+        # listens, so allow 60 s for the socket to appear.
+        if wait_socket "$BACKEND_SOCK" 60 "$pid"; then
+            print_row "$name" "-" "OK" "pid $pid — socket $BACKEND_SOCK"
+            STARTED+=("$name")
+        else
+            if pid_alive "$pid"; then detail="pid $pid alive but no UDS socket in 60s — see $log";
+            else detail="process exited — see $log"; fi
+            print_row "$name" "-" "FAIL" "$detail"
+            FAILED+=("$name ($detail)")
+        fi
+    elif [ "$name" = "slskd" ]; then
+        # slskd has no /healthz; any HTTP response counts.
+        if wait_health "$name" "$SLSKD_PORT" "/" 30 1 "$pid"; then
+            print_row "$name" "$SLSKD_PORT" "OK" "pid $pid — http://127.0.0.1:$SLSKD_PORT/"
+            STARTED+=("$name")
+        else
+            if pid_alive "$pid"; then detail="pid $pid alive but no HTTP response in 30s — see $log";
+            else detail="process exited — see $log"; fi
+            print_row "$name" "$SLSKD_PORT" "FAIL" "$detail"
+            FAILED+=("$name ($detail)")
+        fi
     else
-        pid="$(cat "$pidf" 2>/dev/null || true)"
-        if pid_alive "$pid"; then detail="pid $pid alive but no healthy /healthz in 30s — see $log";
-        else detail="process exited — see $log"; fi
-        print_row "$name" "$port" "FAIL" "$detail"
-        FAILED+=("$name ($detail)")
+        if wait_health "$name" "$CORE_PORT" "/healthz" 30 0 "$pid"; then
+            print_row "$name" "$CORE_PORT" "OK" "pid $pid — http://127.0.0.1:$CORE_PORT/healthz"
+            STARTED+=("$name")
+        else
+            if pid_alive "$pid"; then detail="pid $pid alive but no healthy /healthz in 30s — see $log";
+            else detail="process exited — see $log"; fi
+            print_row "$name" "$CORE_PORT" "FAIL" "$detail"
+            FAILED+=("$name ($detail)")
+        fi
     fi
 done
 
@@ -267,5 +233,5 @@ if [ "${#FAILED[@]}" -gt 0 ]; then
     say "Check the logs in $ROOT/logs/ and re-run ./start.sh after ./stop.sh, or fix .env and retry."
     exit 1
 fi
-say "All services up. GUI: http://127.0.0.1:3000 — core API: http://127.0.0.1:8080/healthz"
+say "Engine up: backend on $BACKEND_SOCK — core API: http://127.0.0.1:$CORE_PORT/healthz"
 say "Stop everything with ./stop.sh; check status with ./status.sh."

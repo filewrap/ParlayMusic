@@ -1,28 +1,18 @@
 #!/usr/bin/env bash
 # Parlay — status table without starting anything.
-# For each service: PID alive? + GET /healthz. Exits 0 only when every
-# required service is UP (slskd shows SKIPPED when it is not enabled).
+#   backend: PID alive? + UDS socket file present?
+#   core:    PID alive? + GET /healthz on :8080
+#   slskd:   PID alive? + any HTTP response on :5030 (optional; shows
+#            SKIPPED when it is not enabled).
+# Exits 0 only when every required process (backend, core) is UP.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-# name|port|required|health-path — same table as start.sh.
-SERVICES=(
-    "slskd|5030|optional|/"
-    "downloaders|8009|required|/healthz"
-    "netease|8010|required|/healthz"
-    "spotify|8007|required|/healthz"
-    "vc-go|8001|required|/healthz"
-    "vc-ts|8002|required|/healthz"
-    "vc-rust|8003|required|/healthz"
-    "audio-fx|8004|required|/healthz"
-    "share|8005|required|/healthz"
-    "queue|8006|required|/healthz"
-    "radio|8008|required|/healthz"
-    "gui|3000|required|/healthz"
-    "core|8080|required|/healthz"
-)
+BACKEND_SOCK="$ROOT/data/parlay-backend.sock"
+CORE_PORT="${PORT:-8080}"
+SLSKD_PORT=5030
 
 pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 health_code() { # port path any(0/1) -> prints UP/DOWN (+code)
@@ -44,24 +34,45 @@ slskd_enabled() {
 
 printf '%-12s %-6s %-8s %s\n' "SERVICE" "PORT" "STATUS" "DETAIL"
 ALL_UP=1
-for entry in "${SERVICES[@]}"; do
-    IFS='|' read -r name port required health <<< "$entry"
-    if [ "$name" = "slskd" ] && ! slskd_enabled; then
-        printf '%-12s %-6s %-8s %s\n' "slskd" "5030" "SKIPPED" "opt-in, needs Soulseek account"
-        continue
-    fi
-    pid="$(cat "$ROOT/run/$name.pid" 2>/dev/null || true)"
-    any=0; [ "$name" = "slskd" ] && any=1
+
+# --- backend (UDS socket, no HTTP port) ---
+pid="$(cat "$ROOT/run/backend.pid" 2>/dev/null || true)"
+if pid_alive "$pid"; then
+    if [ -S "$BACKEND_SOCK" ]; then status="UP"; detail="pid $pid, socket $BACKEND_SOCK";
+    else status="DOWN"; ALL_UP=0; detail="pid $pid alive but no UDS socket at $BACKEND_SOCK"; fi
+else
+    status="DOWN"; ALL_UP=0; detail="not running (no live PID)"
+fi
+printf '%-12s %-6s %-8s %s\n' "backend" "-" "$status" "$detail"
+
+# --- core (HTTP :8080 /healthz) ---
+pid="$(cat "$ROOT/run/core.pid" 2>/dev/null || true)"
+if pid_alive "$pid"; then
+    hc="$(health_code "$CORE_PORT" "/healthz" 0)"
+    case "$hc" in
+        UP*) status="UP" ;;
+        *)   status="DOWN"; ALL_UP=0 ;;
+    esac
+    printf '%-12s %-6s %-8s %s\n' "core" "$CORE_PORT" "$status" "pid $pid, $hc"
+else
+    ALL_UP=0
+    printf '%-12s %-6s %-8s %s\n' "core" "$CORE_PORT" "DOWN" "not running (no live PID)"
+fi
+
+# --- slskd (optional) ---
+if ! slskd_enabled; then
+    printf '%-12s %-6s %-8s %s\n' "slskd" "$SLSKD_PORT" "SKIPPED" "opt-in, needs Soulseek account"
+else
+    pid="$(cat "$ROOT/run/slskd.pid" 2>/dev/null || true)"
     if pid_alive "$pid"; then
-        hc="$(health_code "$port" "$health" "$any")"
+        hc="$(health_code "$SLSKD_PORT" "/" 1)"
         case "$hc" in
             UP*) status="UP" ;;
-            *)   status="DOWN"; [ "$required" = "required" ] && ALL_UP=0 ;;
+            *)   status="DOWN" ;;
         esac
-        printf '%-12s %-6s %-8s %s\n' "$name" "$port" "$status" "pid $pid, $hc"
+        printf '%-12s %-6s %-8s %s\n' "slskd" "$SLSKD_PORT" "$status" "pid $pid, $hc"
     else
-        [ "$required" = "required" ] && ALL_UP=0
-        printf '%-12s %-6s %-8s %s\n' "$name" "$port" "DOWN" "not running (no live PID)"
+        printf '%-12s %-6s %-8s %s\n' "slskd" "$SLSKD_PORT" "DOWN" "not running (no live PID)"
     fi
-done
+fi
 exit $((1 - ALL_UP))

@@ -5,23 +5,23 @@ Phase 9 gaps — coordinator rulings on port-engines-gaps.md).
 Deduped from NoxBeats (15 modules, 35 `c*` channel commands — 34 +
 `/caskip`, Phase 6), Yukki-Go / ArcMusic / TgMusicBot, TGVCBot /
 remix, ParvatiMusic. Implemented in
-`services/core-cpp/src/dispatcher.cpp` (8,000 lines, route table
+`services/core-cpp/src/dispatcher.cpp` (8,880 lines, route table
 with Scope/Perm + full alias map) with all core-facing strings in
-`services/core-cpp/src/ui_texts.hpp` (3,256 lines). Every command
-dispatches to a real IPC call or a real Store action — no stub
-replies. Contract `contracts/ipc.json` v0.3.1 (56 actions).
+`services/core-cpp/src/ui_texts.hpp` (2,376 lines). Every command
+dispatches to a real UDS call or a real Store action — no stub
+replies. Contract `contracts/ipc.json` v0.3.1 (65 actions).
 
 Permission levels: **O**wner > **S**udo > **A**dmin/auth-user >
 **E**veryone. `admin_mode` 0/1/2 and `play_mode` (admin/everyone)
-gate playback control; maintenance → sudo only; 1 cmd/s per-chat
-rate limit. Channel commands (`c*`) run the same command against a
+gate playback control; maintenance → sudo only; token-bucket rate
+limit (per-chat 5 burst / 1.0/s refill, per-user 3 / 1.0/s). Channel commands (`c*`) run the same command against a
 linked channel (`via_channel=true`, 34 commands).
 
 ## Playback
 
 | Command | Args | Who | Implements (IPC / service) |
 |---|---|---|---|
-| `/play` | `<song, link or id>` (`-f` force, `-v` video) | play_mode | `vc.play` → vc-go/vc-ts/vc-rust (per-chat engine) |
+| `/play` | `<song, link or id>` (`-f` force, `-v` video) | play_mode | `vc.play` → backend-go (single backend, UDS) |
 | `/playforce` | same as play, forces | play_mode | `vc.play` (force) |
 | `/vplay`, `/vplayforce` | `<...>` video in VC | play_mode | `vc.play` (video) |
 | `/playplaylist` | — | play_mode | playlist → `vc.play` |
@@ -52,7 +52,7 @@ linked channel (`via_channel=true`, 34 commands).
 | `/move` | `<a> <b>` | play_mode | `vc.queue` move |
 | `/shuffle` | — | play_mode | `vc.shuffle` |
 | `/pos` | — | E | current position |
-| `/autoplay` | `[on\|off\|lang\|mood]` | admin | `vc.autoplay` + background watcher |
+| `/autoplay` | `[on\|off\|lang\|mood]` | admin | `vc.autoplay` (backend-owned; the core's 5 s watcher was deleted in Phase 2) |
 | `/autoplay-skip`, `/askip` | — | play_mode | `vc.autoplay_skip` |
 
 ## Playlists
@@ -74,15 +74,15 @@ linked channel (`via_channel=true`, 34 commands).
 
 | Command | Args | Who | Implements |
 |---|---|---|---|
-| `/search` | `<query>` | E | `search.query` (vc-ts; `ne:` → NetEase); numbered buttons (5/row), 10/page pagination, tap-to-play, or reply with the result number (5 s per-user cooldown) |
+| `/search` | `<query>` | E | `search.query` (backend-go; `ne:` → NetEase); numbered buttons (5/row), 10/page pagination, tap-to-play, or reply with the result number (5 s per-user cooldown) |
 | `/download` | `<song or link>` | E | `download.youtube` / `download.spotify` / `download.deezer` / `download.tiktok` / `download.navidrome`; in-place progress message, Spotify playlist/album → zip-or-one-by-one picker, lossy-fallback prompt, FX prompt after delivery |
-| `/lyrics` | `[song]` | E | current track → card (chunked at 4096); named song → `.lrc` document with expandable lyric caption (NetEase); when `netease.lyrics` returns `lrc_path` the service-written file is sent, otherwise the core writes its own stripped copy |
-| `/radio` | `[station]` | play_mode | `vc.radio` → radio-js → VC engine handoff |
+| `/lyrics` | `[song]` | E | current track → card (chunked at 4096); named song → `.lrc` document with expandable lyric caption (NetEase); when `netease.lyrics` returns `lrc_path` the backend-written file is sent, otherwise the core writes its own stripped copy |
+| `/radio` | `[station]` | play_mode | `vc.radio` → backend radio package |
 | `/new` | `<station>` | admin | `radio.start` (group only) |
 | `/destroy` | — | admin | `radio.stop` (group only) |
-| `/manage` | — | admin | `radio.status` card (group only; no listener counts — radio-js reports 0 always, so the card omits them) |
+| `/manage` | — | admin | `radio.status` card (group only; no listener counts — the backend reports 0 always, no listener accounting exists, so the card omits them) |
 | `/share` | `<song>` | E | `share.create` → anonymous link; core keeps creator→token mapping for `/start share_<token>` and My Link |
-| `/engine` | `[go\|ts\|rust]` | admin | per-chat engine switch (durable, Store) |
+| `/engine` | `[anything]` | admin | retired — answers that there is one unified backend and no engine to switch (arguments ignored) |
 
 ## Settings (chat)
 
@@ -90,7 +90,7 @@ linked channel (`via_channel=true`, 34 commands).
 |---|---|---|---|
 | `/playmode` | `[admin\|everyone]` | admin | Store |
 | `/settings` | — | admin | inline settings panel (toggles + timer 2–7 min, group only) |
-| `/download-settings` | — | E | per-user download prefs (format / YouTube mode / path template); template set by free text afterwards (prefs stored, not yet sent to the downloaders — no contract fields) |
+| `/download-settings` | — | E | per-user download prefs (format / YouTube mode / path template); template set by free text afterwards (prefs stored, not yet sent to the backend — the `download.prefs` UDS action exists but the core does not call it yet) |
 | `/adminmode` | `[admin\|adminauth\|everyone]` | admin | Store |
 | `/cmddelete` | `[on\|off]` | admin | Store |
 | `/cleanmode` | `[on\|off\|minutes 1–1440]` | admin | Store + background sweeper |
@@ -149,8 +149,9 @@ panel presses are requester-only and silently ignored for others.
 ## Inline mode (Phase 9 gaps, §13)
 
 The core answers `inline_query` updates itself (`answerInlineQuery`,
-`getUpdates` asks for `inline_query`). Modes mirror vc-ts
-`resolvers.js inlineMode`: `np` / `s` / `l` / `help` match the whole
+via the TDLib poll loop — `getUpdates` is gone). Modes mirror the
+backend's `search.inline` (`internal/search/inline.go`): `np` / `s` /
+`l` / `help` match the whole
 query; `lib` / `del` / `search` take an argument after a space; empty
 or <3-char queries get the hint button (`np  s  l  lib  del — or type
 to search`, `start_parameter=help`). `search.inline` request carries
@@ -158,7 +159,7 @@ optional `chat_id` (contract v0.3.1) — the core passes it for `np` /
 `s` / `l` only, taken from `last_chat:<user>` (the user's most recent
 group chat, recorded on group text/commands and callback presses; an
 inline query carries no chat id). `l` fetches the lyrics text via
-`/v1/lyrics` with the same `chat_id` and renders the article
+the `vc.lyrics` UDS action with the same `chat_id` and renders the article
 (`Lyrics: {title}`, first 100 chars in the description, plain lyrics
 truncated to 4000 chars + `\n...`). `lib` / `del` return empty results
 (no library backend). `help` → two articles sending `Parlay v0.2.0`;
@@ -184,28 +185,27 @@ a plain audio result, not cached audio — the Track carries no
 ## Not yet (named, with reason)
 
 - `/volume`: no core command exists (removed from the table above, Phase 6
-  — it was listed but never routed). Volume lives as vc-ts IPC
-  (`POST /v1/volume`, 0–200 remix scale) and the `/menu` panel +
-  now-playing card (`volinc`/`voldec` buttons, `vc.volume` IPC);
+  — it was listed but never routed). Volume lives as the backend
+  `vc.volume` UDS action (0–200 scale) and the `/menu` panel +
+  now-playing card (`volinc`/`voldec` buttons, `vc.volume` UDS);
   a core `/volume` command is a small follow-up.
-- `/mix`, `/recognize`, `/scan`, `/sharescan`, `/rmcache`: no IPC
-  action exists for any of them (Phase 9) — the UI strings are in
-  `ui_texts.hpp` but no command is routed; they need an engine-side
-  action first.
-- Download cancel (`pl:dl:cancel`): the button is shown, but no
-  `download.cancel` IPC action exists — taps answer "feature
-  unavailable" honestly. Live per-second progress polling is still
-  impossible by design: the downloaders POST blocks until the
-  transfer completes, so the run id is only known after the POST
-  returns. Contract v0.3.1 now documents `run_id` (12-hex) on all
-  seven download POST responses, and the core already reads it for
-  the post-POST IPC-4 snapshot — the remaining step for live polling
-  is an async download POST on the engines side, not a core change.
-  The progress message is edited in place (fetching → outcome) and
-  the final snapshot is fetched after the POST.
-- Inline `lib` / `del` modes return empty results (no library
-  backend in vc-ts); the core does not render them as functional.
-  Needs a `library.search` / `library.delete` action first.
+- `/mix`, `/recognize`, `/scan`, `/sharescan`, `/rmcache`: no command
+  is routed for any of them — but the UDS actions now exist
+  (`mix.generate`, `audio.recognize` (AudD, env-gated),
+  `library.scan`, `library.sharescan`, `cache.clear`); the remaining
+  step is routing the commands, not building the actions.
+- Download cancel (`pl:dl:cancel`): the button is shown, and the
+  `download.cancel` UDS action now exists (OD-3). Downloads also
+  run async now (`async` flag, `DownloadReady` event,
+  `download.progress` UDS action, `run_id` 12-hex on all download
+  responses) — live progress polling is possible; the remaining step
+  is the core polling loop, not a backend change. The progress
+  message is edited in place (fetching → outcome) and the final
+  snapshot is fetched after the POST.
+- Inline `lib` / `del` modes are backed by the real library now
+  (`internal/library`, `library.scan` / `library.delete` UDS
+  actions): `lib` returns matching entries, `del` renders them with
+  delete buttons and `library.delete` does the deleting.
 - Spotify Hide-alerts button: not rendered — `ignored_by` stays 0,
   no ignore store or endpoint exists. Needs a `spotify.ignore`
   action or a `spotify.dislike` extension.
@@ -213,10 +213,9 @@ a plain audio result, not cached audio — the Track carries no
   on report with no dedup (no "already sent" / "already reported"
   message) — no feedback/report store or endpoint exists. Dedup is
   future work.
-- `vc.lyrics` method mismatch (flagged, not changed): the contract
-  writes `GET /v1/lyrics`, but vc-ts implements it POST-only (the
-  route sits behind the POST-only gate in `main.js`) — the core calls
-  POST with body `{chat_id}`, the only form that works.
+- `vc.lyrics` method mismatch: closed by the UDS transport — there
+  are no HTTP methods anymore; `vc.lyrics` is one UDS action
+  (`internal/lyrics` in the backend).
 - Spotify `language` stays null and `features` is null when the
   deprecated audio-features endpoint 403s — the core renders no
   `/details` card (spotify-rust owns §25), so the null-hiding rules
@@ -233,7 +232,8 @@ a plain audio result, not cached audio — the Track carries no
   but no `library.delete` IPC action exists — taps answer "feature
   unavailable" honestly.
 - Spotify companion surfaces (`/details`, `/analyze`, Magic /
-  Recommendation toggles): owned by spotify-rust; the core only
+  Recommendation toggles): owned by the backend's `internal/spotify`
+  (`spotify.details` / `spotify.analyze` UDS actions); the core only
   routes `spotify.dislike` (`pl:spotify:dislike:<id>`).
 - `/settings` download prefs (format / YouTube mode / template) are
   stored per user by the core but not sent to the downloaders — the
@@ -243,13 +243,11 @@ a plain audio result, not cached audio — the Track carries no
   exists in core-cpp, so `/start` shows the normal card.
 - `/status` counts are 0: the core keeps no song cache.
 - `/play` from replied-to media: implemented (Phase 5) — core takes the `file_id` from `reply_to_message` (audio/document/voice/video_note) and plays it through the core voice backend.
-- `/speed` / `/bass` audio filter on engine sessions: seek-restart +
-  stored value; vc-go/vc-ts/vc-rust do not apply the filter (see
-  REMAINING.md B11 — vc-go has no audio pipeline at all, and vc-ts /
-  vc-rust run fixed ffmpeg args with no `-af`). On core-voice
-  sessions (replied-file playback) the filter IS applied: the core
-  backend re-attaches the source with ffmpeg `atempo` / lowpass at
-  the current position, and stored values apply to later core plays.
+- `/speed` / `/bass` audio filter: stored per room only, applied by
+  nothing yet — the Phase 5 DSP applies them (see
+  `internal/room` `SetSpeed`: "Phase 3 stores and reports it only").
+  There is no `atempo` / lowpass path in the backend today, and the
+  old core-side re-attach is gone with `attachEngineAudio`.
 - `/broadcast` errors file: implemented (Phase 6 Worker C) — failures
   go out as an `errors.txt` attachment via real Bot API `sendDocument`
   (multipart upload); inline list only if the upload itself fails.

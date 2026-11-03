@@ -268,8 +268,8 @@ int main(int argc, char** argv) {
         CHECK(dl.ok && dl.data.find("run_id") != nullptr,
               "round-trip: legacy download/youtube ok with run_id");
 
-        // Full sweep: every one of the 56 contract actions answers.
-        static const char* kAll56[] = {
+        // Full sweep: every one of the 65 contract actions answers.
+        static const char* kAll65[] = {
             "chat.settings", "download.deezer", "download.navidrome",
             "download.progress", "download.soulseek", "download.spotify",
             "download.spotify_playlist", "download.tiktok",
@@ -286,9 +286,13 @@ int main(int argc, char** argv) {
             "vc.radio", "vc.resume", "vc.seek", "vc.skip", "vc.stop",
             "vc.loop", "vc.shuffle", "vc.autoplay", "vc.autoplay_skip",
             "spotify.collection", "spotify.status", "vc.volume",
+            // 9 OD-3 actions (Phase 3, Wave 2).
+            "download.cancel", "library.delete", "mix.generate",
+            "audio.recognize", "library.scan", "library.sharescan",
+            "cache.clear", "download.prefs", "vc.play_file",
         };
         int sweep_ok = 0;
-        for (const char* a : kAll56) {
+        for (const char* a : kAll65) {
             Json body = Json::objectOf(
                 {{"chat_id", Json((int64_t)-1001)},
                  {"user_id", Json((int64_t)111)},
@@ -314,9 +318,9 @@ int main(int argc, char** argv) {
                 std::cout << "  sweep FAIL " << a << ": " << r.describe()
                           << "\n";
         }
-        CHECK(sweep_ok == 56, "round-trip: all 56 contract actions answer "
+        CHECK(sweep_ok == 65, "round-trip: all 65 contract actions answer "
                               "(got " +
-                                  std::to_string(sweep_ok) + "/56)");
+                                  std::to_string(sweep_ok) + "/65)");
 
         // vc.join exercises the duplex JoinRequest hook.
         join_handled = false;

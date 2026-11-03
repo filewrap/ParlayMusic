@@ -2,7 +2,7 @@
 //
 // *** THIS IS A TEST PEER, NOT PRODUCTION CODE. ***
 // It speaks contracts/uds-protocol.md over a Unix Domain Socket and
-// answers all 56 actions from contracts/ipc.json with structurally
+// answers all 65 actions from contracts/ipc.json with structurally
 // valid (canned) responses, so the core's UDS client (services/
 // core-cpp/src/ipc.*) can be proven against a real peer before the Go
 // backend exists in Phase 3. The locked architecture explicitly
@@ -27,7 +27,7 @@
 //     sends a TrackStarted event frame on the same socket.
 //   * Test-only action "test.sleep_ms" {sleep_ms} sleeps before
 //     answering, so the core's deadline behaviour can be proven.
-//     It is NOT one of the 56 contract actions and the real backend
+//     It is NOT one of the 65 contract actions and the real backend
 //     must reject it.
 //   * All data is canned and clearly fake (track "Stub Song", ids
 //     "stub-*", example.invalid URLs). No network, no state, no auth:
@@ -492,6 +492,74 @@ bool answer(const std::string& action, const Json& payload, Json& data_out) {
             {{"api", Json("spotify")},
              {"credentials_configured", Json(false)},
              {"token_cached", Json(false)}});
+        return true;
+    }
+
+    // --- OD-3 actions (Phase 3, Wave 2; contracts/uds-protocol.md §4
+    // rows 57–65). Canned shapes match the §4 response columns.
+    if (action == "download.cancel") {
+        const Json* r = payload.find("run_id");
+        data_out = Json::objectOf(
+            {{"cancelled", Json(true)},
+             {"run_id", Json(r ? r->asString() : "abcdef123456")},
+             {"phase", Json("cancelled")}});
+        return true;
+    }
+    if (action == "library.delete") {
+        const Json* i = payload.find("id");
+        data_out = Json::objectOf(
+            {{"deleted", Json(true)},
+             {"id", Json(i ? i->asString() : "stub-id")}});
+        return true;
+    }
+    if (action == "mix.generate") {
+        Json::Array tracks;
+        tracks.push_back(cannedTrack());
+        data_out = Json::objectOf(
+            {{"tracks", Json(std::move(tracks))},
+             {"source_track", cannedTrack()}});
+        return true;
+    }
+    if (action == "audio.recognize") {
+        data_out = Json::objectOf(
+            {{"recognized", Json(true)},
+             {"track", cannedTrack()},
+             {"name", Json("Stub Song")},
+             {"artists", Json(Json::Array{Json("Stub Artist")})},
+             {"album", Json("Stub Album")},
+             {"source", Json("stub")}});
+        return true;
+    }
+    if (action == "library.scan") {
+        data_out = Json::objectOf(
+            {{"triggered", Json(true)},
+             {"error", Json(nullptr)},
+             {"tracks_found", Json((int64_t)0)}});
+        return true;
+    }
+    if (action == "library.sharescan") {
+        data_out = Json::objectOf(
+            {{"triggered", Json(true)},
+             {"scheduled_in_min", Json((int64_t)0)}});
+        return true;
+    }
+    if (action == "cache.clear") {
+        data_out = Json::objectOf(
+            {{"cleared", Json(true)},
+             {"names", Json(Json::Array{})}});
+        return true;
+    }
+    if (action == "download.prefs") {
+        data_out = Json::objectOf(
+            {{"user_id", Json(user_id)},
+             {"format", Json("mp3")},
+             {"use_youtube", Json(true)},
+             {"path_template", Json("{artist} - {title}")}});
+        return true;
+    }
+    if (action == "vc.play_file") {
+        data_out = Json::objectOf(
+            {{"now_playing", cannedNowPlaying(chat_id)}});
         return true;
     }
     return false;

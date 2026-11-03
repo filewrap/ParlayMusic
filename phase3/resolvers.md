@@ -34,7 +34,7 @@ No TODO/FIXME/HACK/Unimplemented anywhere in the new code
 | `radio.go` | No resolution — the URL is the stream (`RadioTrackFromURL`: SHA-1 id, duration 0, `is_live`). Native HTTP/ICY probe (headers + first bytes, 10 s budget) replacing the 10 s ffprobe subprocess. Curated 6-station list ported verbatim from `services/radio-js/src/stations.js`. |
 | `download.go` | Shared HTTP download with progress (`percentage`, `done_bytes`, `total_bytes`, `speed`, `eta`, `phase`), daemon download path, `readAllLimit`/`newUUID`/`copyFile` helpers. |
 | `ytdlp.go` | Persistent daemon client: one process, stdin/stdout JSON-RPC lines, request/response demux by id, lazy start (never at construction), ping-verified. |
-| `scripts/yt_dlp_worker.py` | The daemon: warm `yt_dlp.YoutubeDL` in RAM, methods `ping` / `version` / `extract` / `download` (bestaudio → mp3). Runs on `services/downloaders/.venv/bin/python` (yt-dlp 2026.10.26); system python3 does NOT have `yt_dlp` — verified. |
+| `scripts/yt_dlp_worker.py` | The daemon: warm `yt_dlp.YoutubeDL` in RAM, methods `ping` / `version` / `extract` / `download` (bestaudio → mp3). Runs on `scripts/yt-dlp-venv/bin/python` (yt-dlp 2026.10.26 — the venv moved out of the deleted `services/downloaders/.venv` in Wave 2; see wave2-e-verify.md §2.2); system python3 does NOT have `yt_dlp` — verified. |
 
 ## Measured times (live, this sandbox, 2026-11-03)
 
@@ -101,7 +101,7 @@ over stdin/stdout with `{"id","method","params"}` /
 reader goroutine and per-call timeouts (extract 120 s, download
 600 s). The daemon never dies on a bad call (per-call try/except →
 error frame). Python resolution: `$PARLAY_YTDLP_PYTHON`, else
-`services/downloaders/.venv/bin/python` (walk-up from cwd), else
+`scripts/yt-dlp-venv/bin/python` (walk-up from cwd), else
 `python3`. Script resolution: `$PARLAY_YTDLP_WORKER`, else
 `scripts/yt_dlp_worker.py` (walk-up). Verified: venv python has
 yt_dlp 2026.10.26; system python3 does not.

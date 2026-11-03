@@ -383,7 +383,12 @@ func applyEnv(c *Config) {
 	setInt("PARLAY_URL_CACHE_TTL_SEC", &c.Limits.URLCacheTTLsec)
 
 	// Backend keys.
-	setStr("PARLAY_DATA_DIR", &c.Backend.DataDir)
+	// A set-but-empty PARLAY_DATA_DIR means "unset": an empty data
+	// dir would fail validation below, while the C++ core treats it
+	// as unset and falls back to "data" — the two sides must agree.
+	if v, ok := os.LookupEnv("PARLAY_DATA_DIR"); ok && strings.TrimSpace(v) != "" {
+		c.Backend.DataDir = strings.TrimSpace(v)
+	}
 	setStr("PARLAY_UDS_PATH", &c.Backend.UDSPath)
 	setStr("SLSKD_URL", &c.Backend.SlskdURL)
 	setStr("SLSKD_USER", &c.Backend.SlskdUser)

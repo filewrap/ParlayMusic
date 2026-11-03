@@ -76,9 +76,15 @@ TdLibClient::Params TdLibClient::Params::fromEnvFor(SessionKind kind) {
     p.api_id = envInt("TD_API_ID", envInt("API_ID"));
     p.api_hash = envStr("TD_API_HASH", envStr("API_HASH"));
     std::string data_dir = envStr("PARLAY_DATA_DIR", "data");
+    // A set-but-empty PARLAY_DATA_DIR means "unset": an empty
+    // data_dir would otherwise resolve the session dirs to absolute
+    // "/tdlib-bot" / "/tdlib". The core Config applies the same rule.
+    if (data_dir.empty()) data_dir = "data";
     if (p.is_bot) {
         // Bot session dir: data/tdlib-bot (TD_BOT_SESSION_DIR overrides).
         p.session_dir = envStr("TD_BOT_SESSION_DIR", data_dir + "/tdlib-bot");
+        if (p.session_dir.empty())
+            p.session_dir = data_dir + "/tdlib-bot";
         p.bot_token = envStr("BOT_TOKEN");
     } else {
         // Assistant session dir: data/tdlib (TD_SESSION_DIR overrides).
@@ -86,6 +92,7 @@ TdLibClient::Params TdLibClient::Params::fromEnvFor(SessionKind kind) {
         // the session dir itself for the path.
         p.session_dir =
             envStr("TD_SESSION_DIR", data_dir + "/tdlib");
+        if (p.session_dir.empty()) p.session_dir = data_dir + "/tdlib";
     }
     p.phone = envStr("TD_PHONE");
     p.code = envStr("TD_CODE");

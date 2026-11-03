@@ -1,5 +1,16 @@
 # Parlay — v0.2.0 Release (one-click install/start)
 
+> **Superseded note (2026-11-03, Phase 3):** this report documents
+> the v0.2.0 release, which shipped the **old** 12-service HTTP
+> topology (12 services on ports 8001–8010/3000/8080, Mongo/Redis).
+> That topology has since been deleted and replaced by the locked
+> 2-process engine (core-cpp + backend-go over UDS, bbolt store —
+> see `FINAL-ARCHITECTURE.md`, main at `f1a7211`). The one-click
+> install below installs the old topology; do not use it for a fresh
+> install — build from the repo per `README.md` / `INSTALL.md`.
+> There is no newer release tarball yet. The body below is kept
+> verbatim as the record of what v0.2.0 was.
+
 Date: 2026-11-03. Branch: `main`, commit `1309e7b`.
 Tag: `v0.2.0` (pushed, verified via `ls-remote`).
 

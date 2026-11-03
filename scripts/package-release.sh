@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Parlay — build every service in release mode and pack the release tarball.
+# Parlay — build the 2-process engine in release mode and pack the
+# release tarball (FINAL-ARCHITECTURE.md).
 #
 # Output:  release/parlay-<VERSION>-linux-x86_64.tar.gz
 #          release/parlay-<VERSION>-linux-x86_64.tar.gz.sha256
 #          (SHA256SUMS also lives inside the tarball, at its root.)
 #
+# Staged: bin/parlay-core, bin/parlay-backend, lib/libtdjson.so.1.8.69,
+# lib/libntgcalls.so, scripts/yt_dlp_worker.py (the yt-dlp daemon the
+# backend spawns at boot; its venv is created by install.sh, never
+# bundled), launchers, parlay.toml.example, .env.example, README,
+# INSTALL.md, VERSION.
+#
 # Re-runnable: the staging dir is wiped at the start of every run.
-# Never bundles: .env, tokens, session files, refs/, build dirs, venvs,
-# __pycache__, .git, slskd (install.sh fetches it from upstream).
+# Never bundles: .env, tokens, session files, refs/ (except the one
+# prebuilt libntgcalls.so copied to lib/), build dirs, venvs,
+# __pycache__, .git, slskd (install.sh fetches it from upstream),
+# audio-fx-rust (Phase 5 port source, not a shipped service).
 #
 # Launcher scripts (install.sh / start.sh / stop.sh / status.sh) are owned
 # by a parallel workstream. If any is missing this script FAILS, unless
@@ -34,8 +43,8 @@ ARCHIVE_SHA="$ARCHIVE.sha256"
 GO_BIN="${PARLAY_GO_BIN:-$ROOT/.tools/go/bin/go}"
 [ -x "$GO_BIN" ] || GO_BIN="$(command -v go || true)"
 [ -n "$GO_BIN" ] || { echo "ERROR: no Go toolchain (tried $ROOT/.tools/go/bin/go and PATH)" >&2; exit 1; }
-export PATH="$HOME/.cargo/bin:$PATH"
-command -v cargo >/dev/null || { echo "ERROR: cargo not found (tried ~/.cargo/bin and PATH)" >&2; exit 1; }
+# NOTE: go.mod requires Go >= 1.26; a 1.23 toolchain resolves it via
+# GOTOOLCHAIN=auto (downloads the newer toolchain on first use).
 
 # --- launcher scripts -------------------------------------------------------
 LAUNCHERS=(install.sh start.sh stop.sh status.sh)
@@ -57,7 +66,7 @@ fi
 
 # --- clean staging ----------------------------------------------------------
 rm -rf "$STAGE_PARENT"
-mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/services"
+mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/scripts"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 need_file() { [ -f "$1" ] || fail "expected file missing after build: $1"; }
@@ -74,31 +83,12 @@ fi
 need_exec services/core-cpp/build/parlay-core
 cp services/core-cpp/build/parlay-core "$STAGE/bin/parlay-core"
 
-# --- 2. vc-go + netease-go ---------------------------------------------------
-echo "==> vc-go"
-(cd services/vc-go && "$GO_BIN" build -trimpath -o "$STAGE/bin/parlay-vc-go" ./cmd/parlay-vc)
-need_exec "$STAGE/bin/parlay-vc-go"
-echo "==> netease-go"
-(cd services/netease-go && "$GO_BIN" build -trimpath -o "$STAGE/bin/parlay-netease" ./cmd/parlay-netease)
-need_exec "$STAGE/bin/parlay-netease"
+# --- 2. backend-go (unified Go backend) ----------------------------------
+echo "==> backend-go"
+(cd services/backend-go && CGO_ENABLED=1 "$GO_BIN" build -trimpath -o "$STAGE/bin/parlay-backend" ./cmd/backend)
+need_exec "$STAGE/bin/parlay-backend"
 
-# --- 3. Rust services (offline release builds) ------------------------------
-echo "==> rust services"
-declare -A RUST_BINS=(
-  [vc-rust]=parlay-vc-rust
-  [audio-fx-rust]=parlay-audio-fx
-  [share-rust]=parlay-share
-  [queue-rust]=parlay-queue
-  [spotify-rust]=parlay-spotify
-)
-for svc in vc-rust audio-fx-rust share-rust queue-rust spotify-rust; do
-  bin="${RUST_BINS[$svc]}"
-  (cd "services/$svc" && cargo build --release --offline)
-  need_exec "services/$svc/target/release/$bin"
-  cp "services/$svc/target/release/$bin" "$STAGE/bin/$bin"
-done
-
-# --- 4. Native voice libs (copy only — NEVER rebuild here) ------------------
+# --- 3. Native voice libs (copy only — NEVER rebuild here) ------------------
 echo "==> native libs (copy only)"
 TDJSON_SRC="phase4/tdlib-src/build/libtdjson.so.1.8.69"
 NTG_SRC="refs/ntgcalls/shared-output/lib/libntgcalls.so"
@@ -109,40 +99,37 @@ need_file "$TDJSON_SRC"; need_file "$NTG_SRC"
 cp "$TDJSON_SRC" "$STAGE/lib/libtdjson.so.1.8.69"
 cp "$NTG_SRC" "$STAGE/lib/libntgcalls.so"
 
-# --- 5. JS services (sources only — no node_modules, no data, no tests) -----
-echo "==> js services"
-rsync -a --exclude node_modules --exclude data --exclude tests \
-  --exclude Dockerfile --exclude PROGRESS.md --exclude '*.node' \
-  services/vc-ts/ "$STAGE/services/vc-ts/"
-rsync -a --exclude node_modules --exclude data --exclude tests \
-  --exclude Dockerfile --exclude PROGRESS.md \
-  services/gui-js/ "$STAGE/services/gui-js/"
-rsync -a --exclude node_modules --exclude data --exclude tests \
-  --exclude Dockerfile --exclude PROGRESS.md \
-  services/radio-js/ "$STAGE/services/radio-js/"
-need_file "$STAGE/services/vc-ts/src/main.js"
-need_file "$STAGE/services/gui-js/app/main.js"
-need_file "$STAGE/services/radio-js/src/main.js"
+# --- 4. yt-dlp worker (sources only — the venv is created by install.sh) --
+echo "==> yt-dlp worker"
+cp scripts/yt_dlp_worker.py "$STAGE/scripts/yt_dlp_worker.py"
+need_file "$STAGE/scripts/yt_dlp_worker.py"
 
-# --- 6. downloaders (Python sources + requirements.txt only) ----------------
-echo "==> downloaders"
-rsync -a --exclude .venv --exclude venv --exclude __pycache__ --exclude '*.pyc' \
-  --exclude tests --exclude Dockerfile --exclude PROGRESS.md \
-  services/downloaders/ "$STAGE/services/downloaders/"
-need_file "$STAGE/services/downloaders/requirements.txt"
-need_file "$STAGE/services/downloaders/src/main.py"
-
-# --- 7. Root files -----------------------------------------------------------
+# --- 5. Root files -----------------------------------------------------------
 echo "==> root files"
 for f in "${LAUNCHERS[@]}"; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$STAGE/$f"
 done
 cp "$ROOT/.env.example" "$STAGE/.env.example"
+cp "$ROOT/parlay.toml.example" "$STAGE/parlay.toml.example"
 cp "$ROOT/README.md" "$STAGE/README.md"
 cp "$ROOT/INSTALL.md" "$STAGE/INSTALL.md"
 cp "$ROOT/VERSION" "$STAGE/VERSION"
 
-# --- 8. Secret sweep (before the tarball exists) -----------------------------
+# --- 6. Runtime-link check (tarball layout: lib/ next to bin/) -----------
+echo "==> runtime-link check"
+# Both binaries must resolve every shared lib from the staged lib/
+# alone: parlay-core via its $ORIGIN RUNPATH, parlay-backend via
+# LD_LIBRARY_PATH (its baked rpath points at the repo's refs/ dir,
+# which does not exist in the tarball — start.sh exports
+# LD_LIBRARY_PATH=$ROOT/lib for it at runtime).
+for bin in parlay-core parlay-backend; do
+  if LD_LIBRARY_PATH="$STAGE/lib" ldd "$STAGE/bin/$bin" 2>&1 | grep -q "not found"; then
+    LD_LIBRARY_PATH="$STAGE/lib" ldd "$STAGE/bin/$bin" >&2 || true
+    fail "$bin has unresolved shared libraries against the staged lib/"
+  fi
+done
+
+# --- 7. Secret sweep (before the tarball exists) -----------------------------
 echo "==> secret sweep"
 # (a) No live env / session files anywhere in the staging tree.
 if find "$STAGE" \( -name '.env' -o -name '*.session' -o -name '*.session-journal' \
@@ -179,7 +166,7 @@ if find "$STAGE" \( -name '__pycache__' -o -name '.venv' -o -name 'node_modules'
   fail "staging tree contains a forbidden dir (venv/node_modules/build/target/refs/.git/__pycache__)"
 fi
 
-# --- 9. SHA256SUMS inside the tarball + pack --------------------------------
+# --- 8. SHA256SUMS inside the tarball + pack --------------------------------
 echo "==> checksums + pack"
 (cd "$STAGE" && find . -type f -not -name SHA256SUMS -print0 | sort -z \
   | xargs -0 sha256sum > SHA256SUMS)
@@ -189,7 +176,7 @@ tar --owner=0 --group=0 --numeric-owner -czf "$ARCHIVE" -C "$STAGE_PARENT" "$DIS
 sha256sum "$ARCHIVE" > "$ARCHIVE_SHA"
 rm -rf "$STAGE_PARENT"
 
-# --- 10. Report ---------------------------------------------------------------
+# --- 9. Report ---------------------------------------------------------------
 echo
 echo "Built: $ARCHIVE"
 echo "Size:  $(du -h "$ARCHIVE" | cut -f1) ($(stat -c%s "$ARCHIVE") bytes)"

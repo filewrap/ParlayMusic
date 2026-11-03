@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Parlay — one-command setup for a fresh Ubuntu 22.04+ / Debian 12 x86_64 VPS.
 #
+# Installs the 2-process engine (FINAL-ARCHITECTURE.md): the C++ core
+# (services/core-cpp) + the Go unified backend (services/backend-go),
+# the persistent yt-dlp daemon venv (scripts/yt-dlp-venv), and the
+# optional slskd daemon. No Docker, no Mongo/Redis, no Node services.
+#
 # Usage:
 #   ./install.sh [--from-repo] [--dir <path>]
 #
@@ -96,7 +101,6 @@ command -v pip3    >/dev/null 2>&1 || MISSING_PKGS+=(python3-pip)
 command -v ffmpeg  >/dev/null 2>&1 || MISSING_PKGS+=(ffmpeg)
 command -v unzip   >/dev/null 2>&1 || MISSING_PKGS+=(unzip)
 command -v openssl >/dev/null 2>&1 || MISSING_PKGS+=(openssl)
-if ! command -v node >/dev/null 2>&1; then MISSING_PKGS+=(nodejs); fi
 
 if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
     say "Installing missing packages via apt: ${MISSING_PKGS[*]}"
@@ -112,26 +116,14 @@ for tool in curl git python3 ffmpeg unzip openssl; do
 done
 python3 -c "import venv" 2>/dev/null || die "python3-venv is still missing (python3 -m venv unavailable)."
 
-# Node >= 18 is required (vc-ts / radio-js / gui-js use modern Node APIs).
-# Ubuntu 22.04's apt nodejs is v12 — too old — so upgrade via NodeSource.
-NODE_MAJOR=0
-if command -v node >/dev/null 2>&1; then
-    NODE_MAJOR="$(node --version | sed 's/^v//; s/\..*//')"
-fi
-if [ "$NODE_MAJOR" -lt 18 ] 2>/dev/null; then
-    say "node is missing or too old (v${NODE_MAJOR}); installing Node 20 LTS via NodeSource…"
-    curl -fsSL https://deb.nodesource.com/setup_20.x | $SUDO -E bash - \
-        || die "NodeSource setup failed; install Node >= 18 manually, then re-run $0."
-    $SUDO apt-get install -y -qq nodejs \
-        || die "Node 20 install failed; install Node >= 18 manually, then re-run $0."
-    NODE_MAJOR="$(node --version | sed 's/^v//; s/\..*//')"
-fi
-[ "$NODE_MAJOR" -ge 18 ] 2>/dev/null || die "node >= 18 is required (found v${NODE_MAJOR:-none})."
-say "Tools OK: node $(node --version), python3 $(python3 --version | awk '{print $2}'), ffmpeg $(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')."
+python3 -c "import venv" 2>/dev/null || die "python3-venv is still missing (python3 -m venv unavailable)."
+say "Tools OK: python3 $(python3 --version | awk '{print $2}'), ffmpeg $(ffmpeg -version 2>/dev/null | head -1 | awk '{print $3}')."
 
 # ---------------------------------------------------------------- source tree
-is_checkout() { # repo root (compose + services) OR tarball root (services + bin/parlay-core)
-    [ -d "$ROOT/services" ] && { [ -f "$ROOT/docker-compose.yml" ] || [ -x "$ROOT/bin/parlay-core" ]; }
+is_checkout() { # repo root (services/backend-go + services/core-cpp)
+                # OR tarball root (bin/parlay-core + bin/parlay-backend)
+    [ -d "$ROOT/services/backend-go" ] && [ -d "$ROOT/services/core-cpp" ] \
+        || { [ -x "$ROOT/bin/parlay-core" ] && [ -x "$ROOT/bin/parlay-backend" ]; }
 }
 
 if is_checkout; then
@@ -144,7 +136,12 @@ elif [ "$FROM_REPO" -eq 1 ]; then
     git clone --depth 1 "$REPO_URL" "$ROOT" \
         || die "git clone failed. Check network access to github.com, then re-run $0."
     say "Cloned. NOTE: a repo checkout has no prebuilt binaries — build the"
-    say "Go/Rust/C++ services first (see README.md), or use the release tarball instead."
+    say "C++ core and Go backend first (see README.md):"
+    say "  cmake -S services/core-cpp -B services/core-cpp/build -DCMAKE_BUILD_TYPE=Release"
+    say "  cmake --build services/core-cpp/build"
+    say "  (cd services/backend-go && go build -trimpath -o ../../bin/parlay-backend ./cmd/backend)"
+    say "or use the release tarball instead (./start.sh builds the backend"
+    say "on demand when a Go toolchain is present)."
 else
     if [ -x "$ROOT/bin/parlay-core" ]; then
         say "Release already extracted (bin/parlay-core present) — skipping download."
@@ -165,47 +162,44 @@ else
         fi
     fi
 fi
-is_checkout || die "no Parlay checkout at $ROOT after download/clone (expected docker-compose.yml + services/)."
+if ! is_checkout; then
+    # The v0.2.0 release tarball predates the unified engine (no
+    # services/backend-go, no bin/parlay-backend): it cannot be
+    # installed by this script. Use --from-repo until a release is
+    # cut from the unified tree.
+    if [ -x "$ROOT/bin/parlay-core" ]; then
+        die "the tree at $ROOT predates the unified engine (bin/parlay-core present but no backend-go / bin/parlay-backend) — re-run with --from-repo, or wait for a release cut from the unified tree."
+    fi
+    die "no Parlay checkout at $ROOT after download/clone (expected services/backend-go + services/core-cpp, or bin/parlay-core + bin/parlay-backend)."
+fi
 
 # ---------------------------------------------------------------- dirs + venv
-mkdir -p "$ROOT/data" "$ROOT/logs" "$ROOT/run" "$ROOT/bin" "$ROOT/lib"
-for svc in core vc-go vc-ts vc-rust audio-fx share queue spotify radio gui downloaders netease slskd; do
-    mkdir -p "$ROOT/data/$svc"
-done
-mkdir -p "$ROOT/data/downloads" "$ROOT/data/netease"
+# One shared data dir for the whole engine: the bbolt store
+# (data/parlay.db), the backend UDS socket (data/parlay-backend.sock),
+# downloads (data/downloads), the TDLib session dirs (data/tdlib-bot
+# for the bot, data/tdlib for the assistant — the core creates them
+# mode 0700 itself), and the optional slskd app dir (data/slskd).
+mkdir -p "$ROOT/data" "$ROOT/data/downloads" "$ROOT/data/slskd" "$ROOT/logs" "$ROOT/run" "$ROOT/bin" "$ROOT/lib"
 
-if [ ! -x "$ROOT/.venv/bin/python" ]; then
-    say "Creating Python venv at $ROOT/.venv …"
-    python3 -m venv "$ROOT/.venv" || die "python3 -m venv failed."
+# The persistent yt-dlp daemon runs on this venv's python
+# (scripts/yt-dlp-venv/bin/python); the Go backend spawns it at boot
+# and locates it by walking up from its working directory. System
+# python3 does NOT have yt_dlp — the venv is the only yt-dlp path.
+YTDLP_VENV="$ROOT/scripts/yt-dlp-venv"
+if [ ! -x "$YTDLP_VENV/bin/python" ]; then
+    say "Creating yt-dlp venv at $YTDLP_VENV …"
+    python3 -m venv "$YTDLP_VENV" || die "python3 -m venv failed."
 fi
-if [ -f "$ROOT/services/downloaders/requirements.txt" ]; then
-    if [ -x "$ROOT/.venv/bin/yt-dlp" ]; then
-        say "Downloaders venv already has yt-dlp — skipping pip install."
-    else
-        say "Installing downloaders requirements into .venv (yt-dlp, pycryptodomex)…"
-        if ! "$ROOT/.venv/bin/pip" install -q -r "$ROOT/services/downloaders/requirements.txt"; then
-            warn "pip install failed (network?). The downloaders service still starts,"
-            warn "but YouTube/Deezer resolves will fail until you run:"
-            warn "  $ROOT/.venv/bin/pip install -r $ROOT/services/downloaders/requirements.txt"
-        fi
-    fi
-fi
-
-# ---------------------------------------------------------------- yt-dlp binary
-# Direct binary (no npm, no pipx): the services find yt-dlp via $YT_DLP,
-# PATH, or the downloaders venv — bin/yt-dlp is the first of those.
-if [ -x "$ROOT/bin/yt-dlp" ] && "$ROOT/bin/yt-dlp" --version >/dev/null 2>&1; then
-    say "yt-dlp already present: $("$ROOT/bin/yt-dlp" --version)"
+if "$YTDLP_VENV/bin/python" -c "import yt_dlp" 2>/dev/null; then
+    say "yt-dlp venv already has yt_dlp — skipping pip install."
 else
-    say "Fetching yt-dlp standalone binary…"
-    if curl -fsSL -o "$ROOT/bin/yt-dlp" https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-        && chmod +x "$ROOT/bin/yt-dlp" && "$ROOT/bin/yt-dlp" --version >/dev/null 2>&1; then
-        say "yt-dlp OK: $("$ROOT/bin/yt-dlp" --version)"
-    else
-        rm -f "$ROOT/bin/yt-dlp"
-        warn "yt-dlp binary download failed; the downloaders venv copy (if pip worked)"
-        warn "is the fallback — services look there next. To add it later:"
-        warn "  curl -L -o $ROOT/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp && chmod +x $ROOT/bin/yt-dlp"
+    say "Installing yt-dlp into the daemon venv…"
+    if ! "$YTDLP_VENV/bin/pip" install -q yt-dlp; then
+        warn "pip install failed (network?). The backend still starts,"
+        warn "but the yt-dlp fallback (age-gated/ciphered YouTube,"
+        warn "TikTok metadata, YouTube/Spotify downloads) stays down"
+        warn "until you run:"
+        warn "  $YTDLP_VENV/bin/pip install yt-dlp"
     fi
 fi
 
@@ -259,7 +253,7 @@ else
     if [ -f "$ROOT/.env.example" ]; then
         cp "$ROOT/.env.example" "$ROOT/.env"
     else
-        printf '# Parlay — generated by install.sh. Never commit this file.\nBOT_TOKEN=\nAPI_ID=\nAPI_HASH=\nOWNER_ID=\nPARLAY_TOKEN=\n' > "$ROOT/.env"
+        printf '# Parlay — generated by install.sh. Never commit this file.\nBOT_TOKEN=\nAPI_ID=\nAPI_HASH=\nOWNER_ID=\nPARLAY_TOKEN=\n# Spotify OAuth redirect URI — must match the Spotify app exactly.\nSPOTIFY_REDIRECT_URI=http://127.0.0.1:8080/callback\n' > "$ROOT/.env"
     fi
     chmod 600 "$ROOT/.env"
 

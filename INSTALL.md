@@ -1,131 +1,121 @@
-# Parlay — Install guide (manual / VPS, no Docker)
+# Parlay — Install guide (manual / VPS, repo checkout)
 
-Parlay is a Telegram music bot (C++ core + Go/Rust/TS/JS services). This
-guide covers the **release-tarball install** on a plain Linux VPS. For
-the Docker route instead, see `README.md` (Quick start) and
-`docker-compose.yml`.
+Parlay is a Telegram music bot: a C++20 core + a unified Go backend
+talking over one Unix Domain Socket, with a persistent yt-dlp daemon
+and an embedded bbolt store — no inter-service HTTP, no Mongo/Redis.
+See `FINAL-ARCHITECTURE.md` for the locked architecture. This guide
+covers the **repo-checkout install** on a plain Linux VPS.
+
+> The v0.2.0 release tarball installs the **old** 12-service topology
+> and predates this architecture — do not use it for a fresh install.
+> There is no newer release tarball yet; build from the repo (main at
+> `f1a7211`, Phase 3). `install.sh` / `start.sh` / `stop.sh` /
+> `status.sh` still describe the old topology and are being rewritten
+> — until then, start the two processes by hand as below.
 
 ## Prereqs
 
 | Requirement | Detail |
 |---|---|
 | OS / arch | Ubuntu 22.04+ or Debian 12, **x86_64** (the tarball ships x86_64 binaries + `.so` libs) |
-| RAM | 2 GB minimum (core + 11 services + slskd) |
+| RAM | 2 GB minimum (core + backend + yt-dlp daemon + slskd) |
 | Disk | ~500 MB for the install, plus room for downloads under `data/` |
-| Network | Outbound HTTPS (Telegram Bot API, YouTube/Spotify/NetEase, slskd upstream); **open UDP + direct TCP to Telegram DCs** if you want live voice chat (see Troubleshooting) |
-| Tools | `curl`, `tar`, `python3` (+ `venv`/`pip`), `node` 18+, `ffmpeg`, `yt-dlp` |
+| Network | Outbound HTTPS (Telegram, YouTube/Spotify/NetEase, slskd upstream); **open UDP + direct TCP to Telegram DCs** if you want live voice chat (see Troubleshooting) |
+| Tools | `curl`, `tar`, `python3` (+ `venv`/`pip`), `ffmpeg`, `go` 1.23+, `cmake`, `g++` (C++20) |
 | Accounts | A Telegram bot token from [@BotFather](https://t.me/BotFather), Telegram `API_ID`/`API_HASH` from [my.telegram.org](https://my.telegram.org) (needed for the TDLib voice backend), a Soulseek account if you want Soulseek downloads |
 
 Install the tools on Debian/Ubuntu:
 
 ```bash
-sudo apt update && sudo apt install -y curl tar python3 python3-venv python3-pip ffmpeg
-# node 18+ (nodesource) and yt-dlp:
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs
-sudo pip install --break-system-packages -U yt-dlp   # or: sudo apt install -y yt-dlp
+sudo apt update && sudo apt install -y curl tar python3 python3-venv python3-pip ffmpeg cmake g++
+# go 1.23+ (https://go.dev/dl/ — no distro package is new enough on 22.04):
+curl -LO https://go.dev/dl/go1.23.0.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.23.0.linux-amd64.tar.gz
+export PATH=$PATH:/usr/local/go/bin
 ```
 
-## One-click path (release tarball)
+## Install from the repo
 
 ```bash
-curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.2.0/parlay-v0.2.0-linux-x86_64.tar.gz
-tar xzf parlay-v0.2.0-linux-x86_64.tar.gz
-cd parlay-v0.2.0-linux-x86_64 && ./install.sh
-```
-
-Then configure and start:
-
-```bash
+git clone https://github.com/filewrap/ParlayMusic.git && cd ParlayMusic
 cp .env.example .env   # fill in BOT_TOKEN, API_ID, API_HASH, OWNER_ID, PARLAY_TOKEN
-./start.sh
-./status.sh            # check every service answers /healthz
-./stop.sh              # stop everything
+cp parlay.toml.example parlay.toml   # optional: defaults apply without it
+
+# yt-dlp daemon venv (the backend starts the daemon from this venv at boot)
+python3 -m venv scripts/yt-dlp-venv
+scripts/yt-dlp-venv/bin/pip install -U yt-dlp
+
+# build both processes
+cd services/backend-go && go build -o parlay-backend ./cmd/backend && cd ../..
+cd services/core-cpp && cmake -B build && cmake --build build && cd ../..
 ```
 
-`install.sh` is idempotent and safe to re-run: it performs first-time
-setup (fetches the slskd daemon from upstream — slskd is **not** in the
-tarball — prepares runtime directories, and installs the downloaders'
-Python dependencies). It never overwrites an existing `.env`.
-
-## Manual path (same tarball, no install.sh)
+Then start, backend first (it creates the UDS socket the core
+connects to), core second:
 
 ```bash
-curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.2.0/parlay-v0.2.0-linux-x86_64.tar.gz
-tar xzf parlay-v0.2.0-linux-x86_64.tar.gz
-cd parlay-v0.2.0-linux-x86_64
-cp .env.example .env   # fill in BOT_TOKEN, API_ID, API_HASH, OWNER_ID, PARLAY_TOKEN
-
-# downloaders' Python deps (isolated venv, nothing system-wide)
-python3 -m venv services/downloaders/.venv
-services/downloaders/.venv/bin/pip install -r services/downloaders/requirements.txt
-
-# slskd (Soulseek daemon) — fetched by install.sh; manually:
-# download the slskd release for linux-x64 from https://github.com/slskd/slskd/releases
-# and place the `slskd` binary on PATH (or set SLSKD_URL to a running instance).
-
-# make sure the native libs are findable (start.sh sets this for you)
-export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
-export TDJSON_LIB="$PWD/lib/libtdjson.so.1.8.69"
-export NTGCALLS_LIB="$PWD/lib/libntgcalls.so"
-
-./start.sh
+./services/backend-go/parlay-backend &
+./services/core-cpp/build/parlay-core
 ```
 
-The JS services (`vc-ts`, `gui-js`, `radio-js`) use Node's stdlib only —
-no `npm install` needed. The Go/Rust binaries in `bin/` are prebuilt;
-nothing needs compiling on the host.
+Stop with Ctrl-C / `kill` on each process (no `stop.sh` yet — the
+launcher rewrite is pending). Both processes log to stdout/stderr;
+redirect to files if you want persistent logs.
 
-## Ports
+## Manual notes
 
-All services listen on localhost by default; only the ones you publish
-are reachable from outside. The core's HTTP API is on `:8080`.
+- The backend warms the yt-dlp daemon at boot (first resolve never
+  forks). If the warm fails, startup continues with the native
+  resolvers only and yt-dlp stays down until restart.
+- The backend opens the bbolt store at `data/parlay.db` (0600 in a
+  0700 `data/` dir) and listens on `data/parlay-backend.sock`.
+  Override the data dir with `PARLAY_DATA_DIR` / `backend.data_dir`
+  in `parlay.toml`.
+- TDLib sessions live under `data/` too: `data/tdlib-bot` (bot
+  session, token auth) and `data/tdlib` (assistant session), both
+  0700. First assistant login: `scripts/tdlib_login.py` (phone →
+  code → 2FA, or QR).
+- slskd (Soulseek daemon) is opt-in: fetch the slskd release for
+  linux-x64 from https://github.com/slskd/slskd/releases and place
+  the `slskd` binary on PATH (or set `SLSKD_URL` to a running
+  instance).
+- The core's legacy `:8080` HTTP server still starts at boot but
+  nothing uses it (FINAL-ARCHITECTURE.md §6-R1 schedules its
+  deletion); core↔backend traffic is UDS-only.
 
-| Service | Port | Notes |
+## Ports / sockets
+
+No inter-service HTTP ports exist anymore. The only listeners are:
+
+| Thing | Address | Notes |
 |---|---|---|
-| core-cpp | 8080 | Bot core + HTTP API (`/healthz`, `/api/now-playing`, `/api/queue`) |
-| vc-go | 8001 | Go VC engine |
-| vc-ts | 8002 | TS VC engine |
-| vc-rust | 8003 | Rust VC engine |
-| audio-fx-rust | 8004 | Audio effects |
-| share-rust | 8005 | Anonymous share links |
-| queue-rust | 8006 | Voting queue |
-| spotify-rust | 8007 | Spotify watch / classifier |
-| radio-js | 8008 | Internet radio |
-| downloaders | 8009 | Python download workers |
-| netease-go | 8010 | NetEase search/download |
-| gui-js | 3000 | Web GUI / Mini App player (the one port you normally publish) |
-| slskd | 5030 / 5031 | Soulseek daemon web UI+API (HTTP / HTTPS) |
-| mongo / redis | 27017 / 6379 | **Docker Compose only** — the tarball install does not use them (see below) |
+| core ↔ backend IPC | `data/parlay-backend.sock` (UDS) | backend creates/listens; core connects; `PARLAY_UDS_PATH` overrides |
+| bbolt store | `data/parlay.db` (file, not a port) | single embedded store for all state |
+| core legacy HTTP | `:8080` | leftover server, unused, slated for deletion (§6-R1) |
+| slskd | 5030 / 5031 | Soulseek daemon web UI+API (HTTP / HTTPS), opt-in |
 
-## State, logs, and Mongo
+## State and logs
 
-The tarball install uses **JSON-file stores** (under `data/`, one subdir
-per service) — MongoDB and Redis are Compose-only and are **not**
-required here. `MONGO_URI` / `REDIS_URL` in `.env` are ignored on this
-path; Mongo support is aside upstream, so do not point the tarball
-install at a Mongo server expecting shared state.
+All state lives in the single bbolt store **`data/parlay.db`** —
+rooms, queues, votes, shares, Spotify state, settings, radio state
+(7 buckets). There is no Mongo/Redis and no per-service JSON store
+anymore; `MONGO_URI` / `REDIS_URL` in `.env` are legacy and ignored.
+`data/` (store, downloads, TDLib sessions) is untouched by an
+upgrade — back it up before one.
 
-Logs live under `logs/` in the install directory (one file per service,
-written by `start.sh`). Check them first when something misbehaves:
-
-```bash
-tail -f logs/core.log        # core-cpp
-tail -f logs/vc-go.log       # any other service: logs/<service>.log
-```
+When run by hand, both processes log to stdout/stderr — redirect
+them yourself (`>> logs/backend.log 2>&1`, `>> logs/core.log 2>&1`)
+until the launcher rewrite restores `logs/<service>.log` files.
 
 ## systemd
 
-`start.sh` backgrounds every service itself (plain shell `&`, one PID
-file per service in `run/`, logs in `logs/`) and then exits, so the unit
-must **not** be `Type=simple` — systemd would see `start.sh` exit,
-conclude the service died, and `Restart=on-failure` would loop forever
-re-running it. `Type=forking` is wrong too: there is no single daemon
-PID (there are twelve). The coherent shape is a oneshot unit that stays
-"active" after the start script exits, with `stop.sh` as the stop
-action. Because the services are plain background children (not
-detached with `nohup`/`setsid`), they stay in the unit's cgroup while
-it is active; on stop, `stop.sh` kills them by PID file and systemd
-then reaps any stragglers:
+> Pending the launcher rewrite: `start.sh` / `stop.sh` do not exist
+> in their new form yet, so the unit below is a sketch, not a tested
+> unit. The shape that fits the new layout is a oneshot unit that
+> stays "active" after the start script exits, with `stop.sh` as the
+> stop action — the same shape as before, because the start script
+> still backgrounds processes itself and then exits (there are two
+> processes + the daemon now, not twelve services).
 
 ```ini
 # /etc/systemd/system/parlay.service
@@ -149,7 +139,7 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo cp -r parlay-v0.2.0-linux-x86_64 /opt/parlay
+sudo cp -r ParlayMusic /opt/parlay
 sudo useradd -r -m -d /opt/parlay parlay 2>/dev/null || true
 sudo chown -R parlay:parlay /opt/parlay
 sudo systemctl daemon-reload
@@ -160,32 +150,30 @@ systemctl status parlay
 Notes:
 
 - `Restart=on-failure` here only retries a *failed start* (a oneshot
-  unit has no running process to restart). If a service dies later,
-  nothing restarts it automatically — run `./stop.sh` then `./start.sh`
-  (or `systemctl restart parlay`) to bring it back; check `logs/` and
-  `./status.sh` first.
+  unit has no running process to restart). If a process dies later,
+  nothing restarts it automatically — restart the bot by hand and
+  check the logs first.
 - Run as a non-root user (`User=parlay`); the install dir must be
   writable by that user (`data/`, `logs/`, downloads).
 - If you would rather have systemd supervise the core in the
-  foreground instead, run `bin/parlay-core` directly with
-  `Type=simple` in a *separate* unit — but then it does not start
-  the other eleven services, so do not mix the two approaches in
+  foreground instead, run `services/core-cpp/build/parlay-core`
+  directly with `Type=simple` in a *separate* unit — but then it
+  does not start the backend, so do not mix the two approaches in
   one unit.
 
 ## Updating
 
-1. Download the new release tarball and verify its checksum
-   (`sha256sum -c parlay-vX.Y.Z-linux-x86_64.tar.gz.sha256`).
-2. Stop the bot: `./stop.sh` (or `systemctl stop parlay`).
-3. Extract the new tarball **over** the install directory.
-4. Re-run `./install.sh` (refreshes slskd / Python deps if needed).
-5. Start again: `./start.sh` (or `systemctl start parlay`).
+1. Stop the bot (kill both processes, backend + core).
+2. `git pull` and rebuild both processes (see "Install from the
+   repo" above).
+3. Back up `data/` first (the bbolt store + TDLib sessions).
+4. Start again, backend first, core second.
 
-Your `.env` is preserved — `install.sh` never overwrites it, and the
-tarball ships only `.env.example`. `data/` (state, queues, downloads)
-is also untouched by an upgrade. If a release changes the config
-template, diff `.env.example` against your `.env` and add any new
-variables by hand.
+Your `.env` and `parlay.toml` are preserved — they live outside the
+build dirs. `data/` (state, queues, downloads) is also untouched by
+an upgrade. If a release changes the config template, diff
+`.env.example` / `parlay.toml.example` against your files and add
+any new variables by hand.
 
 ## Troubleshooting
 
@@ -204,55 +192,65 @@ reading a stale `.env` — restart after every `.env` edit). If the VPS
 needs an HTTP proxy for outbound traffic, the core honours the
 standard `https_proxy`/`HTTPS_PROXY` environment variables.
 
+**UDS socket already in use / backend won't start.**
+The backend creates `data/parlay-backend.sock` at startup. If a
+stale backend is still running (or a previous one died without
+removing the socket), the new backend fails to listen. Kill any
+stale `parlay-backend` process first; the socket file itself is
+removed and recreated on a clean start. The legacy core `:8080`
+HTTP port can also clash — see "Port already in use" below.
+
 **Port already in use.**
-`./status.sh` shows which services are up; a failed bind is also in
-`logs/<service>.log` ("address already in use"). Find the squatter
-with `ss -tlnp | grep <port>` and stop it, or change the service's
-`PORT` in `.env` (and the matching `*_URL` the core uses to reach it —
-see `.env.example`; the port table above is the source of truth).
+Only the legacy core `:8080` HTTP server binds a TCP port now (and
+it is slated for deletion). A failed bind shows in the core's log
+("address already in use"). Find the squatter with
+`ss -tlnp | grep 8080` and stop it. There are no per-service ports
+to change anymore — core↔backend traffic is the UDS socket above.
 
 **Voice chat never joins / `[voice] backend=unavailable`.**
-Live voice needs all four, and the core logs exactly which one is
+Live voice needs all three, and the core logs exactly which one is
 missing at startup:
 
 1. An **assistant session**: `API_ID`/`API_HASH` (or `TD_API_ID`/
-   `TD_API_HASH`) plus a pre-authorized `TD_SESSION_DIR`, or
-   first-auth via `TD_PHONE`+`TD_CODE` (or `TD_QR=1` for QR login).
+   `TD_API_HASH`) plus a pre-authorized session dir
+   (`data/tdlib`, or `TD_SESSION_DIR`), or first-auth via
+   `TD_PHONE`+`TD_CODE` (or `TD_QR=1` for QR login).
    The bot token alone cannot join a voice chat.
-2. `NTGCALLS_LIB` pointing at `lib/libntgcalls.so` (the tarball ships
-   it; `start.sh` sets this — if you start binaries by hand, export
-   it yourself).
-3. `TDJSON_LIB` pointing at `lib/libtdjson.so.1.8.69` (same).
-4. An **open network**: direct TCP to Telegram DCs plus working
+2. **Build-time linked libraries**: TDLib 1.8.69 is linked into the
+   core at build time and ntgcalls into the backend via cgo — there
+   are no `NTGCALLS_LIB` / `TDJSON_LIB` runtime env vars anymore.
+   If the build could not find them, the binaries fail at build
+   time, not at runtime; a missing `libtdjson.so.1.8.69` is a build
+   problem (see `services/core-cpp/CMakeLists.txt`, `-DTDJSON_LIB=`).
+3. An **open network**: direct TCP to Telegram DCs plus working
    UDP/RTP. Sandboxes and locked-down VPS firewalls block this —
    the sandbox this release was built in cannot do it at all, so a
    failed join there proves nothing about your host. If UDP is
    blocked, voice cannot work no matter what the config says.
 
 **`/play` works but there is no audio.**
-Same causes as above — the engine resolved the track but no voice
-backend is attached. Check `logs/core.log` for the `[voice]` line.
+Same causes as above — the backend resolved the track but no voice
+backend is attached. Check the core's log for the `[voice]` line.
 
 **slskd fails / Soulseek downloads never start.**
 slskd needs a **Soulseek account** (username + password) — set them in
 slskd's own config/web UI on first run (`http://<host>:5030`). Without
-a login slskd runs but cannot search or download, and the downloaders
-fail those requests honestly. Also note Soulseek search is paced
+a login slskd runs but cannot search or download, and the backend
+fails those requests honestly. Also note Soulseek search is paced
 (`SLSKD_SEARCH_MIN_INTERVAL_SECS`, default 10 s) — flooding it gets
 the account throttled by the network.
 
-**`PARLAY_TOKEN` warnings at startup.**
-The core warns when `PARLAY_TOKEN` is empty. Set the same value in
-`.env` for all services (the core and every engine read it from the
-same file on this path). Empty means IPC auth is off — fine for a
-local test, not for a public host.
+**`PARLAY_TOKEN` missing at startup.**
+The core refuses to start without `PARLAY_TOKEN` (and `BOT_TOKEN`)
+— it is a required variable, not a warning. Set it in `.env`; the
+backend reads the same file. There is no per-service token anymore.
 
-**A service exits immediately.**
-Read its log in `logs/` — the usual causes are a missing env var
-(named in the log), a port clash (above), or a missing tool
-(`ffmpeg`/`yt-dlp` for the engines, `node` for the JS services).
+**A process exits immediately.**
+Read its log — the usual causes are a missing env var (named in the
+log), a stale UDS socket (above), or a missing tool (`ffmpeg` for
+the voice pipeline, `yt-dlp` in `scripts/yt-dlp-venv` for the
+daemon).
 
 **Still stuck?**
-Run `./status.sh`, then attach the last 50 lines of the failing
-service's `logs/<service>.log` (redact any token first) when asking
-for help. Never paste your `.env`.
+Attach the last 50 lines of the failing process's log (redact any
+token first) when asking for help. Never paste your `.env`.

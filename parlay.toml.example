@@ -82,3 +82,42 @@ max_duration_minutes = 60
 max_queue_size = 20
 prefetch_lead_time_sec = 30
 url_cache_ttl_sec = 120
+
+# --- Backend-only keys ------------------------------------------------------
+# The Go backend reads these from the [backend] table
+# (services/backend-go/internal/config/config.go). The C++ core ignores
+# this table entirely. Env overrides always win over the values here
+# (PARLAY_DATA_DIR, PARLAY_UDS_PATH, SLSKD_URL, SPOTIFY_*, ... — see
+# .env.example). Secrets must NEVER be committed with real values.
+#
+# LIVE keys — honored from this file: data_dir, uds_path,
+# spotify_client_id, spotify_client_secret, spotify_redirect_uri,
+# spotify_oauth_key, gemini_api_key, audd_api_token.
+# PARSED-BUT-UNPLUGGED keys — accepted here but currently IGNORED at
+# runtime: the resolvers read the env vars directly and never look at
+# these fields (see phase3/wiring-audit-b-config.md §3). Until that
+# wiring lands, set the env var, not the file key: slskd_url (SLSKD_URL),
+# slskd_user / slskd_pass (unused — slskd auth is API-key only),
+# deezer_arl (DEEZER_ARL), netease_music_u (NETEASE_MUSIC_U),
+# navidrome_url / navidrome_user / navidrome_pass (NAVIDROME_URL /
+# NAVIDROME_USER / NAVIDROME_PASSWORD — note the resolver reads
+# NAVIDROME_PASSWORD, not NAVIDROME_PASS), ytdlp_path (use
+# PARLAY_YTDLP_PYTHON / PARLAY_YTDLP_WORKER instead).
+[backend]
+data_dir = "data"
+# uds_path = "data/parlay-backend.sock"  # default: <data_dir>/parlay-backend.sock
+# slskd_url = "http://127.0.0.1:5030"  # parsed but unplugged; set SLSKD_URL
+# slskd_user = ""  # parsed but unplugged; slskd auth is API-key only
+# slskd_pass = ""  # parsed but unplugged; slskd auth is API-key only
+# deezer_arl = ""  # parsed but unplugged; set DEEZER_ARL
+# netease_music_u = ""  # parsed but unplugged; set NETEASE_MUSIC_U
+# spotify_client_id = ""  # Spotify app client id (metadata + per-user OAuth)
+# spotify_client_secret = ""  # never commit a real value
+spotify_redirect_uri = "http://127.0.0.1:8080/callback"  # must match the Spotify app registration exactly; never "localhost"
+# spotify_oauth_key = ""  # base64 of 32 random bytes (PARLAY_SPOTIFY_OAUTH_KEY); unset = generated once, stored <data_dir>/spotify-user-key (0600)
+# navidrome_url = ""  # parsed but unplugged; set NAVIDROME_URL
+# navidrome_user = ""  # parsed but unplugged; set NAVIDROME_USER
+# navidrome_pass = ""  # parsed but unplugged; the resolver reads NAVIDROME_PASSWORD
+# gemini_api_key = ""  # AI lyrics classifier (GEMINI_API_KEY)
+# ytdlp_path = "yt-dlp"  # parsed but unplugged; use PARLAY_YTDLP_PYTHON / PARLAY_YTDLP_WORKER
+# audd_api_token = ""  # AudD music recognition (AUDD_API_TOKEN)

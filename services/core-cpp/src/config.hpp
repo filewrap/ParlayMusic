@@ -144,18 +144,21 @@ struct Config {
     int64_t api_id = 0;       // API_ID (MTProto, reserved for the voice path)
     std::string api_hash;     // API_HASH (MTProto, reserved for the voice path)
 
-    // Shared state (reserved for later Mongo/Redis wiring; the core keeps
-    // its runtime state in memory today — see README.md).
+    // Shared state: Store (MongoDB wire protocol > Redis RESP > JSON
+    // file — see store.hpp). Mongo/Redis are live backends when
+    // MONGO_URI / REDIS_URL are set, not "later wiring".
     std::string mongo_uri;    // MONGO_URI
     std::string redis_url;    // REDIS_URL
 
     // IPC auth shared with every service (contracts/ipc.json).
     std::string parlay_token;  // PARLAY_TOKEN
 
-    // IPC service base URLs (defaults match docker-compose.yml).
-    // NOTE: the 11 HTTP services are deleted by the locked
-    // architecture (Phase 3); these URLs are kept until Wave 2
-    // removes the HTTP IPC client, and are NOT in parlay.toml.
+    // IPC service base URLs (defaults match the deleted docker-compose
+    // topology). NOTE: all 10 HTTP services are deleted by the locked
+    // architecture (Phase 3); the UDS IpcClient ignores these URLs
+    // (signature compat only — see ipc.cpp). The fields are dead and
+    // kept only until the 26 dispatcher call sites are re-pointed at
+    // the no-URL helpers; they are NOT in parlay.toml.
     std::string vc_go_url = "http://vc-go:8001";       // VC_GO_URL
     std::string vc_ts_url = "http://vc-ts:8002";       // VC_TS_URL
     std::string vc_rust_url = "http://vc-rust:8003";   // VC_RUST_URL
@@ -180,9 +183,6 @@ struct Config {
     // lives in TD_SESSION_DIR (TDLib); there is no Telethon session
     // file and no voice bridge any more (Phase 5: deleted).
     std::set<int64_t> assistant_ids;         // ASSISTANT_IDS, comma-sep
-    // NTGCALLS_LIB (explicit libntgcalls.so path). Empty = the dlopen
-    // search in voice_call.cpp (release lib/ next to the binary first).
-    std::string ntgcalls_lib;
     std::string rtp_sink;                    // VOICE_RTP_SINK host:port for Opus pipeline proof
 
     // TDLib voice backend (names only — values stay in the environment).
@@ -193,10 +193,6 @@ struct Config {
     // TD_API_ID/TD_API_HASH and drops a pre-authorized session dir
     // there needs nothing else for the session path.
     std::string td_session_dir;
-    // TDJSON_LIB (explicit libtdjson.so path). Empty = the dlopen
-    // search in tdlib_client.cpp (release lib/ next to the binary,
-    // then the repo phase4 build output).
-    std::string tdlib_lib;
     std::string td_phone;           // TD_PHONE (login phone, if auth needed)
     std::string td_code;            // TD_CODE (login code, if auth needed)
     std::string td_password;        // TD_PASSWORD (2FA password, if auth needed)

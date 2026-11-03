@@ -350,13 +350,20 @@ void applyLegacyEnv(Config& c) {
     c.allow_chats = envIdSet("PARLAY_ALLOW_CHATS");
     c.block_chats = envIdSet("PARLAY_BLOCK_CHATS");
     c.assistant_ids = envIdSet("ASSISTANT_IDS");
-    c.ntgcalls_lib = envStr("NTGCALLS_LIB");
     c.rtp_sink = envStr("VOICE_RTP_SINK");
     c.td_api_id = envInt("TD_API_ID", c.api_id);
     c.td_api_hash = envStr("TD_API_HASH", c.api_hash);
-    c.data_dir = envStr("PARLAY_DATA_DIR", c.data_dir);
-    c.td_session_dir = envStr("TD_SESSION_DIR", c.data_dir + "/tdlib");
-    c.tdlib_lib = envStr("TDJSON_LIB");
+    // A set-but-empty PARLAY_DATA_DIR means "unset": an empty
+    // data_dir would otherwise resolve the TDLib session dirs to
+    // absolute "/tdlib" / "/tdlib-bot" (TdLibClient::Params::
+    // fromEnvFor) while the socket path silently falls back to
+    // "data" — the two sides must agree on "data".
+    if (std::string dd = envStr("PARLAY_DATA_DIR"); !dd.empty())
+        c.data_dir = dd;
+    if (std::string tsd = envStr("TD_SESSION_DIR"); !tsd.empty())
+        c.td_session_dir = tsd;
+    else
+        c.td_session_dir = c.data_dir + "/tdlib";
     c.td_phone = envStr("TD_PHONE");
     c.td_code = envStr("TD_CODE");
     c.td_password = envStr("TD_PASSWORD");

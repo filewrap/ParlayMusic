@@ -1,5 +1,19 @@
 # Parlay — REMAINING.md (source of truth)
 
+> **Superseded note (2026-11-03, Phase 3):** this file was the
+> source of truth for the **old** 12-service topology (Phase 7
+> verification: 717 tests across 12 services, Mongo/Redis store,
+> per-service `/healthz`). That topology has since been deleted and
+> replaced by the locked 2-process engine (FINAL-ARCHITECTURE.md,
+> main at `f1a7211`). The per-item verification numbers and the
+> service paths below are therefore stale as a description of the
+> current tree. What still stands: A1 (live voice join — code
+> complete, live proof pending on the user's host) and the
+> key-gated-only table in spirit (same keys, new package paths —
+> see CURRENT-STATE.md §8). The body below is kept verbatim as the
+> Phase 7 record; do not use its service table or test counts as
+> current.
+
 Date: 2026-11-03. Rewritten by the Phase 7 coordinator after re-verifying
 every Section A item against the current tree (rebuilds + full test runs
 + combined smoke + fresh stub grep). This file contains ONLY what truly
