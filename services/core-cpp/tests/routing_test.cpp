@@ -313,6 +313,9 @@ public:
                            const parlay::Json&,
                            int = 30) const override {
         if (action == "vote" || action == "dislike") return ok(parlay::Json::parse(R"({})"));
+        if (action == "spotify.analyze")
+            return ok(parlay::Json::parse(
+                R"({"analysis":"Clean lyrics, upbeat song.","profane_words":[]})"));
         if (action == "fx")
             return ok(parlay::Json::parse(
                 R"({"output_path":"/tmp/parlay-routing-test/fx-out.ogg"})"));
@@ -322,7 +325,7 @@ public:
         if (action == "pause" || action == "resume" || action == "seek" ||
             action == "skip" || action == "stop" || action == "autoplay" ||
             action == "shuffle" || action == "volume" || action == "queue" ||
-            action == "play" || action == "mute")
+            action == "play" || action == "mute" || action == "loop")
             return ok(nowPlaying());
         return fail404();
     }
@@ -331,6 +334,10 @@ public:
         if (contains(path, "now-playing")) return ok(nowPlaying());
         if (contains(path, "queue"))
             return ok(parlay::Json::parse(R"({"queue":[]})"));
+        // spotify.details (E8): the Phase 3 companion surface.
+        if (contains(path, "spotify/details"))
+            return ok(parlay::Json::parse(
+                R"({"track":{"id":"track1","title":"Test Track","artist":"Test Artist","album":"Test Album","duration_sec":200,"url":"https://open.spotify.com/track/track1"},"features":{"key":"C","modality":"Major","tempo_bpm":120,"acousticness":0.1,"danceability":0.8,"energy":0.9,"instrumentalness":0.0,"liveness":0.2,"speechiness":0.05,"valence":0.7},"genres":["pop"],"disliked_by":[111,222],"ignored_by":[],"profanity":null,"language":null,"lyrics":"la la la","lyrics_link":"https://example.invalid/lyrics"})"));
         return fail404();
     }
 };
@@ -712,7 +719,6 @@ int main(int argc, char** argv) {
             {"hello", "non-pl: data"},
             {"", "empty data"},
             {"pl:player:unknownverb:-1001234567890", "unknown verb"},
-            {"pl:spotify:analyze:track1", "companion verb (Phase 3)"},
         };
         for (const auto& [data, why] : unknowns) {
             size_t before = rig.tg.toasts.size();
@@ -723,6 +729,26 @@ int main(int argc, char** argv) {
                       rig.tg.toasts.back().text ==
                           "This feature is not available yet.",
                   "unknown callback toast is honest: " + why);
+        }
+        // spotify details/analyze are routed now (E8, Phase 3):
+        // details renders the card in place, analyze renders the
+        // analysis — neither is an unknown callback any more.
+        {
+            size_t edits_before = rig.tg.edits.size();
+            rig.d.handleCallback(makeCq("pl:spotify:details:track1"));
+            CHECK(rig.tg.edits.size() > edits_before &&
+                      contains(rig.tg.edits.back().text, "Test Track") &&
+                      contains(rig.tg.edits.back().text, "Key C Major") &&
+                      contains(rig.tg.edits.back().text,
+                               "Disliked by 2 people"),
+                  "spotify details routed: card rendered in place");
+            size_t edits_before_a = rig.tg.edits.size();
+            rig.d.handleCallback(makeCq("pl:spotify:analyze:track1"));
+            CHECK(rig.tg.edits.size() > edits_before_a &&
+                      contains(rig.tg.edits.back().text,
+                               "Lyrics analysis") &&
+                      contains(rig.tg.edits.back().text, "Clean lyrics"),
+                  "spotify analyze routed: analysis rendered in place");
         }
         // Exactly 64 bytes is accepted by the guard (routed, not
         // rejected); 65 bytes is rejected with the same alert.

@@ -1,6 +1,38 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "actions": {
+    "audio.recognize": {
+      "from": "phase3/actions-inventory.md §9-E4 (OD-3); provider AudD per OD-10 (user decision 2026-11-03)",
+      "method": "POST /v1/audio/recognize",
+      "request": {
+        "file_path": "string (path under the data dir)",
+        "file_id": "string (Telegram file id, optional)"
+      },
+      "response": {
+        "recognized": "boolean",
+        "track": "Track (when recognized)",
+        "name": "string",
+        "artists": ["string"],
+        "album": "string",
+        "source": "string (spotify|deezer|audd)"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3) — env-gated on AUDD_API_TOKEN, honest 502 while unconfigured"
+    },
+    "cache.clear": {
+      "from": "phase3/actions-inventory.md §9-E7 (OD-3)",
+      "method": "POST /v1/cache/clear",
+      "request": {
+        "scope": "track|all",
+        "name": "string (track scope: cached track name)"
+      },
+      "response": {
+        "cleared": "boolean",
+        "names": ["string"]
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
+    },
     "chat.settings": {
       "from": "UI_INVENTORY.md §29 IPC-6 (Phase 9)",
       "method": "GET /v1/chat/settings?chat_id= | POST /v1/chat/settings",
@@ -31,6 +63,20 @@
       },
       "service": "core-cpp"
     },
+    "download.cancel": {
+      "from": "phase3/actions-inventory.md §9-E1 (OD-3)",
+      "method": "POST /v1/download/cancel",
+      "request": {
+        "run_id": "string"
+      },
+      "response": {
+        "cancelled": "boolean",
+        "run_id": "string",
+        "phase": "string"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
+    },
     "download.deezer": {
       "method": "POST /v1/download/deezer",
       "request": {
@@ -57,6 +103,24 @@
         "run_id": "string"
       },
       "service": "downloaders"
+    },
+    "download.prefs": {
+      "from": "phase3/actions-inventory.md §9-E9 (OD-3)",
+      "method": "GET /v1/download/prefs | POST /v1/download/prefs",
+      "request": {
+        "user_id": "UserId",
+        "format": "string (POST only: mp3|aac|flac|opus|m4a|wav)",
+        "use_youtube": "boolean (POST only)",
+        "path_template": "string (POST only, must contain {ext})"
+      },
+      "response": {
+        "user_id": "UserId",
+        "format": "string",
+        "use_youtube": "boolean",
+        "path_template": "string"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "download.progress": {
       "from": "UI_INVENTORY.md §29 IPC-4 (Phase 9); downloaders server.py",
@@ -238,6 +302,58 @@
         ]
       },
       "service": "vc-ts"
+    },
+    "library.delete": {
+      "from": "phase3/actions-inventory.md §9-E2 (OD-3)",
+      "method": "POST /v1/library/delete",
+      "request": {
+        "id": "string (one of id / path required)",
+        "path": "string (one of id / path required)"
+      },
+      "response": {
+        "deleted": "boolean",
+        "id": "string"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
+    },
+    "library.scan": {
+      "from": "phase3/actions-inventory.md §9-E5 (OD-3)",
+      "method": "POST /v1/library/scan",
+      "request": {},
+      "response": {
+        "triggered": "boolean",
+        "error": "string (empty when triggered)",
+        "tracks_found": "integer"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
+    },
+    "library.sharescan": {
+      "from": "phase3/actions-inventory.md §9-E6 (OD-3)",
+      "method": "POST /v1/library/sharescan",
+      "request": {},
+      "response": {
+        "triggered": "boolean",
+        "scheduled_in_min": "integer (omitted: slskd exposes no estimate)"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
+    },
+    "mix.generate": {
+      "from": "phase3/actions-inventory.md §9-E3 (OD-3)",
+      "method": "POST /v1/mix/generate",
+      "request": {
+        "chat_id": "ChatId",
+        "query": "string (optional: explicit seed query)",
+        "requested_by": "UserId"
+      },
+      "response": {
+        "tracks": ["Track"],
+        "source_track": "Track"
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "netease.download": {
       "from": "Music163bot-Go handlers_music.go",
@@ -651,12 +767,37 @@
       "request": {
         "chat_id": "ChatId",
         "query": "string (title, URL or track id)",
-        "requested_by": "UserId"
+        "requested_by": "UserId",
+        "speed": "number (playback speed, e.g. 1.5; carried into the room, record-only until the Phase 5 DSP applies it)",
+        "bass": "integer (bass boost level; carried into the room, record-only until the Phase 5 DSP applies it)"
       },
       "response": {
         "now_playing": "NowPlaying"
       },
       "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.play_file": {
+      "from": "phase3/actions-inventory.md §3.3 + §9-E12 (OD-3); core posts it for replied media (dispatcher.cpp playRepliedFile)",
+      "method": "POST /v1/play_file",
+      "request": {
+        "chat_id": "ChatId",
+        "file_path": "string (path under the data dir)",
+        "file_id": "string (Telegram file id, optional)",
+        "title": "string (optional)",
+        "kind": "audio|video|voice|video_note|document",
+        "duration_sec": "integer (optional)",
+        "requested_by": "UserId"
+      },
+      "response": {
+        "now_playing": "NowPlaying",
+        "voice_state": {
+          "joined": "boolean (live call record, never claimed)",
+          "streaming": "boolean (always false in Phase 3 — record-only, no feed bound)",
+          "detail": "string (\"local file — audio path lands with the DSP\")"
+        }
+      },
+      "service": "backend-go",
+      "ported": "Phase 3 Wave 2 (OD-3) — record-only per inventory §3.3; the only implementation is internal/handlers"
     },
     "vc.queue": {
       "method": "POST /v1/queue",

@@ -24,6 +24,10 @@ phase5/
 .tools/
 **/.venv/
 **/venv/
+# yt-dlp daemon runtime (moved from services/downloaders/.venv in
+# Phase 3; local-only, never committed — rebuild with
+# python3 -m venv scripts/yt-dlp-venv && scripts/yt-dlp-venv/bin/pip install yt-dlp)
+scripts/yt-dlp-venv/
 *.sqlite3
 *.sqlite
 *.node

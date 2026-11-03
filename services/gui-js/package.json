@@ -1,1 +1,0 @@
-{"name":"parlay-gui","version":"0.2.0","private":true,"scripts":{"dev":"node app/main.js","start":"node app/main.js","test":"node --test tests/run.js"}}

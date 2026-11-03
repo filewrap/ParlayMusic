@@ -134,7 +134,7 @@ uses 1,000,000+). The core runs the handler on a worker thread, so
 a slow TDLib `joinVideoChat` never stalls the reader or other
 in-flight responses. See §6.
 
-## §4. Action table — all 56 contract actions
+## §4. Action table — all 65 contract actions
 
 Payload/response shapes are exactly `contracts/ipc.json`
 `actions/<name>` (request / response objects, `Track` /
@@ -144,6 +144,14 @@ the UDS envelope and records the core-side legacy name it replaces
 `download/youtube`, `radio/start`, `share`, `fx`, `vote`,
 `dislike`, vc short names — to these dotted names; that shim dies
 with the dispatcher/engine-router rewrite in Wave 2).
+
+Rows 57–65 are the nine OD-3 actions (Phase 3, Wave 2): they had
+no IPC action before (their buttons answered "unavailable"). Rows
+13–14 and 23–24 carry backend superset fields added in Wave 2
+(`run_id` / `size_bytes` on `lemonic.download`, `via` on
+`lemonic.search`, `mode` on `search.inline`, `source_status` on
+`search.query`) — the core ignores unknown fields, so old readers
+keep working.
 
 | # | Action | Request (payload) | Response (data) | Deadline |
 |---|---|---|---|---|
@@ -159,8 +167,8 @@ with the dispatcher/engine-router rewrite in Wave 2).
 | 10 | `fx.apply` | `effect`, `input_path`, `requested_by` | `output_path` | 30 s |
 | 11 | `gui.now_playing` | `chat_id` | `now_playing` | 10 s |
 | 12 | `gui.queue` | `chat_id` | `queue` ([QueueItem]) | 10 s |
-| 13 | `lemonic.download` | `track_id` | `file_path`, `track` | 30 s |
-| 14 | `lemonic.search` | `query` | `results` ([Track]) | 30 s |
+| 13 | `lemonic.download` | `track_id` | `file_path`, `track`, `size_bytes`, `run_id` | 30 s |
+| 14 | `lemonic.search` | `query` | `results` ([Track]), `via` | 30 s |
 | 15 | `netease.download` | `track_id` | `file_path`, `track`, `auth` | 30 s |
 | 16 | `netease.lyrics` | `track_id` | `lyrics`, `track_id`, `title`, `artist`, `source`, `truncated`, `lrc_path` | 30 s |
 | 17 | `netease.search` | `query` | `results` ([Track]) | 30 s |
@@ -169,8 +177,8 @@ with the dispatcher/engine-router rewrite in Wave 2).
 | 20 | `radio.start` | `chat_id`, `station` | `stream_url` | 30 s |
 | 21 | `radio.status` | `chat_id` | `now_playing`, `station`, `stream_url`, `reachable`, `vc_handoff` | 10 s |
 | 22 | `radio.stop` | `chat_id` | `stopped` | 30 s |
-| 23 | `search.inline` | `query`, `user_id`, `chat_id` | `results` ([Track]) | 30 s |
-| 24 | `search.query` | `query`, `source`, `limit` | `results` ([Track]) | 30 s |
+| 23 | `search.inline` | `query`, `user_id`, `chat_id` | `results` ([Track] or lib entries with `file_path`, `cached`, `size_bytes`), `mode` | 30 s |
+| 24 | `search.query` | `query`, `source`, `limit` | `results` ([Track]), `source_status` | 30 s |
 | 25 | `share.create` | `track`, `created_by` | `link`, `token` | 30 s |
 | 26 | `share.resolve` | `token` | `track` | 10 s |
 | 27 | `spotify.analyze` | `user_id`, `track_id` | `analysis`, `profane_words` | 30 s |
@@ -203,6 +211,15 @@ with the dispatcher/engine-router rewrite in Wave 2).
 | 54 | `spotify.collection` | `url` | `api`, `kind`, `name`, `tracks`, `truncated` | 30 s |
 | 55 | `spotify.status` | — | `api`, `credentials_configured`, `token_cached` | 10 s |
 | 56 | `vc.volume` | `chat_id`, `volume` (0–200) | `now_playing` | 30 s |
+| 57 | `download.cancel` | `run_id` | `cancelled`, `run_id`, `phase` | 10 s |
+| 58 | `library.delete` | `id`, `path` (one required) | `deleted`, `id` | 10 s |
+| 59 | `mix.generate` | `chat_id`, `query`, `requested_by` | `tracks` ([Track]), `source_track` | 30 s* |
+| 60 | `audio.recognize` | `file_path`, `file_id` | `recognized`, `track`, `name`, `artists`, `album`, `source` | 30 s |
+| 61 | `library.scan` | — | `triggered`, `error`, `tracks_found` | 30 s |
+| 62 | `library.sharescan` | — | `triggered`, `scheduled_in_min` | 30 s |
+| 63 | `cache.clear` | `scope` (track\|all), `name` | `cleared`, `names` ([string]) | 10 s |
+| 64 | `download.prefs` | `user_id`; POST only: `format`, `use_youtube`, `path_template` | `user_id`, `format`, `use_youtube`, `path_template` | 10 s |
+| 65 | `vc.play_file` | `chat_id`, `file_path`, `file_id`, `title`, `kind`, `duration_sec`, `requested_by` | `now_playing` | 30 s |
 
 \* Download actions: the old HTTP call sites passed an explicit
 120 s timeout for `download.*` POSTs. That explicit value still
@@ -210,8 +227,141 @@ governs (the deadline table has no `download.*` entry, so the
 call-site parameter wins — see §8). The config rewrite should set
 a `download_ms` budget instead.
 
-Protocol-level action (NOT one of the 56): `ping`, empty payload,
+Protocol-level action (NOT one of the 65): `ping`, empty payload,
 answers `{service: "backend-go", …}` — the core's `healthz()`.
+
+### §4.1 OD-3 actions (Phase 3, Wave 2)
+
+The nine actions below had no IPC action before Wave 2 (their
+buttons answered "unavailable"). Shapes match the handlers in
+`services/backend-go/internal/{download,library,search,recognize}`.
+All nine fail honestly — a missing credential, a missing file, or
+an unconfigured provider is an error code, never fake data.
+
+**`download.cancel` (E1)** — cancels a live run. Request
+`{run_id}`. A live run is cancelled via its context: the provider
+stops between chunks/tracks, the partial file is deleted by the
+job's failure path, and the run finishes `failed` with reason
+"cancelled by user". Response `{cancelled: true, run_id, phase:
+"failed"}`. A finished run answers `{cancelled: false, run_id,
+phase: "done"|"failed"}` (200, not an error — the core's "Nothing
+to cancel — already finished." path). Unknown `run_id` →
+`not_found`. Note the phase value is `"failed"`, not `"cancelled"`:
+the run transitions to failed per the §8.3 run lifecycle.
+
+**`library.delete` (E2)** — deletes a library track record AND the
+file on disk (when the record has one and the path is under the
+data dir — the `sanitize_path` rule; `..` → `bad_request`).
+Request `{id}` or `{path}` (one required; an id that looks like a
+path is treated as a path). Unknown id → `not_found`. A top-level
+directory as path → `bad_request` ("Cannot delete top-level
+directories."). File already gone but record exists → the record
+is deleted, `{deleted: true}`. Record gone but file exists → the
+file is deleted, `{deleted: true}`. Response `{deleted, id}`.
+
+**`mix.generate` (E3)** — `/mix [song or URL]`, or bare `/mix`
+while a track is playing. Request `{chat_id, query?,
+requested_by?}`. Resolution: an explicit query is resolved first
+(same router as `vc.play`); otherwise the seed is the room's
+current track — no query and nothing playing → `bad_request`
+("Nothing is playing — give me a song to mix from."). Only
+YouTube seeds have mixes: a non-YouTube seed → `502
+engine_unavailable` ("Failed to get mix: Please try again later.").
+The mix is the YouTube `RD<id>` flat playlist via the warm yt-dlp
+daemon, up to 10 tracks, excluding the seed, the room queue, and
+the autoplay history (`RoomState.AutoplayHistory`, capped at 50).
+Response `{tracks: [Track], source_track: Track}`; zero tracks
+after filtering → `200 {tracks: []}`.
+
+**`audio.recognize` (E4)** — music recognition against AudD
+(`https://api.audd.io`, POST multipart `api_token` + `file`,
+`return=apple_music,spotify,deezer,musicbrainz`). Request
+`{file_path, file_id?}`: a local audio path under the data dir
+(the core downloaded the replied voice message / audio file via
+the TDLib bot session — the same flow as `vc.play_file`). No
+token configured (`AUDD_API_TOKEN` empty) → `502
+engine_unavailable` "Music recognition is not configured" — the
+user has not supplied a token yet; the action stays env-gated and
+answers honestly until configured. No file → `bad_request`;
+missing file → `not_found`; unreadable file or AudD provider
+error → `502` ("Can't read this voice message right now…" /
+"Music recognition failed temporarily…"); file over the AudD
+10 MB cap → `502`. A match → `{recognized: true, track, name,
+artists, album, source}` where the track id is `spotify:<id>` when
+AudD returned one (resolvable through the normal Spotify
+resolver), else `deezer:<id>`, else the label-only
+`audd:<artist> - <title>` (never a fake resolvable id). No match
+→ `200 {recognized: false}`. There is no second provider.
+
+**`library.scan` (E5)** — triggers a Navidrome library rescan
+(Subsonic `startScan`) and returns immediately (`triggered: true`
+— the scan itself is async on the server). Request: none (the
+payload is ignored). Navidrome env unset → `200 {triggered:
+false, error: "not configured"}` (not an error); wrong
+credentials → `200 {triggered: false, error: "wrong
+credentials"}`; server unreachable → `502 engine_unavailable`.
+On success the backend refreshes its library count from the
+server (bounded: one `getAlbumList2` page + one `getAlbum` per
+album) and reports it as `tracks_found` when the count succeeds;
+a failed count never fails the trigger. Response `{triggered,
+error?, tracks_found?}`.
+
+**`library.sharescan` (E6)** — triggers (or schedules) an slskd
+share scan (`POST /api/v0/options/shares/scan`, `X-API-Key` when
+`SLSKD_API_KEY` is set). Request: none. slskd down → `502
+engine_unavailable` naming `SLSKD_URL`. Scan already running
+(slskd `409`) → `200 {triggered: false}`; `scheduled_in_min` is
+omitted — the slskd API exposes no minute estimate, so none is
+invented. Response `{triggered, scheduled_in_min?}`.
+
+**`cache.clear` (E7)** — clears per-track cache entries in the
+embedded store (the library bucket — the cached-file records that
+back the inline "Song not cached" marker). Request `{scope:
+"track"|"all", name?}`. Scope `track` + `name` → delete that
+entry (exact id, else exact title, case-insensitive); scope `all`
+(or absent) → delete all cache entries. Unknown name → `200
+{cleared: false, names: []}` (the "Song not cached" string), not
+an error. Scope other than `track|all` → `bad_request`. A
+cleared entry's file is deleted with it. Boundary: this is the
+embedded-store cache only — the URL cache is Phase 4's, and this
+action never touches it. Response `{cleared, names: [string]}`.
+
+**`download.prefs` (E9)** — per-user download preferences.
+Request `{user_id}` (GET) or `{user_id, format?,
+use_youtube?, path_template?}` (POST — any settable field makes
+it a POST). GET returns the stored prefs or the defaults (`200`,
+never `404`): format `mp3`, `use_youtube` true, `path_template`
+`"{artist} - {title}.{ext}"`. POST validates and stores: unknown
+format → `bad_request` naming the six formats
+(`mp3|m4a|flac|opus|ogg|wav`); a template must contain `{ext}`,
+no separator or `..`, ≤ 150 chars. An empty format/template
+coerces to the default. Enforcement: a non-`mp3` format is
+refused honestly on daemon-backed downloads (the yt-dlp daemon
+extracts mp3 only — a format parameter on the daemon download
+method is the fix); `use_youtube: false` refuses Spotify
+downloads honestly. The `path_template` rename applies to single
+files after download (collisions disambiguated with the track
+id). Response `{user_id, format, use_youtube, path_template}`.
+
+**`vc.play_file` (E12)** — replied-media playback. Request
+`{chat_id, file_path, file_id?, title?, kind?,
+duration_sec?, requested_by?}`. The core already has the file on
+disk (downloaded via the TDLib bot session); the action carries a
+path, not bytes (16 MiB frame cap). The path must be under the
+data dir (`..` rejected — the `sanitize_path` rule); a missing
+file → `not_found`; a directory → `bad_request`. `kind` is one
+of `audio|video|voice|video_note|document` (voice/video are
+accepted as audio sources). The track is `{id:
+"file:<file_id or basename-hash>", source: "file"}` and plays
+now when the room is idle, else enqueues, exactly like `vc.play`.
+Duration 0 never auto-advances. A file over the old 50 MB cap is
+fine (MTProto, 2 GB limit). Response `{now_playing}`.
+Implementation note (Wave 2 verification): the download package's
+feed-binding `vc.play_file` implementation was deleted; the ONLY
+implementation is `internal/handlers` (record-only per inventory
+§3.3 — no feed bound in Phase 3, the Phase 5 DSP decodes the local
+path). The action is registered exactly once, by
+`handlers.Register`.
 
 ## §5. Backend-initiated events
 

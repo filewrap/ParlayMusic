@@ -1,1 +1,0 @@
-{"name":"parlay-radio","version":"0.2.0","private":true,"scripts":{"start":"node src/main.js","test":"node --test tests/run.js tests/store.js"}}

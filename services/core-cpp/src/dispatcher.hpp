@@ -759,14 +759,27 @@ private:
     void onMute(const CommandContext& ctx);
     void onJoin(const CommandContext& ctx);
     // Play a replied-to (or captioned) Telegram file: download via
-    // TDLib, then hand it to the backend. The backend owns playback;
-    // until it exposes a local-file play action (Phase 3) the file is
-    // downloaded for real and the user is told honestly that local-file
-    // playback is not wired up yet — never a fake "Now playing".
-    // Always returns false in Phase 2 (nothing plays yet).
+    // TDLib, then hand it to the backend with vc.play_file (§3.3).
+    // The backend owns playback; the core never claims a play it
+    // did not get back as now_playing. Returns false when the
+    // download or the backend call fails (and the failure is
+    // already reported); true when the file is playing or queued.
     bool playRepliedFile(const CommandContext& ctx,
                          const std::string& file_id,
                          const std::string& title, const std::string& kind);
+    // Shared post-play rendering for onPlay and playRepliedFile (the
+    // vc.play / vc.play_file response is the same shape): duration-
+    // limit stop, call-active marking, last-track bookkeeping, logger
+    // line, and the queued vs now-playing card. Replies exactly once.
+    // `r` must be ok (the caller reports the backend error itself).
+    void finishPlay(const CommandContext& ctx, int64_t chat,
+                    const IpcResult& r, const std::string& query,
+                    bool was_active, const std::string& old_id);
+    // vc.play request body (§1.1 + §4.4): the contract fields plus
+    // the chat's stored speed/bass, so the backend room carries them
+    // on every play (record-only until the Phase 5 DSP).
+    Json vcPlayBody(int64_t chat, const std::string& query,
+                    int64_t requested_by);
     void onReplay(const CommandContext& ctx);
     void onPlayer(const CommandContext& ctx);
     void onLyrics(const CommandContext& ctx);

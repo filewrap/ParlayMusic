@@ -7,12 +7,12 @@
 // events + duplex join handshake + token-bucket limiter (Phase 2).
 // (Phase 1 telemetry, §J) Every /play emits one t_dispatch_to_ipc
 // line: dispatch_to_post_us + post_to_response_us == total,
-// transport=uds / ok, or ipc=none on the replied-file + usage-error
-// paths (no backend IPC exists there).
+// transport=uds / ok, or ipc=none on the usage-error path (no
+// backend IPC exists there).
 //
 // - onPlay: reply with audio/document file_id downloads (fake) and
-//   answers the honest gap (local-file playback is a Phase 3 backend
-//   action); no media + no query answers the honest usage error;
+//   hands the local path to the backend with vc.play_file (§3.3);
+//   no media + no query answers the honest usage error;
 //   download failures are reported honestly, never faked.
 // - onMute: playing session -> vc.mute through the backend; nothing
 //   playing -> "Nothing is playing."
@@ -354,6 +354,17 @@ public:
     mutable std::string download_response;
     mutable std::string radio_status_response;
     mutable std::string last_post_body;
+    // Every POST body, in order (last_post_body keeps the latest).
+    mutable std::vector<std::string> post_bodies;
+    // Scripted Wave 2 answers (empty = fall through to the 404
+    // below): vc.loop / vc.play_file success payloads, fx.apply,
+    // spotify.analyze, spotify.details (GET), and the vc.queue list.
+    mutable std::string loop_response;
+    mutable std::string play_file_response;
+    mutable std::string fx_response;
+    mutable std::string spotify_analyze_response;
+    mutable std::string spotify_details_response;
+    mutable std::string queue_list_response;
     // Scripted vc.join / vc.mute answers (Phase 2): join_ok=false
     // fails the join with join_error; mute_error fails a mute.
     mutable bool join_ok = true;
@@ -374,6 +385,7 @@ public:
         (void)timeout_sec;
         posts.push_back(base_url + "|" + action);
         last_post_body = body.dump();
+        post_bodies.push_back(body.dump());
         parlay::IpcResult r;
         if (action == "inline" && !inline_response.empty()) {
             r.ok = true;
@@ -408,6 +420,39 @@ public:
             r.data = parlay::Json::parse(download_response);
             return r;
         }
+        if (action == "loop") {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = loop_response.empty()
+                         ? parlay::Json::parse(R"({})")
+                         : parlay::Json::parse(loop_response);
+            return r;
+        }
+        if (action == "dislike") {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
+        if (action == "vc.play_file" && !play_file_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(play_file_response);
+            return r;
+        }
+        if (action == "fx" && !fx_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(fx_response);
+            return r;
+        }
+        if (action == "spotify.analyze" &&
+            !spotify_analyze_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(spotify_analyze_response);
+            return r;
+        }
         if (action == "seek" && np_ok) {
             r.ok = true;
             r.http_status = 200;
@@ -427,16 +472,20 @@ public:
             r.data = parlay::Json::parse(skip_response);
             return r;
         }
-        // Queue actions (Phase 9 §K): list returns an empty queue,
-        // clear succeeds. Enough for /clear's empty-queue reply and
-        // for the queued-play fallback (which guards size() > 1).
+        // Queue actions (Phase 9 §K): list returns the scripted
+        // waiting queue when set, else an empty queue; clear/add/
+        // remove succeed. Enough for /clear's empty-queue reply and
+        // for the queued-play fallback (which guards on non-empty).
         if (action == "queue") {
             const parlay::Json* a = body.find("action");
             std::string act = a ? a->asString() : "";
             r.ok = true;
             r.http_status = 200;
-            r.data = parlay::Json::parse(
-                act == "list" ? R"({"queue":[]})" : R"({})");
+            if (act == "list" && !queue_list_response.empty())
+                r.data = parlay::Json::parse(queue_list_response);
+            else
+                r.data = parlay::Json::parse(
+                    act == "list" ? R"({"queue":[]})" : R"({})");
             return r;
         }
         if (action == "pause" && !pause_response.empty()) {
@@ -506,6 +555,13 @@ public:
         (void)timeout_sec;
         gets.push_back(path);
         parlay::IpcResult r;
+        if (path.rfind("/v1/spotify/details", 0) == 0 &&
+            !spotify_details_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(spotify_details_response);
+            return r;
+        }
         if (path.rfind("/v1/radio/status", 0) == 0 &&
             !radio_status_response.empty()) {
             r.ok = true;
@@ -682,15 +738,28 @@ struct Rig {
 
 int main() {
 
+    auto has_post = [](const Rig& rig, const std::string& action) {
+        for (const auto& p : rig.ipc.posts)
+            if (p.find("|" + action) != std::string::npos) return true;
+        return false;
+    };
+    auto last_post_body = [](const Rig& rig) {
+        return rig.ipc.last_post_body;
+    };
+
     // --- A. parseMessage: deleted with telegram_api.cpp
     // (Phase 2). Updates now arrive as TDLib JSON via main.cpp.
-    // --- B. onPlay: replied media (Phase 2 honest gap) ------------------
-    // The file is downloaded via the TDLib bot session, but local-file
-    // playback needs a backend action that does not exist yet (Phase
-    // 3): the download is real, the reply says plainly that nothing
-    // plays, and no IPC call is issued. Never a fake "Now playing".
+    // --- B. onPlay: replied media (Phase 3 vc.play_file) ---------------
+    // The file is downloaded via the TDLib bot session, then handed
+    // to the backend with vc.play_file (§3.3): the action carries the
+    // local path, not bytes. A successful play renders the Now
+    // playing card; a backend refusal reports the exact error, never
+    // a fake "Now playing".
+    const std::string play_file_np =
+        R"({"now_playing":{"track":{"id":"file:AUDIO123","title":"Artist - Song","artist":"Artist","duration_sec":200,"source":"file"},"position_sec":0,"paused":false}})";
     {
         Rig rig;
+        rig.ipc.play_file_response = play_file_np;
         parlay::TgMessage m = makeMsg(-1001, 111, "/play");
         m.has_reply_to = true;
         m.reply_to_message_id = 5;
@@ -699,19 +768,31 @@ int main() {
         m.reply_media_kind = "audio";
         m.reply_media_title = "Artist - Song";
         rig.d.handleMessage(m);
+        CHECK(has_post(rig, "vc.play_file"),
+              "play reply audio: vc.play_file issued to the backend");
+        {
+            parlay::Json b = parlay::Json::parse(rig.ipc.last_post_body);
+            CHECK(b.find("file_id") &&
+                      b.find("file_id")->asString() == "AUDIO123" &&
+                      b.find("file_path") &&
+                      contains(b.find("file_path")->asString(),
+                               "/replied/") &&
+                      b.find("kind") &&
+                      b.find("kind")->asString() == "audio" &&
+                      !b.find("video") && !b.find("force"),
+                  "play reply audio: play_file carries path + file_id + "
+                  "kind, no video/force");
+        }
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Downloaded") &&
-                  contains(rig.tg.replies[0], "Artist - Song") &&
-                  contains(rig.tg.replies[0], "not available yet") &&
-                  contains(rig.tg.replies[0], "Nothing is playing"),
-              "play reply audio: downloaded, honest gap reply, no fake "
-              "Now playing");
-        CHECK(rig.ipc.posts.empty(),
-              "play reply audio: no vc.play IPC call (no backend "
-              "action yet)");
+                  contains(rig.tg.replies[0], "Now playing") &&
+                  contains(rig.tg.replies[0], "Artist - Song"),
+              "play reply audio: Now playing card, no gap reply");
+        auto c = rig.store.get("call:-1001");
+        CHECK(c && *c == "1", "play reply audio: call marked active");
     }
     {
         Rig rig;
+        rig.ipc.play_file_response = play_file_np;
         parlay::TgMessage m = makeMsg(-1002, 111, "/play");
         m.has_reply_to = true;
         m.reply_to_message_id = 6;
@@ -720,13 +801,31 @@ int main() {
         m.reply_media_kind = "document";
         m.reply_media_title = "track.mp3";
         rig.d.handleMessage(m);
+        CHECK(has_post(rig, "vc.play_file"),
+              "play reply document: vc.play_file issued");
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Downloaded") &&
-                  contains(rig.tg.replies[0], "track.mp3") &&
-                  contains(rig.tg.replies[0], "not available yet"),
-              "play reply document: downloaded, honest gap reply");
-        CHECK(rig.ipc.posts.empty(),
-              "play reply document: no vc.play IPC call");
+                  contains(rig.tg.replies[0], "Now playing"),
+              "play reply document: Now playing card");
+    }
+    {
+        // Backend refuses vc.play_file: the exact error, never a
+        // "Now playing" over a failed play.
+        Rig rig;
+        parlay::TgMessage m = makeMsg(-1005, 111, "/play");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 8;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "AUDIO123";
+        m.reply_media_kind = "audio";
+        m.reply_media_title = "Artist - Song";
+        rig.d.handleMessage(m);
+        CHECK(has_post(rig, "vc.play_file"),
+              "play reply audio, backend refuses: vc.play_file issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "not_found") &&
+                  !contains(rig.tg.replies[0], "Now playing"),
+              "play reply audio, backend refuses: exact error, no "
+              "fake Now playing");
     }
     {
         Rig rig;
@@ -1067,20 +1166,20 @@ int main() {
         R"({"now_playing":{"track":{"id":"t1","title":"Test Song","artist":"Test Artist","duration_sec":200,"stream_url":"https://example.invalid/audio.webm"},"stream_url":"https://example.invalid/audio.webm","position_sec":0,"paused":false}})";
     const std::string skip_np =
         R"({"now_playing":{"track":{"id":"t2","title":"Next Song","artist":"Next Artist","duration_sec":180,"stream_url":"https://example.invalid/next.webm"},"position_sec":0,"paused":false}})";
-    auto has_post = [](const Rig& rig, const std::string& action) {
-        for (const auto& p : rig.ipc.posts)
-            if (p.find("|" + action) != std::string::npos) return true;
-        return false;
-    };
-    auto last_post_body = [](const Rig& rig) {
-        return rig.ipc.last_post_body;
-    };
     {
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.d.handleMessage(makeMsg(-1051, 111, "/play Test Song"));
         CHECK(has_post(rig, "play"),
               "play query: vc.play issued to the backend");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("speed") && b.find("speed")->asDouble() == 1.0 &&
+                      b.find("bass") && b.find("bass")->asInt() == 0 &&
+                      !b.find("video") && !b.find("force"),
+                  "play query: vc.play carries default speed 1.0 / "
+                  "bass 0, no video/force");
+        }
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Now playing") &&
                   contains(rig.tg.replies[0], "Test Song"),
@@ -1089,8 +1188,8 @@ int main() {
         CHECK(c && *c == "1", "play query: call marked active");
     }
     {
-        // Stored speed/bass are kept, not sent to a core voice path:
-        // the backend owns the audio now (DSP is Phase 5).
+        // Stored speed/bass ride the vc.play body into the backend
+        // room (§4.4): the room carries them for the Phase 5 DSP.
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.store.hset("chat:-1052", "speed", "1.5");
@@ -1098,6 +1197,14 @@ int main() {
         rig.d.handleMessage(makeMsg(-1052, 111, "/play Test Song"));
         CHECK(has_post(rig, "play"),
               "play query: vc.play issued with stored speed/bass");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("speed") && b.find("speed")->asDouble() == 1.5 &&
+                      b.find("bass") && b.find("bass")->asInt() == 40 &&
+                      !b.find("video") && !b.find("force"),
+                  "play query: vc.play carries stored speed 1.5 / "
+                  "bass 40 into the room, no video/force");
+        }
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Now playing"),
               "play query: Now playing reply with stored speed/bass");
@@ -1131,12 +1238,16 @@ int main() {
               "play no stream_url: play succeeds without a URL");
     }
     {
+        // /vplay is accepted but the video flag is dropped from the
+        // vc.play payload (D13): the backend owns the audio now and
+        // there is no video lane.
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.d.handleMessage(makeMsg(-1055, 111, "/vplay Test Song"));
         CHECK(has_post(rig, "play") &&
-                  contains(last_post_body(rig), "\"video\":true"),
-              "vplay: vc.play issued with video=true");
+                  !contains(last_post_body(rig), "\"video\"") &&
+                  !contains(last_post_body(rig), "\"force\""),
+              "vplay: vc.play issued, video/force dropped");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Now playing"),
               "vplay: Now playing reply");
@@ -2273,9 +2384,11 @@ int main() {
               "the exact error code");
     }
     {
-        // Replied-file /play: no engine IPC exists on this path, so
-        // the line carries ipc=none and the voice outcome.
+        // Replied-file /play: vc.play_file is a real backend IPC
+        // post, so the line carries dispatch_to_post +
+        // post_to_response == total with ok=1 — no ipc=none any more.
         Rig rig;
+        rig.ipc.play_file_response = play_file_np;
         parlay::TgMessage m = makeMsg(-1072, 111, "/play");
         m.has_reply_to = true;
         m.reply_to_message_id = 5;
@@ -2290,11 +2403,16 @@ int main() {
             out = cap.str();
         }
         std::string line = telemetryLine(out, "t_dispatch_to_ipc");
-        CHECK(!line.empty() && contains(line, "ipc=none") &&
-                  contains(line, "ok=0") &&
-                  contains(line, "error=replied_file_failed"),
-              "telemetry /play replied file: line emitted with "
-              "ipc=none, ok=0, error=replied_file_failed");
+        CHECK(!line.empty() && contains(line, "ok=1") &&
+                  !contains(line, "ipc=none"),
+              "telemetry /play replied file: line emitted with ok=1, "
+              "real IPC post (no ipc=none)");
+        int64_t total = fieldInt(line, "t_dispatch_to_ipc_us");
+        int64_t d2p = fieldInt(line, "dispatch_to_post_us");
+        int64_t p2r = fieldInt(line, "post_to_response_us");
+        CHECK(total >= 0 && d2p >= 0 && p2r >= 0 && total == d2p + p2r,
+              "telemetry /play replied file: dispatch_to_post + "
+              "post_to_response == total");
     }
     {
         // /play with no query and no media: usage error, still timed.
@@ -2575,6 +2693,340 @@ int main() {
               "join handshake bad request: ok=false immediately");
         CHECK(rig.assistant.calls.empty(),
               "join handshake bad request: no TDLib call attempted");
+    }
+
+    // --- W. Phase 3 Wave 2 core fixes (D3/D4/D13/D14/D16/E8) -----------
+    auto queue_posts = [](const Rig& rig, const std::string& act) {
+        std::vector<parlay::Json> out;
+        for (const auto& b : rig.ipc.post_bodies) {
+            parlay::Json j = parlay::Json::parse(b);
+            const parlay::Json* a = j.find("action");
+            if (a && a->asString() == act) out.push_back(j);
+        }
+        return out;
+    };
+    const std::string queue3 =
+        R"({"queue":[
+          {"position":0,"requested_by":111,"track":{"id":"w0","title":"First Waiting","duration_sec":200}},
+          {"position":1,"requested_by":111,"track":{"id":"w1","title":"Second Waiting","duration_sec":210}},
+          {"position":2,"requested_by":111,"track":{"id":"w2","title":"Third Waiting","duration_sec":220}}]})";
+    const std::string queue2 =
+        R"({"queue":[
+          {"position":0,"requested_by":111,"track":{"id":"w0","title":"First Waiting","duration_sec":200}},
+          {"position":1,"requested_by":111,"track":{"id":"w1","title":"Second Waiting","duration_sec":210}}]})";
+    const std::string dl_ok =
+        R"({"file_path":"/tmp/parlay-dispatcher-test/dl/song.mp3","track":{"id":"t1","title":"Song","artist":"A","duration_sec":200},"run_id":"abcdef123456"})";
+
+    // /loop (D3): vc.loop with the count, nothing queued.
+    {
+        Rig rig;
+        rig.store.set("call:-1101", "1");
+        rig.d.handleMessage(makeMsg(-1101, 111, "/loop 3"));
+        CHECK(has_post(rig, "loop"), "/loop 3: vc.loop issued");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("count") && b.find("count")->asInt() == 3,
+                  "/loop 3: vc.loop carries count 3");
+        }
+        CHECK(queue_posts(rig, "add").empty(),
+              "/loop 3: no queue copies enqueued (no 2N looping)");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Turned loop on"),
+              "/loop 3: loop-on reply");
+        auto f = rig.store.hgetall("chat:-1101");
+        CHECK(f["loop"] == "3", "/loop 3: count recorded in the room");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1102", "1");
+        rig.store.hset("chat:-1102", "loop", "3");
+        rig.d.handleMessage(makeMsg(-1102, 111, "/loop off"));
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(has_post(rig, "loop") && b.find("count") &&
+                      b.find("count")->asInt() == 0,
+                  "/loop off: vc.loop carries count 0");
+        }
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Turned loop off"),
+              "/loop off: loop-off reply");
+        auto f = rig.store.hgetall("chat:-1102");
+        CHECK(f["loop"] == "0", "/loop off: count cleared in the room");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1103", "1");
+        rig.store.hset("chat:-1103", "loop", "2");
+        rig.d.handleMessage(makeMsg(-1103, 111, "/loop"));
+        CHECK(!has_post(rig, "loop"),
+              "/loop no args: no vc.loop call, state only");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Turned loop on"),
+              "/loop no args: reports the stored loop-on state");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1104", "1");
+        rig.d.handleMessage(makeMsg(-1104, 111, "/loop 99"));
+        parlay::Json b = parlay::Json::parse(last_post_body(rig));
+        CHECK(has_post(rig, "loop") && b.find("count") &&
+                  b.find("count")->asInt() == 10,
+              "/loop 99: count clamped to the backend limit 10");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1105, 111, "/loop 3"));
+        CHECK(rig.ipc.posts.empty() &&
+                  rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Not streaming"),
+              "/loop with nothing streaming: honest reply, no IPC");
+    }
+
+    // Queue display N -> backend N-1 (D4).
+    {
+        Rig rig;
+        rig.ipc.queue_list_response = queue3;
+        rig.d.handleMessage(makeMsg(-1111, 111, "/remove 2"));
+        auto removes = queue_posts(rig, "remove");
+        CHECK(removes.size() == 1 && removes[0].find("position") &&
+                  removes[0].find("position")->asInt() == 1,
+              "/remove 2: backend position 1");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Removed #2") &&
+                  contains(rig.tg.replies[0], "Second Waiting"),
+              "/remove 2: reply names the 2nd waiting track");
+    }
+    {
+        Rig rig;
+        rig.ipc.queue_list_response = queue3;
+        rig.d.handleMessage(makeMsg(-1112, 111, "/remove 1"));
+        auto removes = queue_posts(rig, "remove");
+        CHECK(removes.size() == 1 && removes[0].find("position") &&
+                  removes[0].find("position")->asInt() == 0,
+              "/remove 1: backend position 0");
+        CHECK(contains(rig.tg.replies[0], "Removed #1") &&
+                  contains(rig.tg.replies[0], "First Waiting"),
+              "/remove 1: reply names the 1st waiting track");
+    }
+    {
+        Rig rig;
+        rig.ipc.queue_list_response = queue3;
+        rig.d.handleMessage(makeMsg(-1113, 111, "/move 1 3"));
+        auto removes = queue_posts(rig, "remove");
+        CHECK(removes.size() == 3 &&
+                  removes[0].find("position")->asInt() == 2 &&
+                  removes[1].find("position")->asInt() == 1 &&
+                  removes[2].find("position")->asInt() == 0,
+              "/move 1 3: removes 0-based positions from the end");
+        auto adds = queue_posts(rig, "add");
+        CHECK(adds.size() == 3 &&
+                  adds[0].find("track")->find("id")->asString() == "w1" &&
+                  adds[1].find("track")->find("id")->asString() == "w2" &&
+                  adds[2].find("track")->find("id")->asString() == "w0",
+              "/move 1 3: re-adds in the new order (B, C, A)");
+        CHECK(contains(rig.tg.replies[0], "Moved #1 to #3"),
+              "/move 1 3: moved reply");
+    }
+    {
+        // Display 1 used to be refused as "the currently playing
+        // track" — it is a waiting track now (0 is current).
+        Rig rig;
+        rig.ipc.queue_list_response = queue3;
+        rig.d.handleMessage(makeMsg(-1114, 111, "/move 1 2"));
+        auto adds = queue_posts(rig, "add");
+        CHECK(adds.size() == 3 &&
+                  adds[0].find("track")->find("id")->asString() == "w1" &&
+                  adds[1].find("track")->find("id")->asString() == "w0",
+              "/move 1 2: moving the first waiting track is allowed");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1115", "1");
+        rig.ipc.queue_list_response = queue2;
+        rig.d.handleMessage(makeMsg(-1115, 111, "/shuffle"));
+        auto removes = queue_posts(rig, "remove");
+        CHECK(removes.size() == 2 &&
+                  removes[0].find("position")->asInt() == 1 &&
+                  removes[1].find("position")->asInt() == 0,
+              "/shuffle with 2 waiting tracks: removes positions 1, 0");
+        auto adds = queue_posts(rig, "add");
+        std::vector<std::string> ids;
+        for (const auto& a : adds)
+            ids.push_back(a.find("track")->find("id")->asString());
+        std::sort(ids.begin(), ids.end());
+        CHECK(adds.size() == 2 && ids.size() == 2 && ids[0] == "w0" &&
+                  ids[1] == "w1",
+              "/shuffle with 2 waiting tracks: both re-added "
+              "(was blocked by the old size < 3 guard)");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1116", "1");
+        rig.ipc.queue_list_response = queue3;
+        rig.d.handleMessage(makeMsg(-1116, 111, "/clear"));
+        CHECK(contains(rig.tg.replies[0], "Cleared <b>3</b> queued tracks"),
+              "/clear: counts all waiting tracks, not size-1");
+        rig.d.handleMessage(makeMsg(-1116, 111, "/restore"));
+        auto adds = queue_posts(rig, "add");
+        CHECK(adds.size() == 3 &&
+                  adds[0].find("track")->find("id")->asString() == "w0" &&
+                  adds[1].find("track")->find("id")->asString() == "w1" &&
+                  adds[2].find("track")->find("id")->asString() == "w2",
+              "/restore: restores all 3 saved tracks, not 2");
+        CHECK(contains(rig.tg.replies[1], "Queue restored"),
+              "/restore: restored reply");
+    }
+    {
+        // /queue shows every waiting track, numbered from 1, and the
+        // first waiting track is no longer skipped.
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.queue_list_response = queue3;
+        rig.d.handleMessage(makeMsg(-1117, 111, "/queue"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Up Next") &&
+                  contains(rig.tg.replies[0], "3 tracks") &&
+                  contains(rig.tg.replies[0], "First Waiting") &&
+                  contains(rig.tg.replies[0], "Second Waiting") &&
+                  contains(rig.tg.replies[0], "Third Waiting") &&
+                  contains(rig.tg.replies[0], "1.") &&
+                  contains(rig.tg.replies[0], "2.") &&
+                  contains(rig.tg.replies[0], "3."),
+              "/queue: all waiting tracks listed, numbered 1..3");
+    }
+
+    // /download routes by link type (D14).
+    {
+        Rig rig;
+        rig.ipc.download_response = dl_ok;
+        rig.d.handleMessage(makeMsg(
+            -1121, 111, "/download https://www.deezer.com/track/123"));
+        CHECK(has_post(rig, "download/deezer"),
+              "/download Deezer URL: download.deezer issued");
+        parlay::Json b = parlay::Json::parse(last_post_body(rig));
+        CHECK(b.find("query") && contains(b.find("query")->asString(),
+                                           "deezer.com/track/123"),
+              "/download Deezer URL: query carries the link");
+    }
+    {
+        Rig rig;
+        rig.ipc.download_response = dl_ok;
+        rig.d.handleMessage(makeMsg(
+            -1122, 111,
+            "/download https://www.tiktok.com/@user/video/123"));
+        CHECK(has_post(rig, "download/tiktok"),
+              "/download TikTok URL: download.tiktok issued");
+        parlay::Json b = parlay::Json::parse(last_post_body(rig));
+        CHECK(b.find("url") && contains(b.find("url")->asString(),
+                                         "tiktok.com/@user/video/123"),
+              "/download TikTok URL: url carries the link");
+    }
+    {
+        Rig rig;
+        rig.ipc.download_response = dl_ok;
+        rig.d.handleMessage(makeMsg(-1123, 111, "/download navidrome:abc123"));
+        CHECK(has_post(rig, "download/navidrome"),
+              "/download navidrome: id: download.navidrome issued");
+        parlay::Json b = parlay::Json::parse(last_post_body(rig));
+        CHECK(b.find("url") && b.find("url")->asString() == "navidrome:abc123",
+              "/download navidrome: id: url carries the id");
+    }
+    {
+        Rig rig;
+        rig.ipc.download_response = dl_ok;
+        rig.d.handleMessage(
+            makeMsg(-1124, 111, "/download soulseek:Artist - Title"));
+        CHECK(has_post(rig, "download/soulseek"),
+              "/download soulseek: query: download.soulseek issued");
+        parlay::Json b = parlay::Json::parse(last_post_body(rig));
+        CHECK(b.find("query") && b.find("query")->asString() == "Artist - Title",
+              "/download soulseek: query: soulseek: prefix stripped");
+    }
+    {
+        Rig rig;
+        rig.ipc.download_response = dl_ok;
+        rig.d.handleMessage(makeMsg(-1125, 111, "/download some song"));
+        CHECK(has_post(rig, "download/youtube"),
+              "/download plain query: still falls through to YouTube");
+    }
+
+    // cbDl FX honours applied:false (D16).
+    {
+        Rig rig;
+        rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
+        rig.ipc.fx_response =
+            R"({"output_path":"/tmp/in.ogg","applied":false,"effect":"slow-reverb","pending_dsp":true})";
+        rig.d.handleCallback(makeCq("pl:dl:fx:run1:slow"));
+        CHECK(rig.tg.audios.empty(),
+              "cbDl FX applied:false: no audio sent for a "
+              "recorded-only effect");
+        CHECK(rig.tg.toasts.size() >= 2 &&
+                  contains(rig.tg.toasts.back().text, "recorded") &&
+                  contains(rig.tg.toasts.back().text, "Phase 5"),
+              "cbDl FX applied:false: honest recorded/Phase 5 toast");
+    }
+    {
+        Rig rig;
+        rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
+        rig.ipc.fx_response =
+            R"({"output_path":"/tmp/in.ogg","applied":true,"effect":"original","pending_dsp":false})";
+        rig.d.handleCallback(makeCq("pl:dl:fx:run1:orig"));
+        CHECK(rig.tg.audios.size() == 1 &&
+                  rig.tg.audios[0].audio == "/tmp/in.ogg",
+              "cbDl FX applied:true (original): file still sent");
+    }
+
+    // cbSpotify details/analyze (E8).
+    const std::string spot_details =
+        R"({"track":{"id":"track1","title":"Test Track","artist":"Test Artist","album":"Test Album","duration_sec":200,"url":"https://open.spotify.com/track/track1"},"features":{"key":"C","modality":"Major","tempo_bpm":120,"acousticness":0.1,"danceability":0.8,"energy":0.9,"instrumentalness":0.0,"liveness":0.2,"speechiness":0.05,"valence":0.7},"genres":["pop"],"disliked_by":[111,222],"ignored_by":[],"profanity":null,"language":null,"lyrics":"la la la","lyrics_link":"https://example.invalid/lyrics"})";
+    {
+        Rig rig;
+        rig.ipc.spotify_details_response = spot_details;
+        rig.d.handleCallback(makeCq("pl:spotify:details:track1"));
+        bool got = false;
+        for (const auto& g : rig.ipc.gets)
+            if (contains(g, "spotify/details") &&
+                contains(g, "track_id=track1"))
+                got = true;
+        CHECK(got, "cbSpotify details: spotify.details GET issued");
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Test Track") &&
+                  contains(rig.tg.edits[0].text, "Test Album") &&
+                  contains(rig.tg.edits[0].text, "Key C Major") &&
+                  contains(rig.tg.edits[0].text, "120 BPM") &&
+                  contains(rig.tg.edits[0].text, "Disliked by 2 people") &&
+                  contains(rig.tg.edits[0].text, "Ignored by 0 people") &&
+                  contains(rig.tg.edits[0].text, "Genres: pop") &&
+                  contains(rig.tg.edits[0].text, "la la la"),
+              "cbSpotify details: card shows title, album, features, "
+              "counts, genres, lyrics");
+    }
+    {
+        Rig rig;
+        rig.ipc.spotify_analyze_response =
+            R"({"analysis":"Clean lyrics, upbeat song.","profane_words":[]})";
+        rig.d.handleCallback(makeCq("pl:spotify:analyze:track1"));
+        CHECK(has_post(rig, "spotify.analyze"),
+              "cbSpotify analyze: spotify.analyze POST issued");
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Lyrics analysis") &&
+                  contains(rig.tg.edits[0].text, "Clean lyrics") &&
+                  contains(rig.tg.edits[0].text, "No profanity found"),
+              "cbSpotify analyze: analysis card rendered in place");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:spotify:links:track1"));
+        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert &&
+                  contains(rig.tg.toasts[0].text, "not available yet"),
+              "cbSpotify unknown verb: honest unavailable toast");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:spotify:dislike:track1"));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  contains(rig.tg.toasts[0].text, "Disliked"),
+              "cbSpotify dislike: still routed to spotify.dislike");
     }
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");

@@ -161,6 +161,130 @@ std::string runShell(const std::string& cmd, int timeout_sec, int& code_out) {
     return out;
 }
 
+// --- Spotify companion cards (§9-E8, §6.10–§6.11) --------------------------
+// Rendered here in the core (ui_texts.hpp owns no companion-card
+// builder — the cards were owned by spotify-rust). Emoji-free, Bot API
+// HTML only. Every field is read defensively: the contract shape and
+// the old service shape differ in names (`audio_features` vs
+// `features`, `lyrics_url` vs `lyrics_link`, `profane_words` vs
+// `profanity`) and in `disliked_by` / `ignored_by` ([UserId] arrays
+// in the contract, integer counts in the old code, §10-D6) — the card
+// shows the count either way and never a faked value.
+std::string spotifyDetailsText(const Json& d) {
+    const Json* track = d.find("track");
+    std::string title = track && track->find("title")
+                            ? track->find("title")->asString()
+                            : "?";
+    std::string artist = track && track->find("artist")
+                             ? track->find("artist")->asString()
+                             : "";
+    std::string album = track && track->find("album")
+                            ? track->find("album")->asString()
+                            : "";
+    std::string out = "<b>" + ui_texts::htmlEscape(title) + "</b>";
+    if (!artist.empty())
+        out += "\n" + ui_texts::htmlEscape(artist);
+    if (!album.empty())
+        out += "\nAlbum: " + ui_texts::htmlEscape(album);
+    const Json* feat = d.find("audio_features");
+    if (!feat) feat = d.find("features");
+    if (feat && !feat->isNull()) {
+        std::string key = feat->find("key") ? feat->find("key")->asString()
+                                            : "Unknown";
+        std::string mod = feat->find("modality")
+                              ? feat->find("modality")->asString()
+                              : "Unknown";
+        double tempo = feat->find("tempo_bpm")
+                           ? feat->find("tempo_bpm")->asDouble()
+                           : 0.0;
+        auto pct = [&](const char* k) {
+            double v = feat->find(k) ? feat->find(k)->asDouble() : 0.0;
+            return static_cast<int>(v * 100.0 + 0.5);
+        };
+        char tb[32];
+        std::snprintf(tb, sizeof tb, "%.0f", tempo);
+        out += "\n\nKey " + ui_texts::htmlEscape(key) + " " +
+               ui_texts::htmlEscape(mod) + " · " + tb + " BPM";
+        out += "\nAcoustic " + std::to_string(pct("acousticness")) + "%";
+        out += "\nDanceability " + std::to_string(pct("danceability")) + "%";
+        out += "\nEnergy " + std::to_string(pct("energy")) + "%";
+        out += "\nInstrumentalness " +
+               std::to_string(pct("instrumentalness")) + "%";
+        out += "\nLive performance " + std::to_string(pct("liveness")) + "%";
+        out += "\nSpeech-like " + std::to_string(pct("speechiness")) + "%";
+        out += "\nPositivity " + std::to_string(pct("valence")) + "%";
+    }
+    auto countOf = [](const Json* v) -> int64_t {
+        if (!v || v->isNull()) return 0;
+        if (v->isArray()) return static_cast<int64_t>(v->size());
+        return v->asInt();
+    };
+    out += "\n\nDisliked by " +
+           std::to_string(countOf(d.find("disliked_by"))) + " people";
+    out += "\nIgnored by " +
+           std::to_string(countOf(d.find("ignored_by"))) + " people";
+    const Json* genres = d.find("genres");
+    if (genres && genres->isArray() && genres->size() > 0) {
+        out += "\nGenres: ";
+        bool first = true;
+        for (const auto& g : genres->asArray()) {
+            if (!first) out += ", ";
+            first = false;
+            out += ui_texts::htmlEscape(g.asString());
+        }
+    }
+    const Json* prof = d.find("profanity");
+    if (!prof) prof = d.find("profane_words");
+    if (prof && !prof->isNull()) {
+        if (prof->isArray() && prof->size() > 0) {
+            out += "\nProfanity: ";
+            bool first = true;
+            for (const auto& w : prof->asArray()) {
+                if (!first) out += ", ";
+                first = false;
+                out += ui_texts::htmlEscape(w.asString());
+            }
+        } else if (!prof->isArray() && !prof->asString().empty()) {
+            out += "\nProfanity " + ui_texts::htmlEscape(prof->asString());
+        }
+    }
+    const Json* lang = d.find("language");
+    if (lang && !lang->isNull() && !lang->asString().empty())
+        out += "\nLanguage: " + ui_texts::htmlEscape(lang->asString());
+    const Json* lyrics = d.find("lyrics");
+    if (lyrics && !lyrics->isNull() && !lyrics->asString().empty())
+        out += "\n\n" + ui_texts::htmlEscape(lyrics->asString());
+    else
+        out += "\n\nNo lyrics found";
+    const Json* link = d.find("lyrics_url");
+    if (!link) link = d.find("lyrics_link");
+    if (link && !link->isNull() && !link->asString().empty())
+        out += "\n<a href=\"" + ui_texts::htmlEscape(link->asString()) +
+               "\">Lyrics</a>";
+    return out;
+}
+
+std::string spotifyAnalyzeText(const Json& d) {
+    std::string analysis = d.find("analysis") ? d.find("analysis")->asString()
+                                              : "";
+    std::string out = "<b>Lyrics analysis</b>";
+    if (!analysis.empty())
+        out += "\n\n" + ui_texts::htmlEscape(analysis);
+    const Json* words = d.find("profane_words");
+    if (words && words->isArray() && words->size() > 0) {
+        out += "\n\nProfane words: ";
+        bool first = true;
+        for (const auto& w : words->asArray()) {
+            if (!first) out += ", ";
+            first = false;
+            out += ui_texts::htmlEscape(w.asString());
+        }
+    } else {
+        out += "\n\nNo profanity found.";
+    }
+    return out;
+}
+
 }  // namespace
 
 std::string Dispatcher::lowerStr(std::string s) {
@@ -1323,14 +1447,17 @@ bool Dispatcher::buildQueueCard(int64_t chat_id, bool show_all,
     std::vector<ui_texts::CardTrack> up;
     size_t total = 0;
     if (items) {
-        // Item 0 is the now-playing track; the tail is the up-next list.
-        total = items->size() > 0 ? items->size() - 1 : 0;
+        // The list is the waiting queue only (§1.7, §10-D4): the
+        // current track is never in it, so every item is up-next,
+        // numbered 1..N in display order (display N is backend
+        // waiting position N−1).
+        total = items->size();
         size_t shown = show_all ? total
                                 : std::min<size_t>(
                                       total,
                                       static_cast<size_t>(
                                           ui_texts::kQueuePageSize));
-        for (size_t i = 1; i <= shown; ++i) {
+        for (size_t i = 0; i < shown; ++i) {
             const Json& item = items->asArray()[i];
             const Json* t = item.find("track");
             if (!t) continue;
@@ -1377,24 +1504,27 @@ bool Dispatcher::resolveQueueToken(int64_t chat_id,
     if (!q.ok) return false;
     const Json* items = q.data.find("queue");
     if (!items) return false;
+    // The list is the waiting queue only (§1.7, §10-D4): positions
+    // are 0-based waiting indices, the current track is never in it.
     int64_t pos = 0;
     for (const auto& item : items->asArray()) {
-        ++pos;
         const Json* t = item.find("track");
-        if (!t) continue;
-        std::string id = t->find("id") ? t->find("id")->asString() : "";
-        if (ui_texts::trackToken(id) == token) {
-            item_out = item;
-            // The engine's remove wants the position as shown in
-            // /queue: item 0 is now-playing, so the queue position is
-            // the 1-based index in the list; prefer the item's own
-            // "position" field when the engine provides one.
-            if (const Json* p = item.find("position"))
-                position_out = p->asInt();
-            else
-                position_out = pos;
-            return true;
+        if (t) {
+            std::string id = t->find("id") ? t->find("id")->asString() : "";
+            if (ui_texts::trackToken(id) == token) {
+                item_out = item;
+                // The engine's remove wants the 0-based waiting
+                // position: prefer the item's own "position" field
+                // when the engine provides one, else the 0-based
+                // index in the list.
+                if (const Json* p = item.find("position"))
+                    position_out = p->asInt();
+                else
+                    position_out = pos;
+                return true;
+            }
         }
+        ++pos;
     }
     return false;
 }
@@ -1522,9 +1652,11 @@ void Dispatcher::refreshPanel(const TgCallbackQuery& cq, int64_t chat_id) {
         IpcResult q = vcCall(fake, "queue", body);
         if (q.ok) {
             const Json* items = q.data.find("queue");
-            if (items && items->size() > 1) {
+            // Waiting-only list (§1.7): the next track is items[0],
+            // never items[1] — the current track is not in the list.
+            if (items && items->size() > 0) {
                 const Json* nt =
-                    items->asArray()[1].find("track");
+                    items->asArray()[0].find("track");
                 if (nt) {
                     next_title =
                         nt->find("title") ? nt->find("title")->asString()
@@ -2280,29 +2412,31 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         return;
     }
     // Flags: -f (force) -v (video) -s (shuffle, playplaylist only).
+    // -v is accepted and ignored: the backend plays audio in Phase 3
+    // (no video stream), so no `video` field is sent (§10-D13).
     auto words = splitArgs(ctx.args);
-    bool flag_f = false, flag_v = false;
+    bool flag_f = false;
     std::string query;
     for (const auto& w : words) {
         if (w == "-f") flag_f = true;
-        else if (w == "-v") flag_v = true;
-        else if (w == "-s") { /* shuffle: only for /playplaylist */
+        else if (w == "-v") { /* video: no backend effect */
+        } else if (w == "-s") { /* shuffle: only for /playplaylist */
         } else {
             if (!query.empty()) query += " ";
             query += w;
         }
     }
+    // `force` is core-side only (stop-then-play below): it is NOT
+    // sent in the play body (§10-D13 — the contract lists no
+    // `force` field, and the backend ignores unknown fields).
     bool force = flag_f ||
                  ctx.command == "playforce" || ctx.command == "vplayforce";
-    bool video = (ctx.command == "vplay" || ctx.command == "vplayforce" ||
-                  flag_v);
     // Reply-to media (or media sent with the command as its caption):
     // /play on a replied audio/video/voice/video_note/document plays
     // that Telegram file (source "file"). The core downloads it via
-    // the TDLib bot session; local-file playback is a backend action
-    // that does not exist yet (Phase 3), so the download is followed
-    // by an honest gap reply — never a fake "Now playing". No query
-    // is needed.
+    // the TDLib bot session and hands the local path to the backend
+    // with vc.play_file (§3.3) — the file is never re-uploaded over
+    // UDS. No query is needed.
     if (query.empty() && ctx.command != "playplaylist") {
         std::string file_id, title, kind;
         if (ctx.message.has_reply_media) {
@@ -2316,13 +2450,9 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         }
         if (!file_id.empty()) {
             if (!playAllowed(ctx, force)) return;
-            bool replied_ok = playRepliedFile(ctx, file_id, title, kind);
-            // No backend IPC on this path: the line still fires on
-            // every /play (ipc=none). ok is the replied-file outcome
-            // (download + honest gap reply).
-            emitDispatchToIpc(telemetry::nowUs() - receiptUs(ctx), -1, -1,
-                              vcTarget(ctx), replied_ok,
-                              replied_ok ? "" : "replied_file_failed");
+            // The replied-file path issues its own backend IPC
+            // (vc.play_file) and its own telemetry line.
+            playRepliedFile(ctx, file_id, title, kind);
             return;
         }
         emitDispatchToIpc(telemetry::nowUs() - receiptUs(ctx), -1, -1,
@@ -2352,13 +2482,8 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     bool was_active = nowPlaying(vcTarget(ctx), np_before, track_before);
     std::string old_id =
         track_before.find("id") ? track_before.find("id")->asString() : "";
-    Json body = Json::objectOf({
-        {"chat_id", Json(vcTarget(ctx))},
-        {"query", Json(trim(query))},
-        {"requested_by", Json(ctx.message.from.id)},
-        {"video", Json(video)},
-        {"force", Json(force)},
-    });
+    Json body = vcPlayBody(vcTarget(ctx), trim(query),
+                           ctx.message.from.id);
     // Phase 1 telemetry: dispatch -> IPC POST issued, and POST
     // issued -> response received. "POST issued" is measured at the
     // vcCall entry (the core handing the play to the IPC layer); the
@@ -2376,6 +2501,31 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
+    finishPlay(ctx, vcTarget(ctx), r, query, was_active, old_id);
+}
+
+// --- shared vc.play / vc.play_file rendering -------------------------------
+// The vc.play and vc.play_file responses are the same shape
+// ({now_playing}, plus the `queued` superset field), so both handlers
+// share this tail. `r` must be ok — the caller reports the backend
+// error itself.
+Json Dispatcher::vcPlayBody(int64_t chat, const std::string& query,
+                            int64_t requested_by) {
+    // §4.4: the room carries the chat's stored speed/bass on every
+    // play (record-only until the Phase 5 DSP); the backend reads
+    // them off this body. No `video` / `force` fields (§10-D13).
+    return Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"query", Json(query)},
+        {"requested_by", Json(requested_by)},
+        {"speed", Json(chatSpeedField(chat))},
+        {"bass", Json(static_cast<int64_t>(chatIntField(chat, "bass", 0)))},
+    });
+}
+
+void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
+                            const IpcResult& r, const std::string& query,
+                            bool was_active, const std::string& old_id) {
     const Json* np = r.data.find("now_playing");
     Json now = np ? *np : r.data;
     const Json* track = now.find("track");
@@ -2384,7 +2534,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
             track->find("duration_sec") ? track->find("duration_sec")->asInt() : 0;
         if (dur > 0 && dur > cfg_.duration_limit_min * 60) {
             vcCall(ctx, "stop",
-                   Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}));
+                   Json::objectOf({{"chat_id", Json(chat)}}));
             replyHtml(ctx, ui_texts::playTooLongText(cfg_.duration_limit_min));
             return;
         }
@@ -2396,7 +2546,6 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     // over a silent call. The backend accepted the play, so it is in
     // the call for this chat: record that (the /pause-style gates read
     // it); /stop and the TrackEnded/QueueEmpty events clear it.
-    int64_t chat = vcTarget(ctx);
     setCallActive(chat, true);
     if (track) {
         setChatField(chat, "last_track",
@@ -2423,15 +2572,17 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         queued = !old_id.empty() && new_id == old_id;
     }
     if (queued) {
-        // The new track is the tail of the queue: render the queued
-        // card for it (Yukki §4) with the Play Now button.
+        // The new track is the tail of the waiting queue: render the
+        // queued card for it (Yukki §4) with the Play Now button.
+        // The queue list is waiting-only (§1.7), so the tail's
+        // display position is the list size.
         Json qbody = Json::objectOf({
             {"chat_id", Json(chat)},
             {"action", Json("list")},
         });
         IpcResult qr = vcCall(ctx, "queue", qbody);
         const Json* items = qr.ok ? qr.data.find("queue") : nullptr;
-        if (items && items->size() > 1) {
+        if (items && items->size() > 0) {
             const Json& last = items->asArray()[items->size() - 1];
             const Json* lt = last.find("track");
             if (lt) {
@@ -2440,7 +2591,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
                                  : ctx.message.from.id;
                 ui_texts::CardTrack ct = cardTrack(*lt, by);
                 std::string text = ui_texts::queuedText(
-                    static_cast<int>(items->size() - 1), ct);
+                    static_cast<int>(items->size()), ct);
                 std::string thumb =
                     lt->find("thumbnail")
                         ? lt->find("thumbnail")->asString()
@@ -2472,11 +2623,12 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
 }
 
 // --- /play from a replied-to Telegram file ----------------------------------
-// HONEST GAP (Phase 2): the file is downloaded via the TDLib bot
-// session, but local-file playback needs a backend action that does
-// not exist yet (Phase 3). The download is kept (the file is on disk
-// under data_dir/replied for the Phase 3 action to pick up), and the
-// user is told plainly — never a fake "Now playing".
+// The file is downloaded via the TDLib bot session, then handed to
+// the backend with vc.play_file (§3.3, §9-E12): the core already has
+// the file on disk, so the action carries a path, not bytes (the UDS
+// frame cap is 16 MiB). Duration is unknown for replied media, so it
+// is omitted (0 when unknown). Play-now-if-idle else enqueue, exactly
+// like vc.play — the backend takes ownership of the file.
 bool Dispatcher::playRepliedFile(const CommandContext& ctx,
                                  const std::string& file_id,
                                  const std::string& title,
@@ -2487,17 +2639,36 @@ bool Dispatcher::playRepliedFile(const CommandContext& ctx,
         reply(ctx, "Could not fetch the replied file: " + err);
         return false;
     }
-    (void)kind;
     std::string track_title = title.empty() ? "Replied file" : title;
     setChatField(chat, "last_track", track_title);
-    reply(ctx,
-          "Downloaded \"" + track_title +
-              "\" (" + saved +
-              "), but playing a replied file is not available yet — "
-              "local-file playback lands with the Phase 3 backend "
-              "action. Nothing is playing.");
-    deleteCommandMessage(ctx);
-    return false;
+    // What was playing before this call: a play_file that lands while
+    // something is already playing queues the file instead, and the
+    // reply is the queued card (§4), not the now-playing card.
+    Json np_before, track_before;
+    bool was_active = nowPlaying(chat, np_before, track_before);
+    std::string old_id =
+        track_before.find("id") ? track_before.find("id")->asString() : "";
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"file_path", Json(saved)},
+        {"file_id", Json(file_id)},
+        {"title", Json(track_title)},
+        {"kind", Json(kind)},
+        {"requested_by", Json(ctx.message.from.id)},
+    });
+    const int64_t t_post = telemetry::nowUs();
+    IpcResult r = vcCall(ctx, "vc.play_file", body);
+    const int64_t t_resp = telemetry::nowUs();
+    emitDispatchToIpc(t_resp - receiptUs(ctx), t_post - receiptUs(ctx),
+                      t_resp - t_post, chat, r.ok,
+                      r.ok ? ""
+                           : r.error_code + ": " + r.error_message);
+    if (!r.ok) {
+        replyError(ctx, r);
+        return false;
+    }
+    finishPlay(ctx, chat, r, track_title, was_active, old_id);
+    return true;
 }
 
 void Dispatcher::onPause(const CommandContext& ctx) {
@@ -2646,81 +2817,34 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
         return;
     }
     std::string a = lowerStr(args[0]);
+    int64_t count = -1;
     if (a == "off" || a == "disable") {
-        // Remove the queued copies of the current track (loop-off).
-        Json np, track;
-        if (nowPlaying(chat, np, track)) {
-            std::string tid = track.find("id") ? track.find("id")->asString() : "";
-            Json body = Json::objectOf({
-                {"chat_id", Json(chat)},
-                {"action", Json("list")},
-            });
-            IpcResult q = vcCall(ctx, "queue", body);
-            if (q.ok) {
-                const Json* items = q.data.find("queue");
-                if (items) {
-                    // Remove from the end so positions stay valid.
-                    std::vector<int64_t> positions;
-                    int64_t pos = 0;
-                    for (const auto& item : items->asArray()) {
-                        ++pos;
-                        const Json* t = item.find("track");
-                        if (t && t->find("id") &&
-                            t->find("id")->asString() == tid && pos > 1)
-                            positions.push_back(pos);
-                    }
-                    for (auto it = positions.rbegin(); it != positions.rend();
-                         ++it) {
-                        Json rm = Json::objectOf({
-                            {"chat_id", Json(chat)},
-                            {"action", Json("remove")},
-                            {"position", Json(*it)},
-                        });
-                        vcCall(ctx, "queue", rm);
-                    }
-                }
-            }
-        }
-        setChatField(chat, "loop", "0");
-        replyHtml(ctx, ui_texts::kCtlLoopOff);
-        return;
-    }
-    if (!isDigits(a)) {
+        count = 0;
+    } else if (isDigits(a)) {
+        long n = std::stol(a.substr(0, 9));
+        if (n < 1) n = 0;
+        if (n > 10) n = 10;
+        count = n;
+    } else {
         reply(ctx, "Usage: /loop <1-10|off>");
         return;
     }
-    long n = std::stol(a.substr(0, 9));
-    if (n < 1) n = 0;
-    if (n > 10) n = 10;
-    if (n == 0) {
-        setChatField(chat, "loop", "0");
-        replyHtml(ctx, ui_texts::kCtlLoopOff);
+    // Native vc.loop (§1.8, §10-D3): the backend replays the current
+    // track `count` times at the natural track end (0 = off). The old
+    // copy-queueing path is deleted — queueing N copies AND setting
+    // the loop count would loop the track 2N times.
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"count", Json(count)},
+    });
+    IpcResult r = vcCall(ctx, "loop", body);
+    if (!r.ok) {
+        replyError(ctx, r);
         return;
     }
-    // Loop is enforced by queueing n copies of the current track after it:
-    // when the track ends the engine auto-advances to an identical copy.
-    // (The vc services have no native loop action; this uses only the
-    // queue contract, so the loop is real, not a stored flag.)
-    Json np, track;
-    if (!nowPlaying(chat, np, track)) {
-        replyHtml(ctx, ui_texts::kCtlNotStreaming);
-        return;
-    }
-    int added = 0;
-    for (long i = 0; i < n; ++i) {
-        Json body = Json::objectOf({
-            {"chat_id", Json(chat)},
-            {"action", Json("add")},
-            {"track", track},
-            {"requested_by", Json(ctx.message.from.id)},
-        });
-        IpcResult r = vcCall(ctx, "queue", body);
-        if (!r.ok) break;
-        ++added;
-    }
-    setChatField(chat, "loop", std::to_string(added));
-    replyHtml(ctx, added > 0 ? ui_texts::kCtlLoopOn
-                             : "Could not queue loop copies (engine error).");
+    setChatField(chat, "loop", std::to_string(count));
+    replyHtml(ctx, count > 0 ? ui_texts::kCtlLoopOn
+                             : ui_texts::kCtlLoopOff);
 }
 
 void Dispatcher::onSeek(const CommandContext& ctx) {
@@ -2791,7 +2915,9 @@ void Dispatcher::onClear(const CommandContext& ctx) {
     IpcResult q = vcCall(ctx, "queue", list_body);
     if (q.ok) {
         const Json* items = q.data.find("queue");
-        if (items && items->size() > 1)
+        // Waiting-only list (§1.7): every item is a queued track,
+        // so a non-empty list is worth saving for /restore.
+        if (items && items->size() > 0)
             store_.set("cleared:" + std::to_string(vcTarget(ctx)),
                        items->dump());
     }
@@ -2806,15 +2932,14 @@ void Dispatcher::onClear(const CommandContext& ctx) {
     }
     int cleared = 0;
     {
-        // The snapshot saved above (before the clear) is the pending
-        // tail: index 0 is the then-current track, the rest were
-        // cleared.
+        // The snapshot saved above (before the clear) is the waiting
+        // queue: every item in it was cleared (the current track
+        // keeps playing — it was never in the list, §1.7).
         auto snap = store_.get("cleared:" + std::to_string(vcTarget(ctx)));
         if (snap) {
             try {
                 Json arr = Json::parse(*snap);
-                cleared = static_cast<int>(arr.size() > 1 ? arr.size() - 1
-                                                          : 0);
+                cleared = static_cast<int>(arr.size());
             } catch (...) {
             }
         }
@@ -2841,9 +2966,9 @@ void Dispatcher::onRestore(const CommandContext& ctx) {
         return;
     }
     int added = 0;
-    // The saved queue includes the then-current track at index 0; skip it
-    // (it is still playing) and restore only the pending tail.
-    for (size_t i = 1; i < arr.asArray().size(); ++i) {
+    // The saved queue is the waiting queue (§1.7): restore every
+    // item — nothing is skipped, the current track was never in it.
+    for (size_t i = 0; i < arr.asArray().size(); ++i) {
         const Json& item = arr.asArray()[i];
         const Json* track = item.find("track");
         if (!track) continue;
@@ -2872,8 +2997,10 @@ void Dispatcher::onRemove(const CommandContext& ctx) {
         replyHtml(ctx, ui_texts::kRemoveUsage);
         return;
     }
-    // Positions are the 1-based up-next numbers from /queue (which
-    // are also the engine queue positions: index 0 is now-playing).
+    // Positions are the 1-based up-next numbers from /queue. The
+    // backend queue is waiting-only and 0-based (§1.7, §10-D4), so
+    // display position N is backend position N−1 — the current track
+    // is never in the list and can never be removed this way.
     // Syntax (§5, NoxBeats usage line): a single position, a range
     // "1-5", or a list "1,3,5". Ranges/lists remove from the highest
     // position down, so earlier positions stay valid.
@@ -2943,13 +3070,13 @@ void Dispatcher::onRemove(const CommandContext& ctx) {
     }
     std::string first_title;
     for (int64_t p : positions) {
-        if (p < 1 || p >= static_cast<int64_t>(items->size())) {
+        if (p < 1 || p > static_cast<int64_t>(items->size())) {
             replyHtml(ctx, ui_texts::kRemoveBadPos);
             return;
         }
         if (positions.size() == 1) {
             const Json* t =
-                items->asArray()[static_cast<size_t>(p)].find("track");
+                items->asArray()[static_cast<size_t>(p) - 1].find("track");
             if (t && t->find("title"))
                 first_title = t->find("title")->asString();
         }
@@ -2959,7 +3086,8 @@ void Dispatcher::onRemove(const CommandContext& ctx) {
         Json body = Json::objectOf({
             {"chat_id", Json(vcTarget(ctx))},
             {"action", Json("remove")},
-            {"position", Json(p)},
+            // Display N -> backend waiting position N−1 (§10-D4).
+            {"position", Json(p - 1)},
         });
         IpcResult r = vcCall(ctx, "queue", body);
         if (!r.ok) {
@@ -2988,6 +3116,12 @@ void Dispatcher::onMove(const CommandContext& ctx) {
     int64_t to = std::stoll(args[1]);
     // The vc queue contract has no move: implement it as list -> remove
     // -> re-add at the target position (real IPC calls, same effect).
+    // Positions are the 1-based up-next numbers from /queue; the
+    // backend list is waiting-only and 0-based (§1.7, §10-D4), so
+    // display N is waiting index N−1. Display 1 is the first waiting
+    // track — the current track is never in the list and can never be
+    // moved (the old "Cannot move the currently playing track" guard
+    // for from==1 was the index-0 bug).
     Json list_body = Json::objectOf({
         {"chat_id", Json(vcTarget(ctx))},
         {"action", Json("list")},
@@ -3009,10 +3143,6 @@ void Dispatcher::onMove(const CommandContext& ctx) {
         const Json* t = item.find("track");
         if (t) tracks.push_back(*t);
     }
-    if (from == 1) {
-        reply(ctx, "Cannot move the currently playing track.");
-        return;
-    }
     if (from == to) {
         reply(ctx, "Already at position " + std::to_string(to) + ".");
         return;
@@ -3020,10 +3150,11 @@ void Dispatcher::onMove(const CommandContext& ctx) {
     Json moved = tracks[static_cast<size_t>(from) - 1];
     tracks.erase(tracks.begin() + (from - 1));
     tracks.insert(tracks.begin() + (to - 1), moved);
-    // Rebuild the pending tail: remove all pending (from the end, so
-    // positions stay valid), then re-add in the new order.
-    std::vector<Json> pending(tracks.begin() + 1, tracks.end());
-    for (int64_t pos = static_cast<int64_t>(items->size()); pos >= 2; --pos) {
+    // Rebuild the whole waiting queue: remove every waiting item
+    // (0-based positions, from the end so positions stay valid),
+    // then re-add in the new order.
+    for (int64_t pos = static_cast<int64_t>(items->size()) - 1; pos >= 0;
+         --pos) {
         Json rm = Json::objectOf({
             {"chat_id", Json(vcTarget(ctx))},
             {"action", Json("remove")},
@@ -3031,7 +3162,7 @@ void Dispatcher::onMove(const CommandContext& ctx) {
         });
         vcCall(ctx, "queue", rm);
     }
-    for (const auto& t : pending) {
+    for (const auto& t : tracks) {
         Json add = Json::objectOf({
             {"chat_id", Json(vcTarget(ctx))},
             {"action", Json("add")},
@@ -3061,27 +3192,31 @@ void Dispatcher::onShuffle(const CommandContext& ctx) {
         return;
     }
     const Json* items = q.data.find("queue");
-    if (!items || items->size() < 3) {
+    // Waiting-only list (§1.7): every item is a waiting track, so
+    // two waiting tracks are enough to shuffle.
+    if (!items || items->size() < 2) {
         replyHtml(ctx, ui_texts::kShuffleFew);
         return;
     }
     std::vector<Json> pending;
-    for (size_t i = 1; i < items->size(); ++i) {
+    for (size_t i = 0; i < items->size(); ++i) {
         const Json* t = items->asArray()[i].find("track");
         if (t) pending.push_back(*t);
     }
     std::random_device rd;
     std::mt19937 rng(rd());
     std::shuffle(pending.begin(), pending.end(), rng);
-    // Rebuild the pending tail in shuffled order (remove all, re-add).
-    for (size_t i = pending.size(); i >= 1; --i) {
+    // Rebuild the waiting queue in shuffled order: remove every
+    // waiting item (0-based positions, from the end so positions
+    // stay valid), then re-add.
+    for (int64_t pos = static_cast<int64_t>(pending.size()) - 1; pos >= 0;
+         --pos) {
         Json rm = Json::objectOf({
             {"chat_id", Json(vcTarget(ctx))},
             {"action", Json("remove")},
-            {"position", Json(static_cast<int64_t>(i) + 1)},
+            {"position", Json(pos)},
         });
         vcCall(ctx, "queue", rm);
-        if (i == 1) break;
     }
     for (const auto& t : pending) {
         Json add = Json::objectOf({
@@ -3631,12 +3766,30 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
         replyHtml(ctx, ui_texts::kDlUsage);
         return;
     }
-    // Route by link type (NoxBeats links::source_of): Spotify links go
-    // to download.spotify (playlist links to the playlist action), everything
-    // else to download.youtube.
+    // Route by link type (§3.1 row 7, §10-D14 — mirrors the backend's
+    // ClassifyQuery: source prefixes plus the providers' URL shapes).
+    // Spotify links go to download.spotify (playlist links to the
+    // playlist action); Deezer / TikTok / Navidrome / Soulseek links
+    // go to their own download.* actions; everything else is a
+    // YouTube search/download.
     std::string low = lowerStr(query);
     bool is_spotify = low.find("spotify.com") != std::string::npos ||
                       low.rfind("spotify:", 0) == 0;
+    // Deezer: deezer.com/(track|album|playlist|artist)/<id> (the old
+    // providers.py _DEEZER_RE) or the deezer: prefix.
+    bool is_deezer = low.find("deezer.com") != std::string::npos ||
+                     low.rfind("deezer:", 0) == 0;
+    // TikTok: tiktok.com/@…/video/, tiktok.com/v/, vm./vt.tiktok.com/
+    // (the old providers.py _TIKTOK_RE) or the tiktok: prefix.
+    bool is_tiktok = low.find("tiktok.com") != std::string::npos ||
+                     low.rfind("tiktok:", 0) == 0;
+    // Navidrome: a self-hosted server URL has no fixed shape, so the
+    // routable form is the navidrome: prefix (the backend's
+    // ClassifyQuery routes navidrome:<id> the same way).
+    bool is_navidrome = low.rfind("navidrome:", 0) == 0;
+    // Soulseek: no URLs exist in Soulseek; the routable form is the
+    // soulseek: prefix, and the text after it is the search query.
+    bool is_soulseek = low.rfind("soulseek:", 0) == 0;
     bool playlist = is_spotify &&
                     (low.find("/playlist/") != std::string::npos ||
                      low.find(":playlist:") != std::string::npos ||
@@ -3658,6 +3811,33 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
         action = "download/spotify";
         body = Json::objectOf({
             {"url", Json(query)},
+            {"requested_by", Json(ctx.message.from.id)},
+        });
+    } else if (is_deezer) {
+        action = "download/deezer";
+        body = Json::objectOf({
+            {"query", Json(query)},
+            {"requested_by", Json(ctx.message.from.id)},
+        });
+    } else if (is_tiktok) {
+        action = "download/tiktok";
+        body = Json::objectOf({
+            {"url", Json(query)},
+            {"requested_by", Json(ctx.message.from.id)},
+        });
+    } else if (is_navidrome) {
+        action = "download/navidrome";
+        body = Json::objectOf({
+            {"url", Json(query)},
+            {"requested_by", Json(ctx.message.from.id)},
+        });
+    } else if (is_soulseek) {
+        // The "soulseek:" prefix is a routing marker, not search
+        // text: the old provider splits the query on " - " into
+        // artist/title, so the prefix must not ride along.
+        action = "download/soulseek";
+        body = Json::objectOf({
+            {"query", Json(query.substr(std::string("soulseek:").size()))},
             {"requested_by", Json(ctx.message.from.id)},
         });
     } else {
@@ -4025,11 +4205,8 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
         reply(ctx, "Radio service returned no stream URL.");
         return;
     }
-    Json play = Json::objectOf({
-        {"chat_id", Json(vcTarget(ctx))},
-        {"query", Json(url->asString())},
-        {"requested_by", Json(ctx.message.from.id)},
-    });
+    Json play = vcPlayBody(vcTarget(ctx), url->asString(),
+                           ctx.message.from.id);
     IpcResult pr = vcCall(ctx, "play", play);
     if (!pr.ok) {
         replyError(ctx, pr);
@@ -4436,11 +4613,10 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
         tracks.resize(static_cast<size_t>(cfg_.queue_limit));
     // First track via /play, the rest queued (NoxBeats playlist_to_queue).
     Json first = tracks[0];
-    Json body = Json::objectOf({
-        {"chat_id", Json(vcTarget(ctx))},
-        {"query", Json(first.find("title") ? first.find("title")->asString() : "")},
-        {"requested_by", Json(ctx.message.from.id)},
-    });
+    Json body = vcPlayBody(
+        vcTarget(ctx),
+        first.find("title") ? first.find("title")->asString() : "",
+        ctx.message.from.id);
     IpcResult r = vcCall(ctx, "play", body);
     if (!r.ok) {
         replyError(ctx, r);
@@ -5668,10 +5844,16 @@ void Dispatcher::onMenu(const CommandContext& ctx) {
         now_url = track.find("url") ? track.find("url")->asString() : "";
         Json q;
         std::string qerr;
-        if (apiQueueList(chat, q, qerr) && q.size() > 1) {
-            const Json& nxt = q.asArray()[1];
-            next_title = nxt.find("title") ? nxt.find("title")->asString() : "";
-            next_url = nxt.find("url") ? nxt.find("url")->asString() : "";
+        // Waiting-only list (§1.7): the next track is items[0] —
+        // the current track is not in the list.
+        if (apiQueueList(chat, q, qerr) && q.size() > 0) {
+            const Json* nt = q.asArray()[0].find("track");
+            if (nt) {
+                next_title =
+                    nt->find("title") ? nt->find("title")->asString() : "";
+                next_url =
+                    nt->find("url") ? nt->find("url")->asString() : "";
+            }
         }
     }
     int64_t msg = replyKb(ctx,
@@ -7237,6 +7419,24 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
             answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
             return;
         }
+        // §7.8 / §10-D16: fx.apply is record-only in Phase 3 (no
+        // ffmpeg subprocess — the DSP is Phase 5). Only `original`
+        // answers applied:true (a no-op by definition); every other
+        // effect answers applied:false with the INPUT path as
+        // output_path. The file is unprocessed and must never be
+        // sent as processed audio: say so honestly instead.
+        // `applied` absent is treated the same way — only an
+        // explicit true means the file was really processed.
+        bool applied = false;
+        if (const Json* a = r.data.find("applied")) applied = a->asBool();
+        if (!applied) {
+            answerCb(cq, fx_effect +
+                             " recorded — live DSP filtering lands in "
+                             "Phase 5. The file is unprocessed, so "
+                             "nothing was sent.",
+                     true);
+            return;
+        }
         std::string err;
         if (tg_.sendAudioFile(cq.chat_id, out_path, "", &err) < 0)
             answerCb(cq, err, true);
@@ -7747,24 +7947,70 @@ void Dispatcher::cbDlset(const TgCallbackQuery& cq,
 
 void Dispatcher::cbSpotify(const TgCallbackQuery& cq,
                            const std::vector<std::string>& parts) {
-    // pl:spotify:<verb>… — companion cards owned by spotify-rust
-    // (engines worker). The core only owns the dislike action, which
-    // already has its IPC (spotify.dislike): pl:spotify:dislike:<id>.
-    if (parts.size() < 4 || parts[2] != "dislike") {
-        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+    // pl:spotify:<verb>:<id> — companion cards owned by spotify-rust
+    // (engines worker). `dislike` already has its IPC
+    // (spotify.dislike); `details` / `analyze` route to the existing
+    // spotify.details / spotify.analyze actions (§9-E8). Any other
+    // verb still answers honestly (§7.5: never leave a callback
+    // un-answered). The track id is rejoined from parts[3:] for
+    // details/analyze — ids are opaque and a ':' inside one must not
+    // truncate it (cbVote rule); `dislike` keeps its exact current
+    // parsing (parts[3]) — it is Live and out of scope here.
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
         return;
     }
-    IpcResult r = ipc_.post(cfg_.spotify_url, "dislike",
-                            Json::objectOf({
-                                {"user_id", Json(cq.from.id)},
-                                {"track_id", Json(parts[3])},
-                            }),
-                            15);
-    if (!r.ok) {
-        answerCb(cq, r.error_message, true);
+    const std::string& verb = parts[2];
+    if (verb == "dislike") {
+        IpcResult r = ipc_.post(cfg_.spotify_url, "dislike",
+                                Json::objectOf({
+                                    {"user_id", Json(cq.from.id)},
+                                    {"track_id", Json(parts[3])},
+                                }),
+                                15);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        answerCb(cq, ui_texts::kToastDisliked);
         return;
     }
-    answerCb(cq, ui_texts::kToastDisliked);
+    std::string track_id = parts[3];
+    for (size_t i = 4; i < parts.size(); ++i) track_id += ":" + parts[i];
+    if (verb == "details") {
+        // GET /v1/spotify/details?user_id=&track_id= (§6.10, 10 s):
+        // IpcClient::get translates the path to spotify.details and
+        // carries the query params as the request payload.
+        std::string path = "/v1/spotify/details?user_id=" +
+                           std::to_string(cq.from.id) +
+                           "&track_id=" + track_id;
+        IpcResult r = ipc_.get(cfg_.spotify_url, path, 10);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        answerCb(cq, "");
+        InlineKeyboard kb = {{InlineButton::callback(
+            "Analyze text", "pl:spotify:analyze:" + track_id)}};
+        editCbCard(cq, spotifyDetailsText(r.data), kb);
+        return;
+    }
+    if (verb == "analyze") {
+        IpcResult r = ipc_.post(cfg_.spotify_url, "spotify.analyze",
+                                Json::objectOf({
+                                    {"user_id", Json(cq.from.id)},
+                                    {"track_id", Json(track_id)},
+                                }),
+                                30);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        answerCb(cq, "");
+        editCbCard(cq, spotifyAnalyzeText(r.data), InlineKeyboard{});
+        return;
+    }
+    answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
 }
 
 
