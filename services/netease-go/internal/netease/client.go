@@ -27,6 +27,7 @@ package netease
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,6 +55,31 @@ type Track struct {
 	Source      string `json:"source"`
 	Thumbnail   string `json:"thumbnail,omitempty"`
 	URL         string `json:"url,omitempty"`
+	// IPC-3 (§29): human duration, always derived ("M:SS" / "Xh Ym Zs"
+	// / "∞"); a NetEase track is never live, and the API reports no
+	// views/uploader/upload date (those stay absent, never invented).
+	DurationStr string `json:"duration_str,omitempty"`
+	IsLive      bool   `json:"is_live,omitempty"`
+}
+
+// formatDurationStr renders the IPC-3 human duration — same rendering
+// as vc-go / vc-ts / vc-rust / downloaders (asserted identically in
+// each service's tests).
+func formatDurationStr(sec int, isLive bool) string {
+	if isLive || sec <= 0 {
+		return "∞"
+	}
+	if sec < 3600 {
+		return fmt.Sprintf("%d:%02d", sec/60, sec%60)
+	}
+	parts := []string{fmt.Sprintf("%dh", sec/3600)}
+	if (sec%3600)/60 > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", (sec%3600)/60))
+	}
+	if sec%60 > 0 {
+		parts = append(parts, fmt.Sprintf("%ds", sec%60))
+	}
+	return strings.Join(parts, " ")
 }
 
 // Client talks to music.163.com anonymously, or logged in when
@@ -89,6 +115,15 @@ func New() *Client {
 func NewWithMusicU(u string) *Client {
 	c := New()
 	c.musicU = strings.TrimSpace(u)
+	return c
+}
+
+// NewWithBase returns a client pointed at a different API base (tests;
+// New uses https://music.163.com). Only the base changes — auth,
+// timeouts and the cookie rules are identical.
+func NewWithBase(base string) *Client {
+	c := New()
+	c.base = strings.TrimRight(base, "/")
 	return c
 }
 
@@ -172,14 +207,16 @@ func (s apiSong) toTrack() Track {
 	for _, a := range s.Artists {
 		artists = append(artists, a.Name)
 	}
+	durationSec := int(s.Duration / 1000)
 	return Track{
 		ID:          strconv.FormatInt(s.ID, 10),
 		Title:       s.Name,
 		Artist:      strings.Join(artists, ", "),
-		DurationSec: int(s.Duration / 1000),
+		DurationSec: durationSec,
 		Source:      "netease",
 		Thumbnail:   s.Album.PicURL,
 		URL:         "https://music.163.com/song?id=" + strconv.FormatInt(s.ID, 10),
+		DurationStr: formatDurationStr(durationSec, false),
 	}
 }
 
@@ -419,6 +456,11 @@ func (c *Client) mirrorURL(id int64) (string, int64, error) {
 	return res.URL, res.Size, nil
 }
 
+// ErrNoLyrics marks a successful API call that returned no lyrics —
+// the track exists, it simply has none. Callers map it to a 404
+// (not_found), not an engine error.
+var ErrNoLyrics = errors.New("netease lyrics: no lyrics")
+
 // Lyrics fetches the (original-language) lyrics for one track id.
 func (c *Client) Lyrics(id int64) (string, error) {
 	req, err := http.NewRequest(http.MethodGet,
@@ -443,7 +485,7 @@ func (c *Client) Lyrics(id int64) (string, error) {
 		return "", fmt.Errorf("netease lyrics: API code %d", res.Code)
 	}
 	if res.Lrc.Lyric == "" {
-		return "", fmt.Errorf("netease lyrics: no lyrics for track %d", id)
+		return "", fmt.Errorf("%w for track %d", ErrNoLyrics, id)
 	}
 	return res.Lrc.Lyric, nil
 }

@@ -114,6 +114,12 @@ func (r *Room) snapshotLocked() types.NowPlaying {
 		Loop:        r.loop,
 		Shuffle:     r.shuffle,
 		Autoplay:    r.autoplay,
+		// IPC-1 (§29): mirror fields for the core's now-playing card.
+		IsPaused:        r.paused,
+		IsMuted:         r.volume == 0,
+		LoopCount:       r.loop,
+		Speed:           1.0, // vc-go has no speed control
+		AutoplayEnabled: r.autoplay,
 	}
 	if r.current != nil {
 		t := *r.current

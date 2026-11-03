@@ -68,6 +68,7 @@ function positionSec(room) {
 
 function nowPlaying(room) {
   const vs = voicecall.voiceState(room.chat_id);
+  const muted = room.volume === 0 && room.muted_volume !== null && room.muted_volume !== undefined;
   const np = {
     chat_id: room.chat_id,
     engine: "ts",
@@ -79,10 +80,18 @@ function nowPlaying(room) {
     loop: room.loop, // integer 0-10 (contract NowPlaying.loop)
     shuffle: Boolean(room.shuffle),
     autoplay: Boolean(room.autoplay),
-    muted: room.volume === 0 && room.muted_volume !== null && room.muted_volume !== undefined,
+    muted,
     voice: vs.voice,
     voice_joined: vs.joined,
     voice_reason: vs.reason,
+    // IPC-1 (§29): the fields the core's merged 5-row now-playing
+    // card reads. is_muted mirrors the legacy `muted` field above;
+    // speed is always 1.0 — vc-ts has no speed control.
+    is_paused: room.paused,
+    is_muted: muted,
+    loop_count: room.loop,
+    speed: 1.0,
+    autoplay_enabled: Boolean(room.autoplay),
   };
   // Top-level stream_url mirrors the current track's (contract
   // NowPlaying.stream_url, A8 residual): readers need not dig into
@@ -389,6 +398,7 @@ function panelState(room) {
     now: now ? { title: now.title, url: now.url || now.stream_url || "", artist: now.artist } : null,
     next: next ? { title: next.title, url: next.url || next.stream_url || "", artist: next.artist } : null,
     paused: room.paused,
+    is_muted: room.volume === 0 && room.muted_volume !== null && room.muted_volume !== undefined,
     position_sec: positionSec(room),
     duration_sec: now ? Number(now.duration_sec) || 0 : 0,
     volume: room.volume,
@@ -406,7 +416,8 @@ function panelAction(room, action) {
     case "update":
       return { ok: true, message: "Updated.", state: panelState(room) };
     case "shuffle": {
-      if (room.queue.length < 1) return { ok: false, message: "No enough items to shuffle." };
+      // §27 typo correction (remix "No enough items" -> "Not enough").
+      if (room.queue.length < 1) return { ok: false, message: "Not enough items to shuffle." };
       for (let i = room.queue.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [room.queue[i], room.queue[j]] = [room.queue[j], room.queue[i]];
@@ -583,6 +594,29 @@ const server = http.createServer(async (req, res) => {
       const room = rooms.get(chatId);
       if (!room || !room.current) return fail(res, 404, "not_found", "no playback state for this chat");
       return ok(res, { now_playing: nowPlaying(room) });
+    }
+
+    if (req.method === "GET" && p === "/v1/progress") {
+      // IPC-2 (§29): progress snapshot for the core's no-op
+      // progress-bar button refresh and the remix /menu panel.
+      // Same 404 rule as /v1/now-playing: no room, or a room with
+      // nothing playing. (A missing/non-integer chat_id is a 400 —
+      // Number(null) is 0, so the raw param is checked first.)
+      const raw = url.searchParams.get("chat_id");
+      const chatId = raw === null ? NaN : Number(raw);
+      if (!Number.isInteger(chatId)) return fail(res, 400, "bad_request", "chat_id query param is required");
+      const room = rooms.get(chatId);
+      if (!room || !room.current) return fail(res, 404, "not_found", "no playback state for this chat");
+      const next = room.queue[0] ? room.queue[0].track : null;
+      return ok(res, {
+        position_sec: positionSec(room),
+        duration_sec: Number(room.current.duration_sec) || 0,
+        is_paused: room.paused,
+        is_muted: room.volume === 0 && room.muted_volume !== null && room.muted_volume !== undefined,
+        loop_enabled: room.loop > 0,
+        now: room.current,
+        next,
+      });
     }
 
     if (req.method === "GET" && p === "/v1/panel") {
@@ -819,19 +853,33 @@ const server = http.createServer(async (req, res) => {
       // remix handlers/lyrics.ts: lyrics for the now-playing title.
       // Title/artist may be given directly; otherwise the room's
       // current track is used. Source: LRCLib (keyless).
+      // Response is IPC-5 (§29): track_id/title/artist/source/
+      // truncated + lyrics. track_id is the room's current track when
+      // the lookup came from a chat_id, else null. truncated is false
+      // — LRCLib lyrics are returned whole; the core chunks at 4096
+      // chars for display (remix view) and 4000 for inline `l`.
       let title = String(body.title || "").trim();
       let artist = String(body.artist || "").trim();
+      let trackId = null;
       if (!title && body.chat_id !== undefined && body.chat_id !== null) {
         const room = rooms.get(Number(body.chat_id));
         if (room && room.current) {
           title = room.current.title || "";
           artist = room.current.artist || "";
+          trackId = room.current.id || null;
         }
       }
       if (!title) return fail(res, 400, "bad_request", "title is required (or chat_id with a track playing)");
       const found = await R.fetchLyrics(title, artist);
       if (!found) return fail(res, 404, "not_found", `no lyrics found for "${title}"`);
-      return ok(res, found);
+      return ok(res, {
+        track_id: trackId,
+        title: found.title,
+        artist: found.artist,
+        lyrics: found.lyrics,
+        source: found.source,
+        truncated: false,
+      });
     }
 
     if (p === "/v1/search") {
@@ -877,15 +925,47 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/v1/inline") {
-      const query = String(body.query || "").trim();
-      if (!query) return fail(res, 400, "bad_request", "query is required");
-      // Inline path (lemonic handlers/inline_query.ts): YouTube first,
-      // Lemonic appended; JioSaavn skipped (no inline use). Lemonic is
-      // always attempted now — its unauthenticated path needs no key —
-      // and skipped only if the API itself fails.
-      const data = await handleSearch({ query, source: "youtube", limit: 5 });
+      // §13: navidrome modes (np/s/l/lib/del) + Music163bot help +
+      // lemonic track results. lemonic's per-track documentPdf type is
+      // NOT ported (a track is not a PDF) — the core renders lemonic
+      // tracks as audio results from the Track below. The response
+      // stays {results:[Track]} per the contract: the core knows the
+      // query it sent, so it renders the mode-specific result kind
+      // (cached audio for np, share message for s, lyrics article for
+      // l — lyrics text via /v1/lyrics with the same chat_id) and the
+      // static hint/help/no-results articles itself.
+      const raw = String(body.query || "");
+      const { mode, arg } = R.inlineMode(raw);
+      const chatId = body.chat_id !== undefined && body.chat_id !== null
+        ? Number(body.chat_id) : null;
+      // np/s/l need a chat's now-playing. The core passes chat_id when
+      // it knows which chat the inline user is playing in; without it
+      // (or with nothing playing) the result is honestly empty — §13:
+      // "Empty when nothing is playing".
+      if (mode === "np" || mode === "s" || mode === "l") {
+        const room = Number.isInteger(chatId) ? rooms.get(chatId) : null;
+        if (!room || !room.current) return ok(res, { results: [] });
+        return ok(res, { results: [room.current] });
+      }
+      if (mode === "lib" || mode === "del") {
+        // No library backend in vc-ts: library search/delete need the
+        // Navidrome library, which this service does not host (see
+        // phase9/port-engines-gaps.md). Empty results, honestly.
+        return ok(res, { results: [] });
+      }
+      if (mode === "hint" || mode === "help" || (mode === "search" && !arg)) {
+        // Hint button / help articles / "Please enter a keyword" are
+        // static inventory text the core renders from the query it
+        // already has; the engine returns no tracks for them.
+        return ok(res, { results: [] });
+      }
+      // Inline search (lemonic handlers/inline_query.ts): YouTube
+      // first, Lemonic appended; JioSaavn skipped (no inline use).
+      // Lemonic is always attempted — its unauthenticated path needs
+      // no key — and skipped only if the API itself fails.
+      const data = await handleSearch({ query: arg, source: "youtube", limit: 5 });
       try {
-        const lem = await R.searchLemonic(query, 5);
+        const lem = await R.searchLemonic(arg, 5);
         data.results.push(...lem.results);
       } catch (e) {
         console.log("[vc-ts] inline: lemonic skipped:", e.message);

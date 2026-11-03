@@ -86,12 +86,20 @@ def _format_label_from_result(r):
     return " ".join(parts) if parts else ext
 
 
-def _await_one_file(username, remote_filename, timeout_secs=DOWNLOAD_TIMEOUT_SECS):
-    """Wait for slskd to finish a single file. Returns the final state string."""
+def _await_one_file(username, remote_filename, timeout_secs=DOWNLOAD_TIMEOUT_SECS,
+                    progress_cb=None, state_cb=None):
+    """Wait for slskd to finish a single file. Returns the final state string.
+
+    ``progress_cb`` / ``state_cb`` are slskd's own transfer callbacks
+    (see client.wait_for_files) — the real per-second numbers from the
+    peer transfer, wired to the IPC-4 run by the caller.
+    """
     states = slskd.wait_for_files(
         username=username,
         target_filenames=[remote_filename],
         timeout_secs=timeout_secs,
+        progress_cb=progress_cb,
+        state_cb=state_cb,
     )
     return states.get(remote_filename, "Unknown")
 
@@ -117,15 +125,52 @@ def _ensure_enqueued(chosen):
                 "to it for %s", active, chosen.basename)
 
 
-def _download_chosen(chosen, dest_dir, name):
+def _download_chosen(chosen, dest_dir, name, run=None, track_index=None,
+                     overall_pct=None, done_bytes_base=None):
     """Enqueue a single file, wait, move to dest_dir.
 
     Returns ``(filepath, bytes, fmt_label)``. Raises
     ``PeerTransferError`` for per-peer issues (caller retries another peer);
     other exceptions (OSError on move, ...) propagate as-is.
+
+    ``run`` is the IPC-4 DownloadRun (or None): the slskd transfer
+    callbacks fold the real numbers into it — per-track checklist
+    entry ``track_index`` (peer / state / pct) plus the run's
+    top-level fields. ``overall_pct`` maps this file's pct (0-100)
+    onto the run's overall percentage (identity for a single track;
+    for an album: (done tracks + pct/100) / total * 100).
+    ``done_bytes_base`` returns the bytes already banked by earlier
+    files (albums only; single tracks start at 0).
     """
     _ensure_enqueued(chosen)
-    state = _await_one_file(chosen.username, chosen.filename)
+    if run is not None and track_index is not None:
+        run.set_track(track_index, state="downloading", peer=chosen.username)
+
+    def _on_progress(filename, pct, state, speed_bps, bytes_done, size):
+        if run is None:
+            return
+        base = done_bytes_base() if done_bytes_base else 0
+        run.update(
+            percentage=(overall_pct(pct) if overall_pct else pct),
+            done_bytes=base + int(bytes_done),
+            total_bytes=int(size) if size else None,
+            speed_bytes_per_sec=int(speed_bps or 0),
+            phase="downloading")
+        if track_index is not None:
+            run.set_track(track_index, state="downloading", pct=pct,
+                          peer=chosen.username)
+
+    def _on_state(filename, state, queue_position, queued_seconds):
+        # Only the remotely-queued state is interesting on the
+        # checklist; the transfer itself is reported by _on_progress.
+        if run is None or track_index is None:
+            return
+        low = (state or "").lower()
+        if "queued" in low and "remotely" in low:
+            run.set_track(track_index, state="queued", peer=chosen.username)
+
+    state = _await_one_file(chosen.username, chosen.filename,
+                            progress_cb=_on_progress, state_cb=_on_state)
     if "succeeded" not in state.lower():
         try:
             slskd.cancel_download(chosen.username, chosen.filename)
@@ -158,7 +203,8 @@ def _download_chosen(chosen, dest_dir, name):
 
 
 def _try_candidates(candidates, dest_dir, name, max_attempts=None,
-                    failed_keys=None):
+                    failed_keys=None, run=None, track_index=None,
+                    overall_pct=None, done_bytes_base=None):
     """Try peers in order; return on first success. Only ``PeerTransferError``
     is treated as 'try the next peer' — any other exception (local I/O,
     etc.) is a real bug and propagates so it doesn't get silently
@@ -186,7 +232,9 @@ def _try_candidates(candidates, dest_dir, name, max_attempts=None,
             break
         attempts += 1
         try:
-            filepath, size, fmt = _download_chosen(cand, dest_dir, name)
+            filepath, size, fmt = _download_chosen(
+                cand, dest_dir, name, run=run, track_index=track_index,
+                overall_pct=overall_pct, done_bytes_base=done_bytes_base)
             return filepath, size, fmt, cand
         except PeerTransferError as e:
             last_err = str(e)
@@ -212,17 +260,24 @@ def find_lossy_candidates(track, album_artist=None):
 
 
 def download_single_track(track, dest_dir, accept_lossy=False,
-                          precomputed_candidates=None):
+                          precomputed_candidates=None, run=None):
     """Download one track. ``track`` is a Parlay track dict
     ({title, artist, duration_sec?}). Returns
     ``(filepath, was_downloaded, format_label, peer_username)``.
     Raises RuntimeError with an honest reason when Soulseek has no
     usable copy (or slskd is unreachable — SearchError propagates).
+
+    ``run`` is the IPC-4 DownloadRun (or None): phase transitions,
+    the single checklist entry, and — when no FLAC exists but lossy
+    copies do — ``lossy_available`` / ``lossy_summary`` so the core
+    can offer the mp3 fallback instead of a bare failure.
     """
     os.makedirs(dest_dir, exist_ok=True)
     title = track.get("title", "")
     artist = track.get("artist", "")
     name = "%s - %s" % (artist or "soulseek", title or "track")
+    if run is not None:
+        run.update(phase="searching")
 
     best_score = None
     if precomputed_candidates is not None:
@@ -239,6 +294,21 @@ def download_single_track(track, dest_dir, accept_lossy=False,
 
         if not candidates:
             reason = _no_match_reason(diag)
+            if run is not None:
+                run.set_track(0, state="failed", reason=reason)
+                if diag.get("lossy_dropped") and not accept_lossy:
+                    # Real preview, not a guess: ask the matcher for
+                    # the lossy copies it dropped, so the core can
+                    # offer the mp3 fallback with a true peer count.
+                    lossy = find_lossy_candidates(track)
+                    if lossy:
+                        run.update(
+                            lossy_available=True,
+                            lossy_summary=(
+                                "%d mp3/m4a %s available from Soulseek "
+                                "peers — retry with accept_lossy=true"
+                                % (len(lossy),
+                                   "copy" if len(lossy) == 1 else "copies")))
             if accept_lossy:
                 raise RuntimeError(
                     "No mp3/m4a fallback either for %s — %s (%s)"
@@ -256,10 +326,19 @@ def download_single_track(track, dest_dir, accept_lossy=False,
                 artist, title, candidates[0].username, best_score,
                 len(candidates))
     t0 = time.monotonic()
-    res = _try_candidates(candidates, dest_dir, name)
+    if run is not None:
+        run.update(phase="downloading")
+        run.set_track(0, state="searching", peer=candidates[0].username)
+    res = _try_candidates(candidates, dest_dir, name, run=run, track_index=0)
     if not res:
+        if run is not None:
+            run.set_track(0, state="failed",
+                          reason="all matching peers failed")
         raise RuntimeError("All candidate peers failed.")
     filepath, size, fmt, chosen = res
+    if run is not None:
+        run.set_track(0, state="done", pct=100.0, peer=chosen.username)
+        run.update(percentage=100.0, done_bytes=size, total_bytes=size)
     elapsed = time.monotonic() - t0
     speed = (size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
     logger.info(
@@ -270,13 +349,17 @@ def download_single_track(track, dest_dir, accept_lossy=False,
     return filepath, True, fmt, chosen.username
 
 
-def download_album(album, dest_dir):
+def download_album(album, dest_dir, run=None):
     """Download an album. ``album`` is a Parlay dict
     ({artist, title, tracks: [{title, artist?, duration_sec?}]}).
     Returns ``{album_dir, downloaded, skipped, failed, total, format,
     elapsed_secs, source_counts}``. No library dedup/tagging: Parlay
     has no library, so every track is downloaded fresh (``skipped``
     is always 0) and files land flat in ``dest_dir``.
+
+    ``run`` is the IPC-4 DownloadRun (or None): the per-track
+    checklist (one entry per album track) plus the overall
+    percentage, folded live from slskd's transfer callbacks.
     """
     slskd.remove_completed_downloads()
 
@@ -309,12 +392,25 @@ def download_album(album, dest_dir):
         tid = str(i)
         name = "%s - %s" % (track.get("artist") or artist,
                             track.get("title") or "track")
+        if run is not None:
+            run.set_track(i - 1, state="searching")
+            run.update(phase="downloading")
+
+        def _overall(pct):
+            # Overall % = completed tracks + this file's fraction.
+            done = sum(1 for t in run.per_track if t["state"] == "done") \
+                if run is not None else 0
+            return (done + pct / 100.0) / max(total, 1) * 100.0
+
         try:
             t0 = time.monotonic()
             res = _try_candidates(
                 candidates, dest_dir, name,
                 max_attempts=max(len(candidates), 1),
                 failed_keys=failed_candidate_keys,
+                run=run, track_index=i - 1,
+                overall_pct=_overall,
+                done_bytes_base=lambda: album_bytes,
             )
             if res is None:
                 raise PeerTransferError("no peer returned a usable file")
@@ -335,6 +431,11 @@ def download_album(album, dest_dir):
             track_provenance[tid] = chosen.username
             remaining_track_ids.discard(tid)
             last_error.pop(tid, None)
+            if run is not None:
+                run.set_track(i - 1, state="done", pct=100.0,
+                              peer=chosen.username)
+                run.update(percentage=downloaded / max(total, 1) * 100.0,
+                           done_bytes=album_bytes)
             return chosen
         except PeerTransferError as e:
             reason = str(e)
@@ -342,6 +443,8 @@ def download_album(album, dest_dir):
                           "no peer returned a usable file"):
                 reason = last_error.get(tid, reason)
             last_error[tid] = reason
+            if run is not None:
+                run.set_track(i - 1, state="failed", reason=reason)
             logger.warning("  [%d/%d] track %s — failed: %s",
                            i, total, track.get("title"), e)
             return None
@@ -480,6 +583,8 @@ def download_album(album, dest_dir):
             if not candidates:
                 reason = search_dead or _no_match_reason(diag)
                 last_error.setdefault(str(i), reason)
+                if run is not None:
+                    run.set_track(i - 1, state="failed", reason=reason)
                 continue
             used = _attempt(i, track, candidates)
             if used is not None and quality_lock is None:

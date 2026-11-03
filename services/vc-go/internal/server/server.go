@@ -44,6 +44,7 @@ func New(mgr *queue.Manager, res *resolver.Resolver, cfg runner.Config, token st
 	s.mux.HandleFunc("/v1/autoplay", s.auth(s.handleAutoplay))
 	s.mux.HandleFunc("/v1/autoplay-skip", s.auth(s.handleAutoplaySkip))
 	s.mux.HandleFunc("/v1/now-playing", s.auth(s.handleNowPlaying))
+	s.mux.HandleFunc("/v1/progress", s.auth(s.handleProgress))
 	return s
 }
 
@@ -453,4 +454,52 @@ func (s *Server) handleNowPlaying(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, map[string]any{"now_playing": np})
+}
+
+// handleProgress serves IPC-2 (UI_INVENTORY.md §29): GET
+// /v1/progress?chat_id= — the snapshot the core's no-op progress-bar
+// button refresh and the remix /menu panel read. It is a read-only
+// view over the room snapshot: position, duration, pause/mute/loop
+// state, and the current + next tracks (nil when there is none).
+// Same 404 rule as /v1/now-playing: no room, or a room with nothing
+// playing and an empty queue.
+func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, http.StatusMethodNotAllowed, "bad_request", "GET required")
+		return
+	}
+	raw := r.URL.Query().Get("chat_id")
+	chatID, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || chatID == 0 {
+		badRequest(w, "chat_id query parameter is required")
+		return
+	}
+	room := s.mgr.Lookup(chatID)
+	if room == nil {
+		notFound(w, "no playback state for this chat")
+		return
+	}
+	np := room.Snapshot()
+	if np.Track == nil && len(np.Queue) == 0 {
+		notFound(w, "no playback state for this chat")
+		return
+	}
+	var duration int64
+	if np.Track != nil {
+		duration = np.Track.DurationSec
+	}
+	var next *types.Track
+	if len(np.Queue) > 0 {
+		t := np.Queue[0].Track
+		next = &t
+	}
+	writeOK(w, map[string]any{
+		"position_sec": np.PositionSec,
+		"duration_sec": duration,
+		"is_paused":    np.Paused,
+		"is_muted":     np.IsMuted,
+		"loop_enabled": np.Loop > 0,
+		"now":          np.Track,
+		"next":         next,
+	})
 }

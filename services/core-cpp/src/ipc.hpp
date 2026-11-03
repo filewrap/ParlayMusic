@@ -20,7 +20,7 @@ inline bool isKnownVcAction(const std::string& action) {
     static const char* kKnown[] = {
         "play", "pause", "resume", "skip", "stop", "seek", "queue",
         "now-playing", "loop", "shuffle", "autoplay", "autoplay-skip",
-        "radio", "join", "mute",
+        "radio", "join", "mute", "volume",
     };
     for (const char* k : kKnown)
         if (action == k) return true;

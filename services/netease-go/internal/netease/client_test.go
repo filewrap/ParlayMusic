@@ -7,6 +7,7 @@ package netease
 // this repo.
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -251,5 +252,77 @@ func TestDownloadSendsMusicUToNetEaseCDN(t *testing.T) {
 	}
 	if buf.String() != "audio-bytes" {
 		t.Fatalf("download body = %q", buf.String())
+	}
+}
+
+// ------------------------------------------------ Phase 9: IPC-3/5 --
+
+func TestFormatDurationStr(t *testing.T) {
+	// Same rendering as vc-go / vc-ts / vc-rust / downloaders.
+	cases := []struct {
+		sec  int
+		live bool
+		want string
+	}{
+		{0, false, "∞"}, {-5, false, "∞"}, {45, false, "0:45"},
+		{268, false, "4:28"}, {3599, false, "59:59"}, {3600, false, "1h"},
+		{3661, false, "1h 1m 1s"}, {3720, false, "1h 2m"},
+		{3605, false, "1h 5s"}, {213, true, "∞"},
+	}
+	for _, c := range cases {
+		if got := formatDurationStr(c.sec, c.live); got != c.want {
+			t.Fatalf("formatDurationStr(%d, %v) = %q, want %q", c.sec, c.live, got, c.want)
+		}
+	}
+}
+
+func TestToTrackCarriesIPC3(t *testing.T) {
+	song := apiSong{ID: 186016, Name: "Test Song", Duration: 213000,
+		Artists: []struct {
+			Name string `json:"name"`
+		}{{Name: "Test Artist"}}}
+	song.Album.PicURL = "https://p1.music.126.net/cover.jpg"
+	tr := song.toTrack()
+	if tr.DurationStr != "3:33" {
+		t.Fatalf("DurationStr = %q, want 3:33", tr.DurationStr)
+	}
+	if tr.IsLive {
+		t.Fatal("IsLive must be false for a NetEase song")
+	}
+	if tr.Thumbnail != "https://p1.music.126.net/cover.jpg" {
+		t.Fatalf("Thumbnail = %q", tr.Thumbnail)
+	}
+	// Unknown duration renders ∞, never a fake value.
+	zero := apiSong{ID: 1, Name: "No Duration", Duration: 0}
+	if zero.toTrack().DurationStr != "∞" {
+		t.Fatalf("zero-duration DurationStr = %q, want ∞", zero.toTrack().DurationStr)
+	}
+}
+
+func TestLyricsNoLyricsIsSentinel(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200,"lrc":{"lyric":""}}`))
+	}))
+	defer stub.Close()
+	c := NewWithBase(stub.URL)
+	if _, err := c.Lyrics(186016); !errors.Is(err, ErrNoLyrics) {
+		t.Fatalf("empty lyric must be ErrNoLyrics, got %v", err)
+	}
+}
+
+func TestLyricsReturnsLRC(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200,"lrc":{"lyric":"[00:01.00]hello\n[00:05.00]world"}}`))
+	}))
+	defer stub.Close()
+	c := NewWithBase(stub.URL)
+	got, err := c.Lyrics(186016)
+	if err != nil {
+		t.Fatalf("Lyrics: %v", err)
+	}
+	if got != "[00:01.00]hello\n[00:05.00]world" {
+		t.Fatalf("Lyrics = %q", got)
 	}
 }

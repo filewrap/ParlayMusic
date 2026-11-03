@@ -71,8 +71,40 @@ def safe_join(base, *parts):
     return path
 
 
+def format_duration_str(sec, is_live=False):
+    """IPC-3 (§29): human duration — "M:SS" under an hour, "Xh Ym Zs"
+    at/over an hour, "∞" when the duration is unknown (sec <= 0) or
+    the track is live. Zero-valued hour/minute/second parts are dropped.
+    Same rendering as vc-go / vc-ts / vc-rust (asserted identically
+    in each service's tests)."""
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        sec = 0
+    if is_live or sec <= 0:
+        return "∞"
+    if sec < 3600:
+        return "%d:%02d" % (sec // 60, sec % 60)
+    parts = ["%dh" % (sec // 3600)]
+    if (sec % 3600) // 60:
+        parts.append("%dm" % ((sec % 3600) // 60))
+    if sec % 60:
+        parts.append("%ds" % (sec % 60))
+    return " ".join(parts)
+
+
+def format_upload_date(raw):
+    """IPC-3: yt-dlp upload_date ("YYYYMMDD") -> "YYYY-MM-DD" for the
+    search metadata rows. Anything else passes through unchanged."""
+    raw = str(raw or "")
+    if len(raw) == 8 and raw.isdigit():
+        return "%s-%s-%s" % (raw[:4], raw[4:6], raw[6:])
+    return raw
+
+
 def track_dict(track_id, title, source, artist=None, duration_sec=None,
-               url=None, thumbnail=None, note=None):
+               url=None, thumbnail=None, note=None, views=None,
+               uploader=None, upload_time=None, is_live=False):
     t = {"id": str(track_id), "title": title, "source": source}
     if artist:
         t["artist"] = artist
@@ -81,6 +113,24 @@ def track_dict(track_id, title, source, artist=None, duration_sec=None,
             t["duration_sec"] = int(duration_sec)
         except (TypeError, ValueError):
             pass
+    # IPC-3 (§29): duration_str is always derived (never invented —
+    # unknown durations render "∞"); views/uploader/upload_time only
+    # when the source reported them; is_live only when true.
+    t["duration_str"] = format_duration_str(
+        t.get("duration_sec", 0), is_live)
+    if views is not None:
+        try:
+            views = int(views)
+        except (TypeError, ValueError):
+            views = None
+        if views is not None and views > 0:
+            t["views"] = views
+    if uploader:
+        t["uploader"] = uploader
+    if upload_time:
+        t["upload_time"] = format_upload_date(upload_time)
+    if is_live:
+        t["is_live"] = True
     if url:
         t["url"] = url
     if thumbnail:

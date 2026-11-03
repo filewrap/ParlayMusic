@@ -134,6 +134,33 @@ type ytDlpJSON struct {
 	Thumbnail  string  `json:"thumbnail"`
 	URL        string  `json:"url"` // direct stream URL, when present
 	WebpageURL string  `json:"webpage_url"`
+	// IPC-3 fields (UI_INVENTORY.md §29): view count, publish date
+	// ("YYYYMMDD") and the live markers, when yt-dlp reports them.
+	ViewCount  int64  `json:"view_count"`
+	UploadDate string `json:"upload_date"`
+	IsLive     bool   `json:"is_live"`
+	LiveStatus string `json:"live_status"`
+}
+
+// enrichIPC3 fills a Track's IPC-3 search-result fields from one
+// yt-dlp info object. DurationStr is always derived (never left
+// empty for a known duration); views/uploader/upload_time/is_live
+// are set only when the source reports them.
+func enrichIPC3(t *types.Track, info ytDlpJSON) {
+	t.DurationStr = types.FormatDurationStr(t.DurationSec, info.IsLive || info.LiveStatus == "is_live")
+	if info.ViewCount > 0 {
+		v := info.ViewCount
+		t.Views = &v
+	}
+	if info.Uploader != "" {
+		t.Uploader = info.Uploader
+	}
+	if info.UploadDate != "" {
+		t.UploadTime = types.FormatUploadDate(info.UploadDate)
+	}
+	if info.IsLive || info.LiveStatus == "is_live" {
+		t.IsLive = true
+	}
 }
 
 // isBotCheck spots YouTube's bot-check gate in yt-dlp stderr — the
@@ -214,6 +241,7 @@ func (r *Resolver) resolveViaYtDlp(ctx context.Context, query string) (*types.Tr
 		Thumbnail:   info.Thumbnail,
 		StreamURL:   info.URL,
 	}
+	enrichIPC3(t, info)
 	if info.WebpageURL != "" {
 		t.URL = info.WebpageURL
 	} else {
@@ -269,6 +297,7 @@ func (r *Resolver) Related(ctx context.Context, last types.Track, exclude map[st
 			Thumbnail:   info.Thumbnail,
 			URL:         "https://www.youtube.com/watch?v=" + info.ID,
 		}
+		enrichIPC3(t, info)
 		if t.Title == "" {
 			t.Title = info.ID
 		}

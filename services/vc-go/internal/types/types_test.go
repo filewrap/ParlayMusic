@@ -110,3 +110,117 @@ func TestTrackPrefetchedStaysInternal(t *testing.T) {
 		t.Fatalf("Prefetched must stay internal to vc-go, got %s", b)
 	}
 }
+
+// IPC-3 (§29): duration_str is M:SS under an hour, Xh Ym Zs at/over an
+// hour, and ∞ when unknown or live.
+func TestFormatDurationStr(t *testing.T) {
+	cases := []struct {
+		sec    int64
+		live   bool
+		expect string
+	}{
+		{0, false, "∞"},
+		{-5, false, "∞"},
+		{45, false, "0:45"},
+		{268, false, "4:28"},
+		{3599, false, "59:59"},
+		{3600, false, "1h"},
+		{3661, false, "1h 1m 1s"},
+		{3720, false, "1h 2m"},
+		{3605, false, "1h 5s"},
+		{7325, false, "2h 2m 5s"},
+		{213, true, "∞"},
+		{0, true, "∞"},
+	}
+	for _, c := range cases {
+		if got := FormatDurationStr(c.sec, c.live); got != c.expect {
+			t.Fatalf("FormatDurationStr(%d, live=%v) = %q, want %q", c.sec, c.live, got, c.expect)
+		}
+	}
+}
+
+func TestFormatUploadDate(t *testing.T) {
+	if got := FormatUploadDate("20200115"); got != "2020-01-15" {
+		t.Fatalf("FormatUploadDate(20200115) = %q, want 2020-01-15", got)
+	}
+	for _, raw := range []string{"", "2020", "2020011", "2020-01-15", "abcdefgh", "2020AB15"} {
+		if got := FormatUploadDate(raw); got != raw {
+			t.Fatalf("FormatUploadDate(%q) must pass through unchanged, got %q", raw, got)
+		}
+	}
+}
+
+// IPC-3 (§29): the enriched search fields serialize with the exact
+// contract names; views stays absent (null) when the source has none.
+func TestTrackIPC3FieldsSerialized(t *testing.T) {
+	views := int64(1234567)
+	tr := Track{
+		ID: "yt:abc", Title: "A", Source: "youtube",
+		DurationSec: 268, DurationStr: "4:28", Views: &views,
+		Uploader: "Rick Astley", UploadTime: "2009-10-25", IsLive: false,
+	}
+	b, err := json.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal Track: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal Track JSON: %v", err)
+	}
+	if m["duration_str"] != "4:28" {
+		t.Fatalf("duration_str missing/wrong in %s", b)
+	}
+	if m["views"] != float64(1234567) {
+		t.Fatalf("views missing/wrong in %s", b)
+	}
+	if m["uploader"] != "Rick Astley" || m["upload_time"] != "2009-10-25" {
+		t.Fatalf("uploader/upload_time missing/wrong in %s", b)
+	}
+	if _, ok := m["is_live"]; ok {
+		t.Fatalf("is_live:false must be omitted, got %s", b)
+	}
+	live := Track{ID: "yt:live", Title: "L", Source: "youtube", IsLive: true, DurationStr: "∞"}
+	b, _ = json.Marshal(live)
+	var lm map[string]any
+	_ = json.Unmarshal(b, &lm)
+	if lm["is_live"] != true || lm["duration_str"] != "∞" {
+		t.Fatalf("live track must carry is_live:true + duration_str ∞, got %s", b)
+	}
+	plain := Track{ID: "yt:abc", Title: "A", Source: "youtube"}
+	b, _ = json.Marshal(plain)
+	if strings.Contains(string(b), "duration_str") || strings.Contains(string(b), "views") ||
+		strings.Contains(string(b), "uploader") || strings.Contains(string(b), "upload_time") {
+		t.Fatalf("IPC-3 fields must be omitted when unknown, got %s", b)
+	}
+}
+
+// IPC-1 (§29): the now-playing card fields serialize with the exact
+// contract names and mirror the legacy fields.
+func TestNowPlayingIPC1Fields(t *testing.T) {
+	tr := Track{ID: "yt:abc", Title: "A", Source: "youtube"}
+	np := NowPlaying{
+		ChatID: 42, Track: &tr, Engine: "go", Queue: []QueueItem{},
+		Paused: true, Loop: 3, Autoplay: true,
+		IsPaused: true, IsMuted: true, LoopCount: 3, Speed: 1.0, AutoplayEnabled: true,
+	}
+	b, err := json.Marshal(np)
+	if err != nil {
+		t.Fatalf("marshal NowPlaying: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal NowPlaying JSON: %v", err)
+	}
+	if m["is_paused"] != true || m["is_muted"] != true {
+		t.Fatalf("is_paused/is_muted missing/wrong in %s", b)
+	}
+	if m["loop_count"] != float64(3) {
+		t.Fatalf("loop_count missing/wrong in %s", b)
+	}
+	if m["speed"] != float64(1) {
+		t.Fatalf("speed missing/wrong in %s", b)
+	}
+	if m["autoplay_enabled"] != true {
+		t.Fatalf("autoplay_enabled missing/wrong in %s", b)
+	}
+}

@@ -11,8 +11,10 @@
 //!   GET  /v1/share/:token                     -> {track}
 //!
 //! Tokens are 16 random alphanumeric chars from /dev/urandom.
-//! Link: https://t.me/<bot>?start=share_<token>, bot username from
-//! $PARLAY_BOT_USERNAME (default "ParlayBot").
+//! Link: https://t.me/<bot>?start=share-<token>, bot username from
+//! $PARLAY_BOT_USERNAME (default "ParlayBot"). The hyphen form is the
+//! inventory §22 deep-link (`/start share-<token>`); the token itself
+//! is 16 alphanumerics, so the hyphen is an unambiguous separator.
 //!
 //! Anonymity: `created_by` is accepted (contract field) but deliberately
 //! NOT stored — the stored record is token -> track only, so a link
@@ -126,7 +128,7 @@ fn handle(state: &Arc<Mutex<Store>>, bot: &str, req: &Request) -> (u16, String) 
                 err("internal", &format!("persist failed: {}", e)),
             );
         }
-        let link = format!("https://t.me/{}?start=share_{}", bot, token);
+        let link = format!("https://t.me/{}?start=share-{}", bot, token);
         (
             200,
             ok(&format!(
@@ -224,7 +226,7 @@ mod tests {
         let link = data_field(&resp, "link").as_str().unwrap().to_string();
         assert_eq!(token.len(), 16, "token is 16 chars");
         assert!(token.chars().all(|c| c.is_ascii_alphanumeric()), "token is alnum");
-        assert_eq!(link, format!("https://t.me/ParlayBot?start=share_{}", token));
+        assert_eq!(link, format!("https://t.me/ParlayBot?start=share-{}", token));
 
         // Resolve returns the same track, byte-for-byte in content.
         let (st, resp) = handle(&state, "ParlayBot", &req("GET", &format!("/v1/share/{}", token), ""));

@@ -8,6 +8,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -317,8 +318,44 @@ func (s *Server) handleLyrics(w http.ResponseWriter, r *http.Request) {
 	lyrics, err := s.client.Lyrics(id)
 	if err != nil {
 		log.Printf("lyrics %d: %v", id, err)
+		// No lyrics for an existing track is a 404 (same rule as
+		// vc-ts /v1/lyrics), not an engine failure.
+		if errors.Is(err, netease.ErrNoLyrics) {
+			writeErr(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
 		writeErr(w, http.StatusBadGateway, "engine_unavailable", err.Error())
 		return
 	}
-	writeOK(w, map[string]any{"lyrics": lyrics})
+	// IPC-5 (§29): track_id/title/artist/source/truncated + lyrics.
+	// Title/artist come from a SongDetail call; when that fails the
+	// lyrics still stand — the fields stay empty rather than failing
+	// a response whose lyrics are real.
+	title, artist := "", ""
+	if track, derr := s.client.SongDetail(id); derr == nil {
+		title, artist = track.Title, track.Artist
+	} else {
+		log.Printf("lyrics %d: detail for title/artist failed: %v", id, derr)
+	}
+	// Music163bot named-song .lrc file: the raw LRC is written to the
+	// download dir as netease-<id>.lrc (sanitised name, same scheme as
+	// the audio downloads) so the core can send it as a document.
+	// `lrc_path` is NOT in §29's IPC-5 — it is returned here per the
+	// Phase 9 task and recorded in port-engines-gaps.md for the
+	// coordinator to add to the contract.
+	lrcName := fmt.Sprintf("netease-%d.lrc", id)
+	lrcPath := filepath.Join(s.dlDir, lrcName)
+	if werr := os.WriteFile(lrcPath, []byte(lyrics), 0o644); werr != nil {
+		log.Printf("lyrics %d: writing %s failed: %v", id, lrcPath, werr)
+		lrcPath = ""
+	}
+	writeOK(w, map[string]any{
+		"track_id":  strconv.FormatInt(id, 10),
+		"title":     title,
+		"artist":    artist,
+		"lyrics":    lyrics,
+		"source":    "netease",
+		"truncated": false,
+		"lrc_path":  lrcPath,
+	})
 }

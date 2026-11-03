@@ -100,19 +100,30 @@ const PROFANITY: &[&str] = &[
     "tits", "twat", "vagina", "wank", "wanker", "whore",
 ];
 
-/// Case-insensitive word-boundary profanity check. Returns the first
-/// matched word (lower-cased), or None.
-fn profanity_check(text: &str) -> Option<String> {
+/// Case-insensitive word-boundary profanity scan. Returns every
+/// matched word (lower-cased, deduped, in first-appearance order) —
+/// the analyze endpoint reports the full list, while `profanity_check`
+/// (below) keeps returning only the first match for the skip path.
+fn profanity_words(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
     for token in text.split(|c: char| !c.is_alphanumeric()) {
         if token.is_empty() {
             continue;
         }
         let lower = token.to_lowercase();
-        if PROFANITY.binary_search(&lower.as_str()).is_ok() {
-            return Some(lower);
+        if PROFANITY.binary_search(&lower.as_str()).is_ok()
+            && !found.contains(&lower)
+        {
+            found.push(lower);
         }
     }
-    None
+    found
+}
+
+/// Case-insensitive word-boundary profanity check. Returns the first
+/// matched word (lower-cased), or None.
+fn profanity_check(text: &str) -> Option<String> {
+    profanity_words(text).into_iter().next()
 }
 
 // -------------------------------------------------------------- state ---
@@ -354,7 +365,11 @@ fn fetch_genius_lyrics(title: &str, artist: &str) -> Option<String> {
     fetch_genius_lyrics_with(title, artist, token.trim())
 }
 
-fn fetch_genius_lyrics_with(title: &str, artist: &str, token: &str) -> Option<String> {
+/// Genius lyrics + the song-page URL they came from. The URL is the
+/// details `lyrics_link` (the core renders it as the "Lyrics" button);
+/// the plain `fetch_genius_lyrics_with` below keeps the old
+/// lyrics-only shape for the skip path.
+fn fetch_genius_lyrics_with_url(title: &str, artist: &str, token: &str) -> Option<(String, String)> {
     let q = format!("{} {}", title, artist);
     let url = format!(
         "https://api.genius.com/search?q={}",
@@ -387,7 +402,12 @@ fn fetch_genius_lyrics_with(title: &str, artist: &str, token: &str) -> Option<St
     if !page.status.success() {
         return None;
     }
-    extract_genius_lyrics_html(&String::from_utf8_lossy(&page.stdout))
+    let lyrics = extract_genius_lyrics_html(&String::from_utf8_lossy(&page.stdout))?;
+    Some((lyrics, page_url))
+}
+
+fn fetch_genius_lyrics_with(title: &str, artist: &str, token: &str) -> Option<String> {
+    fetch_genius_lyrics_with_url(title, artist, token).map(|(lyrics, _)| lyrics)
 }
 
 /// Pick the Genius song-page URL from a public-API search response
@@ -597,19 +617,28 @@ fn parse_musixmatch_lyrics(v: &Json) -> Option<String> {
 /// provider supplied them (`lyrics_source` in the skip-check response).
 /// No key anywhere → LRCLib only; nothing reachable → (None, None).
 fn fetch_lyrics(title: &str, artist: &str) -> (Option<String>, Option<&'static str>) {
+    let (lyrics, source, _) = fetch_lyrics_with_url(title, artist);
+    (lyrics, source)
+}
+
+/// Lyrics + source + the Genius song-page URL when Genius supplied
+/// them (the details `lyrics_link`). Musixmatch and LRCLib return no
+/// page URL, so the link stays None for those sources.
+fn fetch_lyrics_with_url(title: &str, artist: &str) -> (Option<String>, Option<&'static str>, Option<String>) {
     if genius_configured() {
-        if let Some(lyrics) = fetch_genius_lyrics(title, artist) {
-            return (Some(lyrics), Some("genius"));
+        let token = std::env::var("GENIUS_ACCESS_TOKEN").ok().unwrap_or_default();
+        if let Some((lyrics, page_url)) = fetch_genius_lyrics_with_url(title, artist, token.trim()) {
+            return (Some(lyrics), Some("genius"), Some(page_url));
         }
     }
     if musixmatch_configured() {
         if let Some(lyrics) = fetch_musixmatch_lyrics(title, artist) {
-            return (Some(lyrics), Some("musixmatch"));
+            return (Some(lyrics), Some("musixmatch"), None);
         }
     }
     match fetch_lrclib_lyrics(title, artist) {
-        Some(lyrics) => (Some(lyrics), Some("lrclib")),
-        None => (None, None),
+        Some(lyrics) => (Some(lyrics), Some("lrclib"), None),
+        None => (None, None, None),
     }
 }
 
@@ -717,6 +746,26 @@ fn spotify_api_get(cache: &TokenCache, path: &str) -> Option<Json> {
     parse_json(text.trim())
 }
 
+/// IPC-3 (§29) human duration — same rendering as vc-go / vc-ts /
+/// vc-rust / downloaders / netease-go (asserted identically in each
+/// service's tests). A Spotify track is never live.
+fn format_duration_str(sec: i64) -> String {
+    if sec <= 0 {
+        return "∞".to_string();
+    }
+    if sec < 3600 {
+        return format!("{}:{:02}", sec / 60, sec % 60);
+    }
+    let mut parts = vec![format!("{}h", sec / 3600)];
+    if (sec % 3600) / 60 > 0 {
+        parts.push(format!("{}m", (sec % 3600) / 60));
+    }
+    if sec % 60 > 0 {
+        parts.push(format!("{}s", sec % 60));
+    }
+    parts.join(" ")
+}
+
 /// Map a Spotify track object onto the contract Track shape
 /// (+ `album` name and `thumbnail` from the smallest cover image).
 fn spotify_track_to_json(v: &Json) -> Option<Json> {
@@ -760,6 +809,8 @@ fn spotify_track_to_json(v: &Json) -> Option<Json> {
         ("source".to_string(), Json::Str("spotify".to_string())),
         ("artist".to_string(), Json::Str(artist)),
         ("duration_sec".to_string(), Json::Num(duration_sec as f64)),
+        // IPC-3 (§29): derived human duration, always present.
+        ("duration_str".to_string(), Json::Str(format_duration_str(duration_sec))),
         ("url".to_string(), Json::Str(url)),
         ("album".to_string(), Json::Str(album)),
     ];
@@ -773,6 +824,80 @@ fn spotify_track_to_json(v: &Json) -> Option<Json> {
 fn spotify_fetch_track(cache: &TokenCache, id: &str) -> Option<Json> {
     let v = spotify_api_get(cache, &format!("/tracks/{}", id))?;
     spotify_track_to_json(&v)
+}
+
+/// IPC-7 (§29): map a `/audio-features/{id}` response onto the
+/// details `features` object. `key` (0-11) becomes the note name,
+/// `mode` becomes the modality string. Returns None when the input
+/// is not an object — the endpoint is deprecated and answers 403 for
+/// most app tokens, so an unavailable features object is `null` in
+/// the details response, never faked. A key of -1 (Spotify: "no key
+/// detected") renders as "Unknown", the API's own unknown state.
+fn audio_features_to_json(v: &Json) -> Option<Json> {
+    if !matches!(v, Json::Obj(_)) {
+        return None;
+    }
+    const KEY_NAMES: [&str; 12] = [
+        "C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A",
+        "A#/Bb", "B",
+    ];
+    let num = |key: &str| -> f64 {
+        v.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0)
+    };
+    let key = match v.get("key").and_then(|x| x.as_i64()) {
+        Some(k) if (0..12).contains(&k) => KEY_NAMES[k as usize].to_string(),
+        _ => "Unknown".to_string(),
+    };
+    let modality = match v.get("mode").and_then(|x| x.as_i64()) {
+        Some(1) => "Major",
+        Some(0) => "Minor",
+        _ => "Unknown",
+    };
+    Some(Json::Obj(vec![
+        ("key".into(), Json::Str(key)),
+        ("modality".into(), Json::Str(modality.to_string())),
+        ("tempo_bpm".into(), Json::Num(num("tempo"))),
+        ("acousticness".into(), Json::Num(num("acousticness"))),
+        ("danceability".into(), Json::Num(num("danceability"))),
+        ("energy".into(), Json::Num(num("energy"))),
+        ("instrumentalness".into(), Json::Num(num("instrumentalness"))),
+        ("liveness".into(), Json::Num(num("liveness"))),
+        ("speechiness".into(), Json::Num(num("speechiness"))),
+        ("valence".into(), Json::Num(num("valence"))),
+    ]))
+}
+
+/// IPC-7: collect genres from an `/artists?ids=` response
+/// ({"artists": [{"genres": [...]}]}), deduped, first-seen order.
+fn artist_genres(v: &Json) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(Json::Arr(artists)) = v.get("artists") {
+        for a in artists {
+            if let Some(Json::Arr(genres)) = a.get("genres") {
+                for g in genres {
+                    if let Some(s) = g.as_str() {
+                        let s = s.to_string();
+                        if !s.is_empty() && !out.contains(&s) {
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One-sentence analysis text from a classifier result, for the
+/// analyze endpoint: verdict + provider + the classifier's own
+/// reason. Pure — the wordlist path is deterministic without keys.
+fn analysis_text(result: &classifier::ClassifierResult) -> String {
+    format!(
+        "Verdict: {} ({}) — {}",
+        classifier::verdict_name(&result.verdict),
+        result.provider,
+        result.detail
+    )
 }
 
 /// Fetch a collection's real track list from the Web API.
@@ -1239,6 +1364,195 @@ fn handle_skip_check(st: &State, body: &Json) -> (u16, String) {
     )
 }
 
+/// IPC-7 (§29) `GET /v1/spotify/details?user_id=&track_id=` — the
+/// details card the core renders for /details and the Spotify
+/// companion views: the Track, audio features (null when the
+/// deprecated endpoint refuses the app token), artist genres, how
+/// many users disliked the track, the first profanity word in the
+/// lyrics (if any), and the lyrics + Genius page link (when Genius
+/// supplied them).
+///
+/// `user_id` is accepted (the core always sends the requesting user)
+/// but not needed: `disliked_by` is the count across ALL users, not
+/// a per-user flag. `ignored_by` is 0: no ignore store exists (see
+/// port-engines-gaps.md — the §25 Hide-alerts button has no engine
+/// endpoint yet). `language` is null: no language detection exists.
+fn handle_details(st: &State, tokens: &TokenCache, track_id: &str) -> (u16, String) {
+    if spotify_creds().is_none() {
+        return (
+            502,
+            err(
+                "engine_unavailable",
+                "Spotify details need SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET (client-credentials flow)",
+            ),
+        );
+    }
+    let raw = match spotify_api_get(tokens, &format!("/tracks/{}", track_id)) {
+        Some(v) => v,
+        None => {
+            return (
+                502,
+                err(
+                    "engine_unavailable",
+                    &format!("Spotify track lookup failed for {}", track_id),
+                ),
+            )
+        }
+    };
+    let track = match spotify_track_to_json(&raw) {
+        Some(t) => t,
+        None => {
+            return (
+                502,
+                err(
+                    "engine_unavailable",
+                    &format!("Spotify returned no usable track for {}", track_id),
+                ),
+            )
+        }
+    };
+    let title = raw
+        .get("name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let artist = match raw.get("artists") {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(|a| a.get("name").and_then(|x| x.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    };
+    // Genres from /artists?ids= — enrichment only: a failed call
+    // leaves an empty list, it never fails the details response.
+    let genres = match raw.get("artists") {
+        Some(Json::Arr(items)) => {
+            let ids: Vec<&str> = items
+                .iter()
+                .filter_map(|a| a.get("id").and_then(|x| x.as_str()))
+                .collect();
+            if ids.is_empty() {
+                Vec::new()
+            } else {
+                match spotify_api_get(tokens, &format!("/artists?ids={}", ids.join(","))) {
+                    Some(v) => artist_genres(&v),
+                    None => Vec::new(),
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+    // Audio features: deprecated endpoint, likely 403 for app tokens.
+    // Null when unavailable — never faked.
+    let features = spotify_api_get(tokens, &format!("/audio-features/{}", track_id))
+        .and_then(|v| audio_features_to_json(&v))
+        .unwrap_or(Json::Null);
+    let disliked_by = st
+        .dislikes
+        .values()
+        .filter(|set| set.contains(track_id))
+        .count();
+    let (lyrics, _source, lyrics_link) = fetch_lyrics_with_url(&title, &artist);
+    let profanity = lyrics.as_deref().and_then(profanity_check);
+    let lyrics_json = match &lyrics {
+        Some(l) => quote(l),
+        None => "null".to_string(),
+    };
+    let lyrics_link_json = match &lyrics_link {
+        Some(l) => quote(l),
+        None => "null".to_string(),
+    };
+    let profanity_json = match &profanity {
+        Some(p) => quote(p),
+        None => "null".to_string(),
+    };
+    (
+        200,
+        ok(&format!(
+            "{{\"track\":{},\"features\":{},\"genres\":[{}],\"disliked_by\":{},\"ignored_by\":0,\"profanity\":{},\"language\":null,\"lyrics\":{},\"lyrics_link\":{}}}",
+            track.render(),
+            features.render(),
+            genres.iter().map(|g| quote(g)).collect::<Vec<_>>().join(","),
+            disliked_by,
+            profanity_json,
+            lyrics_json,
+            lyrics_link_json
+        )),
+    )
+}
+
+/// IPC-7 (§29) `POST /v1/spotify/analyze` {user_id, track_id} — the
+/// "Analyze this song" companion action: fetch the lyrics (404
+/// `not_found` when there are none, matching the inventory's "🚫
+/// Lyrics not found"), list EVERY profanity word in them (deduped,
+/// in order), and run the classifier for the one-sentence analysis.
+fn handle_analyze(tokens: &TokenCache, body: &Json) -> (u16, String) {
+    let track_id = match body.get("track_id").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            return (
+                400,
+                err("bad_request", "missing string field: track_id"),
+            )
+        }
+    };
+    if spotify_creds().is_none() {
+        return (
+            502,
+            err(
+                "engine_unavailable",
+                "Spotify analyze needs SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET (client-credentials flow)",
+            ),
+        );
+    }
+    let raw = match spotify_api_get(tokens, &format!("/tracks/{}", track_id)) {
+        Some(v) => v,
+        None => {
+            return (
+                502,
+                err(
+                    "engine_unavailable",
+                    &format!("Spotify track lookup failed for {}", track_id),
+                ),
+            )
+        }
+    };
+    let title = raw
+        .get("name")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let artist = match raw.get("artists") {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(|a| a.get("name").and_then(|x| x.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    };
+    let (lyrics, _source) = fetch_lyrics(&title, &artist);
+    let lyrics = match lyrics {
+        Some(l) => l,
+        None => {
+            return (
+                404,
+                err("not_found", "no lyrics found for this track"),
+            )
+        }
+    };
+    let words = profanity_words(&lyrics);
+    let result = classifier::classify_track(&title, &artist, Some(&lyrics), &profanity_check);
+    (
+        200,
+        ok(&format!(
+            "{{\"analysis\":{},\"profane_words\":[{}]}}",
+            quote(&analysis_text(&result)),
+            words.iter().map(|w| quote(w)).collect::<Vec<_>>().join(",")
+        )),
+    )
+}
+
 /// `POST /v1/spotify/resolve` — parses the link, then, when
 /// SPOTIFY_CLIENT_ID/SECRET are configured, enriches it with real
 /// Web API metadata (track title/artist/duration, or the collection
@@ -1613,6 +1927,21 @@ fn handle(app: &App, req: &Request) -> (u16, String) {
         let np = app.now_playing.lock().unwrap_or_else(|e| e.into_inner());
         return handle_now_playing(&np, user_id);
     }
+    if req.method == "GET" && req.path == "/v1/spotify/details" {
+        // IPC-7 (§29): track_id required; user_id accepted but not
+        // needed (disliked_by is a cross-user count).
+        let track_id = match req.query_param("track_id") {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                return (
+                    400,
+                    err("bad_request", "missing query param: track_id"),
+                )
+            }
+        };
+        let st = lock(&app.state);
+        return handle_details(&st, &app.tokens, &track_id);
+    }
     if req.method != "POST" {
         return (404, err("not_found", "route not found"));
     }
@@ -1633,6 +1962,7 @@ fn handle(app: &App, req: &Request) -> (u16, String) {
         "/v1/spotify/resolve" => handle_resolve(&st, &app.tokens, &body),
         "/v1/spotify/collection" => handle_collection(&app.tokens, &body),
         "/v1/spotify/skip-check" => handle_skip_check(&st, &body),
+        "/v1/spotify/analyze" => handle_analyze(&app.tokens, &body),
         _ => return (404, err("not_found", "route not found")),
     };
     // skip-check and resolve are read-only; saving anyway is harmless
@@ -2090,5 +2420,201 @@ mod tests {
             assert_eq!(fetch_musixmatch_lyrics("Never Gonna Give You Up", "Rick Astley"), None);
             assert!(!musixmatch_configured());
         }
+    }
+
+    // ------------------------------------------------ Phase 9: IPC-7 --
+
+    #[test]
+    fn format_duration_str_cases() {
+        // Same rendering as vc-go / vc-ts / vc-rust / downloaders /
+        // netease-go (asserted identically in each service's tests).
+        assert_eq!(format_duration_str(0), "∞");
+        assert_eq!(format_duration_str(-5), "∞");
+        assert_eq!(format_duration_str(45), "0:45");
+        assert_eq!(format_duration_str(268), "4:28");
+        assert_eq!(format_duration_str(3599), "59:59");
+        assert_eq!(format_duration_str(3600), "1h");
+        assert_eq!(format_duration_str(3661), "1h 1m 1s");
+        assert_eq!(format_duration_str(3720), "1h 2m");
+        assert_eq!(format_duration_str(3605), "1h 5s");
+    }
+
+    #[test]
+    fn track_mapping_carries_duration_str() {
+        let v = parse_json(SAMPLE_TRACK_JSON).expect("fixture parses");
+        let t = spotify_track_to_json(&v).expect("mapping");
+        assert_eq!(
+            t.get("duration_str").and_then(|x| x.as_str()),
+            Some("3:33")
+        );
+        assert_eq!(t.get("duration_sec").and_then(|x| x.as_i64()), Some(213));
+    }
+
+    #[test]
+    fn profanity_words_collects_all_deduped_in_order() {
+        assert_eq!(
+            profanity_words("shit and fuck and shit again, bitch"),
+            vec!["shit".to_string(), "fuck".to_string(), "bitch".to_string()]
+        );
+        assert_eq!(
+            profanity_words("clean lyrics here"),
+            Vec::<String>::new()
+        );
+        // Case-insensitive, word-boundary: "classic" is not "ass".
+        assert_eq!(profanity_words("classic"), Vec::<String>::new());
+        // profanity_check still returns only the first match.
+        assert_eq!(
+            profanity_check("bitch then shit"),
+            Some("bitch".to_string())
+        );
+    }
+
+    #[test]
+    fn audio_features_mapping() {
+        let v = parse_json(
+            r#"{"key": 9, "mode": 0, "tempo": 120.5, "acousticness": 0.01,
+                "danceability": 0.75, "energy": 0.9, "instrumentalness": 0.0,
+                "liveness": 0.1, "speechiness": 0.05, "valence": 0.8}"#,
+        )
+        .expect("parses");
+        let f = audio_features_to_json(&v).expect("mapping");
+        assert_eq!(f.get("key").and_then(|x| x.as_str()), Some("A"));
+        assert_eq!(f.get("modality").and_then(|x| x.as_str()), Some("Minor"));
+        assert_eq!(f.get("tempo_bpm").and_then(|x| x.as_f64()), Some(120.5));
+        assert_eq!(f.get("danceability").and_then(|x| x.as_f64()), Some(0.75));
+        assert_eq!(f.get("valence").and_then(|x| x.as_f64()), Some(0.8));
+        // Key -1 (no key detected) renders as Unknown, not a fake note.
+        let unknown = parse_json(r#"{"key": -1, "mode": 1, "tempo": 100}"#).unwrap();
+        let f = audio_features_to_json(&unknown).expect("mapping");
+        assert_eq!(f.get("key").and_then(|x| x.as_str()), Some("Unknown"));
+        assert_eq!(f.get("modality").and_then(|x| x.as_str()), Some("Major"));
+        // Not an object -> None (the caller renders features: null).
+        assert_eq!(audio_features_to_json(&Json::Null), None);
+        assert_eq!(audio_features_to_json(&Json::Str("nope".into())), None);
+    }
+
+    #[test]
+    fn artist_genres_dedups_in_order() {
+        let v = parse_json(
+            r#"{"artists": [{"genres": ["pop", "dance pop"]},
+                            {"genres": ["dance pop", "rock"]},
+                            {"genres": []}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            artist_genres(&v),
+            vec!["pop".to_string(), "dance pop".to_string(), "rock".to_string()]
+        );
+        assert_eq!(artist_genres(&Json::Null), Vec::<String>::new());
+    }
+
+    /// The wordlist classifier path is deterministic without keys or
+    /// network; skip honestly when a Gemini key is set (the live path
+    /// would call the API).
+    #[test]
+    fn analysis_text_wordlist_paths() {
+        if classifier::gemini_configured() {
+            eprintln!("skipping analysis_text test (GEMINI_API_KEY set)");
+            return;
+        }
+        let clean = classifier::classify_track(
+            "Never Gonna Give You Up", "Rick Astley",
+            Some("never gonna give you up, never gonna let you down"),
+            &profanity_check,
+        );
+        assert_eq!(
+            analysis_text(&clean),
+            "Verdict: clean (wordlist) — no profanity found (wordlist)"
+        );
+        let profane = classifier::classify_track(
+            "Angry Song", "Someone",
+            Some("this shit is fucking awful"),
+            &profanity_check,
+        );
+        assert_eq!(
+            analysis_text(&profane),
+            "Verdict: profanity (wordlist) — profanity in lyrics (wordlist)"
+        );
+    }
+
+    fn test_app() -> App {
+        App {
+            state: Arc::new(Mutex::new(State::default())),
+            tokens: Arc::new(Mutex::new(None)),
+            user_tokens: Arc::new(Mutex::new(auth::TokenStore::load(
+                &std::env::temp_dir(),
+            ))),
+            now_playing: Arc::new(Mutex::new(BTreeMap::new())),
+            data_dir: std::env::temp_dir(),
+            poll_interval_secs: 60,
+        }
+    }
+
+    fn test_req(method: &str, path: &str, query: &str, body: &str) -> Request {
+        Request {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
+            headers: Vec::new(),
+            body: body.to_string(),
+        }
+    }
+
+    /// Handler tests without Spotify credentials are deterministic
+    /// (they fail before any network call). Skip honestly when creds
+    /// happen to be set in the test environment.
+    #[test]
+    fn details_without_creds_is_502() {
+        if spotify_creds().is_some() {
+            eprintln!("skipping details no-creds test (Spotify creds set)");
+            return;
+        }
+        let app = test_app();
+        let (st, resp) = handle(
+            &app,
+            &test_req("GET", "/v1/spotify/details",
+                      "user_id=123&track_id=4uLU6hMCjMI75M1A2tKUQC", ""),
+        );
+        assert_eq!(st, 502, "{}", resp);
+        assert!(resp.contains("engine_unavailable"), "{}", resp);
+        assert!(resp.contains("SPOTIFY_CLIENT_ID"), "{}", resp);
+    }
+
+    #[test]
+    fn details_requires_track_id() {
+        let app = test_app();
+        let (st, resp) = handle(
+            &app,
+            &test_req("GET", "/v1/spotify/details", "user_id=123", ""),
+        );
+        assert_eq!(st, 400, "{}", resp);
+        assert!(resp.contains("track_id"), "{}", resp);
+    }
+
+    #[test]
+    fn analyze_without_creds_is_502() {
+        if spotify_creds().is_some() {
+            eprintln!("skipping analyze no-creds test (Spotify creds set)");
+            return;
+        }
+        let app = test_app();
+        let (st, resp) = handle(
+            &app,
+            &test_req("POST", "/v1/spotify/analyze", "",
+                      r#"{"user_id":123,"track_id":"4uLU6hMCjMI75M1A2tKUQC"}"#),
+        );
+        assert_eq!(st, 502, "{}", resp);
+        assert!(resp.contains("engine_unavailable"), "{}", resp);
+    }
+
+    #[test]
+    fn analyze_requires_track_id() {
+        let app = test_app();
+        let (st, resp) = handle(
+            &app,
+            &test_req("POST", "/v1/spotify/analyze", "", r#"{"user_id":123}"#),
+        );
+        assert_eq!(st, 400, "{}", resp);
+        assert!(resp.contains("track_id"), "{}", resp);
     }
 }

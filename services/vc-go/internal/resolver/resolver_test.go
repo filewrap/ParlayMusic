@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,5 +118,61 @@ func TestRelatedLivePick(t *testing.T) {
 	}
 	if pick.Title == "" || pick.DurationSec <= 0 {
 		t.Fatalf("pick must carry real metadata, got %+v", pick)
+	}
+}
+
+// IPC-3 (§29): a stub yt-dlp info object maps onto the enriched Track
+// fields — duration_str, views, uploader, upload_time, is_live —
+// and a live stream reports duration_str "∞" with is_live true.
+func TestResolveCarriesIPC3Fields(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "yt-dlp")
+	const info = `{"id":"dQw4w9WgXcQ","title":"Never Gonna Give You Up","duration":213,` +
+		`"uploader":"Rick Astley","thumbnail":"https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",` +
+		`"url":"https://example.invalid/audio.webm","view_count":1600000000,"upload_date":"20091025",` +
+		`"webpage_url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"}`
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+info+"'\n"), 0o755); err != nil {
+		t.Fatalf("write stub yt-dlp: %v", err)
+	}
+	r := &Resolver{YtDlp: script}
+	tr, err := r.Resolve(context.Background(), "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if tr.DurationStr != "3:33" {
+		t.Fatalf("duration_str = %q, want 3:33", tr.DurationStr)
+	}
+	if tr.Views == nil || *tr.Views != 1600000000 {
+		t.Fatalf("views = %v, want 1600000000", tr.Views)
+	}
+	if tr.Uploader != "Rick Astley" {
+		t.Fatalf("uploader = %q, want Rick Astley", tr.Uploader)
+	}
+	if tr.UploadTime != "2009-10-25" {
+		t.Fatalf("upload_time = %q, want 2009-10-25", tr.UploadTime)
+	}
+	if tr.IsLive {
+		t.Fatalf("is_live must be false for a normal video")
+	}
+}
+
+func TestResolveLiveStreamIPC3(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "yt-dlp")
+	const info = `{"id":"live1234567","title":"Live Stream","duration":0,` +
+		`"uploader":"Some Channel","thumbnail":"https://example.invalid/t.jpg",` +
+		`"url":"https://example.invalid/audio.webm","is_live":true,` +
+		`"webpage_url":"https://www.youtube.com/watch?v=live1234567"}`
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+info+"'\n"), 0o755); err != nil {
+		t.Fatalf("write stub yt-dlp: %v", err)
+	}
+	r := &Resolver{YtDlp: script}
+	tr, err := r.Resolve(context.Background(), "https://www.youtube.com/watch?v=live1234567")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if !tr.IsLive {
+		t.Fatalf("is_live must be true")
+	}
+	if tr.DurationStr != "∞" {
+		t.Fatalf("duration_str = %q, want ∞ for a live stream", tr.DurationStr)
 	}
 }

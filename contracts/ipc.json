@@ -1,6 +1,36 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "actions": {
+    "chat.settings": {
+      "from": "UI_INVENTORY.md §29 IPC-6 (Phase 9)",
+      "method": "GET /v1/chat/settings?chat_id= | POST /v1/chat/settings",
+      "request": {
+        "chat_id": "ChatId",
+        "key": "string (POST only: admin_mode|play_mode|cmd_delete|clean_mode|clean_delay_min|thumbnails|autoplay|autoplay_lang|autoplay_mood|silent_mode|auto_delete|auto_delete_min|language|paginate_purge_old|chat_music_download)",
+        "value": "string|boolean|integer (POST only)"
+      },
+      "response": {
+        "chat_id": "ChatId",
+        "settings": {
+          "admin_mode": "integer",
+          "play_mode": "string",
+          "cmd_delete": "boolean",
+          "clean_mode": "boolean",
+          "clean_delay_min": "integer",
+          "thumbnails": "boolean",
+          "autoplay": "boolean",
+          "autoplay_lang": "string",
+          "autoplay_mood": "string",
+          "silent_mode": "boolean",
+          "auto_delete": "boolean",
+          "auto_delete_min": "integer",
+          "language": "string",
+          "paginate_purge_old": "boolean",
+          "chat_music_download": "boolean"
+        }
+      },
+      "service": "core-cpp"
+    },
     "download.deezer": {
       "method": "POST /v1/download/deezer",
       "request": {
@@ -9,7 +39,8 @@
       },
       "response": {
         "file_path": "string",
-        "track": "Track"
+        "track": "Track",
+        "run_id": "string"
       },
       "service": "downloaders"
     },
@@ -22,7 +53,37 @@
       },
       "response": {
         "imported": "boolean",
-        "track": "Track"
+        "track": "Track",
+        "run_id": "string"
+      },
+      "service": "downloaders"
+    },
+    "download.progress": {
+      "from": "UI_INVENTORY.md §29 IPC-4 (Phase 9); downloaders server.py",
+      "method": "GET /v1/download/progress?run_id=",
+      "request": {
+        "run_id": "string"
+      },
+      "response": {
+        "run_id": "string",
+        "percentage": "number",
+        "done_bytes": "integer",
+        "total_bytes": "integer|null",
+        "speed_bytes_per_sec": "number",
+        "eta_sec": "integer|null",
+        "elapsed_sec": "number",
+        "phase": "searching|downloading|uploading|done|failed",
+        "per_track": [
+          {
+            "title": "string",
+            "state": "string",
+            "pct": "number",
+            "peer": "string|null",
+            "reason": "string|null"
+          }
+        ],
+        "lossy_available": "boolean",
+        "lossy_summary": "string|null"
       },
       "service": "downloaders"
     },
@@ -53,7 +114,8 @@
         "total": "integer, album only",
         "failed": "array of [title, reason], album only",
         "album_dir": "string, album only",
-        "source": "soulseek"
+        "source": "soulseek",
+        "run_id": "string"
       },
       "errors": {
         "engine_unavailable": "slskd unreachable at SLSKD_URL, or search could not run (e.g. slskd not logged in)",
@@ -70,7 +132,8 @@
       },
       "response": {
         "file_path": "string",
-        "track": "Track"
+        "track": "Track",
+        "run_id": "string"
       },
       "service": "downloaders"
     },
@@ -84,7 +147,11 @@
       },
       "response": {
         "count": "integer",
-        "file_path": "string"
+        "file_path": "string",
+        "file_paths": [
+          "string"
+        ],
+        "run_id": "string"
       },
       "service": "downloaders"
     },
@@ -97,7 +164,8 @@
       },
       "response": {
         "file_path": "string",
-        "track": "Track"
+        "track": "Track",
+        "run_id": "string"
       },
       "service": "downloaders"
     },
@@ -112,7 +180,8 @@
         "file_path": "string",
         "oversize": "boolean",
         "size_bytes": "integer",
-        "track": "Track"
+        "track": "Track",
+        "run_id": "string"
       },
       "service": "downloaders"
     },
@@ -190,7 +259,13 @@
         "track_id": "string"
       },
       "response": {
-        "lyrics": "string"
+        "lyrics": "string",
+        "track_id": "string",
+        "title": "string",
+        "artist": "string",
+        "source": "lrclib|netease|file-tag",
+        "truncated": "boolean",
+        "lrc_path": "string"
       },
       "service": "netease-go"
     },
@@ -243,11 +318,13 @@
     },
     "radio.status": {
       "from": "openradiobot, radio-js src/main.js",
-      "method": "GET /v1/radio/status",
+      "method": "GET /v1/radio/status?chat_id=",
       "response": {
-        "playing": "boolean",
-        "station": "string|null",
-        "chat_id": "ChatId"
+        "now_playing": "object|null",
+        "station": "string",
+        "stream_url": "string",
+        "reachable": "boolean|null",
+        "vc_handoff": "object|null"
       },
       "service": "radio-js"
     },
@@ -267,7 +344,8 @@
       "method": "POST /v1/inline",
       "request": {
         "query": "string",
-        "user_id": "UserId"
+        "user_id": "UserId",
+        "chat_id": "ChatId"
       },
       "response": {
         "results": [
@@ -310,6 +388,58 @@
         "track": "Track"
       },
       "service": "share-rust"
+    },
+    "spotify.analyze": {
+      "from": "UI_INVENTORY.md §29 IPC-7 (Phase 9)",
+      "method": "POST /v1/spotify/analyze",
+      "request": {
+        "user_id": "integer",
+        "track_id": "string"
+      },
+      "response": {
+        "analysis": "string",
+        "profane_words": [
+          "string"
+        ]
+      },
+      "service": "spotify-rust"
+    },
+    "spotify.details": {
+      "from": "UI_INVENTORY.md §29 IPC-7 (Phase 9)",
+      "method": "GET /v1/spotify/details?user_id=&track_id=",
+      "request": {
+        "user_id": "UserId",
+        "track_id": "string"
+      },
+      "response": {
+        "track": "Track",
+        "features": {
+          "key": "string",
+          "modality": "integer",
+          "tempo_bpm": "number",
+          "acousticness": "number",
+          "danceability": "number",
+          "energy": "number",
+          "instrumentalness": "number",
+          "liveness": "number",
+          "speechiness": "number",
+          "valence": "number"
+        },
+        "genres": [
+          "string"
+        ],
+        "disliked_by": [
+          "UserId"
+        ],
+        "ignored_by": [
+          "UserId"
+        ],
+        "profanity": "string|null",
+        "language": "string|null",
+        "lyrics": "string|null",
+        "lyrics_link": "string|null"
+      },
+      "service": "spotify-rust"
     },
     "spotify.auth": {
       "from": "rustify src/spotify/auth.rs + Manager token_refresh + tick/user.rs check",
@@ -449,7 +579,11 @@
       },
       "response": {
         "lyrics": "string|null",
-        "source": "string"
+        "source": "lrclib|netease|file-tag",
+        "track_id": "string",
+        "title": "string",
+        "artist": "string",
+        "truncated": "boolean"
       },
       "service": "vc-ts"
     },
@@ -470,6 +604,23 @@
       "method": "GET /v1/now-playing?chat_id=",
       "response": {
         "now_playing": "NowPlaying"
+      },
+      "service": "vc-go | vc-ts | vc-rust"
+    },
+    "vc.progress": {
+      "from": "UI_INVENTORY.md §29 IPC-2 (Phase 9)",
+      "method": "GET /v1/progress?chat_id=",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "position_sec": "integer",
+        "duration_sec": "integer",
+        "is_paused": "boolean",
+        "is_muted": "boolean",
+        "loop_enabled": "boolean",
+        "now": "Track|null",
+        "next": "Track|null"
       },
       "service": "vc-go | vc-ts | vc-rust"
     },
@@ -664,7 +815,9 @@
   "description": "Single contract for all Parlay services. HTTP + JSON. Every service: POST /v1/<action> with header X-Parlay-Token: $PARLAY_TOKEN. Health: GET /healthz -> {ok, service}. Error envelope everywhere: {ok:false, error:{code, message}}. Success: {ok:true, data:{...}}.",
   "notes": [
     "Files over the 50 MB Bot API cap: download.* returns oversize=true; the core queues them for a later MTProto pass instead of failing.",
-    "New actions are added here first, then in the service, then in the core handler."
+    "New actions are added here first, then in the service, then in the core handler.",
+    "v0.3.0 (Phase 9): IPC-1 vc.now_playing UI fields, IPC-2 vc.progress, IPC-3 search Track fields, IPC-4 download.progress, IPC-5 lyrics fields, IPC-6 chat.settings, IPC-7 spotify.details/analyze. download.spotify_playlist gains file_paths (files mode). radio.status response corrected to the radio-js shape.",
+    "v0.3.1 (Phase 9 gaps): search.inline request gains optional chat_id (np/s/l modes only — the core passes the chat the inline user is playing in; without it those modes return empty results); netease.lyrics response gains lrc_path (the .lrc file the service wrote under the download dir, empty string when the write fails); every download.* POST response gains run_id (12-hex progress-run id — the core reads it from the response for the IPC-4 snapshot. Live polling DURING the transfer is still not possible: the downloaders POST blocks until the transfer completes, so the run_id is only known after the POST returns.)"
   ],
   "title": "Parlay IPC contract",
   "transport": {
@@ -743,6 +896,26 @@
         },
         "volume": {
           "type": "integer"
+        },
+        "is_paused": {
+          "type": "boolean",
+          "description": "IPC-1: canonical UI field; true when playback is paused (engines may also report paused)"
+        },
+        "is_muted": {
+          "type": "boolean",
+          "description": "IPC-1: canonical UI field; true when the voice chat is muted"
+        },
+        "loop_count": {
+          "type": "integer",
+          "description": "IPC-1: canonical UI field; remaining replays of the current track, 0 = off (engines may also report loop)"
+        },
+        "speed": {
+          "type": "number",
+          "description": "IPC-1: canonical UI field; playback speed multiplier, 1.0 = normal"
+        },
+        "autoplay_enabled": {
+          "type": "boolean",
+          "description": "IPC-1: canonical UI field; autoplay on (engines may also report autoplay)"
         }
       },
       "type": "object"
@@ -802,6 +975,35 @@
         },
         "url": {
           "type": "string"
+        },
+        "duration_str": {
+          "type": "string",
+          "description": "IPC-3: pre-formatted duration (e.g. 3:42), when the resolver knows one"
+        },
+        "views": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "IPC-3: view count, when the resolver knows one"
+        },
+        "uploader": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "IPC-3: uploader/channel name, when the resolver knows one"
+        },
+        "upload_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "IPC-3: upload date/time as the resolver reports it"
+        },
+        "is_live": {
+          "type": "boolean",
+          "description": "IPC-3: true for a live stream"
         }
       },
       "required": [
@@ -816,5 +1018,5 @@
       "type": "integer"
     }
   },
-  "version": "0.2.0"
+  "version": "0.3.1"
 }

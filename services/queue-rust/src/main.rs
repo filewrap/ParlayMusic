@@ -458,4 +458,46 @@ mod tests {
         assert_eq!(data(&v).get("queued").and_then(|x| x.as_bool()), Some(true));
         store::del("queue:votes").expect("cleanup");
     }
+
+    /// Phase 9 payload contract (§29: no new IPC for queue.vote — the
+    /// response field set is the whole surface). One vote from each
+    /// side, then a re-vote: the response must carry exactly
+    /// {queued, approvals, declines, threshold, track_id} with the
+    /// values the rules produce, nothing more, nothing less.
+    #[test]
+    fn vote_response_carries_exact_contract_fields() {
+        let (state, file) = tmp_store("contract", 3);
+        let (_, v) = vote(&state, "trk-c", "approve", "u1");
+        let d = data(&v);
+        let rendered = d.render();
+        for key in ["queued", "approvals", "declines", "threshold", "track_id"] {
+            assert!(rendered.contains(&format!("\"{}\"", key)), "missing {} in {}", key, rendered);
+        }
+        // Exactly 5 keys — a stray field would break the core's
+        // strict render of the vote card.
+        match d {
+            Json::Obj(fields) => assert_eq!(fields.len(), 5, "extra fields in {}", rendered),
+            _ => panic!("data is not an object: {}", rendered),
+        }
+        assert_eq!(d.get("queued").and_then(|x| x.as_bool()), Some(false));
+        assert_eq!(d.get("approvals").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(d.get("declines").and_then(|x| x.as_i64()), Some(0));
+        assert_eq!(d.get("threshold").and_then(|x| x.as_i64()), Some(3));
+        assert_eq!(d.get("track_id").and_then(|x| x.as_str()), Some("trk-c"));
+
+        // A decline from a second voter: approvals stay 1, declines 1.
+        let (_, v) = vote(&state, "trk-c", "decline", "u2");
+        let d = data(&v);
+        assert_eq!(d.get("approvals").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(d.get("declines").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(d.get("queued").and_then(|x| x.as_bool()), Some(false));
+
+        // The approver re-votes decline: approval cancelled, declines 2.
+        let (_, v) = vote(&state, "trk-c", "decline", "u1");
+        let d = data(&v);
+        assert_eq!(d.get("approvals").and_then(|x| x.as_i64()), Some(0));
+        assert_eq!(d.get("declines").and_then(|x| x.as_i64()), Some(2));
+        assert_eq!(d.get("queued").and_then(|x| x.as_bool()), Some(false));
+        let _ = std::fs::remove_file(&file);
+    }
 }

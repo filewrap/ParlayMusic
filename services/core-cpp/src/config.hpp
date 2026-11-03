@@ -92,6 +92,18 @@ struct Config {
     int queue_limit = 20;                    // QUEUE_LIMIT
     std::string support_chat;                // SUPPORT_CHAT
 
+    // Phase 9 UI links/images (UI_INVENTORY.md §2/§16: URLs come from
+    // Parlay config only, never hardcoded from a ref bot). Empty =
+    // the button/row is omitted (source) or the card is text-only
+    // (START_IMG / PING_IMG).
+    std::string start_img;      // START_IMG (optional /start photo)
+    std::string ping_img;       // PING_IMG (optional /ping photo)
+    std::string updates_url;    // PARLAY_UPDATES_URL (updates channel)
+    std::string support_url;    // PARLAY_SUPPORT_URL (falls back to
+                                // https://t.me/<SUPPORT_CHAT>)
+    std::string source_url;     // PARLAY_SOURCE_URL (repo, e.g.
+                                // https://github.com/filewrap/ParlayMusic)
+
     std::string long_poll_timeout_sec = "30";
 
     static Config fromEnv();

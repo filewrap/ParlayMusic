@@ -40,6 +40,13 @@ impl Json {
             None
         }
     }
+    pub fn as_f64(&self) -> Option<f64> {
+        if let Json::Num(n) = self {
+            Some(*n)
+        } else {
+            None
+        }
+    }
     pub fn as_bool(&self) -> Option<bool> {
         if let Json::Bool(b) = self {
             Some(*b)

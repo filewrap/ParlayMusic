@@ -174,6 +174,70 @@ test("parseDuration handles seconds, m:ss, h:mm:ss (regression: '4:28' was 0)", 
   assert.equal(R.parseDuration("nonsense"), 0);
 });
 
+// IPC-3 (§29): duration_str is M:SS under an hour, Xh Ym Zs at/over
+// an hour, ∞ when unknown or live.
+test("formatDurationStr renders M:SS / Xh Ym Zs / ∞ (IPC-3)", () => {
+  assert.equal(R.formatDurationStr(0, false), "∞");
+  assert.equal(R.formatDurationStr(-5, false), "∞");
+  assert.equal(R.formatDurationStr(45, false), "0:45");
+  assert.equal(R.formatDurationStr(268, false), "4:28");
+  assert.equal(R.formatDurationStr(3599, false), "59:59");
+  assert.equal(R.formatDurationStr(3600, false), "1h");
+  assert.equal(R.formatDurationStr(3661, false), "1h 1m 1s");
+  assert.equal(R.formatDurationStr(3720, false), "1h 2m");
+  assert.equal(R.formatDurationStr(3605, false), "1h 5s");
+  assert.equal(R.formatDurationStr(213, true), "∞");
+});
+
+test("formatUploadDate converts YYYYMMDD to YYYY-MM-DD, passes the rest through", () => {
+  assert.equal(R.formatUploadDate("20200115"), "2020-01-15");
+  for (const raw of ["", "2020", "2020011", "2020-01-15", "abcdefgh", "2020AB15"]) {
+    assert.equal(R.formatUploadDate(raw), raw);
+  }
+});
+
+test("enrichYtIPC3 maps yt-dlp info onto the Track search fields", () => {
+  const t = R.enrichYtIPC3(
+    { id: "yt:x", title: "T", duration_sec: 213, source: "youtube" },
+    { view_count: 1600000000, uploader: "Rick Astley", upload_date: "20091025", live_status: "not_live" }
+  );
+  assert.equal(t.duration_str, "3:33");
+  assert.equal(t.views, 1600000000);
+  assert.equal(t.uploader, "Rick Astley");
+  assert.equal(t.upload_time, "2009-10-25");
+  assert.equal(t.is_live, undefined);
+  const live = R.enrichYtIPC3(
+    { id: "yt:l", title: "L", duration_sec: 0, source: "youtube" },
+    { is_live: true }
+  );
+  assert.equal(live.is_live, true);
+  assert.equal(live.duration_str, "∞");
+  const bare = R.enrichYtIPC3({ id: "yt:b", title: "B", duration_sec: 90, source: "youtube" }, {});
+  assert.equal(bare.duration_str, "1:30");
+  assert.equal(bare.views, undefined);
+  assert.equal(bare.uploader, undefined);
+});
+
+// §13: inline-mode dispatch — exact-word modes, prefix modes, hint.
+test("inlineMode dispatches np/s/l/lib/del/help/search/hint", () => {
+  assert.deepEqual(R.inlineMode("np"), { mode: "np", arg: "" });
+  assert.deepEqual(R.inlineMode("NP"), { mode: "np", arg: "" });
+  assert.deepEqual(R.inlineMode("s"), { mode: "s", arg: "" });
+  assert.deepEqual(R.inlineMode("l"), { mode: "l", arg: "" });
+  assert.deepEqual(R.inlineMode("help"), { mode: "help", arg: "" });
+  assert.deepEqual(R.inlineMode("lib beatles"), { mode: "lib", arg: "beatles" });
+  assert.deepEqual(R.inlineMode("del beatles"), { mode: "del", arg: "beatles" });
+  assert.deepEqual(R.inlineMode("search kesariya"), { mode: "search", arg: "kesariya" });
+  assert.deepEqual(R.inlineMode("search"), { mode: "search", arg: "" });
+  assert.deepEqual(R.inlineMode("lib"), { mode: "lib", arg: "" });
+  assert.deepEqual(R.inlineMode(""), { mode: "hint", arg: "" });
+  assert.deepEqual(R.inlineMode("ab"), { mode: "hint", arg: "ab" });
+  assert.deepEqual(R.inlineMode("love songs"), { mode: "search", arg: "love songs" });
+  // Mode words must match exactly — "npr" and "l love" are searches.
+  assert.deepEqual(R.inlineMode("npr"), { mode: "search", arg: "npr" });
+  assert.deepEqual(R.inlineMode("l love"), { mode: "search", arg: "l love" });
+});
+
 // ------------------------------------------------------- voice transport --
 // Real Opus/RTP pipeline + in-process ntgcalls offer + join DELEGATED
 // to the core (src/voicecall.js, Phase 7 A1). All offline: the tone
@@ -529,7 +593,15 @@ test("lyrics for the now-playing track come from LRCLib (live)", async () => {
 });
 
 test("lyrics by explicit title; unknown title is an honest 404", async () => {
-  const r = await req(18102, "POST", "/v1/lyrics", { title: "Kesariya", artist: "Arijit Singh" });
+  // LRCLib intermittently 503s upstream (see the sibling test) — the
+  // known-good title retries like it does, so a transient blip does
+  // not fail the suite.
+  let r = null;
+  for (let i = 0; i < 3; i++) {
+    r = await req(18102, "POST", "/v1/lyrics", { title: "Kesariya", artist: "Arijit Singh" });
+    if (r.status === 200) break;
+    await sleep(1500);
+  }
   assert.equal(r.status, 200);
   assert.ok(r.json.data.lyrics.includes("मुझको") || r.json.data.lyrics.toLowerCase().includes("kesariya") || r.json.data.lyrics.length > 100);
   const miss = await req(18102, "POST", "/v1/lyrics", { title: "xqzzy-no-such-song-12345", artist: "nobody" });
@@ -818,4 +890,142 @@ test("autoplay route toggles mode; autoplay-skip needs it on", async () => {
   const off = await req(18102, "POST", "/v1/autoplay", { chat_id: AUTO_CHAT, enabled: false });
   assert.equal(off.json.data.now_playing.autoplay, false);
   await req(18102, "POST", "/v1/stop", { chat_id: AUTO_CHAT });
+});
+
+// ------------------------------------------------- Phase 9: IPC-1/2/3/5, §13 --
+// Phase 9 chat id (separate from CHAT/AUTO_CHAT so these tests never
+// disturb the Phase 4/5 rooms).
+const P9_CHAT = -1004243;
+
+// IPC-2 (§29) + IPC-1 (§29): /v1/progress is a read-only snapshot
+// (position/duration/pause/mute/loop + now/next tracks) and
+// /v1/now-playing carries the card fields. Radio tracks play offline
+// (no yt-dlp), so this test is fully deterministic.
+test("progress endpoint + now-playing IPC-1 fields (radio, offline)", async () => {
+  const url = "https://ice1.somafm.com/groovesalad-128-mp3";
+  const missing = await req(18102, "GET", `/v1/progress?chat_id=${P9_CHAT}`);
+  assert.equal(missing.status, 404);
+  const bad = await req(18102, "GET", "/v1/progress");
+  assert.equal(bad.status, 400);
+
+  const play = await req(18102, "POST", "/v1/play", { chat_id: P9_CHAT, query: `radio:${url}` });
+  assert.equal(play.status, 200, JSON.stringify(play.json));
+  const np = play.json.data.now_playing;
+  assert.equal(np.track.source, "radio");
+  assert.equal(np.track.duration_str, "∞");
+  assert.equal(np.track.is_live, true);
+  assert.equal(np.is_paused, false);
+  assert.equal(np.is_muted, false);
+  assert.equal(np.loop_count, 0);
+  assert.equal(np.speed, 1);
+  assert.equal(np.autoplay_enabled, false);
+
+  // Enqueue a second radio track so progress has a next track.
+  const play2 = await req(18102, "POST", "/v1/play", { chat_id: P9_CHAT, query: `radio:${url}` });
+  assert.equal(play2.status, 200);
+  const prog = await req(18102, "GET", `/v1/progress?chat_id=${P9_CHAT}`);
+  assert.equal(prog.status, 200, JSON.stringify(prog.json));
+  const d = prog.json.data;
+  assert.equal(d.position_sec, 0);
+  assert.equal(d.duration_sec, 0);
+  assert.equal(d.is_paused, false);
+  assert.equal(d.is_muted, false);
+  assert.equal(d.loop_enabled, false);
+  assert.ok(d.now.id.startsWith("radio:"), `now.id = ${d.now.id}`);
+  assert.ok(d.next.id.startsWith("radio:"), `next.id = ${d.next.id}`);
+  assert.equal(d.now.duration_str, "∞");
+  assert.equal(d.now.is_live, true);
+
+  // Pause flips is_paused on the progress snapshot.
+  const paused = await req(18102, "POST", "/v1/pause", { chat_id: P9_CHAT });
+  assert.equal(paused.status, 200);
+  const prog2 = await req(18102, "GET", `/v1/progress?chat_id=${P9_CHAT}`);
+  assert.equal(prog2.json.data.is_paused, true);
+  assert.equal(prog2.json.data.now.id, d.now.id);
+
+  // Volume 0 is the vc-ts mute state (muted_volume is set by /v1/panel
+  // mute; volume 0 via /v1/volume alone is not muted — the panel mute
+  // path is the one that sets muted_volume, tested below).
+  const unmute = await req(18102, "POST", "/v1/panel", { chat_id: P9_CHAT, action: "mute" });
+  assert.equal(unmute.json.data.message, "Muted.");
+  const prog3 = await req(18102, "GET", `/v1/progress?chat_id=${P9_CHAT}`);
+  assert.equal(prog3.json.data.is_muted, true);
+  const np3 = await req(18102, "GET", `/v1/now-playing?chat_id=${P9_CHAT}`);
+  assert.equal(np3.json.data.now_playing.is_muted, true);
+  assert.equal(np3.json.data.now_playing.muted, true);
+  await req(18102, "POST", "/v1/stop", { chat_id: P9_CHAT });
+});
+
+// IPC-1 (§29): loop/autoplay mirror onto the card fields, and the
+// track thumbnail passes through on now-playing (live JioSaavn).
+test("now-playing carries loop_count/autoplay_enabled + thumbnail (live jiosaavn)", async () => {
+  const play = await req(18102, "POST", "/v1/play", { chat_id: P9_CHAT, query: "jiosaavn:kesariya" });
+  assert.equal(play.status, 200, JSON.stringify(play.json));
+  const track = play.json.data.now_playing.track;
+  assert.equal(track.id, "jsvn:rjkrTnma");
+  assert.ok(track.duration_sec > 0, "real duration");
+  assert.match(track.duration_str, /^\d+:\d\d$/, `duration_str = ${track.duration_str}`);
+  assert.ok(typeof track.thumbnail === "string" && track.thumbnail.startsWith("http"), `thumbnail = ${track.thumbnail}`);
+  assert.equal(track.is_live, undefined);
+
+  const loop = await req(18102, "POST", "/v1/loop", { chat_id: P9_CHAT, count: 2 });
+  assert.equal(loop.json.data.now_playing.loop_count, 2);
+  assert.equal(loop.json.data.now_playing.loop, 2);
+  const auto = await req(18102, "POST", "/v1/autoplay", { chat_id: P9_CHAT, enabled: true });
+  assert.equal(auto.json.data.now_playing.autoplay_enabled, true);
+  assert.equal(auto.json.data.now_playing.autoplay, true);
+  await req(18102, "POST", "/v1/stop", { chat_id: P9_CHAT });
+});
+
+// IPC-5 (§29): /v1/lyrics returns track_id/title/artist/source/
+// truncated + lyrics. Same LRCLib retry loop as the Phase 4 test —
+// LRCLib intermittently 503s upstream.
+test("lyrics IPC-5 shape: track_id/title/artist/source/truncated (live)", async () => {
+  const play = await req(18102, "POST", "/v1/play", { chat_id: P9_CHAT, query: "jiosaavn:kesariya" });
+  assert.equal(play.status, 200, JSON.stringify(play.json));
+  let r = null;
+  for (let i = 0; i < 3; i++) {
+    r = await req(18102, "POST", "/v1/lyrics", { chat_id: P9_CHAT });
+    if (r.status === 200) break;
+    await sleep(1500);
+  }
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const d = r.json.data;
+  assert.equal(d.track_id, "jsvn:rjkrTnma");
+  assert.ok(typeof d.title === "string" && d.title.length > 0);
+  assert.ok(typeof d.artist === "string" && d.artist.length > 0);
+  assert.equal(d.source, "lrclib");
+  assert.equal(d.truncated, false);
+  assert.ok(d.lyrics.length > 50, "lyrics text is real content");
+  await req(18102, "POST", "/v1/stop", { chat_id: P9_CHAT });
+});
+
+// §13: inline modes — np/s/l need a chat_id (empty without one),
+// lib/del have no library backend (empty), help/hint/short queries
+// return no tracks (the core renders the static articles itself).
+test("inline modes: np/s/l empty without chat_id, lib/del/help/hint empty", async () => {
+  for (const q of ["np", "s", "l", "lib beatles", "del beatles", "help", "", "ab", "search"]) {
+    const r = await req(18102, "POST", "/v1/inline", { query: q, user_id: 1 });
+    assert.equal(r.status, 200, `inline ${JSON.stringify(q)}: ${JSON.stringify(r.json)}`);
+    assert.deepEqual(r.json.data.results, [], `inline ${JSON.stringify(q)} must be empty`);
+  }
+});
+
+test("inline np/s/l return the current track when chat_id is given", async () => {
+  const url = "https://ice1.somafm.com/groovesalad-128-mp3";
+  const play = await req(18102, "POST", "/v1/play", { chat_id: P9_CHAT, query: `radio:${url}` });
+  assert.equal(play.status, 200, JSON.stringify(play.json));
+  const trackId = play.json.data.now_playing.track.id;
+  for (const q of ["np", "s", "l"]) {
+    const r = await req(18102, "POST", "/v1/inline", { query: q, user_id: 1, chat_id: P9_CHAT });
+    assert.equal(r.status, 200, `inline ${q}: ${JSON.stringify(r.json)}`);
+    assert.equal(r.json.data.results.length, 1, `inline ${q} must return the current track`);
+    assert.equal(r.json.data.results[0].id, trackId);
+    assert.equal(r.json.data.results[0].source, "radio");
+    assert.ok(r.json.data.results[0].thumbnail === null || typeof r.json.data.results[0].thumbnail === "string");
+  }
+  // Nothing playing anymore: np is empty again.
+  await req(18102, "POST", "/v1/stop", { chat_id: P9_CHAT });
+  const gone = await req(18102, "POST", "/v1/inline", { query: "np", user_id: 1, chat_id: P9_CHAT });
+  assert.deepEqual(gone.json.data.results, []);
 });

@@ -257,6 +257,9 @@ function nowPlaying(radio) {
       title: `${station ? station.name : radio.station_id} — ${entry.title}`,
       artist: entry.artist,
       duration_sec: 0,
+      // IPC-3 (§29): a station stream is live and endless.
+      duration_str: "∞",
+      is_live: true,
       url: radio.stream_url,
       source: "radio",
     },
@@ -264,6 +267,14 @@ function nowPlaying(radio) {
     position_sec: Math.floor((Date.now() - radio.playlist_started_at_ms) / 1000) % PLAYLIST_ROTATE_SEC,
     queue: [],
     volume: 100,
+    // IPC-1 (§29): a radio stream is never paused/muted/looped, has
+    // no speed control and no autoplay — the constants are the honest
+    // values for this engine, not placeholders for missing state.
+    is_paused: false,
+    is_muted: false,
+    loop_count: 0,
+    speed: 1.0,
+    autoplay_enabled: false,
   };
 }
 
@@ -412,7 +423,27 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isInteger(chatId)) return fail(res, 400, "bad_request", "chat_id query param is required");
       const radio = radios.get(chatId);
       if (!radio) return fail(res, 404, "not_found", "no active radio for this chat");
-      return ok(res, { now_playing: nowPlaying(radio), station: radio.station_id, stream_url: radio.stream_url, reachable: radio.reachable, vc_handoff: radio.vc_handoff });
+      const station = findStation(radio.station_id);
+      return ok(res, {
+        now_playing: nowPlaying(radio),
+        station: radio.station_id,
+        // §21 /manage card fields, as far as this engine honestly
+        // knows them: started_at_ms is real; listeners/total_listeners
+        // are always 0 (no listener tracking exists — there is no web
+        // player, the stream goes to the VC engine); the station
+        // stream is endless, so loop_type is "none", autoplay is off
+        // and the queue is empty.
+        station_name: station ? station.name : radio.station_id,
+        started_at_ms: radio.started_at_ms,
+        listeners: 0,
+        total_listeners: 0,
+        loop_type: "none",
+        autoplay_enabled: false,
+        queue_length: 0,
+        stream_url: radio.stream_url,
+        reachable: radio.reachable,
+        vc_handoff: radio.vc_handoff,
+      });
     }
 
     if (req.method !== "POST") return fail(res, 404, "not_found", "unknown route");

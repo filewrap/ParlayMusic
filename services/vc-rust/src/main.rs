@@ -90,6 +90,85 @@ struct Track {
     /// state-wise (old stub behaviour) instead of stalling forever.
     downloaded: bool,
     download_failed: bool,
+    /// Cover-art URL (contract Track.thumbnail). The core renders the
+    /// now-playing / queue / search cards as photos from this URL, so
+    /// every resolver that knows one must fill it in (Phase 9).
+    thumbnail: Option<String>,
+    // IPC-3 (UI_INVENTORY.md §29): enriched search-result fields for
+    // the core's numbered result list. duration_str is always derived
+    // ("M:SS" / "Xh Ym Zs" / "∞"); the rest are set only when the
+    // resolving source reports them (all optional per §29).
+    duration_str: String,
+    views: Option<i64>,
+    uploader: Option<String>,
+    upload_time: Option<String>,
+    is_live: bool,
+}
+
+// IPC-3 (§29): human duration — "M:SS" under an hour, "Xh Ym Zs"
+// at/over an hour, "∞" when the duration is unknown (sec <= 0) or the
+// track is live. Zero-valued hour/minute/second parts are dropped.
+fn format_duration_str(sec: i64, is_live: bool) -> String {
+    if is_live || sec <= 0 {
+        return "∞".to_string();
+    }
+    if sec < 3600 {
+        return format!("{}:{:02}", sec / 60, sec % 60);
+    }
+    let h = sec / 3600;
+    let m = (sec % 3600) / 60;
+    let s = sec % 60;
+    let mut out = format!("{}h", h);
+    if m > 0 {
+        out.push_str(&format!(" {}m", m));
+    }
+    if s > 0 {
+        out.push_str(&format!(" {}s", s));
+    }
+    out
+}
+
+// IPC-3: yt-dlp upload_date ("YYYYMMDD") -> "YYYY-MM-DD" for the
+// search metadata rows. Anything else passes through unchanged.
+fn format_upload_date(raw: &str) -> String {
+    if raw.len() == 8 && raw.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..])
+    } else {
+        raw.to_string()
+    }
+}
+
+// IPC-3: read the enriched search fields out of one yt-dlp info
+// object. Returns (duration_str, views, uploader, upload_time,
+// is_live); duration_str is always derived from duration_sec.
+fn ipc3_from_ytdlp(v: &Json, duration_sec: i64) -> (String, Option<i64>, Option<String>, Option<String>, bool) {
+    let is_live = v
+        .get("is_live")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+        || v
+            .get("live_status")
+            .and_then(|x| x.as_str())
+            .map(|s| s == "is_live")
+            .unwrap_or(false);
+    let views = v.get("view_count").and_then(|x| x.as_i64()).filter(|n| *n > 0);
+    let uploader = v
+        .get("uploader")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let upload_time = v
+        .get("upload_date")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(format_upload_date);
+    (
+        format_duration_str(duration_sec, is_live),
+        views,
+        uploader,
+        upload_time,
+        is_live,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +345,26 @@ fn track_json(t: &Track) -> Json {
     if let Some(u) = &t.stream_url {
         fields.push(("stream_url".into(), Json::Str(u.clone())));
     }
+    // Contract Track.thumbnail (Phase 9): the core renders cards as
+    // photos from it; emitted only when the resolver knows one.
+    if let Some(u) = &t.thumbnail {
+        fields.push(("thumbnail".into(), Json::Str(u.clone())));
+    }
+    // IPC-3 (§29): duration_str is always present (derived); the rest
+    // only when the source reported them.
+    fields.push(("duration_str".into(), Json::Str(t.duration_str.clone())));
+    if let Some(v) = t.views {
+        fields.push(("views".into(), Json::Num(v as f64)));
+    }
+    if let Some(u) = &t.uploader {
+        fields.push(("uploader".into(), Json::Str(u.clone())));
+    }
+    if let Some(u) = &t.upload_time {
+        fields.push(("upload_time".into(), Json::Str(u.clone())));
+    }
+    if t.is_live {
+        fields.push(("is_live".into(), Json::Bool(true)));
+    }
     Json::Obj(fields)
 }
 
@@ -280,6 +379,7 @@ fn ji64(v: &Json, key: &str) -> Option<i64> {
 fn track_from_json(v: &Json) -> Option<Track> {
     let id = jstr(v, "id")?;
     let title = jstr(v, "title")?;
+    let duration_sec = ji64(v, "duration_sec").unwrap_or(0);
     Some(Track {
         id,
         title,
@@ -288,7 +388,7 @@ fn track_from_json(v: &Json) -> Option<Track> {
         url: jstr(v, "url").unwrap_or_default(),
         // A persisted track without a duration has an UNKNOWN duration
         // (0) — never a fake one. The ticker never auto-advances it.
-        duration_sec: ji64(v, "duration_sec").unwrap_or(0),
+        duration_sec,
         resolved_by: jstr(v, "resolved_by").unwrap_or_else(|| "client".to_string()),
         stream_url: jstr(v, "stream_url"),
         file_path: jstr(v, "file_path"),
@@ -297,6 +397,19 @@ fn track_from_json(v: &Json) -> Option<Track> {
             .get("download_failed")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        thumbnail: jstr(v, "thumbnail"),
+        // IPC-3: re-derive duration_str when the stored payload lacks
+        // it (old state files); otherwise keep the stored value.
+        duration_str: jstr(v, "duration_str").unwrap_or_else(|| {
+            format_duration_str(
+                duration_sec,
+                v.get("is_live").and_then(|x| x.as_bool()).unwrap_or(false),
+            )
+        }),
+        views: ji64(v, "views"),
+        uploader: jstr(v, "uploader"),
+        upload_time: jstr(v, "upload_time"),
+        is_live: v.get("is_live").and_then(|x| x.as_bool()).unwrap_or(false),
     })
 }
 
@@ -353,9 +466,25 @@ fn track_canonical_json(t: &Track) -> Json {
         ("source".into(), Json::Str(t.source.clone())),
         ("url".into(), Json::Str(t.url.clone())),
         ("duration_sec".into(), Json::Num(t.duration_sec as f64)),
+        ("duration_str".into(), Json::Str(t.duration_str.clone())),
     ];
     if let Some(u) = &t.stream_url {
         fields.push(("stream_url".into(), Json::Str(u.clone())));
+    }
+    if let Some(u) = &t.thumbnail {
+        fields.push(("thumbnail".into(), Json::Str(u.clone())));
+    }
+    if let Some(v) = t.views {
+        fields.push(("views".into(), Json::Num(v as f64)));
+    }
+    if let Some(u) = &t.uploader {
+        fields.push(("uploader".into(), Json::Str(u.clone())));
+    }
+    if let Some(u) = &t.upload_time {
+        fields.push(("upload_time".into(), Json::Str(u.clone())));
+    }
+    if t.is_live {
+        fields.push(("is_live".into(), Json::Bool(true)));
     }
     Json::Obj(fields)
 }
@@ -665,6 +794,23 @@ fn ytdlp_info(target: &str) -> Option<Json> {
 
 /// Real metadata resolve for a YouTube watch URL (real title,
 /// uploader, duration, stream URL — never a placeholder).
+// yt-dlp info objects carry a `thumbnails` array (smallest last);
+// the last URL is the card thumbnail. A bare `thumbnail` string is
+// the fallback.
+fn thumbnail_from_ytdlp(v: &Json) -> Option<String> {
+    match v.get("thumbnails") {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(|i| i.get("url")?.as_str().map(|s| s.to_string()))
+            .last(),
+        _ => v
+            .get("thumbnail")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    }
+}
+
 fn resolve_youtube_url(url: &str, id: &str) -> Option<Track> {
     let v = ytdlp_info(url)?;
     let title = v
@@ -697,6 +843,7 @@ fn resolve_youtube_url(url: &str, id: &str) -> Option<Track> {
         .and_then(|x| x.as_str())
         .filter(|u| u.starts_with("https://"))
         .map(|u| u.to_string());
+    let (duration_str, views, uploader, upload_time, is_live) = ipc3_from_ytdlp(&v, duration);
     Some(Track {
         id: id.to_string(),
         title,
@@ -709,6 +856,12 @@ fn resolve_youtube_url(url: &str, id: &str) -> Option<Track> {
         file_path: None,
         downloaded: false,
         download_failed: false,
+        thumbnail: thumbnail_from_ytdlp(&v),
+        duration_str,
+        views,
+        uploader,
+        upload_time,
+        is_live,
     })
 }
 
@@ -743,6 +896,7 @@ fn resolve_via_ytdlp(query: &str) -> Option<Track> {
         .and_then(|x| x.as_str())
         .filter(|u| u.starts_with("https://"))
         .map(|u| u.to_string());
+    let (duration_str, views, uploader, upload_time, is_live) = ipc3_from_ytdlp(&v, duration);
     Some(Track {
         id,
         title,
@@ -755,6 +909,12 @@ fn resolve_via_ytdlp(query: &str) -> Option<Track> {
         file_path: None,
         downloaded: false,
         download_failed: false,
+        thumbnail: thumbnail_from_ytdlp(&v),
+        duration_str,
+        views,
+        uploader,
+        upload_time,
+        is_live,
     })
 }
 
@@ -877,6 +1037,16 @@ fn spotify_track_from_json(v: &Json, id: &str) -> Option<Track> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    // Album art (first image, 640px) — the card thumbnail. The
+    // Spotify API reports no views/uploader/upload date, and a
+    // Spotify track is never live (IPC-3: those stay absent/false).
+    let thumbnail = match v.get("album").and_then(|a| a.get("images")) {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(|i| i.get("url")?.as_str().map(|s| s.to_string()))
+            .next(),
+        _ => None,
+    };
     Some(Track {
         id: id.to_string(),
         title,
@@ -890,6 +1060,12 @@ fn spotify_track_from_json(v: &Json, id: &str) -> Option<Track> {
         file_path: None,
         downloaded: false,
         download_failed: false,
+        thumbnail,
+        duration_str: format_duration_str(duration, false),
+        views: None,
+        uploader: None,
+        upload_time: None,
+        is_live: false,
     })
 }
 
@@ -1273,6 +1449,11 @@ fn first_unplayed_entry(
             .and_then(|x| x.as_i64())
             .unwrap_or(0)
             .max(0);
+        // Flat-playlist entries carry thumbnails (smallest last) and
+        // sometimes view_count/uploader — enrich IPC-3 from them.
+        let thumbnail = thumbnail_from_ytdlp(e);
+        let (duration_str, views, uploader, upload_time, is_live) =
+            ipc3_from_ytdlp(e, duration);
         return Some(Track {
             id: id.clone(),
             title,
@@ -1286,6 +1467,12 @@ fn first_unplayed_entry(
             file_path: None,
             downloaded: false,
             download_failed: false,
+            thumbnail,
+            duration_str,
+            views,
+            uploader,
+            upload_time,
+            is_live,
         });
     }
     None
@@ -1340,6 +1527,16 @@ fn now_playing_json(room: &Room) -> Json {
         ("loop".into(), Json::Num(room.loop_n as f64)),
         ("shuffle".into(), Json::Bool(room.shuffle)),
         ("autoplay".into(), Json::Bool(room.autoplay)),
+        // IPC-1 (§29): the merged 5-row control-panel card fields.
+        // Legacy paused/loop/autoplay stay as the mirrors; is_muted
+        // is volume 0 (this engine has no separate mute flag — the
+        // core mutes via volume 0); speed is always 1.0 (no speed
+        // control in this engine; playback is always normal speed).
+        ("is_paused".into(), Json::Bool(room.paused)),
+        ("is_muted".into(), Json::Bool(room.volume == 0)),
+        ("loop_count".into(), Json::Num(room.loop_n as f64)),
+        ("speed".into(), Json::Num(1.0)),
+        ("autoplay_enabled".into(), Json::Bool(room.autoplay)),
     ];
     // Top-level stream_url mirrors the current track's (contract
     // NowPlaying.stream_url, A8 residual). Omitted when idle or when
@@ -1350,6 +1547,38 @@ fn now_playing_json(room: &Room) -> Json {
         }
     }
     Json::Obj(fields)
+}
+
+// IPC-2 (§29): progress snapshot for the core's no-op progress-bar
+// button refresh and the remix /menu panel. Pure — takes a room,
+// returns the JSON object. `next` is the first queued track (or
+// null); `loop_enabled` is loop_count > 0.
+fn progress_json(room: &Room) -> Json {
+    let now = match &room.current {
+        Some(t) => track_json(t),
+        None => Json::Null,
+    };
+    let next = match room.queue.first() {
+        Some(q) => track_json(&q.track),
+        None => Json::Null,
+    };
+    Json::Obj(vec![
+        ("position_sec".into(), Json::Num(room.position_sec as f64)),
+        (
+            "duration_sec".into(),
+            Json::Num(
+                room.current
+                    .as_ref()
+                    .map(|t| t.duration_sec)
+                    .unwrap_or(0) as f64,
+            ),
+        ),
+        ("is_paused".into(), Json::Bool(room.paused)),
+        ("is_muted".into(), Json::Bool(room.volume == 0)),
+        ("loop_enabled".into(), Json::Bool(room.loop_n > 0)),
+        ("now".into(), now),
+        ("next".into(), next),
+    ])
 }
 
 fn need_chat(body: &Json) -> Result<i64, (u16, String)> {
@@ -1713,6 +1942,33 @@ fn handle(state: &Arc<Mutex<State>>, req: &Request) -> (u16, String) {
         };
         return (200, ok(&format!("{{\"now_playing\":{}}}", np.render())));
     }
+    if req.method == "GET" && req.path == "/v1/progress" {
+        // IPC-2 (§29): same 404 rule as vc-go / vc-ts — no room, or a
+        // room with nothing playing, is not_found (unlike
+        // /v1/now-playing above, which returns an empty room with
+        // 200 for an idle chat).
+        let chat_id = match req
+            .query_param("chat_id")
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            Some(id) => id,
+            None => {
+                return (
+                    400,
+                    err("bad_request", "missing integer query param: chat_id"),
+                )
+            }
+        };
+        let st = lock(state);
+        return match st.rooms.get(&chat_id) {
+            Some(room) if room.current.is_some() => {
+                // IPC-2 fields at the top level of data (same shape
+                // as vc-go / vc-ts) — not nested under "progress".
+                (200, ok(&progress_json(room).render()))
+            }
+            _ => (404, err("not_found", "no playback state for this chat")),
+        };
+    }
     if req.method != "POST" {
         return (404, err("not_found", "route not found"));
     }
@@ -1953,6 +2209,12 @@ mod tests {
             file_path: None,
             downloaded: true,
             download_failed: false,
+            thumbnail: Some("https://i.ytimg.com/vi/x/hqdefault.jpg".to_string()),
+            duration_str: "3:00".to_string(),
+            views: Some(1234),
+            uploader: Some("Test Channel".to_string()),
+            upload_time: Some("2020-01-15".to_string()),
+            is_live: false,
         }
     }
 
@@ -2513,5 +2775,177 @@ mod tests {
         for leaked in ["resolved_by", "file_path", "downloaded", "download_failed"] {
             assert!(!rendered.contains(leaked), "leaked {} in: {}", leaked, rendered);
         }
+    }
+
+    // ------------------------------------------------ Phase 9: IPC-1/2/3 --
+
+    #[test]
+    fn format_duration_str_cases() {
+        assert_eq!(format_duration_str(0, false), "∞");
+        assert_eq!(format_duration_str(-5, false), "∞");
+        assert_eq!(format_duration_str(45, false), "0:45");
+        assert_eq!(format_duration_str(268, false), "4:28");
+        assert_eq!(format_duration_str(3599, false), "59:59");
+        assert_eq!(format_duration_str(3600, false), "1h");
+        assert_eq!(format_duration_str(3661, false), "1h 1m 1s");
+        assert_eq!(format_duration_str(3720, false), "1h 2m");
+        assert_eq!(format_duration_str(3605, false), "1h 5s");
+        assert_eq!(format_duration_str(213, true), "∞");
+    }
+
+    #[test]
+    fn format_upload_date_cases() {
+        assert_eq!(format_upload_date("20200115"), "2020-01-15");
+        for raw in ["", "2020", "2020011", "2020-01-15", "abcdefgh", "2020AB15"] {
+            assert_eq!(format_upload_date(raw), raw);
+        }
+    }
+
+    #[test]
+    fn ipc3_from_ytdlp_maps_fields() {
+        let v = parse_json(
+            r#"{"view_count": 1600000000, "uploader": "Rick Astley", "upload_date": "20091025", "live_status": "not_live"}"#,
+        )
+        .unwrap();
+        let (ds, views, uploader, upload_time, is_live) = ipc3_from_ytdlp(&v, 213);
+        assert_eq!(ds, "3:33");
+        assert_eq!(views, Some(1600000000));
+        assert_eq!(uploader.as_deref(), Some("Rick Astley"));
+        assert_eq!(upload_time.as_deref(), Some("2009-10-25"));
+        assert!(!is_live);
+        let live = parse_json(r#"{"is_live": true, "live_status": "is_live"}"#).unwrap();
+        let (ds, _, _, _, is_live) = ipc3_from_ytdlp(&live, 0);
+        assert_eq!(ds, "∞");
+        assert!(is_live);
+        // view_count 0 is not a view count (prevents a fake "0 views").
+        let zero = parse_json(r#"{"view_count": 0}"#).unwrap();
+        let (_, views, _, _, _) = ipc3_from_ytdlp(&zero, 90);
+        assert_eq!(views, None);
+    }
+
+    #[test]
+    fn track_json_carries_thumbnail_and_ipc3() {
+        let t = mk_track("x");
+        let rendered = track_json(&t).render();
+        assert!(rendered.contains("\"thumbnail\":\"https://i.ytimg.com/vi/x/hqdefault.jpg\""), "thumbnail missing in: {}", rendered);
+        assert!(rendered.contains("\"duration_str\":\"3:00\""), "duration_str missing in: {}", rendered);
+        assert!(rendered.contains("\"views\":1234"), "views missing in: {}", rendered);
+        assert!(rendered.contains("\"uploader\":\"Test Channel\""), "uploader missing in: {}", rendered);
+        assert!(rendered.contains("\"upload_time\":\"2020-01-15\""), "upload_time missing in: {}", rendered);
+        // is_live false is omitted (optional per §29).
+        assert!(!rendered.contains("is_live"), "is_live must be omitted when false: {}", rendered);
+        // Round-trip preserves every IPC-3 field.
+        let back = track_from_json(&track_json(&t)).expect("round-trip");
+        assert_eq!(back.thumbnail, t.thumbnail);
+        assert_eq!(back.duration_str, "3:00");
+        assert_eq!(back.views, Some(1234));
+        assert_eq!(back.uploader.as_deref(), Some("Test Channel"));
+        assert_eq!(back.upload_time.as_deref(), Some("2020-01-15"));
+        // A stored track without duration_str re-derives it.
+        let bare = parse_json(r#"{"id": "yt:b", "title": "B", "duration_sec": 90}"#).unwrap();
+        let back = track_from_json(&bare).expect("bare round-trip");
+        assert_eq!(back.duration_str, "1:30");
+        assert_eq!(back.thumbnail, None);
+    }
+
+    #[test]
+    fn spotify_track_from_json_carries_thumbnail_and_duration_str() {
+        let v = parse_json(
+            r#"{"name": "Blinding Lights", "artists": [{"name": "The Weeknd"}],
+                "duration_ms": 200000, "external_urls": {"spotify": "https://open.spotify.com/track/abc"},
+                "album": {"images": [{"url": "https://i.scdn.co/image/big"}, {"url": "https://i.scdn.co/image/small"}]}}"#,
+        )
+        .unwrap();
+        let t = spotify_track_from_json(&v, "abc").expect("spotify mapping");
+        assert_eq!(t.thumbnail.as_deref(), Some("https://i.scdn.co/image/big"));
+        assert_eq!(t.duration_str, "3:20");
+        assert_eq!(t.views, None);
+        assert_eq!(t.uploader, None);
+        assert!(!t.is_live);
+    }
+
+    #[test]
+    fn first_unplayed_entry_carries_ipc3_and_thumbnail() {
+        let entries = vec![Json::Obj(vec![
+            ("id".into(), Json::Str("mix1".into())),
+            ("title".into(), Json::Str("Mix One".into())),
+            ("uploader".into(), Json::Str("Mix Channel".into())),
+            ("duration".into(), Json::Num(3661.0)),
+            ("view_count".into(), Json::Num(42.0)),
+            ("upload_date".into(), Json::Str("20200115".into())),
+            (
+                "thumbnails".into(),
+                Json::Arr(vec![
+                    Json::Obj(vec![("url".into(), Json::Str("https://i.ytimg.com/vi/mix1/hq.jpg".into()))]),
+                    Json::Obj(vec![("url".into(), Json::Str("https://i.ytimg.com/vi/mix1/small.jpg".into()))]),
+                ]),
+            ),
+        ])];
+        let pick = first_unplayed_entry(&entries, "other", &[]).expect("a pick");
+        assert_eq!(pick.duration_str, "1h 1m 1s");
+        assert_eq!(pick.views, Some(42));
+        assert_eq!(pick.uploader.as_deref(), Some("Mix Channel"));
+        assert_eq!(pick.upload_time.as_deref(), Some("2020-01-15"));
+        assert_eq!(pick.thumbnail.as_deref(), Some("https://i.ytimg.com/vi/mix1/small.jpg"));
+    }
+
+    #[test]
+    fn now_playing_json_carries_ipc1_fields() {
+        let (mut st, chat_id) = mk_room_with_queue(&["a"]);
+        let room = st.rooms.get_mut(&chat_id).unwrap();
+        room.current = Some(mk_track("cur"));
+        room.paused = true;
+        room.volume = 0;
+        room.loop_n = 2;
+        room.autoplay = true;
+        let rendered = now_playing_json(room).render();
+        assert!(rendered.contains("\"is_paused\":true"), "is_paused missing in: {}", rendered);
+        assert!(rendered.contains("\"is_muted\":true"), "is_muted missing in: {}", rendered);
+        assert!(rendered.contains("\"loop_count\":2"), "loop_count missing in: {}", rendered);
+        assert!(rendered.contains("\"speed\":1"), "speed missing in: {}", rendered);
+        assert!(rendered.contains("\"autoplay_enabled\":true"), "autoplay_enabled missing in: {}", rendered);
+        // Legacy mirrors stay for back-compat.
+        assert!(rendered.contains("\"paused\":true"), "legacy paused missing");
+        assert!(rendered.contains("\"loop\":2"), "legacy loop missing");
+    }
+
+    #[test]
+    fn progress_json_snapshot() {
+        let (mut st, chat_id) = mk_room_with_queue(&["a", "b"]);
+        let room = st.rooms.get_mut(&chat_id).unwrap();
+        room.current = Some(mk_track("cur"));
+        room.position_sec = 57;
+        room.paused = false;
+        room.volume = 80;
+        room.loop_n = 1;
+        let rendered = progress_json(room).render();
+        assert!(rendered.contains("\"position_sec\":57"), "position missing in: {}", rendered);
+        assert!(rendered.contains("\"duration_sec\":180"), "duration missing in: {}", rendered);
+        assert!(rendered.contains("\"is_paused\":false"), "is_paused missing in: {}", rendered);
+        assert!(rendered.contains("\"is_muted\":false"), "is_muted missing in: {}", rendered);
+        assert!(rendered.contains("\"loop_enabled\":true"), "loop_enabled missing in: {}", rendered);
+        assert!(rendered.contains("\"now\":{\"id\":\"cur\""), "now missing in: {}", rendered);
+        assert!(rendered.contains("\"next\":{\"id\":\"a\""), "next missing in: {}", rendered);
+        // Muted + unlooped + empty queue variant.
+        let (mut st2, chat2) = mk_room_with_queue(&[]);
+        let room2 = st2.rooms.get_mut(&chat2).unwrap();
+        room2.current = Some(mk_track("solo"));
+        room2.volume = 0;
+        room2.loop_n = 0;
+        let rendered2 = progress_json(room2).render();
+        assert!(rendered2.contains("\"is_muted\":true"), "muted variant missing in: {}", rendered2);
+        assert!(rendered2.contains("\"loop_enabled\":false"), "loop variant missing in: {}", rendered2);
+        assert!(rendered2.contains("\"next\":null"), "next must be null when the queue is empty: {}", rendered2);
+    }
+
+    #[test]
+    fn canonical_track_carries_contract_ipc3_fields() {
+        let (st, chat_id) = mk_room_with_queue(&["a"]);
+        let room = st.rooms.get(&chat_id).unwrap();
+        let rendered = room_canonical_json(room).render();
+        assert!(rendered.contains("\"duration_str\":\"3:00\""), "canonical duration_str missing in: {}", rendered);
+        assert!(rendered.contains("\"thumbnail\":"), "canonical thumbnail missing in: {}", rendered);
+        assert!(rendered.contains("\"views\":1234"), "canonical views missing in: {}", rendered);
+        assert!(!rendered.contains("resolved_by"), "canonical must not leak engine state");
     }
 }

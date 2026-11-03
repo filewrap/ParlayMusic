@@ -8,10 +8,12 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -21,6 +23,60 @@
 
 namespace parlay {
 namespace {
+
+// Mint a 12-hex-char run id (§1: pl:dl:cancel:<run_id>, 12 hex).
+// The downloaders mint their own server run id per POST; the core
+// mints its own id for the progress/cancel UI and maps it to the
+// server run id once the POST returns.
+std::string mintRunId() {
+    static std::random_device rd;
+    static std::mt19937_64 rng(rd() ^ (std::chrono::steady_clock::now()
+                                           .time_since_epoch()
+                                           .count()));
+    std::uniform_int_distribution<unsigned long long> dist(0, 0xffffffffffffULL);
+    unsigned long long v = dist(rng);
+    char buf[13];
+    std::snprintf(buf, sizeof(buf), "%012llx", v);
+    return buf;
+}
+
+// Number of UTF-8 code points (JS string length counts UTF-16 units;
+// close enough for the inline-mode <3-char rule — the core and vc-ts
+// must agree on hint vs search for short queries).
+size_t utf8Len(const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s)
+        if ((c & 0xC0) != 0x80) ++n;
+    return n;
+}
+
+// Strip [mm:ss.xx] timestamp prefixes, one per line (LRC -> plain
+// lyrics, navidrome §7.9.4 / Music163bot §6.5). Used by the inline
+// `l` article; onLyrics keeps its own inline copy (tested path).
+std::string stripLrcTimestamps(const std::string& text) {
+    std::istringstream in(text);
+    std::string line, out;
+    while (std::getline(in, line)) {
+        while (line.size() > 1 && line[0] == '[') {
+            size_t close = line.find(']');
+            if (close == std::string::npos) break;
+            line = line.substr(close + 1);
+        }
+        if (!line.empty() && line[0] == ' ') line.erase(0, 1);
+        out += line + "\n";
+    }
+    return out;
+}
+
+// Cut to max_chars UTF-8 chars with NO ellipsis (the inventory's
+// "first 100 chars" description is literal; truncUtf8's "…" would
+// make it 101).
+std::string headUtf8(const std::string& s, size_t max_chars) {
+    std::string cut = ui_texts::truncUtf8(s, max_chars);
+    if (cut.size() >= 3 && cut.substr(cut.size() - 3) == "…")
+        cut = cut.substr(0, cut.size() - 3);
+    return cut;
+}
 
 std::string trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n");
@@ -206,13 +262,52 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onPlaylist(c); });
     add({"rmplaylist", "clearplaylist"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onRmPlaylist(c); });
+    // Named playlists (Parvati/TgMusicBot model, §17).
+    add({"createplaylist"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onCreatePlaylist(c); });
+    add({"deleteplaylist"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onDeletePlaylist(c); });
+    add({"addtoplaylist"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onAddToPlaylist(c); });
+    add({"removefromplaylist"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onRemoveFromPlaylist(c); });
+    add({"playlistinfo"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onPlaylistInfo(c); });
+    add({"myplaylists"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onMyPlaylists(c); });
+    // Radio lifecycle (§21).
+    add({"new"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onNewRadio(c); });
+    add({"destroy"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onDestroyRadio(c); });
+    add({"manage"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onManageRadio(c); });
+    // New Phase 9 commands (§2/§16/§9).
+    add({"menu"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onMenu(c); });
+    add({"id"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onId(c); });
+    add({"keyboard"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onKeyboard(c); });
+    add({"about"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onAbout(c); });
+    add({"status"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onStatus(c); });
+    add({"now"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onNow(c); });
+    add({"repo"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onRepo(c); });
+    add({"download-settings"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onDownloadSettings(c); });
     // Settings / chat settings / autoplay / channel play.
     add({"start"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onStart(c); });
-    add({"help"}, Scope::Private, Perm::Everyone,
+    add({"help"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onHelp(c); });
-    add({"playmode", "settings"}, Scope::Group, Perm::Everyone,
+    add({"playmode"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onPlaymode(c); });
+    add({"settings"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onSettings(c); });
     add({"lang", "language"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onLang(c); });
     add({"adminmode"}, Scope::Group, Perm::Everyone,
@@ -328,7 +423,7 @@ void Dispatcher::registerCommands() {
         {"cvplay", {"vplay", true}}, {"cfplay", {"playforce", true}},
         {"fcplay", {"playforce", true}}, {"cforceplay", {"playforce", true}},
         {"cplayforce", {"playforce", true}}, {"fvcplay", {"vplayforce", true}},
-        {"fvcpay", {"vplayforce", true}}, {"vcplayforce", {"vplayforce", true}},
+        {"fvplay", {"vplayforce", true}}, {"vcplayforce", {"vplayforce", true}},
         {"cpause", {"pause", false}}, {"cresume", {"resume", false}},
         {"cmute", {"mute", false}}, {"cunmute", {"unmute", false}},
         {"cskip", {"skip", false}}, {"caskip", {"autoplay-skip", false}},
@@ -348,6 +443,54 @@ void Dispatcher::registerCommands() {
     };
 }
 
+bool Dispatcher::forwardShareMedia(const TgMessage& msg) {
+    if (!msg.has_media || msg.chat.type != "private") return false;
+    auto target = store_.get("sharetarget:" + std::to_string(msg.from.id));
+    if (!target) return false;
+    int64_t target_id = 0;
+    try {
+        target_id = std::stoll(*target);
+    } catch (...) {
+        return false;
+    }
+    if (target_id == 0) return false;
+    CommandContext ctx;
+    ctx.message = msg;
+    ctx.command = "share";
+    if (store_.sismember("shareblocked", std::to_string(msg.from.id))) {
+        replyHtml(ctx, ui_texts::fmt(
+                           ui_texts::kShareBlocked,
+                           {{"name", ui_texts::htmlEscape(
+                                         tg_.getUserMention(target_id))}}));
+        return true;
+    }
+    std::string err;
+    bool ok = false;
+    if (msg.media_kind == "audio" || msg.media_kind == "voice") {
+        int64_t sent = tg_.sendAudio(
+            target_id, msg.media_file_id, "",
+            inlineKeyboardJson(ui_texts::shareReceivedKeyboard(
+                std::to_string(msg.from.id),
+                std::to_string(msg.message_id),
+                msg.media_file_unique_id)),
+            &err);
+        ok = sent > 0;
+    } else {
+        // Video / video note / document: no send-by-file_id call
+        // exists for these, so forward the message itself (no
+        // feedback buttons).
+        ok = tg_.forwardMessage(target_id, msg.chat.id, msg.message_id);
+    }
+    if (ok) {
+        store_.del("sharetarget:" + std::to_string(msg.from.id));
+        replyHtml(ctx, ui_texts::kShareSent);
+    } else {
+        reply(ctx, "Could not send the music" +
+                       (err.empty() ? "." : ": " + err));
+    }
+    return true;
+}
+
 void Dispatcher::handleMessage(const TgMessage& msg) {
     // Service messages first (NoxBeats on_new_members / on_video_chat).
     if (!msg.new_chat_members.empty()) {
@@ -360,6 +503,27 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
                 store_.sadd("chats", std::to_string(msg.chat.id));
                 logToLogger("Bot added to chat " +
                             std::to_string(msg.chat.id));
+                // Greet the group with the start card (§2). The
+                // service message id is not a reply target.
+                CommandContext ctx;
+                ctx.message = msg;
+                ctx.message.message_id = 0;
+                ctx.command = "start";
+                replyKb(ctx, ui_texts::kBotAdded,
+                        ui_texts::startGroupKeyboard(cfg_.updates_url,
+                                                     cfg_.support_url));
+            } else if (u.id == cfg_.owner_id) {
+                CommandContext ctx;
+                ctx.message = msg;
+                ctx.message.message_id = 0;
+                ctx.command = "start";
+                replyHtml(ctx, ui_texts::kOwnerJoined);
+            } else if (isSudo(u.id)) {
+                CommandContext ctx;
+                ctx.message = msg;
+                ctx.message.message_id = 0;
+                ctx.command = "start";
+                replyHtml(ctx, ui_texts::kSudoJoined);
             }
         }
     }
@@ -374,9 +538,182 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         bool fb = false;
         vcCall({msg, "stop", "", false}, "stop",
                Json::objectOf({{"chat_id", Json(msg.chat.id)}}), used, fb);
+        CommandContext ctx;
+        ctx.message = msg;
+        ctx.message.message_id = 0;
+        ctx.command = "start";
+        replyHtml(ctx, msg.video_chat_started ? ui_texts::kVcStarted
+                                              : ui_texts::kVcEndedStop);
         return;
     }
-    if (!msg.has_text) return;
+    if (!msg.has_text) {
+        // Media with no caption: the share-target forward (§22) is a
+        // DM flow. Other media is ignored.
+        if (forwardShareMedia(msg)) return;
+        return;
+    }
+
+    // Plain-text triggers that are not commands.
+    std::string text0 = msg.text;
+    // A captioned media message goes to the pending share target
+    // first (§22); the caption is not a pending-state reply.
+    if (msg.has_media && forwardShareMedia(msg)) return;
+    // Reply-a-number search pick (§7): a bare number with an active
+    // search session plays that result (DM or group).
+    if (!text0.empty() && text0.front() != '/' && isDigits(trim(text0))) {
+        std::string query;
+        Json results;
+        if (loadSearchSession(msg.from.id, query, results)) {
+            int n = std::stoi(trim(text0));
+            if (n >= 1 && n <= static_cast<int>(results.size())) {
+                TgCallbackQuery cq;
+                cq.chat_id = msg.chat.id;
+                cq.from = msg.from;
+                auto sm = store_.get("searchmsg:" +
+                                     std::to_string(msg.from.id));
+                if (sm) {
+                    try {
+                        cq.has_message = true;
+                        cq.message_id = std::stoll(*sm);
+                    } catch (...) {
+                    }
+                }
+                std::string err;
+                if (playSearchPick(cq, msg.from.id, n, err)) return;
+            }
+        }
+    }
+    // Pending-state text flows (DM only): the download-settings
+    // template prompt, share feedback, and a pending share target
+    // that got text instead of music. Commands (leading '/') are
+    // never swallowed by these.
+    if (msg.chat.type == "private" && !text0.empty() &&
+        text0.front() != '/') {
+        int64_t user = msg.from.id;
+        CommandContext ctx;
+        ctx.message = msg;
+        // 1. Download-settings template prompt (§9).
+        if (store_.get("dlset_tpl_pending:" + std::to_string(user))) {
+            store_.del("dlset_tpl_pending:" + std::to_string(user));
+            auto cur = store_.get("dlset:" + std::to_string(user));
+            std::string fmt_v = "mp3", yt_v = "0", tpl_v = text0;
+            if (cur) {
+                std::istringstream in(*cur);
+                std::getline(in, fmt_v);
+                std::getline(in, yt_v);
+            }
+            store_.set("dlset:" + std::to_string(user),
+                       fmt_v + "\n" + yt_v + "\n" + tpl_v);
+            ctx.command = "download-settings";
+            replyKb(ctx, ui_texts::fmt(ui_texts::kDlSettingsTemplate,
+                                       {{"template",
+                                         ui_texts::htmlEscape(tpl_v)}}),
+                    ui_texts::dlSettingsIndexKeyboard());
+            return;
+        }
+        // 2. Share feedback text (§22): forward to the original
+        // sender as a reply to the shared audio.
+        auto fb = store_.get("sharefb:" + std::to_string(user));
+        if (fb) {
+            std::string sender, msg_id, fuid;
+            {
+                size_t a = fb->find(':');
+                size_t b = a == std::string::npos
+                               ? std::string::npos
+                               : fb->find(':', a + 1);
+                if (a != std::string::npos && b != std::string::npos) {
+                    sender = fb->substr(0, a);
+                    msg_id = fb->substr(a + 1, b - a - 1);
+                    fuid = fb->substr(b + 1);
+                }
+            }
+            store_.del("sharefb:" + std::to_string(user));
+            ctx.command = "share";
+            if (sender.empty() || msg_id.empty()) {
+                replyHtml(ctx, ui_texts::kShareFeedbackSent);
+                return;
+            }
+            int64_t sender_id = 0, orig_msg = 0;
+            try {
+                sender_id = std::stoll(sender);
+                orig_msg = std::stoll(msg_id);
+            } catch (...) {
+            }
+            if (sender_id == 0 || orig_msg == 0) {
+                replyHtml(ctx, ui_texts::kShareFeedbackSent);
+                return;
+            }
+            // No dedup (ruling 8): no feedback store/endpoint exists,
+            // so feedback is sent every time — never "already sent".
+            // Dedup is future work; kShareFeedbackAlready is kept in
+            // ui_texts.hpp for it.
+            std::string err;
+            std::string fwd = "Feedback from " +
+                              ui_texts::htmlEscape(
+                                  displayName(msg.from)) +
+                              ":\n" + ui_texts::htmlEscape(text0);
+            if (tg_.sendMessageHtml(sender_id, fwd, Json(nullptr),
+                                    orig_msg, &err) < 0) {
+                reply(ctx, "Could not send the feedback: " + err);
+                return;
+            }
+            replyHtml(ctx, ui_texts::kShareFeedbackSent);
+            return;
+        }
+        // 3. A pending share target that got text instead of music.
+        if (store_.get("sharetarget:" + std::to_string(user))) {
+            if (lowerStr(trim(text0)) == "cancel") {
+                store_.del("sharetarget:" + std::to_string(user));
+                reply(ctx, "Sharing cancelled.");
+                return;
+            }
+            ctx.command = "share";
+            replyHtml(ctx, ui_texts::fmt(
+                               ui_texts::kUnhandledText,
+                               {{"list", availableCommandsList(
+                                             isSudo(user), isOwner(user))}}));
+            return;
+        }
+    }
+    // Delete trigger (any chat): "delete:<path>" (§25).
+    if (text0.rfind("delete:", 0) == 0) {
+        std::string path = trim(text0.substr(7));
+        if (path.empty()) return;
+        CommandContext ctx;
+        ctx.message = msg;
+        ctx.command = "delete";
+        if (path.find("..") != std::string::npos) {
+            reply(ctx, ui_texts::kDelInvalidPath);
+            return;
+        }
+        if (path.find('/') == std::string::npos) {
+            reply(ctx, ui_texts::kDelTopLevel);
+            return;
+        }
+        replyKb(ctx, ui_texts::deleteConfirmTrackText(path),
+                ui_texts::deleteConfirmKeyboard(path));
+        return;
+    }
+    // In a DM, any non-command text gets the start card (§2, Tina).
+    if (msg.chat.type == "private" &&
+        (text0.empty() || text0.front() != '/')) {
+        CommandContext ctx;
+        ctx.message = msg;
+        ctx.command = "start";
+        replyKb(ctx, ui_texts::kStartPm,
+                ui_texts::startPmKeyboard(bot_username_, cfg_.updates_url,
+                                          cfg_.support_url,
+                                          cfg_.source_url));
+        return;
+    }
+
+    // Inline np/s/l need the chat the user is playing in, and an
+    // inline_query carries no chat id — so the core remembers the
+    // user's most recent group chat (last_chat:<user>, §13). Only
+    // recorded for group/supergroup activity, and only written when
+    // the value changes.
+    if (msg.chat.type == "group" || msg.chat.type == "supergroup")
+        noteLastChat(msg.from.id, msg.chat.id);
 
     // Parse "/cmd@bot args" (NoxBeats parse_command): @bot must be us.
     std::string text = msg.text;
@@ -434,12 +771,14 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         }
         // Maintenance: only sudo passes.
         if (maintenanceOn() && !isSudo(msg.from.id)) {
-            std::string why;
             auto reason = store_.get("maint_reason");
-            reply(ctx, "Parlay is under maintenance." +
-                           (reason && !reason->empty()
-                                ? " Reason: " + *reason
-                                : ""));
+            std::string text = ui_texts::kMaintUser;
+            if (reason && !reason->empty())
+                text += "\n" +
+                        ui_texts::fmt(ui_texts::kMaintReasonLine,
+                                      {{"reason", ui_texts::htmlEscape(
+                                                      *reason)}});
+            replyHtml(ctx, text);
             return;
         }
         {
@@ -466,7 +805,12 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         }
         return;  // first match wins
     }
-    reply(ctx, "Unknown command. Try /help.");
+    // Unknown command: the §3 reply (never silent, never a crash).
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kUnknownCommand,
+                                 {{"command", "/" + ctx.command},
+                                  {"list", availableCommandsList(
+                                               isSudo(msg.from.id),
+                                               isOwner(msg.from.id))}}));
 }
 
 // --- permissions -----------------------------------------------------------
@@ -537,7 +881,7 @@ bool Dispatcher::adminCheck(const CommandContext& ctx) {
     if (isSudo(ctx.message.from.id) ||
         isChatAdmin(ctx.message.chat.id, ctx.message.from.id))
         return true;
-    reply(ctx, "You don't have permission to do that here.");
+    replyHtml(ctx, ui_texts::kDenyAdmin);
     return false;
 }
 
@@ -549,8 +893,7 @@ bool Dispatcher::canManageVc(const CommandContext& ctx) {
     if (mode == 2) return true;  // everyone
     if (isChatAdmin(chat, user)) return true;
     if (mode == 0 && isAuthUser(chat, user)) return true;
-    reply(ctx, "Only group admins (or authorized users) can control "
-               "playback. See /adminmode.");
+    replyHtml(ctx, ui_texts::kDenyAdminOrAuth);
     return false;
 }
 
@@ -561,8 +904,7 @@ bool Dispatcher::playAllowed(const CommandContext& ctx, bool force) {
     int64_t user = ctx.message.from.id;
     if (isSudo(user) || isChatAdmin(chat, user) || isAuthUser(chat, user))
         return true;
-    reply(ctx, "Only group admins can use /play in this chat (playmode is "
-               "admin-only).");
+    replyHtml(ctx, ui_texts::kGuardPlayAdmin);
     return false;
 }
 
@@ -607,7 +949,7 @@ double Dispatcher::chatSpeedField(int64_t chat_id) {
     char* end = nullptr;
     double s = std::strtod(v.c_str(), &end);
     if (end == v.c_str() || *end != '\0' || !std::isfinite(s) ||
-        s < 0.5 || s > 2.0)
+        s < 0.5 || s > 4.0)
         return 1.0;
     return s;
 }
@@ -778,6 +1120,532 @@ int64_t Dispatcher::reply(const CommandContext& ctx, const std::string& text) {
 
 void Dispatcher::replyError(const CommandContext& ctx, const IpcResult& r) {
     reply(ctx, "Service error (" + r.error_code + "): " + r.error_message);
+}
+
+// --- Phase 9 reply helpers (HTML + keyboards) ------------------------------
+int64_t Dispatcher::replyHtml(const CommandContext& ctx,
+                              const std::string& text) {
+    int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text,
+                                     Json(nullptr), ctx.message.message_id);
+    if (id < 0) {
+        std::cerr << "[tg] sendMessageHtml failed\n";
+        return -1;
+    }
+    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
+    return id;
+}
+
+int64_t Dispatcher::replyKb(const CommandContext& ctx, const std::string& text,
+                            const InlineKeyboard& kb) {
+    int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text,
+                                     inlineKeyboardJson(kb),
+                                     ctx.message.message_id);
+    if (id < 0) {
+        std::cerr << "[tg] sendMessageHtml (kb) failed\n";
+        return -1;
+    }
+    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
+    return id;
+}
+
+int64_t Dispatcher::replyReplyKb(const CommandContext& ctx,
+                                 const std::string& text,
+                                 const Json& reply_markup) {
+    int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text, reply_markup,
+                                     ctx.message.message_id);
+    if (id < 0) {
+        std::cerr << "[tg] sendMessageHtml (reply kb) failed\n";
+        return -1;
+    }
+    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
+    return id;
+}
+
+int64_t Dispatcher::replyPhoto(const CommandContext& ctx,
+                               const std::string& photo,
+                               const std::string& caption,
+                               const InlineKeyboard& kb) {
+    int64_t id = tg_.sendPhoto(ctx.message.chat.id, photo, caption,
+                               kb.empty() ? Json(nullptr)
+                                          : inlineKeyboardJson(kb));
+    if (id < 0) {
+        std::cerr << "[tg] sendPhoto failed\n";
+        return -1;
+    }
+    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
+    return id;
+}
+
+bool Dispatcher::answerCb(const TgCallbackQuery& cq, const std::string& text,
+                          bool alert) {
+    std::string err;
+    return tg_.answerCallbackQuery(cq.id, text, alert, 0, &err);
+}
+
+bool Dispatcher::editCbCard(const TgCallbackQuery& cq,
+                            const std::string& text,
+                            const InlineKeyboard& kb) {
+    if (!cq.has_message) return false;
+    int64_t card_id = 0;
+    bool is_photo = false;
+    std::string err;
+    // The card kind decides the edit method: photo cards carry their
+    // text as a caption. The recorded card info is authoritative; when
+    // there is none (e.g. a settings panel, which is always text) fall
+    // back to editMessageText.
+    bool have_card = cardInfo(cq.chat_id, card_id, is_photo) &&
+                     card_id == cq.message_id;
+    Json markup = kb.empty() ? Json(nullptr) : inlineKeyboardJson(kb);
+    if (have_card && is_photo)
+        return tg_.editMessageCaption(cq.chat_id, cq.message_id, text,
+                                      markup, &err);
+    return tg_.editMessageText(cq.chat_id, cq.message_id, text, markup,
+                               &err);
+}
+
+bool Dispatcher::editCbKeyboard(const TgCallbackQuery& cq,
+                                const InlineKeyboard& kb) {
+    if (!cq.has_message) return false;
+    std::string err;
+    return tg_.editMessageReplyMarkup(
+        cq.chat_id, cq.message_id,
+        kb.empty() ? Json(nullptr) : inlineKeyboardJson(kb), &err);
+}
+
+// --- Phase 9 card rendering -------------------------------------------------
+std::string Dispatcher::displayName(const TgUser& u) {
+    std::string name = u.first_name;
+    if (name.empty()) name = std::to_string(u.id);
+    if (!u.username.empty()) name += " (@" + u.username + ")";
+    return name;
+}
+
+ui_texts::CardTrack Dispatcher::cardTrack(const Json& track,
+                                         const std::string& requester) {
+    ui_texts::CardTrack t;
+    std::string title =
+        track.find("title") ? track.find("title")->asString() : "?";
+    t.title = ui_texts::truncUtf8(ui_texts::htmlEscape(title), 25);
+    t.url = track.find("url") ? track.find("url")->asString() : "";
+    int64_t dur =
+        track.find("duration_sec") ? track.find("duration_sec")->asInt() : 0;
+    t.duration = ui_texts::durationStr(dur);
+    t.requester = requester;
+    std::string id = track.find("id") ? track.find("id")->asString() : "";
+    t.token = ui_texts::trackToken(id);
+    return t;
+}
+
+ui_texts::CardTrack Dispatcher::cardTrack(const Json& track,
+                                         int64_t requested_by) {
+    return cardTrack(track, std::to_string(requested_by));
+}
+
+ui_texts::ChatSettings Dispatcher::chatSettings(int64_t chat_id) {
+    ui_texts::ChatSettings s;
+    s.admin_mode = chatIntField(chat_id, "admin_mode", 0);
+    s.play_mode = chatField(chat_id, "play_mode", "everyone");
+    s.cmd_delete = chatField(chat_id, "cmd_delete", "off") == "on";
+    s.clean_delay_min = chatIntField(chat_id, "clean_mode", 0);
+    s.thumbnails = chatField(chat_id, "thumb", "on") == "on";
+    s.autoplay = chatField(chat_id, "autoplay", "off") == "on";
+    s.silent = chatField(chat_id, "silent", "off") == "on";
+    s.auto_delete = chatField(chat_id, "autodelete", "off") == "on";
+    s.auto_delete_min = chatIntField(chat_id, "autodelete_min", 5);
+    s.language = chatField(chat_id, "lang", "en");
+    s.paginate_purge_old =
+        chatField(chat_id, "page_purge", "on") == "on";
+    s.chat_music_download =
+        chatField(chat_id, "musicdl", "on") == "on";
+    return s;
+}
+
+void Dispatcher::saveChatSettings(int64_t chat_id,
+                                  const ui_texts::ChatSettings& s) {
+    setChatField(chat_id, "admin_mode", std::to_string(s.admin_mode));
+    setChatField(chat_id, "play_mode", s.play_mode);
+    setChatField(chat_id, "cmd_delete", s.cmd_delete ? "on" : "off");
+    setChatField(chat_id, "clean_mode", std::to_string(s.clean_delay_min));
+    setChatField(chat_id, "thumb", s.thumbnails ? "on" : "off");
+    setChatField(chat_id, "autoplay", s.autoplay ? "on" : "off");
+    if (s.autoplay)
+        store_.set("autoplay:" + std::to_string(chat_id), "1");
+    else
+        store_.set("autoplay:" + std::to_string(chat_id), "0");
+    setChatField(chat_id, "silent", s.silent ? "on" : "off");
+    setChatField(chat_id, "autodelete", s.auto_delete ? "on" : "off");
+    setChatField(chat_id, "autodelete_min",
+                 std::to_string(s.auto_delete_min));
+    setChatField(chat_id, "lang", s.language);
+    setChatField(chat_id, "page_purge", s.paginate_purge_old ? "on" : "off");
+    setChatField(chat_id, "musicdl", s.chat_music_download ? "on" : "off");
+}
+
+void Dispatcher::recordCard(int64_t chat_id, int64_t message_id,
+                            bool is_photo) {
+    store_.set("card:" + std::to_string(chat_id),
+               std::string(is_photo ? "photo|" : "text|") +
+                   std::to_string(message_id));
+}
+
+bool Dispatcher::cardInfo(int64_t chat_id, int64_t& message_id,
+                          bool& is_photo) {
+    auto v = store_.get("card:" + std::to_string(chat_id));
+    if (!v || v->empty()) return false;
+    size_t bar = v->find('|');
+    if (bar == std::string::npos) return false;
+    is_photo = v->substr(0, bar) == "photo";
+    try {
+        message_id = std::stoll(v->substr(bar + 1));
+    } catch (...) {
+        return false;
+    }
+    return message_id != 0;
+}
+
+int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
+                                       const std::string& state_line) {
+    const Json* track = np.find("track");
+    if (!track || track->isNull()) return -1;
+    std::string requester;
+    auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
+    requester = rn ? *rn : "";
+    ui_texts::CardTrack ct = cardTrack(*track, requester);
+    int64_t pos = np.find("position_sec") ? np.find("position_sec")->asInt()
+                                          : 0;
+    if (pos == 0) {
+        // Engines without IPC-1 position_sec: the core's own scratch
+        // position (core_pos) is the fallback.
+        pos = chatIntField(chat_id, "core_pos", 0);
+    }
+    int64_t dur =
+        track->find("duration_sec") ? track->find("duration_sec")->asInt()
+                                    : 0;
+    bool paused = false;
+    if (const Json* p = np.find("paused")) paused = p->asBool();
+    if (const Json* p = np.find("is_paused")) paused = p->asBool();
+    bool autoplay = false;
+    if (const Json* a = np.find("autoplay")) autoplay = a->asBool();
+    if (const Json* a = np.find("autoplay_enabled")) autoplay = a->asBool();
+    int loop = 0;
+    if (const Json* l = np.find("loop")) loop = static_cast<int>(l->asInt());
+    if (const Json* l = np.find("loop_count"))
+        loop = static_cast<int>(l->asInt());
+    if (loop == 0) loop = chatIntField(chat_id, "loop", 0);
+    std::string text = ui_texts::nowPlayingText(ct);
+    if (!state_line.empty()) text = state_line + "\n\n" + text;
+    InlineKeyboard kb = ui_texts::playerKeyboard(
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
+    std::string thumb =
+        track->find("thumbnail") ? track->find("thumbnail")->asString() : "";
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    int64_t id = -1;
+    bool is_photo = false;
+    if (!thumb.empty() && thumbnailsOn(chat_id)) {
+        id = tg_.sendPhoto(chat_id, thumb, text,
+                           kb.empty() ? Json(nullptr)
+                                      : inlineKeyboardJson(kb));
+        if (id > 0) is_photo = true;
+    }
+    if (id < 0) {
+        // No thumbnail, thumbnails off, or sendPhoto failed: text card.
+        id = tg_.sendMessageHtml(chat_id, text, inlineKeyboardJson(kb), 0);
+    }
+    if (id > 0) recordCard(chat_id, id, is_photo);
+    return id;
+}
+
+bool Dispatcher::buildQueueCard(int64_t chat_id, bool show_all,
+                                std::string& text_out, InlineKeyboard& kb_out,
+                                std::string& thumb_out) {
+    Json np, track;
+    if (!nowPlaying(chat_id, np, track)) return false;
+    std::string requester;
+    auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
+    requester = rn ? *rn : "";
+    ui_texts::CardTrack now = cardTrack(track, requester);
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    Engine used;
+    bool fb = false;
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat_id)},
+        {"action", Json("list")},
+    });
+    IpcResult q = vcCall(fake, "queue", body, used, fb);
+    if (!q.ok) return false;
+    const Json* items = q.data.find("queue");
+    std::vector<ui_texts::CardTrack> up;
+    size_t total = 0;
+    if (items) {
+        // Item 0 is the now-playing track; the tail is the up-next list.
+        total = items->size() > 0 ? items->size() - 1 : 0;
+        size_t shown = show_all ? total
+                                : std::min<size_t>(
+                                      total,
+                                      static_cast<size_t>(
+                                          ui_texts::kQueuePageSize));
+        for (size_t i = 1; i <= shown; ++i) {
+            const Json& item = items->asArray()[i];
+            const Json* t = item.find("track");
+            if (!t) continue;
+            int64_t by = item.find("requested_by")
+                             ? item.find("requested_by")->asInt()
+                             : 0;
+            up.push_back(cardTrack(*t, by));
+        }
+    }
+    bool has_more = !show_all && total > up.size();
+    text_out = ui_texts::queueText(now, up, total);
+    kb_out = ui_texts::queueKeyboard(chat_id, up, has_more,
+                                     total - up.size());
+    thumb_out =
+        track.find("thumbnail") ? track.find("thumbnail")->asString() : "";
+    return true;
+}
+
+void Dispatcher::renderQueueCard(const CommandContext& ctx, bool show_all) {
+    int64_t chat = vcTarget(ctx);
+    std::string text;
+    InlineKeyboard kb;
+    std::string thumb;
+    if (!buildQueueCard(chat, show_all, text, kb, thumb)) {
+        replyHtml(ctx, ui_texts::kQueueEmpty);
+        return;
+    }
+    if (!thumb.empty() && thumbnailsOn(chat)) {
+        if (replyPhoto(ctx, thumb, text, kb) > 0) return;
+    }
+    replyKb(ctx, text, kb);
+}
+
+bool Dispatcher::resolveQueueToken(int64_t chat_id,
+                                   const std::string& token, Json& item_out,
+                                   int64_t& position_out) {
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    Engine used;
+    bool fb = false;
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat_id)},
+        {"action", Json("list")},
+    });
+    IpcResult q = vcCall(fake, "queue", body, used, fb);
+    if (!q.ok) return false;
+    const Json* items = q.data.find("queue");
+    if (!items) return false;
+    int64_t pos = 0;
+    for (const auto& item : items->asArray()) {
+        ++pos;
+        const Json* t = item.find("track");
+        if (!t) continue;
+        std::string id = t->find("id") ? t->find("id")->asString() : "";
+        if (ui_texts::trackToken(id) == token) {
+            item_out = item;
+            // The engine's remove wants the position as shown in
+            // /queue: item 0 is now-playing, so the queue position is
+            // the 1-based index in the list; prefer the item's own
+            // "position" field when the engine provides one.
+            if (const Json* p = item.find("position"))
+                position_out = p->asInt();
+            else
+                position_out = pos;
+            return true;
+        }
+    }
+    return false;
+}
+
+void Dispatcher::storeSearchSession(int64_t user_id,
+                                    const std::string& query,
+                                    const Json& results,
+                                    int64_t message_id) {
+    store_.set("search:" + std::to_string(user_id),
+               query + "\n" + results.dump());
+    store_.set("searchmsg:" + std::to_string(user_id),
+               std::to_string(message_id));
+}
+
+bool Dispatcher::loadSearchSession(int64_t user_id, std::string& query_out,
+                                   Json& results_out) {
+    auto v = store_.get("search:" + std::to_string(user_id));
+    if (!v || v->empty()) return false;
+    size_t nl = v->find('\n');
+    if (nl == std::string::npos) return false;
+    query_out = v->substr(0, nl);
+    try {
+        results_out = Json::parse(v->substr(nl + 1));
+    } catch (...) {
+        return false;
+    }
+    return results_out.isArray();
+}
+
+bool Dispatcher::playSearchPick(const TgCallbackQuery& cq, int64_t user_id,
+                                int n, std::string& error) {
+    std::string query;
+    Json results;
+    if (!loadSearchSession(user_id, query, results)) {
+        error = "expired";
+        return false;
+    }
+    if (n < 1 || n > static_cast<int>(results.size())) {
+        error = "range";
+        return false;
+    }
+    const Json& t = results.asArray()[static_cast<size_t>(n) - 1];
+    std::string id = t.find("id") ? t.find("id")->asString() : "";
+    std::string url = t.find("url") ? t.find("url")->asString() : "";
+    std::string title = t.find("title") ? t.find("title")->asString() : "";
+    std::string q = !url.empty() ? url : (!id.empty() ? id : title);
+    if (q.empty()) {
+        error = "empty";
+        return false;
+    }
+    // Delete the search message on a valid tap (§7).
+    if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
+    CommandContext fake;
+    fake.message.chat.id = cq.chat_id;
+    fake.message.from.id = user_id;
+    fake.message.from = cq.from;
+    fake.command = "play";
+    fake.args = q;
+    onPlay(fake);
+    return true;
+}
+
+std::string Dispatcher::availableCommandsList(bool is_sudo,
+                                             bool is_owner) const {
+    std::string list;
+    auto add = [&list](const char* c) {
+        if (!list.empty()) list += ", ";
+        list += c;
+    };
+    for (const auto& h : ui_texts::kCmdHelpTable) {
+        std::string cmd = h.cmd;
+        if (cmd == "eval" || cmd == "sh" || cmd == "maintenance" ||
+            cmd == "addsudo" || cmd == "delsudo") {
+            if (!is_owner) continue;
+        } else if (cmd == "blacklist" || cmd == "unblacklist" ||
+                   cmd == "blacklisted" || cmd == "ac" ||
+                   cmd == "activevc" || cmd == "broadcast" ||
+                   cmd == "autoleave" || cmd == "speedtest" ||
+                   cmd == "logs" || cmd == "logger" || cmd == "restart") {
+            if (!is_sudo && !is_owner) continue;
+        }
+        add(h.cmd);
+    }
+    return list;
+}
+
+std::vector<std::string> Dispatcher::splitCb(const std::string& data) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : data) {
+        if (c == ':') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    out.push_back(cur);
+    return out;
+}
+
+bool Dispatcher::callbackCanControl(int64_t chat_id, int64_t user_id) {
+    if (isSudo(user_id)) return true;
+    if (isChatAdmin(chat_id, user_id)) return true;
+    if (isAuthUser(chat_id, user_id)) return true;
+    return chatIntField(chat_id, "admin_mode", 0) == 2;
+}
+
+void Dispatcher::refreshPanel(const TgCallbackQuery& cq, int64_t chat_id) {
+    Json np, track;
+    std::string now_title;
+    std::string now_url;
+    std::string next_title;
+    std::string next_url;
+    std::string emoji = "🎵";
+    if (chatIntField(chat_id, "loop", 0) > 0) emoji = "🔁";
+    if (nowPlaying(chat_id, np, track)) {
+        now_title = track.find("title") ? track.find("title")->asString()
+                                        : "";
+        now_url = track.find("url") ? track.find("url")->asString() : "";
+        CommandContext fake;
+        fake.message.chat.id = chat_id;
+        Engine used;
+        bool fb = false;
+        Json body = Json::objectOf({
+            {"chat_id", Json(chat_id)},
+            {"action", Json("list")},
+        });
+        IpcResult q = vcCall(fake, "queue", body, used, fb);
+        if (q.ok) {
+            const Json* items = q.data.find("queue");
+            if (items && items->size() > 1) {
+                const Json* nt =
+                    items->asArray()[1].find("track");
+                if (nt) {
+                    next_title =
+                        nt->find("title") ? nt->find("title")->asString()
+                                          : "";
+                    next_url =
+                        nt->find("url") ? nt->find("url")->asString() : "";
+                }
+            }
+        }
+    }
+    std::string text = ui_texts::menuPanelText(
+        emoji, ui_texts::htmlEscape(now_title), now_url,
+        ui_texts::htmlEscape(next_title), next_url);
+    std::string err;
+    tg_.editMessageText(chat_id, cq.message_id, text,
+                        inlineKeyboardJson(ui_texts::menuPanelKeyboard(chat_id)),
+                        &err);
+}
+
+void Dispatcher::refreshCard(const TgCallbackQuery& cq, int64_t chat_id) {
+    Json np, track;
+    if (!nowPlaying(chat_id, np, track)) return;
+    int64_t card_id = 0;
+    bool is_photo = false;
+    if (!cardInfo(chat_id, card_id, is_photo) || card_id != cq.message_id)
+        return;
+    std::string requester;
+    auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
+    requester = rn ? *rn : "";
+    ui_texts::CardTrack ct = cardTrack(track, requester);
+    int64_t pos = np.find("position_sec") ? np.find("position_sec")->asInt()
+                                          : 0;
+    if (pos == 0) pos = chatIntField(chat_id, "core_pos", 0);
+    int64_t dur =
+        track.find("duration_sec") ? track.find("duration_sec")->asInt() : 0;
+    bool paused = false;
+    if (const Json* p = np.find("paused")) paused = p->asBool();
+    if (const Json* p = np.find("is_paused")) paused = p->asBool();
+    bool autoplay = false;
+    if (const Json* a = np.find("autoplay")) autoplay = a->asBool();
+    if (const Json* a = np.find("autoplay_enabled")) autoplay = a->asBool();
+    int loop = 0;
+    if (const Json* l = np.find("loop")) loop = static_cast<int>(l->asInt());
+    if (const Json* l = np.find("loop_count"))
+        loop = static_cast<int>(l->asInt());
+    if (loop == 0) loop = chatIntField(chat_id, "loop", 0);
+    std::string text = ui_texts::nowPlayingText(ct);
+    InlineKeyboard kb = ui_texts::playerKeyboard(
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
+    std::string err;
+    Json markup = inlineKeyboardJson(kb);
+    if (is_photo)
+        tg_.editMessageCaption(chat_id, cq.message_id, text, markup, &err);
+    else
+        tg_.editMessageText(chat_id, cq.message_id, text, markup, &err);
 }
 
 void Dispatcher::logToLogger(const std::string& text) {
@@ -1243,43 +2111,136 @@ void Dispatcher::onStart(const CommandContext& ctx) {
                         std::to_string(ctx.message.chat.id));
         }
     }
-    reply(ctx,
-          "Hi, I'm Parlay — one bot, many music engines.\n"
-          "Use /play <song or link> to start music in a voice chat.\n"
-          "Use /help for all commands.");
+    std::string arg = lowerStr(trim(ctx.args));
+    // Inline deep link: /start spotify----{id} (§13 lemonic) — the
+    // [Open in Parlay Bot] button on an inline search result. The
+    // id is case-sensitive (yt:/lemonic: ids), so the raw args are
+    // used, not the lowercased arg above.
+    std::string raw_arg = trim(ctx.args);
+    if (raw_arg.rfind("spotify----", 0) == 0) {
+        std::string track_id = raw_arg.substr(11);
+        if (!track_id.empty()) {
+            deepLinkDownload(ctx, track_id);
+            return;
+        }
+    }
+    // Deep links: /start help | /start pm_help -> the help menu.
+    if (arg == "help" || arg == "pm_help") {
+        if (isPrivate(ctx)) {
+            replyKb(ctx, ui_texts::kHelpMenu,
+                    ui_texts::helpMenuKeyboard());
+        } else {
+            replyHtml(ctx, ui_texts::kHelpGroup);
+        }
+        return;
+    }
+    // Share deep link: /start share_<token> (share-rust mints
+    // share_…) — also accept the hyphen form the inventory writes.
+    if (arg.rfind("share_", 0) == 0 || arg.rfind("share-", 0) == 0) {
+        std::string token = arg.substr(6);
+        if (!token.empty()) {
+            // (1) A token the core minted at /share time maps to the
+            // link owner: the send-music flow.
+            auto target = store_.get("sharetok:" + token);
+            if (target) {
+                int64_t target_id = 0;
+                try {
+                    target_id = std::stoll(*target);
+                } catch (...) {
+                }
+                if (target_id != 0) {
+                    if (target_id == uid) {
+                        replyHtml(ctx, ui_texts::kShareSelf);
+                        return;
+                    }
+                    store_.set("sharetarget:" + std::to_string(uid),
+                               std::to_string(target_id));
+                    InlineKeyboard kb = {{InlineButton::callback(
+                        ui_texts::kShareCancel, ui_texts::kCbClose)}};
+                    replyKb(ctx,
+                            ui_texts::fmt(ui_texts::kShareSendPrompt,
+                                          {{"name", ui_texts::htmlEscape(
+                                                         tg_.getUserMention(
+                                                             target_id))}}),
+                            kb);
+                    return;
+                }
+            }
+            // (2) Otherwise it is a track token: resolve it via
+            // share-rust and present the track.
+            IpcResult r = ipc_.get(cfg_.share_url,
+                                   "/v1/share/" + token, 15);
+            if (r.ok) {
+                const Json* track = r.data.find("track");
+                if (track) {
+                    ui_texts::CardTrack ct =
+                        cardTrack(*track, "");
+                    replyHtml(ctx,
+                              ui_texts::fmt(
+                                  ui_texts::kShareTrackOpened,
+                                  {{"track", ui_texts::trackLink(ct)},
+                                   {"title",
+                                    track->find("title")
+                                        ? track->find("title")->asString()
+                                        : ""}}));
+                    return;
+                }
+            }
+            replyHtml(ctx, ui_texts::kShareInvalidLink);
+            return;
+        }
+    }
+    if (isPrivate(ctx)) {
+        // The navidrome private-bot notice only applies when Parlay
+        // runs in private mode; there is no such config yet, so the
+        // normal start card is shown (kPrivateBotNotice is kept in
+        // ui_texts.hpp for that mode — see phase9/port-core.md).
+        if (!cfg_.start_img.empty()) {
+            replyPhoto(ctx, cfg_.start_img, ui_texts::kStartPm,
+                       ui_texts::startPmKeyboard(
+                           bot_username_, cfg_.updates_url, cfg_.support_url,
+                           cfg_.source_url));
+        } else {
+            replyKb(ctx, ui_texts::kStartPm,
+                    ui_texts::startPmKeyboard(bot_username_, cfg_.updates_url,
+                                              cfg_.support_url,
+                                              cfg_.source_url));
+        }
+        return;
+    }
+    replyKb(ctx, ui_texts::kStartGroup,
+            ui_texts::startGroupKeyboard(cfg_.updates_url, cfg_.support_url));
 }
 
 void Dispatcher::onHelp(const CommandContext& ctx) {
-    reply(ctx,
-          "Parlay commands:\n"
-          "/play <song, link or id> — play in voice chat (-f force, -v video)\n"
-          "/vplay <...> — play video in voice chat\n"
-          "/playplaylist — play your saved playlist\n"
-          "/pause /resume /skip /autoplay-skip /stop /end — playback\n"
-          "/loop [n|off] — repeat the current track n times (0-10)\n"
-          "/seek <sec> /seekback <sec> /jump <mm:ss> — seek\n"
-          "/queue /playing — show the queue\n"
-          "/clear /restore /remove <n> /move <a> <b> /shuffle — queue edits\n"
-          "/pos — current position  /speed [0.5-2.0] /bass [0-100]\n"
-          "/mute /unmute /replay /player /join — more playback\n"
-          "/lyrics [song] — lyrics for the current (or named) song\n"
-          "/search <query> — search YouTube / NetEase / Lemonic\n"
-          "/download <song or link> — download the audio file\n"
-          "/radio [station] — start a radio station in voice chat\n"
-          "/share <song> — create an anonymous share link\n"
-          "/engine [go|ts|rust] — show or switch this chat's VC engine\n"
-          "/addplaylist <song|url> /playlist /rmplaylist <n|name|all>\n"
-          "/playmode [admin|everyone] /settings — chat settings\n"
-          "/adminmode [admin|adminauth|everyone] — who controls playback\n"
-          "/cmddelete [on|off] /cleanmode [on|off|minutes]\n"
-          "/thumbnail [on|off] /autoplay [on|off|lang|mood]\n"
-          "/channelplay <@channel|id|disable> /userbot — channel play\n"
-          "/auth /unauth /authlist — authorized users\n"
-          "/admincache — refresh the admin list\n"
-          "/ping /stats /json /bug /privacy — tools\n"
-          "Sudo: /blacklist /broadcast /ac /logs /logger /restart "
-          "/speedtest /autoleave\n"
-          "Owner: /addsudo /delsudo /listsudo /maintenance /eval");
+    // In a group, /help points at the DM (all four refs agree).
+    if (isGroup(ctx)) {
+        std::string url = "https://t.me/" + bot_username_ +
+                          "?start=pm_help";
+        InlineKeyboard kb = {
+            {InlineButton::link("📒 Commands", url)}};
+        replyKb(ctx, ui_texts::kHelpGroup, kb);
+        return;
+    }
+    std::string arg = lowerStr(trim(ctx.args));
+    if (!arg.empty()) {
+        // /help <topic> or /help <command>: topic pages first, then
+        // the per-command table (§3).
+        std::string topic_text = ui_texts::helpTopicText(arg);
+        if (!topic_text.empty()) {
+            replyKb(ctx, topic_text, ui_texts::helpTopicKeyboard());
+            return;
+        }
+        const ui_texts::CmdHelp* h = ui_texts::findCmdHelp(arg);
+        if (h) {
+            replyHtml(ctx, ui_texts::perCommandHelpText(h->cmd));
+            return;
+        }
+        replyHtml(ctx, ui_texts::fmt(ui_texts::kHelpUnknownCmd,
+                                     {{"cmd", arg}}));
+        return;
+    }
+    replyKb(ctx, ui_texts::kHelpMenu, ui_texts::helpMenuKeyboard());
 }
 
 // --- handlers: playback ------------------------------------------------------
@@ -1327,7 +2288,8 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
             playRepliedFile(ctx, file_id, title, kind);
             return;
         }
-        reply(ctx, "Usage: /play <song title, link or track id>");
+        replyHtml(ctx, ui_texts::fmt(ui_texts::kNoSongQuery,
+                                     {{"cmd", "/play"}}));
         return;
     }
     if (!playAllowed(ctx, force)) return;
@@ -1346,6 +2308,13 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
             Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
         vcCall(ctx, "stop", stop_body, used, fb);
     }
+    // What was playing before this call: a play that lands while
+    // something is already playing queues the new track instead, and
+    // the reply is the queued card (§4), not the now-playing card.
+    Json np_before, track_before;
+    bool was_active = nowPlaying(vcTarget(ctx), np_before, track_before);
+    std::string old_id =
+        track_before.find("id") ? track_before.find("id")->asString() : "";
     Json body = Json::objectOf({
         {"chat_id", Json(vcTarget(ctx))},
         {"query", Json(trim(query))},
@@ -1371,9 +2340,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
             bool fb2 = false;
             vcCall(ctx, "stop",
                    Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}), u2, fb2);
-            reply(ctx, "That track is longer than the " +
-                           std::to_string(cfg_.duration_limit_min) +
-                           " minute limit.");
+            replyHtml(ctx, ui_texts::playTooLongText(cfg_.duration_limit_min));
             return;
         }
     }
@@ -1401,6 +2368,10 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     if (track) {
         setChatField(chat, "last_track",
                      track->find("title") ? track->find("title")->asString() : "");
+        store_.set("last_requester_name:" + std::to_string(chat),
+                   displayName(ctx.message.from));
+        store_.set("last_requester_id:" + std::to_string(chat),
+                   std::to_string(ctx.message.from.id));
     }
     if (chatField(chat, "logger_on", "") == "1" ||
         store_.get("logger_on") == std::optional<std::string>("1"))
@@ -1408,13 +2379,68 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
                     (track && track->find("title")
                          ? track->find("title")->asString()
                          : query));
-    std::string text = fmtNowPlaying(now, "▶ Now playing");
+    // Queued or playing? vc-rust says so outright ("queued": true);
+    // the other engines queue whenever something was already
+    // playing and the current track did not change.
+    bool queued = false;
+    if (const Json* q = r.data.find("queued")) queued = q->asBool();
+    if (!queued && was_active && track) {
+        std::string new_id =
+            track->find("id") ? track->find("id")->asString() : "";
+        queued = !old_id.empty() && new_id == old_id;
+    }
+    if (queued) {
+        // The new track is the tail of the queue: render the queued
+        // card for it (Yukki §4) with the Play Now button.
+        Engine uq;
+        bool fbq = false;
+        Json qbody = Json::objectOf({
+            {"chat_id", Json(chat)},
+            {"action", Json("list")},
+        });
+        IpcResult qr = vcCall(ctx, "queue", qbody, uq, fbq);
+        const Json* items = qr.ok ? qr.data.find("queue") : nullptr;
+        if (items && items->size() > 1) {
+            const Json& last = items->asArray()[items->size() - 1];
+            const Json* lt = last.find("track");
+            if (lt) {
+                int64_t by = last.find("requested_by")
+                                 ? last.find("requested_by")->asInt()
+                                 : ctx.message.from.id;
+                ui_texts::CardTrack ct = cardTrack(*lt, by);
+                std::string text = ui_texts::queuedText(
+                    static_cast<int>(items->size() - 1), ct);
+                std::string thumb =
+                    lt->find("thumbnail")
+                        ? lt->find("thumbnail")->asString()
+                        : "";
+                InlineKeyboard kb = ui_texts::queuedKeyboard(ct.token);
+                if (!thumb.empty() && thumbnailsOn(chat)) {
+                    if (replyPhoto(ctx, thumb, text, kb) > 0) {
+                        deleteCommandMessage(ctx);
+                        return;
+                    }
+                }
+                replyKb(ctx, text, kb);
+                deleteCommandMessage(ctx);
+                return;
+            }
+        }
+        // Queue list unavailable: the current track is still what
+        // is playing, so show its card (the queued track is visible
+        // in /queue). Never claim the queued track is playing.
+        sendNowPlayingCard(chat, now, "▶ Now playing");
+        deleteCommandMessage(ctx);
+        return;
+    }
+    std::string state_line = "▶ Now playing";
     if (fell_back)
-        text += "(fell back to engine " + std::string(engineName(used)) +
-                " — your preferred engine is unavailable)\n";
+        state_line += "\n(fell back to engine " +
+                      std::string(engineName(used)) +
+                      " — your preferred engine is unavailable)";
     if (chatIntField(chat, "muted", 0))
-        text += "(muted — use /unmute)\n";
-    reply(ctx, text);
+        state_line += "\n(muted — use /unmute)";
+    sendNowPlayingCard(chat, now, state_line);
     deleteCommandMessage(ctx);
 }
 
@@ -1479,16 +2505,20 @@ void Dispatcher::onPause(const CommandContext& ctx) {
         return;
     }
     const Json* np = r.data.find("now_playing");
-    std::string text = fmtNowPlaying(np ? *np : r.data, "⏸ Paused");
+    Json state = np ? *np : r.data;
+    std::string state_line = ui_texts::kCtlPaused;
     // The engine's pause is state only — the audio itself is on the
     // core backend, so pause that too when this chat is core-streaming.
     if (coreStreaming(vcTarget(ctx)) && !voice_.pause(vcTarget(ctx))) {
         std::string why = voice_.lastError();
         if (why.empty()) why = voice_.describe();
-        text += "Note: the core voice backend could not pause: " + why +
-                " — the call may keep playing.\n";
+        state_line += "\nNote: the core voice backend could not pause: " +
+                      why + " — the call may keep playing.";
     }
-    reply(ctx, text);
+    if (state.find("track"))
+        sendNowPlayingCard(vcTarget(ctx), state, state_line);
+    else
+        replyHtml(ctx, state_line);
 }
 
 void Dispatcher::onResume(const CommandContext& ctx) {
@@ -1506,16 +2536,20 @@ void Dispatcher::onResume(const CommandContext& ctx) {
         return;
     }
     const Json* np = r.data.find("now_playing");
-    std::string text = fmtNowPlaying(np ? *np : r.data, "▶ Resumed");
+    Json state = np ? *np : r.data;
+    std::string state_line = ui_texts::kCtlResumed;
     // Mirror of onPause: resume the core backend as well when it is
     // the one streaming this chat.
     if (coreStreaming(vcTarget(ctx)) && !voice_.resume(vcTarget(ctx))) {
         std::string why = voice_.lastError();
         if (why.empty()) why = voice_.describe();
-        text += "Note: the core voice backend could not resume: " + why +
-                " — the call may stay silent.\n";
+        state_line += "\nNote: the core voice backend could not resume: " +
+                      why + " — the call may stay silent.";
     }
-    reply(ctx, text);
+    if (state.find("track"))
+        sendNowPlayingCard(vcTarget(ctx), state, state_line);
+    else
+        replyHtml(ctx, state_line);
 }
 
 void Dispatcher::onSkip(const CommandContext& ctx) {
@@ -1542,20 +2576,21 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
         // failure is reported honestly; the engine keeps the new
         // track as current, so the user can /play or /skip again.
         int64_t chat = vcTarget(ctx);
+        std::string state_line = ui_texts::kCtlSkipped;
         if (coreStreaming(chat)) {
             bool video = chatField(chat, "core_video", "0") == "1";
             std::string err;
             if (!attachEngineAudio(chat, *np, video, 0, "", err)) {
                 voice_.stop(chat);
                 clearCoreStream(chat);
-                reply(ctx, fmtNowPlaying(*np, "⏭ Skipped — now playing") +
-                               "Note: the core voice backend could not "
-                               "attach the new track's audio: " +
-                               err + " — the call is silent.\n");
+                state_line += "\nNote: the core voice backend could not "
+                              "attach the new track's audio: " +
+                              err + " — the call is silent.";
+                sendNowPlayingCard(chat, *np, state_line);
                 return;
             }
         }
-        reply(ctx, fmtNowPlaying(*np, "⏭ Skipped — now playing"));
+        sendNowPlayingCard(chat, *np, state_line);
     } else {
         // Queue empty: the core's stream of the skipped track must
         // end too, or its ffmpeg source keeps playing to the end of
@@ -1594,21 +2629,21 @@ void Dispatcher::onAutoplaySkip(const CommandContext& ctx) {
         // Same re-attach as onSkip: the picked track's audio lives on
         // the core backend, not in the engine.
         int64_t chat = vcTarget(ctx);
+        std::string state_line = "⏭ Autoplay skipped — now playing";
         if (coreStreaming(chat)) {
             bool video = chatField(chat, "core_video", "0") == "1";
             std::string err;
             if (!attachEngineAudio(chat, *np, video, 0, "", err)) {
                 voice_.stop(chat);
                 clearCoreStream(chat);
-                reply(ctx,
-                      fmtNowPlaying(*np, "⏭ Autoplay skipped — now playing") +
-                          "Note: the core voice backend could not attach "
-                          "the new track's audio: " +
-                          err + " — the call is silent.\n");
+                state_line += "\nNote: the core voice backend could not "
+                              "attach the new track's audio: " +
+                              err + " — the call is silent.";
+                sendNowPlayingCard(chat, *np, state_line);
                 return;
             }
         }
-        reply(ctx, fmtNowPlaying(*np, "⏭ Autoplay skipped — now playing"));
+        sendNowPlayingCard(chat, *np, state_line);
     } else {
         voice_.stop(vcTarget(ctx));
         clearCoreStream(vcTarget(ctx));
@@ -1640,38 +2675,34 @@ void Dispatcher::onStop(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    reply(ctx, was_active ? "⏹ Stopped and cleared the queue."
-                          : "Nothing was playing.");
+    if (was_active)
+        replyHtml(ctx, ui_texts::fmt(ui_texts::kStoppedCard,
+                                     {{"user", ui_texts::htmlEscape(
+                                                   userLabel(ctx))}}));
+    else
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
 }
 
 void Dispatcher::onQueue(const CommandContext& ctx) {
-    Json body = Json::objectOf({
-        {"chat_id", Json(vcTarget(ctx))},
-        {"action", Json("list")},
-    });
-    Engine used;
-    bool fell_back = false;
-    IpcResult r = vcCall(ctx, "queue", body, used, fell_back);
-    if (!r.ok) {
-        replyError(ctx, r);
+    if (trim(ctx.args) == "help") {
+        replyHtml(ctx, ui_texts::kQueueHelpOps);
         return;
     }
-    reply(ctx, fmtQueue(r.data));
+    renderQueueCard(ctx, false);
 }
 
 void Dispatcher::onLoop(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     if (!callActive(vcTarget(ctx))) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
     auto args = splitArgs(ctx.args);
     int64_t chat = vcTarget(ctx);
     if (args.empty()) {
         int n = chatIntField(chat, "loop", 0);
-        reply(ctx, n > 0 ? "Looping the current track " + std::to_string(n) +
-                               " more time(s)."
-                         : "Usage: /loop <1-10|off>");
+        replyHtml(ctx, n > 0 ? ui_texts::kCtlLoopOn
+                             : "Usage: /loop <1-10|off>");
         return;
     }
     std::string a = lowerStr(args[0]);
@@ -1715,7 +2746,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
             }
         }
         setChatField(chat, "loop", "0");
-        reply(ctx, "Loop off.");
+        replyHtml(ctx, ui_texts::kCtlLoopOff);
         return;
     }
     if (!isDigits(a)) {
@@ -1727,7 +2758,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
     if (n > 10) n = 10;
     if (n == 0) {
         setChatField(chat, "loop", "0");
-        reply(ctx, "Loop off.");
+        replyHtml(ctx, ui_texts::kCtlLoopOff);
         return;
     }
     // Loop is enforced by queueing n copies of the current track after it:
@@ -1736,7 +2767,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
     // queue contract, so the loop is real, not a stored flag.)
     Json np, track;
     if (!nowPlaying(chat, np, track)) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
     int added = 0;
@@ -1754,10 +2785,8 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
         ++added;
     }
     setChatField(chat, "loop", std::to_string(added));
-    reply(ctx, added > 0
-                   ? "Looping the current track " + std::to_string(added) +
-                         " more time(s)."
-                   : "Could not queue loop copies (engine error).");
+    replyHtml(ctx, added > 0 ? ui_texts::kCtlLoopOn
+                             : "Could not queue loop copies (engine error).");
 }
 
 void Dispatcher::onSeek(const CommandContext& ctx) {
@@ -1831,7 +2860,7 @@ void Dispatcher::onSeek(const CommandContext& ctx) {
 void Dispatcher::onClear(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     if (!callActive(vcTarget(ctx))) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
     Json list_body = Json::objectOf({
@@ -1856,21 +2885,40 @@ void Dispatcher::onClear(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    reply(ctx, "Queue cleared (current track keeps playing).");
+    int cleared = 0;
+    {
+        // The snapshot saved above (before the clear) is the pending
+        // tail: index 0 is the then-current track, the rest were
+        // cleared.
+        auto snap = store_.get("cleared:" + std::to_string(vcTarget(ctx)));
+        if (snap) {
+            try {
+                Json arr = Json::parse(*snap);
+                cleared = static_cast<int>(arr.size() > 1 ? arr.size() - 1
+                                                          : 0);
+            } catch (...) {
+            }
+        }
+    }
+    if (cleared == 0) {
+        replyHtml(ctx, ui_texts::kQueueAlreadyEmpty);
+        return;
+    }
+    replyHtml(ctx, ui_texts::queueClearedText(cleared, userLabel(ctx)));
 }
 
 void Dispatcher::onRestore(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     auto saved = store_.get("cleared:" + std::to_string(vcTarget(ctx)));
     if (!saved || saved->empty()) {
-        reply(ctx, "Nothing to restore.");
+        replyHtml(ctx, ui_texts::kQueueRestoreNone);
         return;
     }
     Json arr;
     try {
         arr = Json::parse(*saved);
     } catch (...) {
-        reply(ctx, "Nothing to restore.");
+        replyHtml(ctx, ui_texts::kQueueRestoreNone);
         return;
     }
     int added = 0;
@@ -1894,7 +2942,7 @@ void Dispatcher::onRestore(const CommandContext& ctx) {
     }
     if (added) {
         store_.del("cleared:" + std::to_string(vcTarget(ctx)));
-        reply(ctx, "Restored " + std::to_string(added) + " track(s).");
+        replyHtml(ctx, ui_texts::queueRestoredText(userLabel(ctx)));
     } else {
         reply(ctx, "Could not restore the queue (engine error).");
     }
@@ -1903,30 +2951,122 @@ void Dispatcher::onRestore(const CommandContext& ctx) {
 void Dispatcher::onRemove(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     auto args = splitArgs(ctx.args);
-    if (args.empty() || !isDigits(args[0])) {
-        reply(ctx, "Usage: /remove <position>");
+    if (args.empty()) {
+        replyHtml(ctx, ui_texts::kRemoveUsage);
         return;
     }
-    Json body = Json::objectOf({
+    // Positions are the 1-based up-next numbers from /queue (which
+    // are also the engine queue positions: index 0 is now-playing).
+    // Syntax (§5, NoxBeats usage line): a single position, a range
+    // "1-5", or a list "1,3,5". Ranges/lists remove from the highest
+    // position down, so earlier positions stay valid.
+    std::vector<int64_t> positions;
+    std::string spec = args[0];
+    auto parse_num = [](const std::string& t, int64_t& out) {
+        if (t.empty()) return false;
+        for (char c : t)
+            if (c < '0' || c > '9') return false;
+        try {
+            out = std::stoll(t);
+        } catch (...) {
+            return false;
+        }
+        return out >= 1;
+    };
+    if (spec.find('-') != std::string::npos) {
+        size_t dash = spec.find('-');
+        int64_t lo = 0, hi = 0;
+        if (!parse_num(spec.substr(0, dash), lo) ||
+            !parse_num(spec.substr(dash + 1), hi) || hi < lo) {
+            replyHtml(ctx, ui_texts::kRemoveUsage);
+            return;
+        }
+        for (int64_t p = hi; p >= lo; --p) positions.push_back(p);
+    } else if (spec.find(',') != std::string::npos) {
+        std::string cur;
+        for (char c : spec + ",") {
+            if (c == ',') {
+                int64_t p = 0;
+                if (!parse_num(cur, p)) {
+                    replyHtml(ctx, ui_texts::kRemoveUsage);
+                    return;
+                }
+                positions.push_back(p);
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        std::sort(positions.begin(), positions.end(),
+                  std::greater<int64_t>());
+        positions.erase(std::unique(positions.begin(), positions.end()),
+                        positions.end());
+    } else {
+        int64_t p = 0;
+        if (!parse_num(spec, p)) {
+            replyHtml(ctx, ui_texts::kRemoveUsage);
+            return;
+        }
+        positions.push_back(p);
+    }
+    // The title for the single-remove reply comes from the queue list.
+    Json list_body = Json::objectOf({
         {"chat_id", Json(vcTarget(ctx))},
-        {"action", Json("remove")},
-        {"position", Json(static_cast<int64_t>(std::stoll(args[0])))},
+        {"action", Json("list")},
     });
     Engine used;
     bool fb = false;
-    IpcResult r = vcCall(ctx, "queue", body, used, fb);
-    if (!r.ok) {
-        replyError(ctx, r);
+    IpcResult q = vcCall(ctx, "queue", list_body, used, fb);
+    if (!q.ok) {
+        replyError(ctx, q);
         return;
     }
-    reply(ctx, "Removed position " + args[0] + " from the queue.");
+    const Json* items = q.data.find("queue");
+    if (!items) {
+        replyHtml(ctx, ui_texts::kRemoveBadPos);
+        return;
+    }
+    std::string first_title;
+    for (int64_t p : positions) {
+        if (p < 1 || p >= static_cast<int64_t>(items->size())) {
+            replyHtml(ctx, ui_texts::kRemoveBadPos);
+            return;
+        }
+        if (positions.size() == 1) {
+            const Json* t =
+                items->asArray()[static_cast<size_t>(p)].find("track");
+            if (t && t->find("title"))
+                first_title = t->find("title")->asString();
+        }
+    }
+    int removed = 0;
+    for (int64_t p : positions) {
+        Json body = Json::objectOf({
+            {"chat_id", Json(vcTarget(ctx))},
+            {"action", Json("remove")},
+            {"position", Json(p)},
+        });
+        IpcResult r = vcCall(ctx, "queue", body, used, fb);
+        if (!r.ok) {
+            replyError(ctx, r);
+            return;
+        }
+        ++removed;
+    }
+    if (removed == 1)
+        replyHtml(ctx, ui_texts::queueRemovedText(
+                           static_cast<int>(positions[0]),
+                           ui_texts::htmlEscape(first_title), userLabel(ctx)));
+    else
+        replyHtml(ctx, ui_texts::queueRemovedManyText(removed,
+                                                      userLabel(ctx)));
 }
 
 void Dispatcher::onMove(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     auto args = splitArgs(ctx.args);
     if (args.size() < 2 || !isDigits(args[0]) || !isDigits(args[1])) {
-        reply(ctx, "Usage: /move <from> <to>");
+        replyHtml(ctx, ui_texts::kMoveUsage);
         return;
     }
     int64_t from = std::stoll(args[0]);
@@ -1948,7 +3088,7 @@ void Dispatcher::onMove(const CommandContext& ctx) {
     if (!items || from < 1 || to < 1 ||
         from > static_cast<int64_t>(items->size()) ||
         to > static_cast<int64_t>(items->size())) {
-        reply(ctx, "Bad position.");
+        replyHtml(ctx, ui_texts::kRemoveBadPos);
         return;
     }
     std::vector<Json> tracks;
@@ -1987,14 +3127,15 @@ void Dispatcher::onMove(const CommandContext& ctx) {
         });
         vcCall(ctx, "queue", add, used, fb);
     }
-    reply(ctx, "Moved position " + std::to_string(from) + " to " +
-                   std::to_string(to) + ".");
+    replyHtml(ctx, ui_texts::queueMovedText(static_cast<int>(from),
+                                              static_cast<int>(to),
+                                              userLabel(ctx)));
 }
 
 void Dispatcher::onShuffle(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     if (!callActive(vcTarget(ctx))) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
     Json list_body = Json::objectOf({
@@ -2010,7 +3151,7 @@ void Dispatcher::onShuffle(const CommandContext& ctx) {
     }
     const Json* items = q.data.find("queue");
     if (!items || items->size() < 3) {
-        reply(ctx, "Need at least 3 tracks in the queue to shuffle.");
+        replyHtml(ctx, ui_texts::kShuffleFew);
         return;
     }
     std::vector<Json> pending;
@@ -2040,14 +3181,14 @@ void Dispatcher::onShuffle(const CommandContext& ctx) {
         });
         vcCall(ctx, "queue", add, used, fb);
     }
-    reply(ctx, "Shuffled " + std::to_string(pending.size()) +
-                   " queued track(s).");
+    replyHtml(ctx, ui_texts::queueShuffledText(
+                        static_cast<int>(pending.size()), userLabel(ctx)));
 }
 
 void Dispatcher::onPos(const CommandContext& ctx) {
     Json np, track;
     if (!nowPlaying(vcTarget(ctx), np, track)) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
     int64_t pos =
@@ -2055,9 +3196,15 @@ void Dispatcher::onPos(const CommandContext& ctx) {
     int64_t dur =
         track.find("duration_sec") ? track.find("duration_sec")->asInt() : 0;
     std::string speed = chatField(vcTarget(ctx), "speed", "1.0");
-    reply(ctx, fmtTrack(track) + "\nPosition: " + fmtSeconds(pos) +
-                   (dur ? " / " + fmtSeconds(dur) : "") +
-                   "  Speed: " + speed + "x");
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kPositionText,
+                                 {{"title",
+                                   ui_texts::htmlEscape(
+                                       track.find("title")
+                                           ? track.find("title")->asString()
+                                           : "?")},
+                                  {"position", fmtSeconds(pos)},
+                                  {"duration", dur ? fmtSeconds(dur) : "∞"},
+                                  {"speed", speed}}));
 }
 
 void Dispatcher::onJump(const CommandContext& ctx) {
@@ -2121,7 +3268,7 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
         reply(ctx, "Current speed: " + chatField(chat, "speed", "1.0") +
-                       "x. Usage: /speed <0.5-2.0|normal>");
+                       "x. Usage: /speed <0.5-4.0|normal>");
         return;
     }
     if (!canManageVc(ctx)) return;
@@ -2137,8 +3284,10 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
             !std::isfinite(s))
             s = 0;
     }
-    if (s < 0.5 || s > 2.0) {
-        reply(ctx, "Speed must be 0.5x to 2.0x.");
+    // atempo accepts 0.5–100.0 in a single filter (§9: 0.50x–4.00x),
+    // so no chaining is needed for the widened range.
+    if (s < 0.5 || s > 4.0) {
+        reply(ctx, "Speed must be 0.5x to 4.0x.");
         return;
     }
     setChatField(chat, "speed", std::to_string(s));
@@ -2261,7 +3410,8 @@ void Dispatcher::onMute(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     int cur = chatIntField(chat, "muted", 0);
     if ((cur != 0) == mute) {
-        reply(ctx, mute ? "Already muted." : "Already unmuted.");
+        replyHtml(ctx, mute ? ui_texts::kCtlAlreadyMuted
+                            : ui_texts::kCtlNotMuted);
         return;
     }
     // The backend work lives in muteVoice (shared with POST /v1/mute).
@@ -2277,7 +3427,7 @@ void Dispatcher::onMute(const CommandContext& ctx) {
         }
         return;
     }
-    reply(ctx, mute ? "Muted." : "Unmuted.");
+    replyHtml(ctx, mute ? ui_texts::kCtlMuted : ui_texts::kCtlUnmuted);
 }
 
 void Dispatcher::onJoin(const CommandContext& ctx) {
@@ -2286,7 +3436,7 @@ void Dispatcher::onJoin(const CommandContext& ctx) {
     if (callActive(chat)) {
         std::string owner = chatField(chat, "voice_owner", "");
         if (owner == "core") {
-            reply(ctx, "Already in the voice chat.");
+            replyHtml(ctx, ui_texts::kCtlAlreadyJoined);
         } else {
             reply(ctx, "Already in the voice chat (the " +
                            (owner.empty() ? std::string("engine") : owner) +
@@ -2306,14 +3456,14 @@ void Dispatcher::onJoin(const CommandContext& ctx) {
     }
     setChatField(chat, "voice_owner", "core");
     setCallActive(chat, true);
-    reply(ctx, "Joined the voice chat.");
+    replyHtml(ctx, ui_texts::kCtlJoined);
 }
 
 void Dispatcher::onReplay(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     Json np, track;
     if (!nowPlaying(vcTarget(ctx), np, track)) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
     Json body = Json::objectOf({
@@ -2327,7 +3477,7 @@ void Dispatcher::onReplay(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    std::string text = "Replaying from the start.";
+    std::string text = ui_texts::kToastReplayOk;
     // Same core re-attach as onSeek: the engine's seek moves state
     // only, the audio is on the core backend.
     if (coreStreaming(vcTarget(ctx))) {
@@ -2345,23 +3495,32 @@ void Dispatcher::onReplay(const CommandContext& ctx) {
 void Dispatcher::onPlayer(const CommandContext& ctx) {
     Json np, track;
     if (!nowPlaying(vcTarget(ctx), np, track)) {
-        reply(ctx, "Nothing is playing.");
+        replyHtml(ctx, ui_texts::kCtlNotStreaming);
         return;
     }
-    reply(ctx, fmtNowPlaying(np, "▶ Now playing"));
+    // /player re-sends the current card and deletes the old one (§4).
+    int64_t old_id = 0;
+    bool was_photo = false;
+    if (cardInfo(vcTarget(ctx), old_id, was_photo) && old_id != 0)
+        tg_.deleteMessage(vcTarget(ctx), old_id);
+    sendNowPlayingCard(vcTarget(ctx), np, "▶ Now playing");
 }
 
 void Dispatcher::onLyrics(const CommandContext& ctx) {
     std::string query = trim(ctx.args);
-    if (query.empty()) {
+    bool named = !query.empty();
+    std::string card_title;
+    if (!named) {
+        // Current track (remix §2.6): no args -> the playing song.
         Json np, track;
         if (!nowPlaying(vcTarget(ctx), np, track)) {
-            reply(ctx, "Nothing is playing. Usage: /lyrics <song>");
+            replyHtml(ctx, ui_texts::kLyricsNotStreaming);
             return;
         }
         query = track.find("title") ? track.find("title")->asString() : "";
+        card_title = query;
         if (query.empty()) {
-            reply(ctx, "Could not tell what is playing.");
+            replyHtml(ctx, ui_texts::kLyricsNotFound);
             return;
         }
     }
@@ -2377,157 +3536,630 @@ void Dispatcher::onLyrics(const CommandContext& ctx) {
     }
     const Json* results = s.data.find("results");
     if (!results || results->size() == 0) {
-        reply(ctx, "No lyrics found for \"" + query + "\".");
+        replyHtml(ctx, named ? ui_texts::kLyricsNoResults
+                             : ui_texts::kLyricsNotFound);
         return;
     }
     const Json* first = &results->asArray()[0];
     std::string tid = first->find("id") ? first->find("id")->asString() : "";
     if (tid.empty()) {
-        reply(ctx, "No lyrics found for \"" + query + "\".");
+        replyHtml(ctx, named ? ui_texts::kLyricsNoResults
+                             : ui_texts::kLyricsNotFound);
         return;
     }
     Json lbody = Json::objectOf({{"track_id", Json(tid)}});
     IpcResult l = ipc_.post(cfg_.netease_url, "netease/lyrics", lbody, 20);
     if (!l.ok) {
-        replyError(ctx, l);
+        replyHtml(ctx, ui_texts::kLyricsFail);
         return;
     }
     const Json* lyrics = l.data.find("lyrics");
     std::string text = lyrics ? lyrics->asString() : "";
     if (text.empty()) {
-        reply(ctx, "No lyrics available for \"" + query + "\".");
+        replyHtml(ctx, named ? ui_texts::kLyricsNoResults
+                             : ui_texts::kLyricsNotFound);
         return;
     }
-    if (text.size() > 3500) text = text.substr(0, 3500) + "\n...";
-    reply(ctx, "Lyrics for " + fmtTrack(*first) + ":\n" + text);
+    if (named) {
+        // Named song (Music163bot §6.5): the .lrc as a document with
+        // the lyric as an expandable quote caption (timestamps
+        // stripped, truncated to 1024 characters + "…" when longer).
+        std::string title =
+            first->find("title") ? first->find("title")->asString() : query;
+        std::string stripped;
+        {
+            std::istringstream in(text);
+            std::string line;
+            while (std::getline(in, line)) {
+                // Drop [mm:ss.xx] timestamp prefixes.
+                while (line.size() > 1 && line[0] == '[') {
+                    size_t close = line.find(']');
+                    if (close == std::string::npos) break;
+                    line = line.substr(close + 1);
+                }
+                if (!line.empty() && line[0] == ' ') line.erase(0, 1);
+                stripped += line + "\n";
+            }
+        }
+        std::string safe;
+        for (char c : title) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ' ')
+                safe += c;
+        }
+        if (safe.empty()) safe = "lyrics";
+        // The service writes the raw .lrc itself and returns its path
+        // (IPC-5 lrc_path, ruling 4): send that file when present — a
+        // real .lrc keeps its timestamps. Otherwise fall back to
+        // writing our own stripped copy under <data_dir>/lyrics. The
+        // caption is the stripped lyric either way (§6: timestamps
+        // stripped in the caption, not the file).
+        std::string path;
+        const Json* lrc = l.data.find("lrc_path");
+        if (lrc && !lrc->asString().empty()) {
+            path = lrc->asString();
+        } else {
+            std::string dir = cfg_.data_dir + "/lyrics";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            path = dir + "/" + safe + ".lrc";
+            std::ofstream out(path, std::ios::binary);
+            if (!out) {
+                replyHtml(ctx, ui_texts::kLyricsFail);
+                return;
+            }
+            out << stripped;
+        }
+        std::string cap_lyric =
+            ui_texts::truncUtf8(ui_texts::htmlEscape(stripped), 1024);
+        std::string caption = "<blockquote expandable>" + cap_lyric +
+                              "</blockquote>";
+        std::string err;
+        if (tg_.sendFile(ctx.message.chat.id, path, caption, &err) < 0)
+            replyError(ctx, IpcResult{false, Json(), "send_failed", err});
+        return;
+    }
+    // Current track (remix): the card, chunked at 4096 characters.
+    std::string header = ui_texts::fmt(
+        ui_texts::kLyricsCard,
+        {{"title", ui_texts::htmlEscape(card_title)}, {"lyrics", ""}});
+    size_t first_room = 4096 > header.size() ? 4096 - header.size() : 0;
+    std::string first_chunk = ui_texts::truncUtf8(
+        ui_texts::htmlEscape(text), static_cast<int>(first_room));
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kLyricsCard,
+                                 {{"title", ui_texts::htmlEscape(card_title)},
+                                  {"lyrics", first_chunk}}));
+    // Remaining chunks (plain text, 4096 chars each). The first chunk
+    // is a prefix of the escaped text, so its byte size is the exact
+    // offset to resume from.
+    std::string escaped = ui_texts::htmlEscape(text);
+    size_t done = first_chunk.size();
+    while (done < escaped.size()) {
+        std::string chunk = ui_texts::truncUtf8(
+            escaped.substr(done), 4096);
+        if (chunk.empty()) break;
+        replyHtml(ctx, chunk);
+        done += chunk.size();
+    }
 }
 
 // --- handlers: search / download / radio / share / engine -------------------
+std::string Dispatcher::searchResultsText(const std::string& query,
+                                          const Json& results, int page) {
+    std::string text = ui_texts::searchHeaderText(query);
+    size_t start = static_cast<size_t>((page - 1) * 10);
+    size_t end = std::min(results.size(), start + 10);
+    for (size_t i = start; i < end; ++i) {
+        const Json& t = results.asArray()[i];
+        auto str_field = [&t](const char* key) {
+            const Json* f = t.find(key);
+            return f ? f->asString() : std::string();
+        };
+        std::string dur = str_field("duration_str");
+        if (dur.empty()) {
+            const Json* ds = t.find("duration_sec");
+            if (ds && ds->asInt() > 0) dur = ui_texts::mmss(ds->asInt());
+        }
+        std::string views;
+        if (const Json* v = t.find("views"))
+            views = std::to_string(v->asInt());
+        bool is_live = false;
+        if (const Json* l = t.find("is_live")) is_live = l->asBool();
+        std::string artists = str_field("artist");
+        if (artists.empty()) artists = str_field("uploader");
+        text += "\n" + ui_texts::searchResultLine(
+                          static_cast<int>(i + 1),
+                          ui_texts::htmlEscape(str_field("title")),
+                          str_field("url"),
+                          ui_texts::htmlEscape(artists), dur, views,
+                          str_field("upload_time"),
+                          ui_texts::htmlEscape(str_field("uploader")),
+                          is_live);
+    }
+    text += "\n";
+    text += ui_texts::kSearchFooter;
+    return text;
+}
+
+InlineKeyboard Dispatcher::searchResultsKeyboard(int64_t user_id,
+                                                 const std::string& query,
+                                                 const Json& results,
+                                                 int page) {
+    size_t start = static_cast<size_t>((page - 1) * 10);
+    size_t end = std::min(results.size(), start + 10);
+    std::vector<std::pair<int, std::string>> picks;
+    for (size_t i = start; i < end; ++i) {
+        const Json& t = results.asArray()[i];
+        std::string id = t.find("id") ? t.find("id")->asString() : "";
+        picks.emplace_back(static_cast<int>(i + 1),
+                           ui_texts::cbSearchPick(static_cast<int>(i + 1),
+                                                  user_id,
+                                                  ui_texts::trackToken(id)));
+    }
+    InlineKeyboard kb = ui_texts::searchKeyboard(picks);
+    int total_pages = static_cast<int>((results.size() + 9) / 10);
+    if (total_pages > 1) {
+        InlineKeyboard nav = ui_texts::searchPageKeyboard(
+            user_id, page, ui_texts::queryHash(query), page > 1,
+            end < results.size(), total_pages);
+        for (auto& row : nav) kb.push_back(std::move(row));
+    }
+    return kb;
+}
+
 void Dispatcher::onSearch(const CommandContext& ctx) {
     std::string query = trim(ctx.args);
     if (query.empty()) {
-        reply(ctx, "Usage: /search <query>  (prefix ne: for NetEase)");
+        replyHtml(ctx, ui_texts::kSearchNoQuery);
         return;
     }
+    // Query cap (§7): 50 chars for the command form.
+    if (query.size() > 50) query = query.substr(0, 50);
+    // Per-user cooldown (lemonic "Too frequent"): 5 s between searches.
+    auto cool = store_.get("searchcool:" + std::to_string(ctx.message.from.id));
+    long long now_s =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    if (cool) {
+        try {
+            long long last = std::stoll(*cool);
+            if (now_s - last < 5) {
+                replyHtml(ctx, ui_texts::searchTooFrequentText(
+                                   static_cast<int>(5 - (now_s - last))));
+                return;
+            }
+        } catch (...) {
+        }
+    }
+    store_.set("searchcool:" + std::to_string(ctx.message.from.id),
+               std::to_string(now_s));
     // Optional source prefix: ne: -> NetEase, else vc-ts (all sources).
-    if (query.rfind("ne:", 0) == 0 || query.rfind("netease:", 0) == 0) {
-        std::string q = query.substr(query.find(':') + 1);
-        Json body = Json::objectOf({
-            {"query", Json(trim(q))},
-            {"limit", Json(static_cast<int64_t>(5))},
-        });
-        IpcResult r = ipc_.post(cfg_.netease_url, "netease/search", body, 20);
-        if (!r.ok) {
-            replyError(ctx, r);
-            return;
-        }
-        const Json* results = r.data.find("results");
-        if (!results || results->size() == 0) {
-            reply(ctx, "No results for \"" + trim(q) + "\".");
-            return;
-        }
-        std::string out = "NetEase results for \"" + trim(q) + "\":\n";
-        size_t i = 0;
-        for (const auto& t : results->asArray())
-            out += std::to_string(++i) + ". " + fmtTrack(t) + "\n";
-        out += "Use /play <title or link> to play one.";
-        reply(ctx, out);
+    bool netease = query.rfind("ne:", 0) == 0 ||
+                   query.rfind("netease:", 0) == 0;
+    std::string q = netease ? trim(query.substr(query.find(':') + 1))
+                            : query;
+    if (q.empty()) {
+        replyHtml(ctx, ui_texts::kSearchNoQuery);
         return;
     }
-    Json body = Json::objectOf({
-        {"query", Json(query)},
-        {"source", Json("all")},
-        {"limit", Json(static_cast<int64_t>(5))},
-    });
-    IpcResult r = ipc_.post(cfg_.vc_ts_url, "search", body, 20);
+    Json body;
+    IpcResult r;
+    if (netease) {
+        body = Json::objectOf({
+            {"query", Json(q)},
+            {"limit", Json(static_cast<int64_t>(10))},
+        });
+        r = ipc_.post(cfg_.netease_url, "netease/search", body, 20);
+    } else {
+        body = Json::objectOf({
+            {"query", Json(q)},
+            {"source", Json("all")},
+            {"limit", Json(static_cast<int64_t>(10))},
+        });
+        r = ipc_.post(cfg_.vc_ts_url, "search", body, 20);
+    }
     if (!r.ok) {
         replyError(ctx, r);
         return;
     }
     const Json* results = r.data.find("results");
     if (!results || results->size() == 0) {
-        reply(ctx, "No results for \"" + query + "\".");
+        replyHtml(ctx, ui_texts::kSearchNoResults);
         return;
     }
-    std::string out = "Results for \"" + query + "\":\n";
-    size_t i = 0;
-    for (const auto& t : results->asArray())
-        out += std::to_string(++i) + ". " + fmtTrack(t) + "\n";
-    out += "Use /play <title or link> to play one.";
-    reply(ctx, out);
+    int64_t msg = replyKb(ctx, searchResultsText(q, *results, 1),
+                          searchResultsKeyboard(ctx.message.from.id, q,
+                                                *results, 1));
+    if (msg > 0)
+        storeSearchSession(ctx.message.from.id, q, *results, msg);
 }
 
 void Dispatcher::onDownload(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     std::string query = trim(ctx.args);
     if (query.empty()) {
-        reply(ctx, "Usage: /download <song title or link>");
+        replyHtml(ctx, ui_texts::kDlUsage);
         return;
     }
     // Route by link type (NoxBeats links::source_of): Spotify links go
     // to download.spotify (playlist links to the playlist action), everything
     // else to download.youtube.
     std::string low = lowerStr(query);
+    bool is_spotify = low.find("spotify.com") != std::string::npos ||
+                      low.rfind("spotify:", 0) == 0;
+    bool playlist = is_spotify &&
+                    (low.find("/playlist/") != std::string::npos ||
+                     low.find(":playlist:") != std::string::npos ||
+                     low.find("/album/") != std::string::npos ||
+                     low.find(":album:") != std::string::npos);
+    if (playlist) {
+        // Spotify playlist/album: the user picks the delivery mode
+        // first (Spotify-Loader §5.3) — the choice runs in cbDl.
+        std::string run_id = mintRunId();
+        store_.set("dlpick:" + run_id,
+                   query + "\n" + std::to_string(ctx.message.chat.id));
+        replyKb(ctx, ui_texts::kDlSpotifyOptions,
+                ui_texts::dlSpotifyOptionsKeyboard(run_id));
+        return;
+    }
     std::string action = "download/youtube";
     Json body;
-    if (low.find("spotify.com") != std::string::npos ||
-        low.rfind("spotify:", 0) == 0) {
-        bool playlist = low.find("/playlist/") != std::string::npos ||
-                        low.find(":playlist:") != std::string::npos;
-        action = playlist ? "download/spotify-playlist" : "download/spotify";
+    if (is_spotify) {
+        action = "download/spotify";
         body = Json::objectOf({
             {"url", Json(query)},
             {"requested_by", Json(ctx.message.from.id)},
         });
-        if (playlist) body.set("mode", Json("files"));
     } else {
         body = Json::objectOf({
             {"query", Json(query)},
             {"requested_by", Json(ctx.message.from.id)},
         });
     }
-    IpcResult r = ipc_.post(cfg_.dl_url, action, body, 60);
+    // Progress message, edited in place (§8): the download POST is
+    // synchronous, so the core cannot poll live percentages — the
+    // downloaders only reveal their run_id in the POST response, by
+    // design (server.py). The message is edited to the outcome, and
+    // the final IPC-4 snapshot is fetched for the album checklist
+    // and the lossy prompt.
+    std::string run_id = mintRunId();
+    store_.set("dlrun:" + run_id,
+               "pending\n" + std::to_string(ctx.message.chat.id));
+    InlineKeyboard cancel_kb = {{InlineButton::callback(
+        ui_texts::kDlCancelBtn, ui_texts::cbDlCancel(run_id))}};
+    int64_t progress_msg = replyKb(ctx, ui_texts::kDlFetching, cancel_kb);
+    auto edit_progress = [&](const std::string& text,
+                             const InlineKeyboard& kb) {
+        if (progress_msg <= 0) return;
+        std::string err;
+        tg_.editMessageText(ctx.message.chat.id, progress_msg, text,
+                            kb.empty() ? Json(nullptr)
+                                       : inlineKeyboardJson(kb),
+                            &err);
+    };
+    IpcResult r = ipc_.post(cfg_.dl_url, action, body, 120);
     if (!r.ok) {
-        replyError(ctx, r);
+        edit_progress(ui_texts::dlFailedText(r.error_message),
+                      InlineKeyboard{});
         return;
     }
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
-        reply(ctx,
-              "That file is over the 50 MB Bot API cap — queued for a later "
-              "MTProto send instead of failing. (See contracts/ipc.json.)");
+        edit_progress("That file is over the 50 MB Bot API cap — queued "
+                      "for a later MTProto send instead of failing.",
+                      InlineKeyboard{});
         return;
     }
     const Json* track = r.data.find("track");
     const Json* path = r.data.find("file_path");
+    std::string file_path = path ? path->asString() : "";
+    std::string artist =
+        track && track->find("artist") ? track->find("artist")->asString()
+                                       : "";
+    std::string title =
+        track && track->find("title") ? track->find("title")->asString()
+                                      : query;
+    // The server run id (for the IPC-4 final snapshot).
+    std::string server_run;
+    if (const Json* rid = r.data.find("run_id"))
+        server_run = rid->asString();
+    store_.set("dlrun:" + run_id,
+               file_path + "\n" + std::to_string(ctx.message.chat.id) +
+                   "\n" + artist + "\n" + title);
+    if (!server_run.empty())
+        store_.set("dlsrv:" + run_id, server_run);
+    // Final IPC-4 snapshot: album checklist + lossy prompt trigger.
+    bool lossy = false;
+    std::string lossy_summary;
+    if (!server_run.empty()) {
+        IpcResult snap = ipc_.get(cfg_.dl_url,
+                                  "/v1/download/progress?run_id=" +
+                                      server_run,
+                                  10);
+        if (snap.ok) {
+            if (const Json* la = snap.data.find("lossy_available"))
+                lossy = la->asBool();
+            if (const Json* ls = snap.data.find("lossy_summary"))
+                lossy_summary = ls->asString();
+        }
+    }
+    if (lossy) {
+        edit_progress(ui_texts::fmt(ui_texts::kLossyPrompt,
+                                    {{"artist", ui_texts::htmlEscape(artist)},
+                                     {"title", ui_texts::htmlEscape(title)},
+                                     {"summary", ui_texts::htmlEscape(
+                                                    lossy_summary)}}),
+                      ui_texts::lossyKeyboard(run_id, lossy_summary));
+        return;
+    }
+    if (file_path.empty() || !std::filesystem::exists(file_path)) {
+        // The file is not on a filesystem the core can read (the
+        // shared /data volume is a compose property): report the
+        // path honestly instead of claiming a delivery.
+        std::string text = ui_texts::kDlSuccess;
+        if (track) text += " " + fmtTrack(*track);
+        if (!file_path.empty()) text += "\nFile: " + file_path;
+        edit_progress(text, InlineKeyboard{});
+        return;
+    }
+    // Deliver the file with the Music163bot caption (§8), then offer
+    // the FX picker on its own message.
+    std::string caption =
+        audioCaption(track, file_path, title, artist, bot_username_);
+    std::string err;
+    if (tg_.sendAudioFile(ctx.message.chat.id, file_path, caption, &err) <
+        0) {
+        edit_progress(ui_texts::dlFailedText(err), InlineKeyboard{});
+        return;
+    }
+    edit_progress(ui_texts::kDlSuccess, InlineKeyboard{});
+    replyKb(ctx,
+            ui_texts::fmt(ui_texts::kDlFxPrompt,
+                          {{"title", ui_texts::htmlEscape(title)}}),
+            ui_texts::dlFxKeyboard(run_id));
+}
+
+// The Music163bot audio caption (§8), shared by /download and the
+// /start spotify---- deep link: name/artists/album/ext/size/kbps/bot.
+// sizeMB/kbps are pre-formatted here (ui_texts::fmt does plain
+// substitution, no float formatting).
+std::string Dispatcher::audioCaption(const Json* track,
+                                     const std::string& file_path,
+                                     const std::string& title,
+                                     const std::string& artist,
+                                     const std::string& bot_username) {
+    return ui_texts::fmt(
+        ui_texts::kAudioCaption,
+        {{"name", ui_texts::htmlEscape(title)},
+         {"artists", ui_texts::htmlEscape(artist)},
+         {"album",
+          ui_texts::htmlEscape(track && track->find("album")
+                                   ? track->find("album")->asString()
+                                   : "")},
+         {"ext", [&] {
+              size_t dot = file_path.find_last_of('.');
+              return dot == std::string::npos
+                         ? std::string("mp3")
+                         : file_path.substr(dot + 1);
+          }()},
+         {"sizeMB", [&] {
+              std::error_code ec;
+              auto bytes = std::filesystem::file_size(file_path, ec);
+              char buf[32];
+              std::snprintf(buf, sizeof(buf), "%.2f",
+                            ec ? 0.0 : bytes / 1000000.0);
+              return std::string(buf);
+          }()},
+         {"kbps", [&] {
+              std::error_code ec;
+              auto bytes = std::filesystem::file_size(file_path, ec);
+              int64_t dur = track && track->find("duration_sec")
+                                ? track->find("duration_sec")->asInt()
+                                : 0;
+              char buf[32];
+              std::snprintf(buf, sizeof(buf), "%.2f",
+                            dur > 0 && !ec ? bytes * 8.0 / dur / 1000.0
+                                           : 0.0);
+              return std::string(buf);
+          }()},
+         {"bot", bot_username}});
+}
+
+// /start spotify----{id} (§13 lemonic): the [Open in Parlay Bot]
+// button on an inline search result. Resolves the track to a URL —
+// the stored inline results first (they carry url + source), else
+// the id prefix — then downloads it like /download and sends the
+// audio file in this chat. One-shot: no lossy prompt and no FX
+// picker (those belong to the /download flow).
+void Dispatcher::deepLinkDownload(const CommandContext& ctx,
+                                  const std::string& track_id) {
+    Json track;
+    std::string url;
+    if (loadInlineTrack(ctx.message.from.id, track_id, track)) {
+        url = track.find("url") ? track.find("url")->asString() : "";
+        if (url.empty() && track.find("stream_url"))
+            url = track.find("stream_url")->asString();
+    }
+    if (url.empty()) {
+        // Prefix fallback (the store may have been cleared since the
+        // inline query). lemonic: ids cannot be resolved without the
+        // stored result — they carry no URL of their own.
+        if (track_id.rfind("spotify:", 0) == 0)
+            url = "https://open.spotify.com/track/" + track_id.substr(8);
+        else if (track_id.rfind("yt:", 0) == 0)
+            url = "https://www.youtube.com/watch?v=" + track_id.substr(3);
+    }
+    if (url.empty()) {
+        replyHtml(ctx, ui_texts::kDlDeepLinkExpired);
+        return;
+    }
+    // Route by link type (same rule as /download): Spotify links to
+    // download.spotify, everything else to download.youtube.
+    std::string low = lowerStr(url);
+    bool is_spotify = low.find("spotify.com") != std::string::npos ||
+                      low.rfind("spotify:", 0) == 0;
+    std::string action =
+        is_spotify ? "download/spotify" : "download/youtube";
+    Json body = is_spotify
+                    ? Json::objectOf({
+                          {"url", Json(url)},
+                          {"requested_by", Json(ctx.message.from.id)},
+                      })
+                    : Json::objectOf({
+                          {"query", Json(url)},
+                          {"requested_by", Json(ctx.message.from.id)},
+                      });
+    int64_t progress_msg =
+        replyKb(ctx, ui_texts::kDlFetching, InlineKeyboard{});
+    auto edit_progress = [&](const std::string& text) {
+        if (progress_msg <= 0) return;
+        std::string err;
+        tg_.editMessageText(ctx.message.chat.id, progress_msg, text,
+                            Json(nullptr), &err);
+    };
+    IpcResult r = ipc_.post(cfg_.dl_url, action, body, 120);
+    if (!r.ok) {
+        edit_progress(ui_texts::dlFailedText(r.error_message));
+        return;
+    }
+    const Json* oversize = r.data.find("oversize");
+    if (oversize && oversize->asBool()) {
+        edit_progress("That file is over the 50 MB Bot API cap — queued "
+                      "for a later MTProto send instead of failing.");
+        return;
+    }
+    const Json* resp_track = r.data.find("track");
+    const Json* path = r.data.find("file_path");
+    std::string file_path = path ? path->asString() : "";
+    std::string title =
+        resp_track && resp_track->find("title")
+            ? resp_track->find("title")->asString()
+            : (track.find("title") ? track.find("title")->asString() : "");
+    std::string artist =
+        resp_track && resp_track->find("artist")
+            ? resp_track->find("artist")->asString()
+            : (track.find("artist") ? track.find("artist")->asString()
+                                    : "");
+    if (file_path.empty() || !std::filesystem::exists(file_path)) {
+        std::string text = ui_texts::kDlSuccess;
+        if (resp_track) text += " " + fmtTrack(*resp_track);
+        if (!file_path.empty()) text += "\nFile: " + file_path;
+        edit_progress(text);
+        return;
+    }
+    std::string err;
+    if (tg_.sendAudioFile(ctx.message.chat.id, file_path,
+                          audioCaption(resp_track, file_path, title, artist,
+                                       bot_username_),
+                          &err) < 0) {
+        edit_progress(ui_texts::dlFailedText(err));
+        return;
+    }
+    edit_progress(ui_texts::kDlSuccess);
+}
+
+// Deliver one Spotify playlist/album pick (cbDl zip / 1by1, §8).
+void Dispatcher::deliverSpotifyCollection(const TgCallbackQuery& cq,
+                                          const std::string& url,
+                                          const std::string& mode) {
+    Json body = Json::objectOf({
+        {"url", Json(url)},
+        {"mode", Json(mode)},
+        {"requested_by", Json(cq.from.id)},
+    });
+    IpcResult r = ipc_.post(cfg_.dl_url, "download/spotify-playlist", body,
+                            300);
+    if (!r.ok) {
+        answerCb(cq, r.error_message, true);
+        return;
+    }
+    const Json* oversize = r.data.find("oversize");
+    if (oversize && oversize->asBool()) {
+        answerCb(cq,
+                 "That collection is over the 50 MB Bot API cap — queued "
+                 "for a later MTProto send instead of failing.",
+                 true);
+        return;
+    }
+    std::string kind = url.find("/album/") != std::string::npos ||
+                               url.find(":album:") != std::string::npos
+                           ? "album"
+                           : "playlist";
     const Json* count = r.data.find("count");
-    std::string text = "Download ready";
-    if (track) text += ": " + fmtTrack(*track);
-    if (count) text += " (" + std::to_string(count->asInt()) + " files)";
-    if (path) text += "\nFile: " + path->asString();
-    text += "\n(Sending the file into chat is the downloaders service's job "
-            "via the core; this build reports the path.)";
-    reply(ctx, text);
+    int total = count ? static_cast<int>(count->asInt()) : 0;
+    if (mode == "zip") {
+        const Json* path = r.data.find("file_path");
+        std::string zip = path ? path->asString() : "";
+        if (zip.empty() || !std::filesystem::exists(zip)) {
+            answerCb(cq, "The ZIP file is not available.", true);
+            return;
+        }
+        std::string err;
+        if (tg_.sendFile(cq.chat_id, zip, "", &err) < 0) {
+            answerCb(cq, err, true);
+            return;
+        }
+        answerCb(cq, ui_texts::dlSpotifySuccessText(total, kind));
+        return;
+    }
+    // One by one: every file in file_paths, in order.
+    const Json* files = r.data.find("file_paths");
+    int sent = 0;
+    int skipped = 0;
+    if (files) {
+        for (const auto& f : files->asArray()) {
+            std::string fp = f.asString();
+            if (fp.empty() || !std::filesystem::exists(fp)) {
+                ++skipped;
+                continue;
+            }
+            std::error_code ec;
+            if (std::filesystem::file_size(fp, ec) > 50 * 1024 * 1024) {
+                ++skipped;
+                continue;
+            }
+            std::string err;
+            if (tg_.sendAudioFile(cq.chat_id, fp, "", &err) < 0)
+                ++skipped;
+            else
+                ++sent;
+        }
+    }
+    std::string text =
+        ui_texts::dlSpotifySuccessText(sent, kind);
+    if (skipped > 0)
+        text += " (" + std::to_string(skipped) + " skipped — over the "
+                "50 MB cap or unavailable)";
+    answerCb(cq, text);
 }
 
 void Dispatcher::onRadio(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     std::string station = trim(ctx.args);
     if (station.empty()) {
-        // List stations (radio.list).
+        // List stations (radio.list). The service returns objects
+        // (id/name/genre/stream_url), not bare strings.
         IpcResult r = ipc_.get(cfg_.radio_url, "/v1/radio/stations", 10);
         if (!r.ok) {
             replyError(ctx, r);
             return;
         }
+        std::string out = ui_texts::kRadioStationsHeader;
         const Json* stations = r.data.find("stations");
-        std::string out = "Radio stations:\n";
         if (stations) {
-            for (const auto& s : stations->asArray())
-                out += "- " + s.asString() + "\n";
+            for (const auto& s : stations->asArray()) {
+                std::string name =
+                    s.find("name") ? s.find("name")->asString() : "";
+                std::string genre =
+                    s.find("genre") ? s.find("genre")->asString() : "";
+                std::string id =
+                    s.find("id") ? s.find("id")->asString() : "";
+                out += "\n" + ui_texts::radioStationLine(name, genre, id);
+            }
         }
-        out += "Start one with /radio <station>.";
-        reply(ctx, out);
+        out += "\n\n" + std::string(ui_texts::kRadioStationsFooter);
+        replyHtml(ctx, out);
         return;
     }
     Json body = Json::objectOf({
@@ -2575,7 +4207,113 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
         reply(ctx, "Could not play the radio in the voice chat: " + err);
         return;
     }
-    reply(ctx, "📻 Radio: " + station + " is now playing in the voice chat.");
+    std::string name =
+        r.data.find("station_name") ? r.data.find("station_name")->asString()
+                                    : station;
+    replyHtml(ctx,
+              ui_texts::radioNowPlayingText(name, url->asString()));
+}
+
+void Dispatcher::onNewRadio(const CommandContext& ctx) {
+    // Group only (§21): a radio belongs to a group voice chat.
+    if (ctx.message.chat.id >= 0) {
+        replyHtml(ctx, ui_texts::kRadioGroupOnly);
+        return;
+    }
+    if (!canManageVc(ctx)) return;
+    std::string station = trim(ctx.args);
+    if (station.empty()) {
+        replyHtml(ctx, ui_texts::kRadioNeedLink);
+        return;
+    }
+    // A radio already exists for this chat -> point at /manage.
+    IpcResult st = ipc_.get(cfg_.radio_url,
+                            "/v1/radio/status?chat_id=" +
+                                std::to_string(vcTarget(ctx)),
+                            10);
+    if (st.ok) {
+        replyHtml(ctx, ui_texts::kRadioExists);
+        return;
+    }
+    Json body = Json::objectOf({
+        {"chat_id", Json(vcTarget(ctx))},
+        {"station", Json(station)},
+    });
+    IpcResult r = ipc_.post(cfg_.radio_url, "radio/start", body, 15);
+    if (!r.ok) {
+        replyError(ctx, r);
+        return;
+    }
+    std::string name =
+        r.data.find("station_name") ? r.data.find("station_name")->asString()
+                                    : station;
+    std::string stream =
+        r.data.find("stream_url") ? r.data.find("stream_url")->asString()
+                                  : "";
+    std::string out = ui_texts::kRadioCreated;
+    if (!stream.empty())
+        out += "\n" + ui_texts::radioNowPlayingText(name, stream);
+    replyHtml(ctx, out);
+}
+
+void Dispatcher::onDestroyRadio(const CommandContext& ctx) {
+    if (ctx.message.chat.id >= 0) {
+        replyHtml(ctx, ui_texts::kRadioGroupOnly);
+        return;
+    }
+    if (!canManageVc(ctx)) return;
+    Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
+    IpcResult r = ipc_.post(cfg_.radio_url, "radio/stop", body, 15);
+    if (!r.ok) {
+        if (r.error_code == "not_found") {
+            replyHtml(ctx, ui_texts::kRadioNoRadio);
+            return;
+        }
+        replyError(ctx, r);
+        return;
+    }
+    replyHtml(ctx, ui_texts::kRadioDestroyed);
+}
+
+void Dispatcher::onManageRadio(const CommandContext& ctx) {
+    if (ctx.message.chat.id >= 0) {
+        replyHtml(ctx, ui_texts::kRadioGroupOnly);
+        return;
+    }
+    if (!canManageVc(ctx)) return;
+    IpcResult r = ipc_.get(cfg_.radio_url,
+                           "/v1/radio/status?chat_id=" +
+                               std::to_string(vcTarget(ctx)),
+                           10);
+    if (!r.ok) {
+        if (r.error_code == "not_found") {
+            replyHtml(ctx, ui_texts::kRadioNoRadio);
+            return;
+        }
+        replyError(ctx, r);
+        return;
+    }
+    std::string now_playing = "—";
+    if (const Json* np = r.data.find("now_playing")) {
+        if (np->isObject() && np->find("title"))
+            now_playing = np->find("title")->asString();
+        else if (np->isString())
+            now_playing = np->asString();
+    }
+    if (now_playing == "—") {
+        if (const Json* s = r.data.find("station"))
+            now_playing = s->asString();
+    }
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kRadioManageCard,
+                                 {{"loopType", "—"},
+                                  {"created", "—"},
+                                  {"nowPlaying",
+                                   ui_texts::htmlEscape(now_playing)},
+                                  {"autoplay", "—"},
+                                  {"queueLen", "—"},
+                                  {"host", cfg_.radio_url},
+                                  {"chatId", std::to_string(
+                                                 ctx.message.chat.id)}}));
 }
 
 void Dispatcher::onShare(const CommandContext& ctx) {
@@ -2601,38 +4339,51 @@ void Dispatcher::onShare(const CommandContext& ctx) {
     const Json* token = r.data.find("token");
     std::string text = "Anonymous share link created:\n";
     if (link) text += link->asString() + "\n";
-    if (token) text += "Token: " + token->asString() + "\n";
+    if (token)
+        text += "Token: <code>" + token->asString() + "</code>\n";
     text += "(No identity is attached to the link.)";
-    reply(ctx, text);
+    // The share service is anonymous by design (token -> track only),
+    // so the core keeps the creator mapping itself: /start share_<token>
+    // and pl:share:mylink both need it (§22).
+    if (token)
+        store_.set("sharetok:" + token->asString(),
+                   std::to_string(ctx.message.from.id));
+    if (link)
+        store_.set("sharelink:" + std::to_string(ctx.message.from.id),
+                   link->asString());
+    replyKb(ctx, text, ui_texts::shareHelpKeyboard());
 }
 
 void Dispatcher::onEngine(const CommandContext& ctx) {
     if (!isPrivate(ctx) &&
         !isChatAdmin(ctx.message.chat.id, ctx.message.from.id)) {
-        reply(ctx, "Only group admins (or the bot owner) can switch engines.");
+        replyHtml(ctx, ui_texts::kEngineOnlyAdmin);
         return;
     }
     std::string arg = lowerStr(trim(ctx.args));
     if (arg.empty()) {
-        reply(ctx, std::string("Current VC engine for this chat: ") +
-                       engineName(router_.engineFor(vcTarget(ctx))) +
-                       "\nSwitch with /engine go|ts|rust");
+        replyHtml(ctx, ui_texts::engineCurrentText(
+                           engineName(router_.engineFor(vcTarget(ctx)))));
         return;
     }
     Engine e;
     if (!engineFromName(arg, e)) {
-        reply(ctx, "Unknown engine \"" + arg + "\". Use go, ts or rust.");
+        replyHtml(ctx, ui_texts::engineUnknownText(arg));
         return;
     }
     router_.setEngine(vcTarget(ctx), e);
-    reply(ctx, std::string("VC engine for this chat is now ") + engineName(e) +
-                   " (fallback: " + engineName(fallbackOrder(e)[1]) + " → " +
-                   engineName(fallbackOrder(e)[2]) + ").");
+    replyHtml(ctx, ui_texts::engineSetText(
+                       engineName(e), engineName(fallbackOrder(e)[1]),
+                       engineName(fallbackOrder(e)[2])));
 }
 
 // --- handlers: playlists -----------------------------------------------------
 namespace {
 constexpr size_t kPlaylistMax = 100;  // NoxBeats DB::kPlaylistMax
+// Max authorized users per chat: ArcMusic / TinaMusic / YukkiMusic-Go
+// all default MAX_AUTH_USERS to 25 (NoxBeats defines no such limit;
+// the 20 the core used before was an unverified assumption).
+constexpr size_t kAuthMaxUsers = 25;
 
 Json playlistOf(Store& store, int64_t user) {
     auto v = store.get("playlist:" + std::to_string(user));
@@ -2646,6 +4397,43 @@ Json playlistOf(Store& store, int64_t user) {
 void savePlaylist(Store& store, int64_t user, const Json& list) {
     store.set("playlist:" + std::to_string(user), list.dump());
 }
+
+// Named playlists (Parvati/TgMusicBot model, §17): one list per user,
+// each entry {id, name, songs: [track, ...]}. The list is user-scoped,
+// so every playlist in it belongs to the caller by construction.
+constexpr size_t kNamedPlaylistMax = 10;
+
+Json namedPlaylistsOf(Store& store, int64_t user) {
+    auto v = store.get("npl:" + std::to_string(user));
+    if (!v) return Json(Json::Array{});
+    try {
+        return Json::parse(*v);
+    } catch (...) {
+        return Json(Json::Array{});
+    }
+}
+void saveNamedPlaylists(Store& store, int64_t user, const Json& list) {
+    store.set("npl:" + std::to_string(user), list.dump());
+}
+// Find a named playlist by id or by name (case-insensitive); returns
+// the index, or -1 when absent.
+long namedPlaylistIndex(const Json& list, const std::string& ref) {
+    auto lower = [](std::string s) {
+        for (char& c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    std::string want = lower(ref);
+    for (size_t i = 0; i < list.size(); ++i) {
+        const Json& p = list.asArray()[i];
+        const Json* id = p.find("id");
+        const Json* name = p.find("name");
+        if ((id && id->asString() == ref) ||
+            (name && lower(name->asString()) == want))
+            return static_cast<long>(i);
+    }
+    return -1;
+}
 }  // namespace
 
 void Dispatcher::onAddPlaylist(const CommandContext& ctx) {
@@ -2655,36 +4443,38 @@ void Dispatcher::onAddPlaylist(const CommandContext& ctx) {
     if (query.empty()) {
         // No argument: add the song playing now (group only).
         if (isPrivate(ctx)) {
-            reply(ctx, "Usage: /addplaylist <song name or link>");
+            replyHtml(ctx, ui_texts::kAddPlaylistUsage);
             return;
         }
         Json np, track;
         if (!nowPlaying(vcTarget(ctx), np, track)) {
-            reply(ctx, "Nothing is playing. Usage: /addplaylist <song>");
+            replyHtml(ctx, ui_texts::kCtlNotStreaming);
             return;
         }
         std::string id = track.find("id") ? track.find("id")->asString() : "";
         if (id.empty()) {
-            reply(ctx, "That track cannot be saved (no id).");
+            replyHtml(ctx, ui_texts::kPlaylistUnsupported);
             return;
         }
         for (const auto& item : list.asArray()) {
             const Json* iid = item.find("id");
             if (iid && iid->asString() == id) {
-                reply(ctx, "Already in your playlist.");
+                replyHtml(ctx, ui_texts::kPlaylistDup);
                 return;
             }
         }
         if (list.size() >= kPlaylistMax) {
-            reply(ctx, "Your playlist is full (" +
-                           std::to_string(kPlaylistMax) + " songs).");
+            replyHtml(ctx,
+                      ui_texts::playlistFullText(
+                          static_cast<int>(kPlaylistMax)));
             return;
         }
         Json::Array arr = list.asArray();
         arr.push_back(track);
         savePlaylist(store_, user, Json(arr));
-        reply(ctx, "Added to your playlist (" +
-                       std::to_string(arr.size()) + " songs).");
+        replyHtml(ctx, ui_texts::playlistAddedText(
+                           ui_texts::htmlEscape(fmtTrack(track)),
+                           static_cast<int>(arr.size())));
         return;
     }
     // Resolve the query to a track via vc-ts search, then save it.
@@ -2700,7 +4490,7 @@ void Dispatcher::onAddPlaylist(const CommandContext& ctx) {
     }
     const Json* results = r.data.find("results");
     if (!results || results->size() == 0) {
-        reply(ctx, "No results for \"" + query + "\".");
+        replyHtml(ctx, ui_texts::kSearchNoResults);
         return;
     }
     Json track = results->asArray()[0];
@@ -2708,40 +4498,47 @@ void Dispatcher::onAddPlaylist(const CommandContext& ctx) {
     for (const auto& item : list.asArray()) {
         const Json* iid = item.find("id");
         if (iid && !id.empty() && iid->asString() == id) {
-            reply(ctx, "Already in your playlist.");
+            replyHtml(ctx, ui_texts::kPlaylistDup);
             return;
         }
     }
     if (list.size() >= kPlaylistMax) {
-        reply(ctx, "Your playlist is full (" + std::to_string(kPlaylistMax) +
-                       " songs).");
+        replyHtml(ctx,
+                  ui_texts::playlistFullText(static_cast<int>(kPlaylistMax)));
         return;
     }
     Json::Array arr = list.asArray();
     arr.push_back(track);
     savePlaylist(store_, user, Json(arr));
-    reply(ctx, "Added \"" + fmtTrack(track) + "\" to your playlist (" +
-                   std::to_string(arr.size()) + " songs).");
+    replyHtml(ctx, ui_texts::playlistAddedText(
+                       ui_texts::htmlEscape(fmtTrack(track)),
+                       static_cast<int>(arr.size())));
 }
 
 void Dispatcher::onPlaylist(const CommandContext& ctx) {
     Json list = playlistOf(store_, ctx.message.from.id);
     if (list.size() == 0) {
-        reply(ctx, "Your playlist is empty. Add songs with /addplaylist.");
+        replyHtml(ctx, ui_texts::kPlaylistEmpty);
         return;
     }
-    std::string text = "Your playlist (" + std::to_string(list.size()) +
-                       " songs):\n";
+    std::string text = ui_texts::playlistHeaderText(
+        displayName(ctx.message.from),
+        static_cast<int>(list.size()));
     size_t i = 0;
     for (const auto& item : list.asArray()) {
-        std::string line = std::to_string(++i) + ". " + fmtTrack(item) + "\n";
-        if (text.size() + line.size() > 3800) break;
+        std::string line = std::to_string(++i) + ". " +
+                           ui_texts::htmlEscape(fmtTrack(item)) + "\n";
+        if (text.size() + line.size() > 3800) {
+            --i;
+            break;
+        }
         text += line;
     }
     if (i < list.size())
-        text += "... and " + std::to_string(list.size() - i) + " more.\n";
-    text += "Play it with /playplaylist.";
-    reply(ctx, text);
+        text += ui_texts::playlistMoreText(
+            static_cast<int>(list.size() - i));
+    text += ui_texts::kPlaylistFooter;
+    replyHtml(ctx, text);
 }
 
 void Dispatcher::onRmPlaylist(const CommandContext& ctx) {
@@ -2752,17 +4549,17 @@ void Dispatcher::onRmPlaylist(const CommandContext& ctx) {
     if (all) {
         size_t n = list.size();
         savePlaylist(store_, user, Json(Json::Array{}));
-        reply(ctx, n ? "Cleared your playlist (" + std::to_string(n) +
-                           " songs removed)."
-                     : "Your playlist is already empty.");
+        replyHtml(ctx, n ? ui_texts::playlistClearedText(
+                               static_cast<int>(n))
+                         : ui_texts::kPlaylistEmpty);
         return;
     }
     if (arg.empty()) {
-        reply(ctx, "Usage: /rmplaylist <number | song name | all>");
+        replyHtml(ctx, ui_texts::kRmPlaylistUsage);
         return;
     }
     if (list.size() == 0) {
-        reply(ctx, "Your playlist is empty.");
+        replyHtml(ctx, ui_texts::kPlaylistEmpty);
         return;
     }
     size_t pos = 0;
@@ -2779,7 +4576,7 @@ void Dispatcher::onRmPlaylist(const CommandContext& ctx) {
         }
     }
     if (pos < 1 || pos > list.size()) {
-        reply(ctx, "No matching song in your playlist.");
+        replyHtml(ctx, ui_texts::kRmPlaylistNone);
         return;
     }
     Json::Array arr = list.asArray();
@@ -2788,8 +4585,9 @@ void Dispatcher::onRmPlaylist(const CommandContext& ctx) {
                             : "?";
     arr.erase(arr.begin() + (pos - 1));
     savePlaylist(store_, user, Json(arr));
-    reply(ctx, "Removed \"" + title + "\" (" + std::to_string(arr.size()) +
-                   " songs left).");
+    replyHtml(ctx, ui_texts::playlistRemovedText(
+                       ui_texts::htmlEscape(title),
+                       static_cast<int>(arr.size())));
 }
 
 void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
@@ -2800,7 +4598,7 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
     if (!playAllowed(ctx, false)) return;
     Json list = playlistOf(store_, ctx.message.from.id);
     if (list.size() == 0) {
-        reply(ctx, "Your playlist is empty. Add songs with /addplaylist.");
+        replyHtml(ctx, ui_texts::kPlaylistEmpty);
         return;
     }
     auto words = splitArgs(ctx.args);
@@ -2863,42 +4661,260 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
                    (queued ? " (+" + std::to_string(queued) + " queued)" : ""));
 }
 
+// --- handlers: named playlists (Parvati/TgMusicBot model, §17) -------------
+void Dispatcher::onCreatePlaylist(const CommandContext& ctx) {
+    std::string name = trim(ctx.args);
+    if (name.empty()) {
+        replyHtml(ctx, ui_texts::kCreatePlaylistUsage);
+        return;
+    }
+    int64_t user = ctx.message.from.id;
+    Json list = namedPlaylistsOf(store_, user);
+    if (list.size() >= kNamedPlaylistMax) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistLimit);
+        return;
+    }
+    if (namedPlaylistIndex(list, name) >= 0) {
+        replyHtml(ctx, ui_texts::namedPlaylistCreateFailText(
+                           "a playlist with that name already exists"));
+        return;
+    }
+    std::string id = mintRunId();
+    Json::Array arr = list.asArray();
+    arr.push_back(Json::objectOf({
+        {"id", Json(id)},
+        {"name", Json(name)},
+        {"songs", Json(Json::Array{})},
+    }));
+    saveNamedPlaylists(store_, user, Json(arr));
+    replyHtml(ctx, ui_texts::namedPlaylistCreatedText(
+                       ui_texts::htmlEscape(name), id));
+}
+
+void Dispatcher::onDeletePlaylist(const CommandContext& ctx) {
+    std::string ref = trim(ctx.args);
+    if (ref.empty()) {
+        replyHtml(ctx, "Usage: <code>/deleteplaylist &lt;name or ID&gt;</code>");
+        return;
+    }
+    int64_t user = ctx.message.from.id;
+    Json list = namedPlaylistsOf(store_, user);
+    long idx = namedPlaylistIndex(list, ref);
+    if (idx < 0) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistNotFound);
+        return;
+    }
+    Json::Array arr = list.asArray();
+    std::string name = arr[static_cast<size_t>(idx)].find("name")
+                           ? arr[static_cast<size_t>(idx)]
+                                 .find("name")
+                                 ->asString()
+                           : ref;
+    arr.erase(arr.begin() + idx);
+    saveNamedPlaylists(store_, user, Json(arr));
+    replyHtml(ctx,
+              ui_texts::namedPlaylistDeletedText(ui_texts::htmlEscape(name)));
+}
+
+void Dispatcher::onAddToPlaylist(const CommandContext& ctx) {
+    // /addtoplaylist <playlist name or ID> <song name or link>
+    std::string args = trim(ctx.args);
+    size_t sp = args.find(' ');
+    if (sp == std::string::npos) {
+        replyHtml(ctx, "Usage: <code>/addtoplaylist &lt;playlist&gt; "
+                       "&lt;song name or link&gt;</code>");
+        return;
+    }
+    std::string ref = args.substr(0, sp);
+    std::string query = trim(args.substr(sp + 1));
+    int64_t user = ctx.message.from.id;
+    Json list = namedPlaylistsOf(store_, user);
+    long idx = namedPlaylistIndex(list, ref);
+    if (idx < 0) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistNotFound);
+        return;
+    }
+    Json body = Json::objectOf({
+        {"query", Json(query)},
+        {"source", Json("all")},
+        {"limit", Json(static_cast<int64_t>(1))},
+    });
+    IpcResult r = ipc_.post(cfg_.vc_ts_url, "search", body, 20);
+    if (!r.ok) {
+        replyError(ctx, r);
+        return;
+    }
+    const Json* results = r.data.find("results");
+    if (!results || results->size() == 0) {
+        replyHtml(ctx, ui_texts::kSearchNoResults);
+        return;
+    }
+    Json track = results->asArray()[0];
+    Json::Array arr = list.asArray();
+    Json& pl = arr[static_cast<size_t>(idx)];
+    Json songs = pl.find("songs") ? *pl.find("songs") : Json(Json::Array{});
+    std::string id = track.find("id") ? track.find("id")->asString() : "";
+    for (const auto& item : songs.asArray()) {
+        const Json* iid = item.find("id");
+        if (iid && !id.empty() && iid->asString() == id) {
+            replyHtml(ctx, ui_texts::kPlaylistDup);
+            return;
+        }
+    }
+    if (songs.size() >= kPlaylistMax) {
+        replyHtml(ctx,
+                  ui_texts::playlistFullText(static_cast<int>(kPlaylistMax)));
+        return;
+    }
+    Json::Array sarr = songs.asArray();
+    sarr.push_back(track);
+    pl.set("songs", Json(sarr));
+    saveNamedPlaylists(store_, user, Json(arr));
+    std::string pname = pl.find("name") ? pl.find("name")->asString() : ref;
+    replyHtml(ctx, ui_texts::namedPlaylistAddedText(
+                       ui_texts::htmlEscape(fmtTrack(track)),
+                       ui_texts::htmlEscape(pname)));
+}
+
+void Dispatcher::onRemoveFromPlaylist(const CommandContext& ctx) {
+    // /removefromplaylist <playlist name or ID> <song number>
+    auto words = splitArgs(ctx.args);
+    if (words.size() < 2) {
+        replyHtml(ctx, "Usage: <code>/removefromplaylist &lt;playlist&gt; "
+                       "&lt;song number&gt;</code>");
+        return;
+    }
+    int64_t user = ctx.message.from.id;
+    Json list = namedPlaylistsOf(store_, user);
+    long idx = namedPlaylistIndex(list, words[0]);
+    if (idx < 0) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistNotFound);
+        return;
+    }
+    if (!isDigits(words[1])) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistBadNumber);
+        return;
+    }
+    size_t n = std::stoul(words[1]);
+    Json::Array arr = list.asArray();
+    Json& pl = arr[static_cast<size_t>(idx)];
+    Json songs = pl.find("songs") ? *pl.find("songs") : Json(Json::Array{});
+    if (n < 1 || n > songs.size()) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistSongNotFound);
+        return;
+    }
+    Json::Array sarr = songs.asArray();
+    sarr.erase(sarr.begin() + (n - 1));
+    pl.set("songs", Json(sarr));
+    saveNamedPlaylists(store_, user, Json(arr));
+    std::string pname = pl.find("name") ? pl.find("name")->asString() : words[0];
+    replyHtml(ctx,
+              ui_texts::namedPlaylistRemovedText(ui_texts::htmlEscape(pname)));
+}
+
+void Dispatcher::onPlaylistInfo(const CommandContext& ctx) {
+    std::string ref = trim(ctx.args);
+    if (ref.empty()) {
+        replyHtml(ctx, "Usage: <code>/playlistinfo &lt;name or ID&gt;</code>");
+        return;
+    }
+    int64_t user = ctx.message.from.id;
+    Json list = namedPlaylistsOf(store_, user);
+    long idx = namedPlaylistIndex(list, ref);
+    if (idx < 0) {
+        replyHtml(ctx, ui_texts::kNamedPlaylistNotFound);
+        return;
+    }
+    const Json& pl = list.asArray()[static_cast<size_t>(idx)];
+    std::string name = pl.find("name") ? pl.find("name")->asString() : ref;
+    Json songs = pl.find("songs") ? *pl.find("songs") : Json(Json::Array{});
+    std::string songs_text;
+    if (songs.size() == 0) {
+        songs_text = ui_texts::kPlaylistInfoEmpty;
+    } else {
+        size_t i = 0;
+        for (const auto& item : songs.asArray()) {
+            std::string line = std::to_string(++i) + ". " +
+                               ui_texts::htmlEscape(fmtTrack(item)) + "\n";
+            if (songs_text.size() + line.size() > 3800) {
+                --i;
+                break;
+            }
+            songs_text += line;
+        }
+        if (i < songs.size())
+            songs_text += ui_texts::playlistMoreText(
+                static_cast<int>(songs.size() - i));
+    }
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kPlaylistInfoCard,
+                                 {{"name", ui_texts::htmlEscape(name)},
+                                  {"owner", ui_texts::htmlEscape(
+                                                displayName(ctx.message.from))},
+                                  {"count", std::to_string(songs.size())},
+                                  {"songs", songs_text}}));
+}
+
+void Dispatcher::onMyPlaylists(const CommandContext& ctx) {
+    Json list = namedPlaylistsOf(store_, ctx.message.from.id);
+    if (list.size() == 0) {
+        replyHtml(ctx, ui_texts::kMyPlaylistsNone);
+        return;
+    }
+    std::string text;
+    for (size_t i = 0; i < list.asArray().size(); ++i) {
+        const auto& p = list.asArray()[i];
+        std::string name = p.find("name") ? p.find("name")->asString() : "?";
+        std::string id = p.find("id") ? p.find("id")->asString() : "";
+        if (i == 0) {
+            text = ui_texts::fmt(ui_texts::kMyPlaylistsHeader,
+                                 {{"name", ui_texts::htmlEscape(name)},
+                                  {"id", id}});
+        } else {
+            text += "\n" + ui_texts::htmlEscape(name) + " (<code>" + id +
+                    "</code>)";
+        }
+    }
+    replyHtml(ctx, text);
+}
+
 // --- handlers: settings / chat settings / autoplay --------------------------
 void Dispatcher::onPlaymode(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     auto args = splitArgs(ctx.args);
-    if (ctx.command == "playmode" && !args.empty()) {
-        std::string a = lowerStr(args[0]);
-        bool admins = a == "admin" || a == "admins" || a == "adminonly";
-        bool all = a == "everyone" || a == "all";
-        if (!admins && !all) {
-            reply(ctx, "Usage: /playmode admin|everyone (current: " +
-                           chatField(chat, "play_mode", "everyone") + ")");
-            return;
-        }
-        if (!adminCheck(ctx)) return;
-        setChatField(chat, "play_mode", admins ? "admin" : "everyone");
-        reply(ctx, std::string("Play mode: ") +
-                       (admins ? "admins only" : "everyone") + ".");
+    if (args.empty()) {
+        reply(ctx, "Usage: /playmode admin|everyone (current: " +
+                       chatField(chat, "play_mode", "everyone") + ")");
         return;
     }
-    // /settings: show the current settings panel as text.
-    std::string out = "Settings for this chat:\n";
-    out += "Play mode: " + chatField(chat, "play_mode", "everyone") + "\n";
-    out += "Admin mode: ";
-    int am = chatIntField(chat, "admin_mode", 0);
-    out += am == 1 ? "admins only" : am == 2 ? "everyone" : "admins + authorized";
-    out += "\nCmd delete: " + chatField(chat, "cmd_delete", "off") + "\n";
-    out += "Clean mode: ";
-    int cm = chatIntField(chat, "clean_mode", 0);
-    out += cm ? std::to_string(cm) + " min" : "off";
-    out += "\nThumbnails: " + chatField(chat, "thumb", "on") + "\n";
-    out += "Autoplay: " + chatField(chat, "autoplay", "off") + " (" +
-           chatField(chat, "ap_lang", "auto") + "/" +
-           chatField(chat, "ap_mood", "any") + ")\n";
-    out += "Language: " + chatField(chat, "lang", "en") + "\n";
-    out += "VC engine: " + std::string(engineName(router_.engineFor(chat)));
-    reply(ctx, out);
+    std::string a = lowerStr(args[0]);
+    bool admins = a == "admin" || a == "admins" || a == "adminonly";
+    bool all = a == "everyone" || a == "all";
+    if (!admins && !all) {
+        reply(ctx, "Usage: /playmode admin|everyone (current: " +
+                       chatField(chat, "play_mode", "everyone") + ")");
+        return;
+    }
+    if (!adminCheck(ctx)) return;
+    setChatField(chat, "play_mode", admins ? "admin" : "everyone");
+    replyHtml(ctx, admins ? ui_texts::kPlayModeAdmin
+                          : ui_texts::kPlayModeEveryone);
+}
+
+void Dispatcher::onSettings(const CommandContext& ctx) {
+    // Group only (§9): the panel edits this chat's settings.
+    if (isPrivate(ctx)) {
+        replyHtml(ctx, ui_texts::kSettingsGroupOnly);
+        return;
+    }
+    if (!adminCheck(ctx)) return;
+    int64_t chat = vcTarget(ctx);
+    std::string title = ctx.message.chat.title;
+    if (title.empty()) title = std::to_string(chat);
+    store_.set("chat_title:" + std::to_string(chat), title);
+    replyKb(ctx, ui_texts::fmt(ui_texts::kSettingsText,
+                               {{"title", ui_texts::htmlEscape(title)},
+                                {"id", std::to_string(chat)}}),
+            ui_texts::settingsKeyboard(chatSettings(chat)));
 }
 
 void Dispatcher::onLang(const CommandContext& ctx) {
@@ -2941,15 +4957,14 @@ void Dispatcher::onAdminmode(const CommandContext& ctx) {
     else if (a == "adminauth" || a == "auth" || a == "dj") mode = 0;
     else if (a == "everyone" || a == "all") mode = 2;
     if (mode < 0) {
-        reply(ctx, "Usage: /adminmode admin|adminauth|everyone");
+        replyHtml(ctx, ui_texts::kAdminModeInvalid);
         return;
     }
     setChatField(chat, "admin_mode", std::to_string(mode));
-    reply(ctx, std::string("Admin mode: ") +
-                   (mode == 1 ? "admins only"
-                              : mode == 2 ? "everyone"
-                                          : "admins + authorized") +
-                   ".");
+    replyHtml(ctx, ui_texts::adminModeUpdatedText(
+                       mode == 1 ? "admins only"
+                                 : mode == 2 ? "everyone"
+                                             : "admins + authorized"));
 }
 
 void Dispatcher::onCmdDelete(const CommandContext& ctx) {
@@ -2971,9 +4986,9 @@ void Dispatcher::onCleanmode(const CommandContext& ctx) {
     int cur = chatIntField(chat, "clean_mode", 0);
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
-        reply(ctx, "Clean mode: " + std::string(cur ? "on (" +
-                       std::to_string(cur) + " min)" : "off") +
-                       ". Usage: /cleanmode on|off|<minutes 1-1440>");
+        replyHtml(ctx, ui_texts::fmt(ui_texts::kCleanModeStatus,
+                                     {{"action", cur ? "on" : "off"},
+                                      {"duration", std::to_string(cur)}}));
         return;
     }
     std::string a = lowerStr(args[0]);
@@ -3002,8 +5017,8 @@ void Dispatcher::onThumb(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     if (args.empty() || (!flagOn(args[0]) && !flagOff(args[0]))) {
         bool on = chatField(chat, "thumb", "on") == "on";
-        reply(ctx, std::string("Thumbnails are ") + (on ? "on" : "off") +
-                       ". Usage: /" + ctx.command + " on|off");
+        replyHtml(ctx, ui_texts::fmt(ui_texts::kThumbStatus,
+                                     {{"on", on ? "on" : "off"}}));
         return;
     }
     if (!canManageVc(ctx)) return;
@@ -3023,11 +5038,10 @@ void Dispatcher::onAutoplay(const CommandContext& ctx) {
     static const std::vector<std::string> moods = {
         "any", "happy", "sad", "romantic", "party", "chill", "devotional"};
     if (args.empty()) {
-        reply(ctx, "Autoplay: " + chatField(chat, "autoplay", "off") +
-                       " (lang " + chatField(chat, "ap_lang", "auto") +
-                       ", mood " + chatField(chat, "ap_mood", "any") +
-                       "). Usage: /autoplay on|off|lang <lang>|mood "
-                       "<mood>");
+        replyHtml(ctx, ui_texts::autoplayStatusText(
+                           chatField(chat, "autoplay", "off") == "on",
+                           chatField(chat, "ap_lang", "auto"),
+                           chatField(chat, "ap_mood", "any")));
         return;
     }
     if (!canManageVc(ctx)) return;
@@ -3035,22 +5049,29 @@ void Dispatcher::onAutoplay(const CommandContext& ctx) {
     if (a == "on" || a == "enable" || a == "start") {
         setChatField(chat, "autoplay", "on");
         store_.set("autoplay:" + std::to_string(chat), "1");
-        reply(ctx, "Autoplay on: when the queue drains, a related track "
-                   "is queued automatically.");
+        replyKb(ctx, ui_texts::autoplayCardText(true),
+                ui_texts::autoplayCardKeyboard(true));
     } else if (a == "off" || a == "disable" || a == "stop") {
         setChatField(chat, "autoplay", "off");
         store_.set("autoplay:" + std::to_string(chat), "0");
-        reply(ctx, "Autoplay off.");
+        replyKb(ctx, ui_texts::autoplayCardText(false),
+                ui_texts::autoplayCardKeyboard(false));
     } else if ((a == "lang" || a == "language") && args.size() >= 2 &&
                std::find(langs.begin(), langs.end(), lowerStr(args[1])) !=
                    langs.end()) {
         setChatField(chat, "ap_lang", lowerStr(args[1]));
-        reply(ctx, "Autoplay language: " + lowerStr(args[1]) + ".");
+        replyHtml(ctx, ui_texts::autoplayStatusText(
+                           chatField(chat, "autoplay", "off") == "on",
+                           lowerStr(args[1]),
+                           chatField(chat, "ap_mood", "any")));
     } else if (a == "mood" && args.size() >= 2 &&
                std::find(moods.begin(), moods.end(), lowerStr(args[1])) !=
                    moods.end()) {
         setChatField(chat, "ap_mood", lowerStr(args[1]));
-        reply(ctx, "Autoplay mood: " + lowerStr(args[1]) + ".");
+        replyHtml(ctx, ui_texts::autoplayStatusText(
+                           chatField(chat, "autoplay", "off") == "on",
+                           chatField(chat, "ap_lang", "auto"),
+                           lowerStr(args[1])));
     } else {
         reply(ctx, "Usage: /autoplay on|off|lang <lang>|mood <mood>");
     }
@@ -3065,42 +5086,44 @@ void Dispatcher::onChannelplay(const CommandContext& ctx) {
             cur = std::stoll(chatField(chat, "cplay", "0"));
         } catch (...) {
         }
-        reply(ctx, cur ? "Linked channel: " + std::to_string(cur) +
-                             ". Use /channelplay disable to unlink."
-                       : "Usage: /channelplay <@channel | channel id | "
-                         "disable>");
+        if (cur) {
+            replyHtml(ctx, ui_texts::cplayStatusText(cur));
+        } else {
+            reply(ctx, "Usage: /channelplay <@channel | channel id | "
+                       "disable>");
+        }
         return;
     }
     if (!adminCheck(ctx)) return;
     std::string a = lowerStr(args[0]);
     if (a == "disable" || a == "off" || a == "none") {
         setChatField(chat, "cplay", "0");
-        reply(ctx, "Channel play disabled.");
+        replyHtml(ctx, ui_texts::kCplayDisabled);
         return;
     }
     int64_t ch = 0;
     if (!args[0].empty() && args[0][0] == '@') {
         ch = tg_.getChatId(args[0]);
         if (ch == 0) {
-            reply(ctx, "Cannot resolve that channel.");
+            replyHtml(ctx, ui_texts::kCplayResolveFail);
             return;
         }
     } else {
         try {
             ch = std::stoll(args[0]);
         } catch (...) {
-            reply(ctx, "Invalid channel id.");
+            replyHtml(ctx, ui_texts::kCplayInvalidTarget);
             return;
         }
     }
     if (ch >= 0 || ch == chat) {
-        reply(ctx, "Invalid channel id.");
+        replyHtml(ctx, ui_texts::kCplayInvalidTarget);
         return;
     }
     // The bot must be an admin of the channel, and so must the linker.
     auto admins = tg_.getChatAdministrators(ch);
     if (admins.empty()) {
-        reply(ctx, "Cannot access that channel (bot must be an admin).");
+        replyHtml(ctx, ui_texts::kCplayNotAccessible);
         return;
     }
     int64_t me = bot_id_;
@@ -3110,17 +5133,15 @@ void Dispatcher::onChannelplay(const CommandContext& ctx) {
         std::find(admins.begin(), admins.end(), ctx.message.from.id) !=
         admins.end();
     if (!bot_admin) {
-        reply(ctx, "The bot must be an admin of that channel.");
+        replyHtml(ctx, ui_texts::kCplayNotAccessible);
         return;
     }
     if (!isSudo(ctx.message.from.id) && !user_admin) {
-        reply(ctx, "You must be an admin of that channel to link it.");
+        replyHtml(ctx, ui_texts::kCplayOwnerRequired);
         return;
     }
     setChatField(chat, "cplay", std::to_string(ch));
-    reply(ctx, "Channel play linked to " + std::to_string(ch) +
-                   ". Use /cplay, /cskip, ... to drive that channel's "
-                   "voice chat.");
+    replyHtml(ctx, ui_texts::cplayEnabledText(ch));
 }
 
 void Dispatcher::onUserbot(const CommandContext& ctx) {
@@ -3132,7 +5153,7 @@ void Dispatcher::onUserbot(const CommandContext& ctx) {
         } catch (...) {
         }
         if (!target) {
-            reply(ctx, "No channel linked. Use /channelplay first.");
+            replyHtml(ctx, ui_texts::kCplayNotLinked);
             return;
         }
     }
@@ -3145,8 +5166,13 @@ void Dispatcher::onUserbot(const CommandContext& ctx) {
     if (!cfg_.assistant_ids.empty()) {
         int64_t ub = *cfg_.assistant_ids.begin();
         std::string st = tg_.getChatMemberStatus(vc, ub);
+        if (st == "kicked" || st == "restricted") {
+            replyHtml(ctx, ui_texts::assistantRestrictedText("The assistant",
+                                                            ub));
+            return;
+        }
         if (st == "member" || st == "administrator" || st == "creator") {
-            reply(ctx, "The assistant is already in this chat.");
+            reply(ctx, ui_texts::userbotAlreadyText("The assistant"));
             return;
         }
     }
@@ -3174,22 +5200,46 @@ void Dispatcher::onAuth(const CommandContext& ctx) {
     if (!adminCheck(ctx)) return;
     auto user = extractUserId(ctx);
     if (!user) {
-        reply(ctx, "Reply to a user or give a user id/@username.");
+        replyHtml(ctx, ui_texts::fmt(ui_texts::kAuthNoUser,
+                                     {{"cmd", "/" + ctx.command}}));
         return;
     }
     int64_t chat = vcTarget(ctx);
     if (ctx.command == "auth") {
         if (isChatAdmin(chat, *user)) {
-            reply(ctx, "That user is already an admin.");
+            replyHtml(ctx, ui_texts::kAuthIsAdmin);
+            return;
+        }
+        if (*user == ctx.message.from.id || isOwner(*user)) {
+            replyHtml(ctx, ui_texts::kAuthCannot);
+            return;
+        }
+        auto auth = store_.smembers("auth:" + std::to_string(chat));
+        if (std::find(auth.begin(), auth.end(), std::to_string(*user)) !=
+            auth.end()) {
+            replyHtml(ctx, ui_texts::kAuthAlready);
+            return;
+        }
+        if (auth.size() >= kAuthMaxUsers) {
+            replyHtml(ctx, ui_texts::authLimitText(
+                               static_cast<int>(kAuthMaxUsers)));
             return;
         }
         store_.sadd("auth:" + std::to_string(chat), std::to_string(*user));
-        reply(ctx, "Authorized user " + std::to_string(*user) +
-                       " to control playback here.");
+        replyHtml(ctx, ui_texts::authAddedText(
+                           ui_texts::htmlEscape(tg_.getUserMention(*user)),
+                           static_cast<int>(auth.size()) + 1,
+                           static_cast<int>(kAuthMaxUsers)));
     } else {
+        auto auth = store_.smembers("auth:" + std::to_string(chat));
+        if (std::find(auth.begin(), auth.end(), std::to_string(*user)) ==
+            auth.end()) {
+            reply(ctx, "That user is not authorized in this chat.");
+            return;
+        }
         store_.srem("auth:" + std::to_string(chat), std::to_string(*user));
-        reply(ctx, "Removed authorization for user " + std::to_string(*user) +
-                       ".");
+        replyHtml(ctx, ui_texts::authRemovedText(
+                           ui_texts::htmlEscape(tg_.getUserMention(*user))));
     }
 }
 
@@ -3197,13 +5247,21 @@ void Dispatcher::onAuthlist(const CommandContext& ctx) {
     if (!adminCheck(ctx)) return;
     auto auth = store_.smembers("auth:" + std::to_string(vcTarget(ctx)));
     if (auth.empty()) {
-        reply(ctx, "No authorized users in this chat.");
+        replyHtml(ctx, ui_texts::kAuthlistEmpty);
         return;
     }
-    std::string out = "Authorized users:\n";
-    int i = 1;
-    for (const auto& u : auth) out += std::to_string(i++) + ". " + u + "\n";
-    reply(ctx, out);
+    std::vector<std::pair<std::string, int64_t>> users;
+    for (const auto& u : auth) {
+        try {
+            int64_t id = std::stoll(u);
+            users.emplace_back(tg_.getUserMention(id), id);
+        } catch (...) {
+        }
+        if (users.size() >= kAuthMaxUsers) break;
+    }
+    replyKb(ctx, ui_texts::authlistText(
+                     users, static_cast<int>(kAuthMaxUsers)),
+            ui_texts::authlistKeyboard(vcTarget(ctx), users));
 }
 
 void Dispatcher::onAdmincache(const CommandContext& ctx) {
@@ -3214,13 +5272,17 @@ void Dispatcher::onAdmincache(const CommandContext& ctx) {
         auto it = hist.find(ctx.message.from.id);
         auto now = std::chrono::steady_clock::now();
         if (it != hist.end() && now < it->second) {
-            reply(ctx, "Admin cache was refreshed recently. Wait 10 minutes.");
+            auto remain = std::chrono::duration_cast<std::chrono::seconds>(
+                              it->second - now)
+                              .count();
+            reply(ctx, ui_texts::reloadCooldownText(
+                           ui_texts::mmss(remain)));
             return;
         }
         hist[ctx.message.from.id] = now + std::chrono::minutes(10);
     }
     cachedAdmins(ctx.message.chat.id, true);
-    reply(ctx, "Admin cache refreshed.");
+    reply(ctx, ui_texts::kReloadShortOk);
 }
 
 void Dispatcher::onBlacklist(const CommandContext& ctx) {
@@ -3253,7 +5315,12 @@ void Dispatcher::onBlacklist(const CommandContext& ctx) {
         }
         if (!is_chat) store_.sadd("bl_users", std::to_string(id));
         store_.sadd("bl_chats", std::to_string(id));
-        reply(ctx, "Blacklisted " + std::to_string(id) + ".");
+        if (is_chat) {
+            replyHtml(ctx, "✅ Chat blocked: <code>" + std::to_string(id) +
+                               "</code>");
+        } else {
+            replyHtml(ctx, ui_texts::blBlockedUserText(id));
+        }
     } else {
         if (!isBlChat(id) && !isBlUser(id)) {
             reply(ctx, "Not blacklisted.");
@@ -3261,19 +5328,21 @@ void Dispatcher::onBlacklist(const CommandContext& ctx) {
         }
         if (!is_chat) store_.srem("bl_users", std::to_string(id));
         store_.srem("bl_chats", std::to_string(id));
-        reply(ctx, "Removed " + std::to_string(id) + " from the blacklist.");
+        replyHtml(ctx, "✅ Removed <code>" + std::to_string(id) +
+                           "</code> from the blacklist.");
     }
 }
 
 void Dispatcher::onBlacklisted(const CommandContext& ctx) {
     auto chats = store_.smembers("bl_chats");
     auto users = store_.smembers("bl_users");
-    std::string out = "Blacklisted chats (" + std::to_string(chats.size()) +
-                      ") and users (" + std::to_string(users.size()) + "):\n";
-    for (const auto& c : chats) out += "chat " + c + "\n";
-    for (const auto& u : users) out += "user " + u + "\n";
+    std::string out = ui_texts::kBlacklistTitle;
+    out += "\nChats (" + std::to_string(chats.size()) + ") and users (" +
+           std::to_string(users.size()) + "):\n";
+    for (const auto& c : chats) out += "chat <code>" + c + "</code>\n";
+    for (const auto& u : users) out += "user <code>" + u + "</code>\n";
     if (out.size() > 3500) out = out.substr(0, 3500) + "\n...";
-    reply(ctx, out);
+    replyHtml(ctx, out);
 }
 
 void Dispatcher::onAddSudo(const CommandContext& ctx) {
@@ -3283,6 +5352,10 @@ void Dispatcher::onAddSudo(const CommandContext& ctx) {
         return;
     }
     if (ctx.command == "addsudo") {
+        if (*user == ctx.message.from.id) {
+            replyHtml(ctx, ui_texts::kSudoSelfJoke);
+            return;
+        }
         if (isSudo(*user)) {
             reply(ctx, "That user is already a sudo user.");
             return;
@@ -3290,7 +5363,11 @@ void Dispatcher::onAddSudo(const CommandContext& ctx) {
         store_.sadd("sudoers", std::to_string(*user));
         reply(ctx, "Added sudo user " + std::to_string(*user) + ".");
     } else {
-        if (!isSudo(*user) || isOwner(*user)) {
+        if (isOwner(*user)) {
+            replyHtml(ctx, ui_texts::kSudoOwnerRemoveBlock);
+            return;
+        }
+        if (!isSudo(*user)) {
             reply(ctx, "That user is not a sudo user (or is the owner).");
             return;
         }
@@ -3300,28 +5377,32 @@ void Dispatcher::onAddSudo(const CommandContext& ctx) {
 }
 
 void Dispatcher::onListSudo(const CommandContext& ctx) {
-    std::string out = "Owner: ";
+    std::string out = ui_texts::kSudoHeader;
+    out += "\nOwner: ";
     out += cfg_.owner_id ? std::to_string(cfg_.owner_id) : "(unset)";
     out += "\n";
     auto sudoers = store_.smembers("sudoers");
-    if (!sudoers.empty()) {
+    if (sudoers.empty()) {
+        out += ui_texts::kSudoNoExtra;
+    } else {
         out += "Sudo users:\n";
         for (const auto& s : sudoers) out += "- " + s + "\n";
     }
-    reply(ctx, out);
+    replyHtml(ctx, out);
 }
 
 void Dispatcher::onActiveVc(const CommandContext& ctx) {
     auto keys = store_.keys("call:");
     if (keys.empty()) {
-        reply(ctx, "No active voice chats.");
+        reply(ctx, ui_texts::kActiveStreamsEmpty);
         return;
     }
     if (ctx.command == "ac") {
-        reply(ctx, "Active voice chats: " + std::to_string(keys.size()) + ".");
+        replyHtml(ctx, ui_texts::activeChatsText(
+                           static_cast<int>(keys.size())));
         return;
     }
-    std::string out = "Active voice chats:\n";
+    std::string out = std::string(ui_texts::kActiveStreamsHeader) + "\n";
     int i = 1;
     for (const auto& key : keys) {
         int64_t chat = 0;
@@ -3335,10 +5416,10 @@ void Dispatcher::onActiveVc(const CommandContext& ctx) {
         if (nowPlaying(chat, np, track) && track.find("title"))
             title = track.find("title")->asString();
         out += std::to_string(i++) + ". " + std::to_string(chat) + " — " +
-               title + "\n";
+               ui_texts::htmlEscape(title) + "\n";
         if (out.size() > 3500) break;
     }
-    reply(ctx, out);
+    replyHtml(ctx, out);
 }
 
 void Dispatcher::onBroadcast(const CommandContext& ctx) {
@@ -3372,6 +5453,15 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
     int64_t sent_id = reply(ctx, "Broadcasting to " +
                                      std::to_string(targets.size()) +
                                      " chats/users...");
+    // Attach the cancel keyboard (§18); cbBcast sets bcast_cancel_.
+    if (sent_id > 0) {
+        std::string kb_err;
+        tg_.editMessageReplyMarkup(
+            ctx.message.chat.id, sent_id,
+            inlineKeyboardJson(ui_texts::bcastKeyboard()), &kb_err);
+    }
+    bcast_running_.store(true);
+    bcast_cancel_.store(false);
     int count = 0, failed = 0;
     // One id per line, after a header that says what the failure
     // was: the Bot API forward/copy calls return only
@@ -3381,6 +5471,7 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
         "# chats that rejected the broadcast (forward/copy failed; "
         "the Bot API returns no per-chat error text)\n";
     for (int64_t target : targets) {
+        if (bcast_cancel_.load()) break;
         bool ok = false;
         if (copy)
             ok = tg_.copyMessage(target, ctx.message.chat.id,
@@ -3396,8 +5487,20 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    std::string text = "Broadcast done: " + std::to_string(count) +
-                       " delivered, " + std::to_string(failed) + " failed.";
+    bool cancelled = bcast_cancel_.load();
+    bcast_running_.store(false);
+    bcast_cancel_.store(false);
+    // Clear the cancel keyboard from the progress message.
+    if (sent_id > 0) {
+        std::string kb_err;
+        tg_.editMessageReplyMarkup(ctx.message.chat.id, sent_id,
+                                   Json(nullptr), &kb_err);
+    }
+    std::string text = cancelled
+                           ? ui_texts::kBcastCancelDone
+                           : "Broadcast done: " + std::to_string(count) +
+                                 " delivered, " + std::to_string(failed) +
+                                 " failed.";
     if (failed && sent_id > 0) {
         // Failures go out as an errors.txt attachment (NoxBeats
         // behaviour), not inline: a big fan-out can fail on hundreds
@@ -3423,18 +5526,26 @@ void Dispatcher::onMaintenance(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
         auto reason = store_.get("maint_reason");
-        reply(ctx, std::string("Maintenance is ") +
-                       (maintenanceOn() ? "ON" : "OFF") +
-                       (reason && !reason->empty() ? " (" + *reason + ")"
-                                                    : "") +
-                       ". Usage: /maintenance on|off [reason]");
+        replyHtml(ctx, ui_texts::fmt(
+                           ui_texts::kMaintUsage,
+                           {{"state", maintenanceOn() ? "ON" : "OFF"},
+                            {"reason", reason && !reason->empty() ? *reason
+                                                                  : "none"}}));
         return;
     }
     if (flagOff(args[0])) {
+        if (!maintenanceOn()) {
+            replyHtml(ctx, ui_texts::kMaintAlreadyOff);
+            return;
+        }
         store_.set("maintenance", "0");
         store_.set("maint_reason", "");
-        reply(ctx, "Maintenance off.");
+        replyHtml(ctx, ui_texts::kMaintDisabled);
     } else if (flagOn(args[0])) {
+        if (maintenanceOn()) {
+            replyHtml(ctx, ui_texts::kMaintAlreadyOn);
+            return;
+        }
         std::string reason;
         for (size_t i = 1; i < args.size(); ++i) {
             if (!reason.empty()) reason += " ";
@@ -3442,10 +5553,15 @@ void Dispatcher::onMaintenance(const CommandContext& ctx) {
         }
         store_.set("maintenance", "1");
         store_.set("maint_reason", reason);
-        reply(ctx, "Maintenance on." +
-                       (reason.empty() ? "" : " Reason: " + reason));
+        replyHtml(ctx, ui_texts::maintEnabledText(
+                           reason.empty() ? "none" : reason));
     } else {
-        reply(ctx, "Usage: /maintenance on|off [reason]");
+        auto reason = store_.get("maint_reason");
+        replyHtml(ctx, ui_texts::fmt(
+                           ui_texts::kMaintUsage,
+                           {{"state", maintenanceOn() ? "ON" : "OFF"},
+                            {"reason", reason && !reason->empty() ? *reason
+                                                                  : "none"}}));
     }
 }
 
@@ -3513,7 +5629,7 @@ std::string Dispatcher::formatSpeedtest(double down_mbps, bool up_ok,
 }
 
 void Dispatcher::onSpeedtest(const CommandContext& ctx) {
-    reply(ctx, "Running speed test...");
+    int64_t prog_id = reply(ctx, ui_texts::kSpeedtestDl);
     // Cloudflare speed endpoints (NoxBeats bot_tools.cpp::run_speedtest):
     // download probe (25 MB) + upload probe (4 MB POST to __up, the
     // endpoint Cloudflare's own speed test uses). Each probe is timed
@@ -3528,10 +5644,16 @@ void Dispatcher::onSpeedtest(const CommandContext& ctx) {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
             .count();
     if (!down.ok() || down.body.empty()) {
-        reply(ctx, "Speed test failed (download probe error).");
+        reply(ctx, ui_texts::kSpeedtestFailed);
         return;
     }
     double down_mbps = speedMbps(down.body.size(), down_secs);
+    // Stage two: the upload probe gets its own notice (§16).
+    if (prog_id > 0) {
+        std::string err;
+        tg_.editMessageText(ctx.message.chat.id, prog_id,
+                            ui_texts::kSpeedtestUp, Json(nullptr), &err);
+    }
     auto u0 = std::chrono::steady_clock::now();
     std::string up_body(4 * 1024 * 1024, '\0');
     HttpResult up = HttpClient::postRaw(
@@ -3548,7 +5670,8 @@ void Dispatcher::onSpeedtest(const CommandContext& ctx) {
 void Dispatcher::onBug(const CommandContext& ctx) {
     std::string text = trim(ctx.args);
     if (text.empty()) {
-        reply(ctx, "Usage: /bug <describe the problem>");
+        reply(ctx, ui_texts::fmt(ui_texts::kBugUsage,
+                                 {{"cmd", "/" + ctx.command}}));
         return;
     }
     if (text.size() > 1500) text.resize(1500);
@@ -3559,23 +5682,21 @@ void Dispatcher::onBug(const CommandContext& ctx) {
     }
     int64_t dest = cfg_.logger_id ? cfg_.logger_id : cfg_.owner_id;
     std::string err;
-    std::string report = "Bug report from user " +
-                         std::to_string(ctx.message.from.id) + " in chat " +
-                         std::to_string(ctx.message.chat.id) + ":\n" + text;
-    if (tg_.sendMessage(dest, report, err)) {
-        reply(ctx, "Bug report sent. Thanks!");
+    std::string report = ui_texts::fmt(
+        ui_texts::kBugReport,
+        {{"from", ui_texts::htmlEscape(displayName(ctx.message.from))},
+         {"id", std::to_string(ctx.message.from.id)},
+         {"where", std::to_string(ctx.message.chat.id)},
+         {"text", ui_texts::htmlEscape(text)}});
+    if (tg_.sendMessageHtml(dest, report, Json(nullptr), 0, &err)) {
+        reply(ctx, ui_texts::kBugThanks);
     } else {
-        reply(ctx, "Could not send the bug report: " + err);
+        reply(ctx, ui_texts::kBugFailed);
     }
 }
 
 void Dispatcher::onPrivacy(const CommandContext& ctx) {
-    reply(ctx,
-          "Parlay privacy: the bot stores per-chat settings (engine, "
-          "play mode, admin mode), authorized users, playlists you save "
-          "with /addplaylist, and the list of chats/users it serves "
-          "(for /broadcast). No audio you play is kept after the stream "
-          "ends. Use /bug to report a privacy concern.");
+    replyHtml(ctx, ui_texts::kPrivacy);
 }
 
 void Dispatcher::onPing(const CommandContext& ctx) {
@@ -3644,52 +5765,222 @@ void Dispatcher::onPing(const CommandContext& ctx) {
                          std::to_string((up / 60) % 60) + "m " +
                          std::to_string(up % 60) + "s";
     std::snprintf(b, sizeof b, "%.1f", latency);
-    std::string out = "Pong!\nLatency: " + std::string(b) +
-                      " ms\nUptime: " + up_str + "\nCPU: ";
+    std::string lat_str = b;
     std::snprintf(b, sizeof b, "%.1f", cpu);
-    out += b;
+    std::string cpu_str = std::string(b) + "%";
     std::snprintf(b, sizeof b, "%.1f", mem_used_pct);
-    out += "%\nRAM: " + std::string(b) + "% of ";
+    std::string ram_str = std::string(b) + "% of ";
     std::snprintf(b, sizeof b, "%.1f", mem_total_gb);
-    out += std::string(b) + " GB\nDisk: ";
-    std::snprintf(b, sizeof b, "%.1f", disk_pct);
-    out += std::string(b) + "%\nRSS: ";
+    ram_str += std::string(b) + " GB (RSS ";
     std::snprintf(b, sizeof b, "%.1f", rss_mb);
-    out += std::string(b) + " MB\nVoice: " + voice_.describe();
-    reply(ctx, out);
+    ram_str += std::string(b) + " MB)";
+    std::snprintf(b, sizeof b, "%.1f", disk_pct);
+    std::string disk_str = std::string(b) + "%";
+    std::string card = ui_texts::pingCardText(
+        bot_username_.empty() ? "Parlay" : "@" + bot_username_, lat_str,
+        up_str, ram_str, cpu_str, disk_str, "");
+    if (!cfg_.ping_img.empty()) {
+        replyPhoto(ctx, cfg_.ping_img, card, InlineKeyboard{});
+    } else {
+        replyHtml(ctx, card);
+    }
 }
 
 void Dispatcher::onStats(const CommandContext& ctx) {
-    std::string out = "Parlay stats:\n";
-    out += "Store backend: " + store_.backend() + "\n";
-    out += "Chats: " + std::to_string(store_.smembers("chats").size()) + "\n";
-    out += "Users: " + std::to_string(store_.smembers("users").size()) + "\n";
-    out += "Sudoers: " +
-           std::to_string(store_.smembers("sudoers").size() +
-                          (cfg_.owner_id ? 1 : 0)) +
-           "\n";
-    out += "Blacklisted chats: " +
-           std::to_string(store_.smembers("bl_chats").size()) + "\n";
-    out += "Blacklisted users: " +
-           std::to_string(store_.smembers("bl_users").size()) + "\n";
-    out += "Active voice chats: " +
-           std::to_string(store_.keys("call:").size()) + "\n";
-    out += "Commands registered: " + std::to_string(routes_.size()) + " routes\n";
-    out += "Voice: " + voice_.describe();
-    if (isSudo(ctx.message.from.id)) {
-        double rss_mb = 0;
+    int64_t up = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - boot_time_)
+            .count());
+    std::string up_str = std::to_string(up / 3600) + "h " +
+                         std::to_string((up / 60) % 60) + "m " +
+                         std::to_string(up % 60) + "s";
+    double mem_used_pct = 0, mem_total_gb = 0, disk_pct = 0, rss_mb = 0;
+    {
+        std::ifstream f("/proc/meminfo");
+        std::string k, unit;
+        double total = 0, avail = 0, v = 0;
+        while (f >> k >> v >> unit) {
+            if (k == "MemTotal:") total = v;
+            if (k == "MemAvailable:") avail = v;
+        }
+        if (total > 0) {
+            mem_total_gb = total / (1024.0 * 1024.0);
+            mem_used_pct = (1.0 - avail / total) * 100.0;
+        }
+    }
+    {
+        struct statvfs s {};
+        if (statvfs("/", &s) == 0) {
+            double total = static_cast<double>(s.f_blocks) * s.f_frsize;
+            double free = static_cast<double>(s.f_bfree) * s.f_frsize;
+            if (total > 0) disk_pct = (total - free) / total * 100.0;
+        }
+    }
+    {
         std::ifstream f("/proc/self/statm");
         long pages = 0, rss = 0;
         f >> pages >> rss;
         rss_mb = rss * static_cast<double>(sysconf(_SC_PAGESIZE)) /
                  (1024.0 * 1024.0);
-        char b[32];
-        std::snprintf(b, sizeof b, "%.1f", rss_mb);
-        out += "\nRSS: " + std::string(b) + " MB\nCores: " +
-               std::to_string(std::thread::hardware_concurrency()) +
-               "\nBuild: C++20, Bot API + MTProto bridge";
     }
-    reply(ctx, out);
+    double cpu = 0;
+    {
+        std::ifstream f("/proc/stat");
+        std::string k;
+        unsigned long long v[8] = {0};
+        f >> k;
+        for (auto& x : v) f >> x;
+        unsigned long long idle = v[3] + v[4], total = 0;
+        for (auto x : v) total += x;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::ifstream f2("/proc/stat");
+        f2 >> k;
+        for (auto& x : v) f2 >> x;
+        unsigned long long idle2 = v[3] + v[4], total2 = 0;
+        for (auto x : v) total2 += x;
+        double dt = static_cast<double>(total2 - total);
+        if (dt > 0) cpu = (1.0 - static_cast<double>(idle2 - idle) / dt) * 100.0;
+    }
+    char b[32];
+    std::snprintf(b, sizeof b, "%.1f", cpu);
+    std::string system_block = "Uptime: " + up_str + "\nCPU: " + b + "%\nCores: " +
+                               std::to_string(std::thread::hardware_concurrency());
+    std::snprintf(b, sizeof b, "%.1f", mem_used_pct);
+    std::string memory_block = "RAM: " + std::string(b) + "% of ";
+    std::snprintf(b, sizeof b, "%.1f", mem_total_gb);
+    memory_block += std::string(b) + " GB\nRSS: ";
+    std::snprintf(b, sizeof b, "%.1f", rss_mb);
+    memory_block += std::string(b) + " MB";
+    std::snprintf(b, sizeof b, "%.1f", disk_pct);
+    std::string server_block = "Disk: " + std::string(b) +
+                               "%\nStore: " + store_.backend();
+    std::string bot_block =
+        "Chats: " + std::to_string(store_.smembers("chats").size()) +
+        "\nUsers: " + std::to_string(store_.smembers("users").size()) +
+        "\nSudoers: " +
+        std::to_string(store_.smembers("sudoers").size() +
+                       (cfg_.owner_id ? 1 : 0)) +
+        "\nBlacklisted chats: " +
+        std::to_string(store_.smembers("bl_chats").size()) +
+        "\nBlacklisted users: " +
+        std::to_string(store_.smembers("bl_users").size()) +
+        "\nActive voice chats: " +
+        std::to_string(store_.keys("call:").size()) +
+        "\nCommands registered: " + std::to_string(routes_.size()) +
+        " routes";
+    std::string versions_block =
+        "Build: C++20, Bot API + MTProto bridge\nVoice: " + voice_.describe();
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kStatsCard,
+                                 {{"system", system_block},
+                                  {"memory", memory_block},
+                                  {"server", server_block},
+                                  {"bot", bot_block},
+                                  {"versions", versions_block},
+                                  {"library", ""}}));
+}
+
+void Dispatcher::onMenu(const CommandContext& ctx) {
+    // Admin-only remix panel (§2.3): the current track + next track
+    // with the merged control keyboard. Panel presses are requester-
+    // only (see cbPlayer).
+    if (!canManageVc(ctx)) return;
+    int64_t chat = vcTarget(ctx);
+    Json np, track;
+    std::string now_title, now_url, next_title, next_url, emoji = "⏹";
+    if (nowPlaying(chat, np, track)) {
+        now_title = track.find("title") ? track.find("title")->asString() : "";
+        now_url = track.find("url") ? track.find("url")->asString() : "";
+        bool paused = false;
+        if (const Json* p = np.find("is_paused")) paused = p->asBool();
+        if (const Json* p = np.find("paused")) paused = p->asBool();
+        emoji = paused ? "⏸" : "▶️";
+        Json q;
+        std::string qerr;
+        if (apiQueueList(chat, q, qerr) && q.size() > 1) {
+            const Json& nxt = q.asArray()[1];
+            next_title = nxt.find("title") ? nxt.find("title")->asString() : "";
+            next_url = nxt.find("url") ? nxt.find("url")->asString() : "";
+        }
+    }
+    int64_t msg = replyKb(ctx,
+                          ui_texts::menuPanelText(emoji, now_title, now_url,
+                                                  next_title, next_url),
+                          ui_texts::menuPanelKeyboard(chat));
+    if (msg > 0) {
+        store_.set("panelmsg:" + std::to_string(chat), std::to_string(msg));
+        store_.set("paneluser:" + std::to_string(chat),
+                   std::to_string(ctx.message.from.id));
+    }
+}
+
+void Dispatcher::onId(const CommandContext& ctx) {
+    replyHtml(ctx, ui_texts::idText(ctx.message.chat.id, 0));
+}
+
+void Dispatcher::onKeyboard(const CommandContext& ctx) {
+    std::string a = lowerStr(trim(ctx.args));
+    if (a == "off" || a == "remove" || a == "hide") {
+        replyReplyKb(ctx, "⌨ Keyboard removed.", removeKeyboardJson());
+        return;
+    }
+    replyReplyKb(ctx, ui_texts::kKeyboardEnabled,
+                 replyKeyboardJson(ui_texts::persistentKeyboard()));
+}
+
+void Dispatcher::onAbout(const CommandContext& ctx) {
+    // The channel handle comes from the updates URL when it is a
+    // t.me link; otherwise the repo name stands in.
+    std::string channel = "ParlayMusic";
+    if (cfg_.updates_url.rfind("https://t.me/", 0) == 0)
+        channel = cfg_.updates_url.substr(13);
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kAbout, {{"channel", channel}}));
+}
+
+void Dispatcher::onStatus(const CommandContext& ctx) {
+    // Music163bot's /status counts cached songs; the core keeps no
+    // song cache, so the counts are honestly zero.
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kStatusText,
+                                 {{"total", "0"},
+                                  {"chat", std::to_string(ctx.message.chat.id)},
+                                  {"chatCount", "0"},
+                                  {"userID", std::to_string(ctx.message.from.id)},
+                                  {"userCount", "0"}}));
+}
+
+void Dispatcher::onNow(const CommandContext& ctx) {
+    Json np, track;
+    if (!nowPlaying(vcTarget(ctx), np, track)) {
+        replyHtml(ctx, ui_texts::kNowIdle);
+        return;
+    }
+    std::string title =
+        track.find("title") ? track.find("title")->asString() : "";
+    std::string url = track.find("url") ? track.find("url")->asString() : "";
+    auto req = store_.get("last_requester_name:" +
+                          std::to_string(vcTarget(ctx)));
+    auto req_id = store_.get("last_requester_id:" +
+                             std::to_string(vcTarget(ctx)));
+    std::string requester = req ? *req : "someone";
+    std::string requester_url =
+        req_id ? "tg://user?id=" + *req_id : url;
+    replyHtml(ctx, ui_texts::nowText(ui_texts::htmlEscape(title), url,
+                                     ui_texts::htmlEscape(requester),
+                                     requester_url));
+}
+
+void Dispatcher::onRepo(const CommandContext& ctx) {
+    std::string url = cfg_.source_url.empty()
+                          ? "https://github.com/filewrap/ParlayMusic"
+                          : cfg_.source_url;
+    InlineKeyboard kb = {
+        {InlineButton::link("🔗 Source Code", url)},
+    };
+    replyKb(ctx, "Source code: <a href=\"" + url + "\">Parlay</a>", kb);
+}
+
+void Dispatcher::onDownloadSettings(const CommandContext& ctx) {
+    replyKb(ctx, ui_texts::kDlSettingsIndex,
+            ui_texts::dlSettingsIndexKeyboard());
 }
 
 void Dispatcher::onEval(const CommandContext& ctx) {
@@ -3697,7 +5988,7 @@ void Dispatcher::onEval(const CommandContext& ctx) {
     // last 3000 chars of output.
     std::string cmd = trim(ctx.args);
     if (cmd.empty()) {
-        reply(ctx, "Usage: /eval <shell command>");
+        reply(ctx, ui_texts::kEvalNoInput);
         return;
     }
     reply(ctx, "Running...");
@@ -3705,29 +5996,43 @@ void Dispatcher::onEval(const CommandContext& ctx) {
     std::string out = runShell(cmd, 60, code);
     if (out.size() > 3000) out = "..." + out.substr(out.size() - 3000);
     if (out.empty()) out = "(no output)";
-    reply(ctx, "Input:\n" + cmd.substr(0, 800) + "\nOutput:\n" + out +
-                   "\nExit: " + std::to_string(code));
+    std::string body =
+        "<b>Input:</b>\n<code>" +
+        ui_texts::htmlEscape(cmd.substr(0, 800)) + "</code>\n" +
+        ui_texts::evalOutputText(ui_texts::htmlEscape(out)) + "\nExit: " +
+        std::to_string(code);
+    if (code != 0) body = std::string(ui_texts::kEvalError) + body;
+    replyHtml(ctx, body);
 }
 
 void Dispatcher::onLogs(const CommandContext& ctx) {
     std::string out;
+    bool file_missing = false;
     if (!cfg_.log_file.empty()) {
         std::ifstream f(cfg_.log_file);
-        std::vector<std::string> lines;
-        std::string l;
-        while (std::getline(f, l)) {
-            lines.push_back(l);
-            if (lines.size() > 200) lines.erase(lines.begin());
+        if (!f) {
+            file_missing = true;
+        } else {
+            std::vector<std::string> lines;
+            std::string l;
+            while (std::getline(f, l)) {
+                lines.push_back(l);
+                if (lines.size() > 200) lines.erase(lines.begin());
+            }
+            for (size_t i = lines.size() > 40 ? lines.size() - 40 : 0;
+                 i < lines.size(); ++i)
+                out += lines[i] + "\n";
         }
-        for (size_t i = lines.size() > 40 ? lines.size() - 40 : 0;
-             i < lines.size(); ++i)
-            out += lines[i] + "\n";
     }
     if (out.empty()) {
         std::lock_guard<std::mutex> lk(log_mu_);
+        if (recent_log_.empty()) {
+            reply(ctx, file_missing ? ui_texts::kLogsMissing
+                                    : ui_texts::kLogsNone);
+            return;
+        }
         out = "Recent commands (in-memory log):\n";
         for (const auto& line : recent_log_) out += line + "\n";
-        if (recent_log_.empty()) out += "(none yet)\n";
     }
     if (out.size() > 3500) out = out.substr(0, 3500) + "\n...";
     reply(ctx, out);
@@ -3735,22 +6040,33 @@ void Dispatcher::onLogs(const CommandContext& ctx) {
 
 void Dispatcher::onLogger(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
-    if (args.empty() || (args[0] != "on" && args[0] != "off")) {
-        auto on = store_.get("logger_on");
-        reply(ctx, std::string("Logger is ") +
-                       ((on && *on == "0") ? "OFF" : "ON") +
-                       " (log chat " +
-                       (cfg_.logger_id ? std::to_string(cfg_.logger_id)
-                                       : "(unset)") +
-                       "). Usage: /logger on|off");
+    auto on = store_.get("logger_on");
+    bool enabled = !(on && *on == "0");
+    if (args.empty() || (args[0] != "on" && args[0] != "off" &&
+                        args[0] != "enable" && args[0] != "disable")) {
+        reply(ctx, ui_texts::fmt(ui_texts::kLoggerUsage,
+                                 {{"status", enabled ? "ON" : "OFF"}}));
         return;
     }
-    store_.set("logger_on", args[0] == "on" ? "1" : "0");
-    reply(ctx, std::string("Logger ") + (args[0] == "on" ? "ON" : "OFF") +
-                   ".");
+    bool want_on = args[0] == "on" || args[0] == "enable";
+    if (want_on && cfg_.logger_id == 0) {
+        reply(ctx, ui_texts::kLoggerNeedId);
+        return;
+    }
+    store_.set("logger_on", want_on ? "1" : "0");
+    reply(ctx, want_on ? ui_texts::kLoggerEnabled
+                       : ui_texts::kLoggerDisabled);
 }
 
 void Dispatcher::onRestart(const CommandContext& ctx) {
+    // A song playing in this chat gets the confirm card (§25);
+    // otherwise restart at once.
+    Json np, track;
+    if (nowPlaying(vcTarget(ctx), np, track)) {
+        replyKb(ctx, ui_texts::kRestartConfirm,
+                ui_texts::restartConfirmKeyboard(vcTarget(ctx)));
+        return;
+    }
     reply(ctx, "Restarting... (exit 42; the supervisor should bring me "
                "back.)");
     std::cout << "[cmd] /restart requested by " << ctx.message.from.id
@@ -3762,25 +6078,41 @@ void Dispatcher::onRestart(const CommandContext& ctx) {
 
 // --- handlers: RTMP ------------------------------------------------------------
 void Dispatcher::onSetRtmp(const CommandContext& ctx) {
+    // RTMP targets carry a stream key: set them in a private chat only
+    // (§20) — a key typed in a group is visible to every member.
+    if (ctx.message.chat.type != "private") {
+        reply(ctx, ui_texts::kRtmpDmOnly);
+        return;
+    }
     auto args = splitArgs(ctx.args);
     int64_t chat = ctx.message.chat.id;
     if (args.empty()) {
         std::string url = chatField(chat, "rtmp_url", "");
         reply(ctx, url.empty()
-                       ? "No RTMP target set. Usage: /setrtmp <rtmp url> "
-                         "<stream key>"
+                       ? ui_texts::kRtmpNotSet
                        : "RTMP target is set (key hidden). Use /setrtmp "
                          "<url> <key> to replace it.");
+        return;
+    }
+    if (args.size() == 1 && lowerStr(args[0]) == "off") {
+        setChatField(chat, "rtmp_url", "");
+        setChatField(chat, "rtmp_key", "");
+        reply(ctx, ui_texts::kRtmpRemoved);
         return;
     }
     if (args.size() < 2) {
         reply(ctx, "Usage: /setrtmp <rtmp url> <stream key>");
         return;
     }
+    if (args[0].rfind("rtmp://", 0) != 0 &&
+        args[0].rfind("rtmps://", 0) != 0) {
+        replyHtml(ctx, ui_texts::kRtmpInvalidUrl);
+        return;
+    }
     // The key is stored but never echoed back (NoxBeats rtmp.cpp scrub()).
     setChatField(chat, "rtmp_url", args[0]);
     setChatField(chat, "rtmp_key", args[1]);
-    reply(ctx, "RTMP target saved (key stored, never shown).");
+    reply(ctx, ui_texts::kRtmpSaved);
 }
 
 void Dispatcher::onStream(const CommandContext& ctx) {
@@ -3789,14 +6121,14 @@ void Dispatcher::onStream(const CommandContext& ctx) {
     std::string url = chatField(chat, "rtmp_url", "");
     std::string key = chatField(chat, "rtmp_key", "");
     if (url.empty()) {
-        reply(ctx, "No RTMP target set. Use /setrtmp in DM first.");
+        reply(ctx, ui_texts::kRtmpNotSet);
         return;
     }
     std::string query = trim(ctx.args);
     if (query.empty()) {
         Json np, track;
         if (!nowPlaying(chat, np, track)) {
-            reply(ctx, "Usage: /stream <song or link>");
+            replyHtml(ctx, ui_texts::kRtmpStreamUsage);
             return;
         }
         query = track.find("title") ? track.find("title")->asString() : "";
@@ -3804,8 +6136,7 @@ void Dispatcher::onStream(const CommandContext& ctx) {
     {
         std::lock_guard<std::mutex> lk(rtmp_mu_);
         if (rtmp_streams_.count(chat)) {
-            reply(ctx, "A stream is already running here. /streamstop "
-                       "first.");
+            reply(ctx, ui_texts::kRtmpAlreadyRunning);
             return;
         }
     }
@@ -3840,16 +6171,18 @@ void Dispatcher::onStream(const CommandContext& ctx) {
         _exit(127);
     }
     if (pid < 0) {
-        reply(ctx, "Could not start ffmpeg.");
+        reply(ctx, ui_texts::kRtmpStartFailed);
         return;
     }
     {
         std::lock_guard<std::mutex> lk(rtmp_mu_);
         rtmp_streams_[chat] = {pid, log_path,
-                               std::chrono::steady_clock::now()};
+                               std::chrono::steady_clock::now(), query};
     }
-    reply(ctx, "Streaming to RTMP (ffmpeg pid " + std::to_string(pid) +
-                   "). /streamstatus for progress, /streamstop to end it.");
+    replyHtml(ctx, ui_texts::rtmpStreamStartedText(
+                       ui_texts::htmlEscape(query),
+                       displayName(ctx.message.from)) +
+                       "\n\n" + ui_texts::kRtmpDelayNote);
 }
 
 void Dispatcher::onStreamStop(const CommandContext& ctx) {
@@ -3860,7 +6193,7 @@ void Dispatcher::onStreamStop(const CommandContext& ctx) {
         std::lock_guard<std::mutex> lk(rtmp_mu_);
         auto it = rtmp_streams_.find(chat);
         if (it == rtmp_streams_.end()) {
-            reply(ctx, "No stream is running here.");
+            reply(ctx, ui_texts::kRtmpNone);
             return;
         }
         pid = it->second.pid;
@@ -3871,7 +6204,7 @@ void Dispatcher::onStreamStop(const CommandContext& ctx) {
         int status = 0;
         waitpid(pid, &status, WNOHANG);
     }
-    reply(ctx, "Stream stopped.");
+    replyHtml(ctx, ui_texts::rtmpStoppedText(displayName(ctx.message.from)));
 }
 
 void Dispatcher::onStreamStatus(const CommandContext& ctx) {
@@ -3879,7 +6212,7 @@ void Dispatcher::onStreamStatus(const CommandContext& ctx) {
     std::lock_guard<std::mutex> lk(rtmp_mu_);
     auto it = rtmp_streams_.find(chat);
     if (it == rtmp_streams_.end()) {
-        reply(ctx, "No stream is running here.");
+        reply(ctx, ui_texts::kRtmpNoneActive);
         return;
     }
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(
@@ -3907,9 +6240,1770 @@ void Dispatcher::onStreamStatus(const CommandContext& ctx) {
             p += 3;
         }
     }
-    reply(ctx, "Stream running for " + std::to_string(secs) +
-                   "s (ffmpeg pid " + std::to_string(it->second.pid) +
-                   ").\n" + tail);
+    replyHtml(ctx, ui_texts::rtmpStatusText(
+                        ui_texts::htmlEscape(it->second.what),
+                        ui_texts::mmss(secs)) +
+                        " (ffmpeg pid " + std::to_string(it->second.pid) +
+                        ").\n" + ui_texts::htmlEscape(tail));
+}
+
+// --- Phase 9: callback router (UI_INVENTORY.md §1) -------------------------
+// One namespace, colon-separated, 64-byte hard limit:
+//   pl:<domain>:<verb>[:<arg>…]
+// Unknown callbacks get a polite alert, never a crash. Player/queue
+// buttons are admin-or-requester gated (§28.2): sudo, chat admin, auth
+// user, or admin_mode==2. Search buttons are requester-only. The remix
+// /menu panel is the exception: other users' taps are silently ignored.
+void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
+    if (cq.data.empty() || cq.data.size() > 64) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    std::vector<std::string> parts = splitCb(cq.data);
+    if (parts.size() < 2 || parts[0] != "pl") {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    // A button press proves the user is looking at this chat — same
+    // last_chat signal as a group message (§13). Group ids are
+    // negative; inline-mode buttons carry no message (chat_id 0).
+    if (cq.chat_id < 0) noteLastChat(cq.from.id, cq.chat_id);
+    const std::string& domain = parts[1];
+    try {
+        if (domain == "help") cbHelp(cq, parts);
+        else if (domain == "start") cbStart(cq);
+        else if (domain == "close") cbClose(cq);
+        else if (domain == "player") cbPlayer(cq, parts);
+        else if (domain == "queue") cbQueue(cq, parts);
+        else if (domain == "set") cbSet(cq, parts);
+        else if (domain == "lang") cbLang(cq, parts);
+        else if (domain == "dl") cbDl(cq, parts);
+        else if (domain == "bcast") cbBcast(cq);
+        else if (domain == "auth") cbAuth(cq, parts);
+        else if (domain == "search") cbSearch(cq, parts);
+        else if (domain == "vote") cbVote(cq, parts);
+        else if (domain == "share") cbShare(cq, parts);
+        else if (domain == "del") cbDel(cq, parts);
+        else if (domain == "lossy") cbLossy(cq, parts);
+        else if (domain == "restart") cbRestart(cq, parts);
+        else if (domain == "dlset") cbDlset(cq, parts);
+        else if (domain == "spotify") cbSpotify(cq, parts);
+        else
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+    } catch (const std::exception& e) {
+        std::cerr << "[cb] handler for " << cq.data
+                  << " threw: " << e.what() << "\n";
+        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+    }
+}
+
+void Dispatcher::handleMyChatMember(const TgChatMemberUpdate& upd) {
+    // Demotion goodbye (§2): the bot was an admin and is now a plain
+    // member — it can no longer manage the voice chat, so it says so
+    // and leaves. Any other transition is not ours to act on.
+    if (upd.old_status != "administrator" || upd.new_status != "member")
+        return;
+    if (bot_id_ != 0 && upd.user_id != bot_id_) return;
+    CommandContext ctx;
+    ctx.message.chat.id = upd.chat_id;
+    ctx.message.message_id = 0;
+    ctx.command = "start";
+    replyHtml(ctx, ui_texts::kDemoted);
+    tg_.leaveChat(upd.chat_id);
+}
+
+// --- inline queries (§13, Phase 9 gaps) ------------------------------------
+
+void Dispatcher::noteLastChat(int64_t user_id, int64_t chat_id) {
+    std::string key = "last_chat:" + std::to_string(user_id);
+    std::string val = std::to_string(chat_id);
+    auto cur = store_.get(key);
+    if (cur && *cur == val) return;  // already current: no disk write
+    store_.set(key, val);
+}
+
+int64_t Dispatcher::inlineChatId(int64_t user_id) const {
+    auto v = store_.get("last_chat:" + std::to_string(user_id));
+    if (!v) return 0;
+    try {
+        return std::stoll(*v);
+    } catch (...) {
+        return 0;
+    }
+}
+
+std::string Dispatcher::inlineModeOf(const std::string& query,
+                                     std::string& arg_out) {
+    // Mirrors vc-ts resolvers.js inlineMode exactly (same order):
+    // exact np/s/l/help; "lib|del|search <arg>"; bare lib/del/search;
+    // <3 chars -> hint; otherwise a search for the whole query.
+    std::string q = trim(query);
+    arg_out.clear();
+    if (q.empty()) return "hint";
+    std::string lower = lowerStr(q);
+    if (lower == "np") return "np";
+    if (lower == "s") return "s";
+    if (lower == "l") return "l";
+    if (lower == "help") return "help";
+    size_t space = q.find_first_of(" \t\r\n");
+    if (space != std::string::npos) {
+        std::string head = lowerStr(q.substr(0, space));
+        std::string rest = trim(q.substr(space + 1));
+        if ((head == "lib" || head == "del" || head == "search") &&
+            !rest.empty()) {
+            arg_out = rest;
+            return head;
+        }
+    }
+    if (lower == "lib" || lower == "del" || lower == "search")
+        return lower;
+    if (utf8Len(q) < 3) return "hint";
+    arg_out = q;
+    return "search";
+}
+
+Json Dispatcher::inlineArticleResult(const std::string& id,
+                                     const std::string& title,
+                                     const std::string& description,
+                                     const std::string& message_text,
+                                     const std::string& thumb_url) {
+    // Plain-text message (no parse_mode): titles and lyrics can
+    // contain '<' '>' '&' that would break HTML parsing.
+    Json content = Json::objectOf({{"message_text", Json(message_text)}});
+    Json r = Json::objectOf({
+        {"type", Json("article")},
+        {"id", Json(id)},
+        {"title", Json(title)},
+        {"input_message_content", content},
+    });
+    if (!description.empty()) r.set("description", Json(description));
+    if (!thumb_url.empty()) r.set("thumb_url", Json(thumb_url));
+    return r;
+}
+
+Json Dispatcher::inlineTrackResult(const Json& track, const std::string& id,
+                                   bool with_button) {
+    std::string title =
+        track.find("title") ? track.find("title")->asString() : "";
+    std::string artist =
+        track.find("artist") ? track.find("artist")->asString() : "";
+    std::string stream =
+        track.find("stream_url") ? track.find("stream_url")->asString()
+                                 : "";
+    std::string url =
+        track.find("url") ? track.find("url")->asString() : "";
+    std::string thumb =
+        track.find("thumbnail") ? track.find("thumbnail")->asString() : "";
+    int64_t dur = track.find("duration_sec")
+                      ? track.find("duration_sec")->asInt()
+                      : 0;
+    Json open_kb = Json(nullptr);
+    if (with_button && !bot_username_.empty()) {
+        Json btn = Json::objectOf({
+            {"text", Json(ui_texts::kInlineOpenInParlay)},
+            {"url", Json(ui_texts::inlineOpenUrl(bot_username_, id))},
+        });
+        open_kb = Json::objectOf({
+            {"inline_keyboard", Json(Json::Array{Json(Json::Array{btn})})},
+        });
+    }
+    if (!stream.empty()) {
+        // Audio result (lemonic §6.7, navidrome §7.9.2/§7.9.7): the
+        // audio's own title/performer/duration/thumbnail are used.
+        // NOT a cached-audio result: the Track carries no file_id
+        // (see phase9/port-core.md) — a plain audio result from the
+        // direct stream URL is the honest form.
+        Json r = Json::objectOf({
+            {"type", Json("audio")},
+            {"id", Json(id)},
+            {"audio_url", Json(stream)},
+            {"title", Json(title)},
+            {"performer", Json(artist)},
+        });
+        if (dur > 0) r.set("audio_duration", Json(dur));
+        if (!thumb.empty()) r.set("thumb_url", Json(thumb));
+        r.set("caption", Json("<b>" + ui_texts::htmlEscape(title) +
+                              "</b> - " + ui_texts::htmlEscape(artist)));
+        r.set("parse_mode", Json("HTML"));
+        if (!open_kb.isNull()) r.set("reply_markup", open_kb);
+        return r;
+    }
+    // Article fallback: a page URL is not playable audio. YouTube /
+    // lemonic search results carry url only; JioSaavn carries a
+    // stream_url and takes the audio branch above. The [Open in
+    // Parlay Bot] button is the functional path to the track.
+    std::string desc = artist;
+    std::string dur_str = track.find("duration_str")
+                              ? track.find("duration_str")->asString()
+                              : "";
+    if (dur_str.empty() && dur > 0) dur_str = ui_texts::mmss(dur);
+    if (!dur_str.empty()) desc += " · " + dur_str;
+    std::string msg = artist + " — " + title;
+    if (!url.empty()) msg += "\n" + url;
+    Json r = inlineArticleResult(id, title, desc, msg, thumb);
+    if (!open_kb.isNull()) r.set("reply_markup", open_kb);
+    return r;
+}
+
+void Dispatcher::storeInlineResults(int64_t user_id, const Json& results) {
+    store_.set("inlinesearch:" + std::to_string(user_id), results.dump());
+}
+
+bool Dispatcher::loadInlineTrack(int64_t user_id, const std::string& track_id,
+                                 Json& track_out) {
+    auto v = store_.get("inlinesearch:" + std::to_string(user_id));
+    if (!v || v->empty()) return false;
+    Json results;
+    try {
+        results = Json::parse(*v);
+    } catch (...) {
+        return false;
+    }
+    if (!results.isArray()) return false;
+    for (const auto& t : results.asArray()) {
+        if (t.find("id") && t.find("id")->asString() == track_id) {
+            track_out = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+void Dispatcher::handleInlineQuery(const TgInlineQuery& iq) {
+    // Silent auth rule (§13): non-allowed users get no results at all.
+    if (isBlUser(iq.from.id) ||
+        (maintenanceOn() && !isSudo(iq.from.id))) {
+        std::string err;
+        tg_.answerInlineQuery(iq.id, Json(Json::Array{}), 0, "", "", &err);
+        return;
+    }
+    auto answer_empty = [&](int cache_time) {
+        std::string err;
+        tg_.answerInlineQuery(iq.id, Json(Json::Array{}), cache_time, "",
+                              "", &err);
+    };
+    std::string arg;
+    std::string mode = inlineModeOf(iq.query, arg);
+    if (mode == "hint") {
+        std::string err;
+        tg_.answerInlineQuery(iq.id, Json(Json::Array{}), 30,
+                              ui_texts::kInlineHintText, "help", &err);
+        return;
+    }
+    if (mode == "help") {
+        Json results = Json(Json::Array{
+            inlineArticleResult("help1", ui_texts::kInlineHelpTitle1, "",
+                                ui_texts::kInlineHelpMessage, ""),
+            inlineArticleResult("help2", ui_texts::kInlineHelpTitle2, "",
+                                ui_texts::kInlineHelpMessage, ""),
+        });
+        std::string err;
+        tg_.answerInlineQuery(iq.id, results, 3600, "", "", &err);
+        return;
+    }
+    if (mode == "search" && arg.empty()) {
+        Json results = Json(Json::Array{inlineArticleResult(
+            "keyword", ui_texts::kInlineNeedKeyword, "",
+            ui_texts::kInlineNeedKeyword, "")});
+        std::string err;
+        tg_.answerInlineQuery(iq.id, results, 3600, "", "", &err);
+        return;
+    }
+    // np/s/l need the chat the user is playing in (ruling 2). No
+    // known chat -> the engine cannot answer them: empty, honestly.
+    int64_t chat_id = 0;
+    bool need_chat = mode == "np" || mode == "s" || mode == "l";
+    if (need_chat) {
+        chat_id = inlineChatId(iq.from.id);
+        if (chat_id == 0) {
+            answer_empty(0);
+            return;
+        }
+    }
+    Json body = Json::objectOf({
+        {"query", Json(iq.query)},
+        {"user_id", Json(iq.from.id)},
+    });
+    if (need_chat) body.set("chat_id", Json(chat_id));
+    IpcResult r = ipc_.post(cfg_.vc_ts_url, "inline", body, 15);
+    if (!r.ok) {
+        // Engine down: answer empty rather than leaving the query
+        // hanging (Telegram shows "no results" instead of an error).
+        answer_empty(0);
+        return;
+    }
+    const Json* results = r.data.find("results");
+    if (!results || results->size() == 0) {
+        if (mode == "search") {
+            Json art = Json(Json::Array{inlineArticleResult(
+                "noresults", ui_texts::kInlineNoResults, "",
+                ui_texts::kInlineNoResults, "")});
+            std::string err;
+            tg_.answerInlineQuery(iq.id, art, 3600, "", "", &err);
+            return;
+        }
+        // np/s/l/lib/del with nothing: empty results (§13).
+        answer_empty(0);
+        return;
+    }
+    if (mode == "l") {
+        // The engine returns the current track only — the lyrics text
+        // comes from /v1/lyrics with the same chat_id (ruling 3).
+        const Json& track = results->asArray()[0];
+        std::string title = track.find("title")
+                                ? track.find("title")->asString()
+                                : "";
+        std::string artist = track.find("artist")
+                                 ? track.find("artist")->asString()
+                                 : "";
+        // vc.lyrics is POST /v1/lyrics in the service (body
+        // {chat_id}); the contract writes GET, but the GET form 404s
+        // — the route sits behind vc-ts's POST-only gate (main.js).
+        // Flagged for the coordinator in phase9/port-core.md.
+        Json lbody = Json::objectOf({{"chat_id", Json(chat_id)}});
+        IpcResult lr = ipc_.post(cfg_.vc_ts_url, "lyrics", lbody, 15);
+        std::string lyrics;
+        if (lr.ok) {
+            const Json* lx = lr.data.find("lyrics");
+            if (lx) lyrics = lx->asString();
+        }
+        if (lyrics.empty()) {
+            answer_empty(0);  // no lyrics for this track: empty (§13)
+            return;
+        }
+        std::string plain = stripLrcTimestamps(lyrics);
+        // The stripper ends every line with "\n", including the last:
+        // drop the trailing blank lines so the article does not end
+        // on an empty line.
+        while (!plain.empty() &&
+               (plain.back() == '\n' || plain.back() == '\r'))
+            plain.pop_back();
+        // Truncated to 4000 chars + "\n..." (§13): truncUtf8 cuts
+        // safely at a UTF-8 boundary and appends "…", which is
+        // swapped for the inventory's literal suffix.
+        std::string cut = ui_texts::truncUtf8(plain, 4000);
+        if (cut.size() >= 3 && cut.substr(cut.size() - 3) == "…")
+            cut = cut.substr(0, cut.size() - 3) + "\n...";
+        std::string desc = artist + " — " + headUtf8(plain, 100);
+        Json art = Json(Json::Array{inlineArticleResult(
+            "l", ui_texts::inlineLyricsTitle(title), desc,
+            artist + " — " + title + "\n\n" + cut, "")});
+        std::string err;
+        tg_.answerInlineQuery(iq.id, art, 0, "", "", &err);
+        return;
+    }
+    if (mode == "s") {
+        // Share message for the current track (§13): "{artist} —
+        // {title}\n{share url}". The track's own URL is the share URL
+        // available here — minting a share.create link would name the
+        // track, not a sender's share flow, so it is not used.
+        const Json& track = results->asArray()[0];
+        std::string title = track.find("title")
+                                ? track.find("title")->asString()
+                                : "";
+        if (title.empty()) {
+            answer_empty(0);
+            return;
+        }
+        std::string artist = track.find("artist")
+                                 ? track.find("artist")->asString()
+                                 : "";
+        std::string url =
+            track.find("url") ? track.find("url")->asString() : "";
+        if (url.empty() && track.find("stream_url"))
+            url = track.find("stream_url")->asString();
+        std::string thumb = track.find("thumbnail")
+                                ? track.find("thumbnail")->asString()
+                                : "";
+        std::string msg = artist + " — " + title;
+        if (!url.empty()) msg += "\n" + url;
+        Json art = Json(
+            Json::Array{inlineArticleResult("s", title, artist, msg, thumb)});
+        std::string err;
+        tg_.answerInlineQuery(iq.id, art, 0, "", "", &err);
+        return;
+    }
+    if (mode == "np") {
+        const Json& track = results->asArray()[0];
+        std::string id =
+            track.find("id") ? track.find("id")->asString() : "";
+        if (id.empty()) {
+            answer_empty(0);
+            return;
+        }
+        Json res = Json(Json::Array{inlineTrackResult(track, id, false)});
+        std::string err;
+        tg_.answerInlineQuery(iq.id, res, 0, "", "", &err);
+        return;
+    }
+    // Search results (lib/del reach here only if a future library
+    // backend returns tracks): one result per track, audio when a
+    // stream_url is known, article otherwise.
+    Json::Array out;
+    for (const auto& t : results->asArray()) {
+        std::string id = t.find("id") ? t.find("id")->asString() : "";
+        std::string title =
+            t.find("title") ? t.find("title")->asString() : "";
+        if (id.empty() || title.empty()) continue;
+        out.push_back(inlineTrackResult(t, id, true));
+    }
+    if (out.empty()) {
+        Json art = Json(Json::Array{inlineArticleResult(
+            "noresults", ui_texts::kInlineNoResults, "",
+            ui_texts::kInlineNoResults, "")});
+        std::string err;
+        tg_.answerInlineQuery(iq.id, art, 3600, "", "", &err);
+        return;
+    }
+    storeInlineResults(iq.from.id, *results);
+    std::string err;
+    tg_.answerInlineQuery(iq.id, Json(out), 3600, "", "", &err);
+}
+
+// One player verb for a chat, shared by the /menu panel and the card
+// buttons. No replies here — the caller answers the toast and
+// re-renders the card. Returns false + error when nothing is playing
+// or the engine refuses.
+bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
+                              int64_t user_id, const TgCallbackQuery* cq,
+                              std::string& error) {
+    CommandContext ctx;
+    ctx.message.chat.id = chat_id;
+    ctx.message.from.id = user_id;
+    if (cq) ctx.message.from = cq->from;
+    ctx.command = "player";
+    Engine used;
+    bool fb = false;
+    Json np, track;
+    auto need_now = [&]() {
+        return nowPlaying(chat_id, np, track);
+    };
+    if (verb == "pause") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        IpcResult r = vcCall(ctx, "pause",
+                             Json::objectOf({{"chat_id", Json(chat_id)}}),
+                             used, fb);
+        if (!r.ok) {
+            error = r.error_message;
+            return false;
+        }
+        voice_.pause(chat_id);  // best effort; engine state wins
+        return true;
+    }
+    if (verb == "resume") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        IpcResult r = vcCall(ctx, "resume",
+                             Json::objectOf({{"chat_id", Json(chat_id)}}),
+                             used, fb);
+        if (!r.ok) {
+            error = ui_texts::kToastResumeFailed;
+            return false;
+        }
+        voice_.resume(chat_id);  // best effort; engine state wins
+        return true;
+    }
+    if (verb == "replay") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        IpcResult r = vcCall(ctx, "seek",
+                             Json::objectOf({
+                                 {"chat_id", Json(chat_id)},
+                                 {"position_sec", Json(static_cast<int64_t>(0))},
+                             }),
+                             used, fb);
+        if (!r.ok) {
+            error = r.error_message;
+            return false;
+        }
+        std::string be;
+        if (!attachEngineAudio(chat_id, np, false, 0, "", be)) {
+            error = be;
+            return false;
+        }
+        return true;
+    }
+    if (verb == "skip") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        IpcResult r = vcCall(ctx, "skip",
+                             Json::objectOf({{"chat_id", Json(chat_id)}}),
+                             used, fb);
+        if (!r.ok) {
+            error = r.error_message;
+            return false;
+        }
+        Json np2, track2;
+        if (!nowPlaying(chat_id, np2, track2)) {
+            // Queue ran dry: stop everything (onSkip behaviour).
+            voice_.stop(chat_id);
+            clearCoreStream(chat_id);
+            setCallActive(chat_id, false);
+            error = ui_texts::kToastSkipEmpty;
+            return false;
+        }
+        std::string be;
+        if (!attachEngineAudio(chat_id, np2, false, 0, "", be)) {
+            error = be;
+            return false;
+        }
+        return true;
+    }
+    if (verb == "stop") {
+        IpcResult r = vcCall(ctx, "stop",
+                             Json::objectOf({{"chat_id", Json(chat_id)}}),
+                             used, fb);
+        if (!r.ok) {
+            error = r.error_message;
+            return false;
+        }
+        voice_.stop(chat_id);
+        clearCoreStream(chat_id);
+        setCallActive(chat_id, false);
+        setChatField(chat_id, "loop", "0");
+        setChatField(chat_id, "speed", "1.0");
+        setChatField(chat_id, "bass", "0");
+        setChatField(chat_id, "muted", "0");
+        return true;
+    }
+    if (verb == "mute" || verb == "unmute") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        std::string be;
+        if (!muteVoice(chat_id, verb == "mute", be)) {
+            error = be;
+            return false;
+        }
+        return true;
+    }
+    if (verb == "seek15" || verb == "seekback15") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        int64_t pos = np.find("position_sec")
+                          ? np.find("position_sec")->asInt()
+                          : chatIntField(chat_id, "core_pos", 0);
+        int64_t dur = track.find("duration_sec")
+                          ? track.find("duration_sec")->asInt()
+                          : 0;
+        int64_t next = verb == "seek15" ? pos + 15 : pos - 15;
+        if (next < 0) next = 0;
+        if (dur > 0 && next >= dur - 2) {
+            error = ui_texts::toastSeekNearEnd(15);
+            return false;
+        }
+        IpcResult r = vcCall(ctx, "seek",
+                             Json::objectOf({
+                                 {"chat_id", Json(chat_id)},
+                                 {"position_sec", Json(next)},
+                             }),
+                             used, fb);
+        if (!r.ok) {
+            error = ui_texts::fmt(ui_texts::kToastSeekFailed,
+                                  {{"error", r.error_message}});
+            return false;
+        }
+        std::string be;
+        if (!attachEngineAudio(chat_id, np, false, next, "", be)) {
+            error = be;
+            return false;
+        }
+        return true;
+    }
+    if (verb == "autoplay") {
+        bool on = chatField(chat_id, "autoplay", "off") != "on";
+        setChatField(chat_id, "autoplay", on ? "on" : "off");
+        store_.set("autoplay:" + std::to_string(chat_id),
+                   on ? "1" : "0");
+        IpcResult r = vcCall(ctx, "autoplay",
+                             Json::objectOf({
+                                 {"chat_id", Json(chat_id)},
+                                 {"enabled", Json(on)},
+                             }),
+                             used, fb);
+        if (!r.ok) {
+            // The engine refused: roll the toggle back, honestly.
+            setChatField(chat_id, "autoplay", on ? "off" : "on");
+            store_.set("autoplay:" + std::to_string(chat_id),
+                       on ? "0" : "1");
+            error = r.error_message;
+            return false;
+        }
+        error = on ? ui_texts::kToastAutoplayOn
+                   : ui_texts::kToastAutoplayOff;
+        return true;
+    }
+    if (verb == "thumb") {
+        bool on = chatField(chat_id, "thumb", "on") != "on";
+        setChatField(chat_id, "thumb", on ? "on" : "off");
+        error = on ? ui_texts::kToastThumbOn : ui_texts::kToastThumbOff;
+        return true;
+    }
+    if (verb == "shuffle") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        IpcResult r = vcCall(ctx, "shuffle",
+                             Json::objectOf({{"chat_id", Json(chat_id)}}),
+                             used, fb);
+        if (!r.ok) {
+            error = r.error_message;
+            return false;
+        }
+        error = ui_texts::kToastShuffle;
+        return true;
+    }
+    if (verb == "voldec" || verb == "volinc") {
+        int v = static_cast<int>(chatIntField(chat_id, "volume", 100));
+        v += verb == "volinc" ? 10 : -10;
+        if (v < 0) v = 0;
+        if (v > 200) v = 200;
+        IpcResult r = vcCall(ctx, "volume",
+                             Json::objectOf({
+                                 {"chat_id", Json(chat_id)},
+                                 {"volume", Json(static_cast<int64_t>(v))},
+                             }),
+                             used, fb);
+        if (!r.ok) {
+            error = r.error_message;
+            return false;
+        }
+        setChatField(chat_id, "volume", std::to_string(v));
+        error = ui_texts::toastVolumeSet(v);
+        return true;
+    }
+    if (verb == "refresh") {
+        if (!need_now()) {
+            error = ui_texts::kToastNothingPlaying;
+            return false;
+        }
+        error = ui_texts::kToastPanelUpdated;
+        return true;
+    }
+    error = ui_texts::kToastUnknownAction;
+    return false;
+}
+
+// --- callback sub-handlers: help / start / close / player / queue ---------
+void Dispatcher::cbHelp(const TgCallbackQuery& cq,
+                        const std::vector<std::string>& parts) {
+    std::string topic = parts.size() > 2 ? parts[2] : "";
+    if (topic.empty() || topic == "main") {
+        answerCb(cq, ui_texts::kHelpBackToast);
+        editCbCard(cq, ui_texts::kHelpMenu, ui_texts::helpMenuKeyboard());
+        return;
+    }
+    std::string text = ui_texts::helpTopicText(topic);
+    if (text.empty()) {
+        answerCb(cq, ui_texts::kHelpUnknownCategory, true);
+        return;
+    }
+    answerCb(cq, ui_texts::helpTopicTitle(topic));
+    editCbCard(cq, text, ui_texts::helpTopicKeyboard());
+}
+
+void Dispatcher::cbStart(const TgCallbackQuery& cq) {
+    // Back from the help menu (or any card) to the start card.
+    editCbCard(cq, ui_texts::kStartPm,
+               ui_texts::startPmKeyboard(bot_username_, cfg_.updates_url,
+                                         cfg_.support_url, cfg_.source_url));
+    answerCb(cq, "");
+}
+
+void Dispatcher::cbClose(const TgCallbackQuery& cq) {
+    if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
+    answerCb(cq, "");
+}
+
+void Dispatcher::cbPlayer(const TgCallbackQuery& cq,
+                          const std::vector<std::string>& parts) {
+    // pl:player:<verb>:<chat_id>[:<token>]
+    // pl:player:progress:<chat_id> — no-op label button.
+    // pl:player:confirm:<verb>:<chat_id>
+    // pl:player:playnow:<chat_id>:<token> / addlist:<chat_id>:<token>
+    if (parts.size() < 3) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    const std::string& verb = parts[2];
+    if (verb == "progress") {
+        answerCb(cq, "");
+        return;
+    }
+    int64_t chat_id = cq.chat_id;
+    std::string token;
+    if (verb == "confirm") {
+        // pl:player:confirm:<verb>:<chat_id>
+        if (parts.size() < 5) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        const std::string& cverb = parts[3];
+        try {
+            chat_id = std::stoll(parts[4]);
+        } catch (...) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        if (!callbackCanControl(chat_id, cq.from.id)) {
+            answerCb(cq, ui_texts::kToastNotAllowed, true);
+            return;
+        }
+        if (cverb == "resume") {
+            std::string err;
+            if (!playerAction(chat_id, "resume", cq.from.id, &cq, err)) {
+                answerCb(cq, err, true);
+                return;
+            }
+            answerCb(cq, ui_texts::toastResumed(0));
+            refreshCard(cq, chat_id);
+            return;
+        }
+        if (cverb == "unmute") {
+            std::string err;
+            if (!playerAction(chat_id, "unmute", cq.from.id, &cq, err)) {
+                answerCb(cq, err, true);
+                return;
+            }
+            answerCb(cq, ui_texts::kToastUnmuted);
+            refreshCard(cq, chat_id);
+            return;
+        }
+        if (cverb == "stop") {
+            std::string err;
+            if (!playerAction(chat_id, "stop", cq.from.id, &cq, err)) {
+                answerCb(cq, err, true);
+                return;
+            }
+            answerCb(cq, ui_texts::kToastStopped);
+            editCbCard(cq, ui_texts::kStoppedCard, InlineKeyboard{});
+            return;
+        }
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    // Plain verbs carry the chat id in parts[3]. Token verbs
+    // (playnow/addlist) carry only the token — cbPlayerToken emits
+    // "pl:player:<verb>:<token>" — and the chat comes from the
+    // callback's own message.
+    if (verb == "playnow" || verb == "addlist") {
+        if (parts.size() < 4) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        token = parts[3];
+        chat_id = cq.chat_id;
+    } else if (parts.size() > 3) {
+        try {
+            chat_id = std::stoll(parts[3]);
+        } catch (...) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+    }
+    // The /menu control panel shares these callbacks (§4, remix
+    // §2.3) but has its own rule: only the user who ran /menu may
+    // press, and everyone else is silently ignored (empty answer,
+    // no toast). The panel is the stored panel message for the chat.
+    bool is_panel = false;
+    if (cq.has_message) {
+        auto pm = store_.get("panelmsg:" + std::to_string(chat_id));
+        if (pm) {
+            try {
+                is_panel = std::stoll(*pm) == cq.message_id;
+            } catch (...) {
+            }
+        }
+    }
+    if (is_panel) {
+        int64_t panel_user = 0;
+        auto pu = store_.get("paneluser:" + std::to_string(chat_id));
+        if (pu) {
+            try {
+                panel_user = std::stoll(*pu);
+            } catch (...) {
+            }
+        }
+        if (panel_user != 0 && cq.from.id != panel_user) {
+            answerCb(cq, "");
+            return;
+        }
+    } else if (!callbackCanControl(chat_id, cq.from.id)) {
+        answerCb(cq, ui_texts::kToastNotAllowed, true);
+        return;
+    }
+    if (verb == "playnow") {
+        Json item;
+        int64_t pos = 0;
+        if (!resolveQueueToken(chat_id, token, item, pos)) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        const Json* t = item.find("track");
+        if (!t) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::string url = t->find("url") ? t->find("url")->asString() : "";
+        std::string id = t->find("id") ? t->find("id")->asString() : "";
+        std::string q = !url.empty() ? url : id;
+        if (q.empty()) {
+            answerCb(cq, ui_texts::kToastInvalidRequest, true);
+            return;
+        }
+        CommandContext ctx;
+        ctx.message.chat.id = chat_id;
+        ctx.message.from = cq.from;
+        ctx.command = "play";
+        ctx.args = q;
+        // Play-now interrupts: stop the current track first, then
+        // play the chosen one (onPlay attaches the audio).
+        Engine used;
+        bool fb = false;
+        vcCall(ctx, "stop",
+               Json::objectOf({{"chat_id", Json(chat_id)}}), used, fb);
+        onPlay(ctx);
+        answerCb(cq, ui_texts::kToastSkipped);
+        refreshCard(cq, chat_id);
+        return;
+    }
+    if (verb == "addlist") {
+        Json item;
+        int64_t pos = 0;
+        if (!resolveQueueToken(chat_id, token, item, pos)) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        const Json* t = item.find("track");
+        if (!t) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        Json list = playlistOf(store_, cq.from.id);
+        std::string id = t->find("id") ? t->find("id")->asString() : "";
+        for (const auto& it : list.asArray()) {
+            const Json* iid = it.find("id");
+            if (iid && iid->asString() == id) {
+                answerCb(cq, ui_texts::kToastAlreadyInPlaylist);
+                return;
+            }
+        }
+        if (list.size() >= kPlaylistMax) {
+            answerCb(cq, ui_texts::kToastPlaylistFull, true);
+            return;
+        }
+        Json::Array arr = list.asArray();
+        arr.push_back(*t);
+        savePlaylist(store_, cq.from.id, Json(arr));
+        answerCb(cq, ui_texts::kToastAddedToPlaylist);
+        return;
+    }
+    if (verb == "stop") {
+        // Stop asks first — but only when there is something to ask
+        // about: paused (resume?) or muted (unmute?). Playing
+        // normally, the stop goes through at once.
+        Json np, track;
+        bool paused = false;
+        bool muted = false;
+        if (nowPlaying(chat_id, np, track)) {
+            if (const Json* p = np.find("paused")) paused = p->asBool();
+            if (const Json* p = np.find("is_paused")) paused = p->asBool();
+            if (const Json* m = np.find("is_muted")) muted = m->asBool();
+            if (chatField(chat_id, "muted", "0") == "1") muted = true;
+        }
+        if (!paused && !muted) {
+            std::string err;
+            if (!playerAction(chat_id, "stop", cq.from.id, &cq, err)) {
+                answerCb(cq, err, true);
+                return;
+            }
+            answerCb(cq, ui_texts::kToastStopped);
+            editCbCard(cq, ui_texts::kStoppedCard, InlineKeyboard{});
+            return;
+        }
+        answerCb(cq, "");
+        if (paused)
+            editCbCard(cq, ui_texts::kStopConfirmPaused,
+                       ui_texts::stopConfirmKeyboard(chat_id, true));
+        else
+            editCbCard(cq, ui_texts::kStopConfirmMuted,
+                       ui_texts::stopConfirmKeyboard(chat_id, false));
+        return;
+    }
+    // Plain control verbs.
+    Json np, track;
+    int64_t pos = 0;
+    if (nowPlaying(chat_id, np, track)) {
+        pos = np.find("position_sec") ? np.find("position_sec")->asInt()
+                                      : chatIntField(chat_id, "core_pos", 0);
+    }
+    std::string err;
+    if (!playerAction(chat_id, verb, cq.from.id, &cq, err)) {
+        answerCb(cq, err, true);
+        if (err == ui_texts::kToastSkipEmpty) {
+            if (is_panel)
+                refreshPanel(cq, chat_id);
+            else
+                editCbCard(cq, ui_texts::kStoppedCard, InlineKeyboard{});
+        }
+        return;
+    }
+    // Success toast per verb (playerAction puts the toggle/vol toast
+    // in err; the rest have their own).
+    if (verb == "pause") answerCb(cq, ui_texts::toastPaused(pos));
+    else if (verb == "resume") answerCb(cq, ui_texts::toastResumed(pos));
+    else if (verb == "replay")
+        answerCb(cq, ui_texts::fmt(ui_texts::kToastReplayedBy,
+                                   {{"user", displayName(cq.from)}}));
+    else if (verb == "skip")
+        answerCb(cq, ui_texts::fmt(ui_texts::kToastSkippedBy,
+                                   {{"user", displayName(cq.from)}}));
+    else if (verb == "mute") answerCb(cq, ui_texts::kToastMuted);
+    else if (verb == "unmute") answerCb(cq, ui_texts::kToastUnmuted);
+    else if (verb == "seek15") answerCb(cq, ui_texts::toastSeekFwd(15));
+    else if (verb == "seekback15") answerCb(cq, ui_texts::toastSeekBack(15));
+    else answerCb(cq, err);  // autoplay/thumb/shuffle/vol/refresh
+    if (is_panel)
+        refreshPanel(cq, chat_id);
+    else
+        refreshCard(cq, chat_id);
+}
+
+void Dispatcher::cbQueue(const TgCallbackQuery& cq,
+                         const std::vector<std::string>& parts) {
+    // pl:queue:more:<chat_id> / pl:queue:del:<chat_id>:<token>
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    const std::string& verb = parts[2];
+    int64_t chat_id = 0;
+    try {
+        chat_id = std::stoll(parts[3]);
+    } catch (...) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (!callbackCanControl(chat_id, cq.from.id)) {
+        answerCb(cq, ui_texts::kToastNotAllowed, true);
+        return;
+    }
+    if (verb == "more") {
+        std::string text;
+        InlineKeyboard kb;
+        std::string thumb;
+        if (!buildQueueCard(chat_id, true, text, kb, thumb)) {
+            answerCb(cq, ui_texts::kToastNothingPlaying, true);
+            return;
+        }
+        answerCb(cq, "");
+        // The card kind decides the edit method (photo caption vs
+        // text); editCbCard reads the recorded card info.
+        editCbCard(cq, text, kb);
+        return;
+    }
+    if (verb == "del") {
+        if (parts.size() < 5) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        Json item;
+        int64_t pos = 0;
+        if (!resolveQueueToken(chat_id, parts[4], item, pos)) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        CommandContext ctx;
+        ctx.message.chat.id = chat_id;
+        ctx.message.from = cq.from;
+        ctx.command = "queue";
+        Engine used;
+        bool fb = false;
+        IpcResult r = vcCall(ctx, "queue",
+                             Json::objectOf({
+                                 {"chat_id", Json(chat_id)},
+                                 {"action", Json("remove")},
+                                 {"position", Json(pos)},
+                             }),
+                             used, fb);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        answerCb(cq, ui_texts::kToastQueueRemoved);
+        std::string text;
+        InlineKeyboard kb;
+        std::string thumb;
+        if (buildQueueCard(chat_id, false, text, kb, thumb))
+            editCbCard(cq, text, kb);
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbSet(const TgCallbackQuery& cq,
+                       const std::vector<std::string>& parts) {
+    // pl:set:<key> / pl:set:info:<key> / pl:set:timer:<n> / pl:set:main
+    // Settings are admin-only (sudo or chat admin) and group-only.
+    if (parts.size() < 3) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (cq.chat_id > 0) {
+        answerCb(cq, ui_texts::kSettingsGroupOnly, true);
+        return;
+    }
+    auto panel_text = [&]() {
+        std::string title;
+        auto t = store_.get("chat_title:" + std::to_string(cq.chat_id));
+        title = t ? *t : std::to_string(cq.chat_id);
+        return ui_texts::fmt(ui_texts::kSettingsText,
+                             {{"title", ui_texts::htmlEscape(title)},
+                              {"id", std::to_string(cq.chat_id)}});
+    };
+    if (parts[2] == "main") {
+        answerCb(cq, "");
+        editCbCard(cq, panel_text(),
+                   ui_texts::settingsKeyboard(chatSettings(cq.chat_id)));
+        return;
+    }
+    if (parts[2] == "info") {
+        if (parts.size() < 4) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        answerCb(cq, ui_texts::settingInfoText(parts[3]), true);
+        return;
+    }
+    if (!isSudo(cq.from.id) && !isChatAdmin(cq.chat_id, cq.from.id)) {
+        answerCb(cq, ui_texts::kDenyAdminCb, true);
+        return;
+    }
+    ui_texts::ChatSettings s = chatSettings(cq.chat_id);
+    const std::string& key = parts[2];
+    // Pagination / chat-music-download sub-screens (§9, IPC-6 keys):
+    // bare tap shows the screen, the toggle keyboard sends :0/:1.
+    if (key == "page" || key == "musicdl") {
+        bool is_page = key == "page";
+        if (parts.size() > 3) {
+            if (parts[3] != "0" && parts[3] != "1") {
+                answerCb(cq, ui_texts::kToastUnknownAction, true);
+                return;
+            }
+            if (is_page)
+                s.paginate_purge_old = parts[3] == "1";
+            else
+                s.chat_music_download = parts[3] == "1";
+            saveChatSettings(cq.chat_id, s);
+            answerCb(cq, ui_texts::kSettingsUpdated);
+        } else {
+            answerCb(cq, "");
+        }
+        editCbCard(cq,
+                   is_page ? ui_texts::kSettingsPageScreen
+                           : ui_texts::kSettingsMusicDlScreen,
+                   ui_texts::settingsToggleKeyboard(
+                       key, is_page ? s.paginate_purge_old
+                                    : s.chat_music_download));
+        return;
+    }
+    if (key == "timer") {
+        if (parts.size() < 4) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        try {
+            int n = std::stoi(parts[3]);
+            if (n < 2 || n > 7) throw std::out_of_range("timer");
+            s.auto_delete_min = n;
+        } catch (...) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+    } else if (key == "adminmode") {
+        s.admin_mode = (s.admin_mode + 1) % 3;
+    } else if (key == "playmode") {
+        s.play_mode = s.play_mode == "admin" ? "everyone" : "admin";
+    } else if (key == "cmddelete") {
+        s.cmd_delete = !s.cmd_delete;
+    } else if (key == "cleanmode") {
+        s.clean_delay_min = s.clean_delay_min == 0 ? 15 : 0;
+    } else if (key == "cleanduration") {
+        s.clean_delay_min = s.clean_delay_min == 15   ? 30
+                            : s.clean_delay_min == 30 ? 60
+                            : s.clean_delay_min == 60 ? 5
+                                                      : 15;
+    } else if (key == "nothumb") {
+        s.thumbnails = !s.thumbnails;
+    } else if (key == "autoplay") {
+        s.autoplay = !s.autoplay;
+    } else if (key == "silent") {
+        s.silent = !s.silent;
+    } else if (key == "autodelete") {
+        s.auto_delete = !s.auto_delete;
+    } else {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    saveChatSettings(cq.chat_id, s);
+    answerCb(cq, ui_texts::kSettingsUpdated);
+    editCbCard(cq, panel_text(), ui_texts::settingsKeyboard(s));
+}
+
+void Dispatcher::cbLang(const TgCallbackQuery& cq,
+                        const std::vector<std::string>& parts) {
+    // pl:lang:select[:<origin>] / pl:lang:<code>[:<origin>]
+    if (parts.size() < 3) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    std::string origin = parts.size() > 3 ? parts[3] : "start";
+    if (parts[2] == "select") {
+        answerCb(cq, "");
+        editCbCard(cq, ui_texts::kLangPicker,
+                   ui_texts::langPickerKeyboard(origin));
+        return;
+    }
+    if (parts[2] != "en") {
+        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+        return;
+    }
+    // Parlay is English-only; the picker offers English alone.
+    if (chatField(cq.chat_id, "lang", "en") == "en") {
+        answerCb(cq, ui_texts::kLangAlready);
+    } else {
+        setChatField(cq.chat_id, "lang", "en");
+        answerCb(cq, ui_texts::langUpdatedText("English"));
+    }
+    // Return to the menu the picker came from.
+    if (origin == "help") {
+        editCbCard(cq, ui_texts::kHelpMenu, ui_texts::helpMenuKeyboard());
+    } else if (origin == "settings") {
+        std::string title;
+        auto t = store_.get("chat_title:" + std::to_string(cq.chat_id));
+        title = t ? *t : std::to_string(cq.chat_id);
+        editCbCard(cq, ui_texts::fmt(ui_texts::kSettingsText,
+                                     {{"title", ui_texts::htmlEscape(title)},
+                                      {"id", std::to_string(cq.chat_id)}}),
+                   ui_texts::settingsKeyboard(chatSettings(cq.chat_id)));
+    } else {
+        editCbCard(cq, ui_texts::kStartPm,
+                   ui_texts::startPmKeyboard(bot_username_, cfg_.updates_url,
+                                             cfg_.support_url,
+                                             cfg_.source_url));
+    }
+}
+
+void Dispatcher::cbDl(const TgCallbackQuery& cq,
+                      const std::vector<std::string>& parts) {
+    // pl:dl:cancel:<run_id> / pl:dl:fx:<run_id>:<effect>
+    // pl:dl:zip:<run_id> / pl:dl:1by1:<run_id> (Spotify picker, §8)
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    const std::string& verb = parts[2];
+    const std::string& run_id = parts[3];
+    if (verb == "zip" || verb == "1by1") {
+        auto pick = store_.get("dlpick:" + run_id);
+        if (!pick) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::string url = pick->substr(0, pick->find('\n'));
+        int64_t chat_id = cq.chat_id;
+        size_t nl = pick->find('\n');
+        if (nl != std::string::npos) {
+            try {
+                chat_id = std::stoll(pick->substr(nl + 1));
+            } catch (...) {
+            }
+        }
+        if (chat_id != cq.chat_id) {
+            answerCb(cq, ui_texts::kToastDlWrongChat, true);
+            return;
+        }
+        store_.del("dlpick:" + run_id);
+        answerCb(cq, ui_texts::kDlFetching);
+        deliverSpotifyCollection(cq, url, verb == "zip" ? "zip" : "files");
+        return;
+    }
+    auto run = store_.get("dlrun:" + run_id);
+    if (verb == "cancel") {
+        if (!run) {
+            answerCb(cq, ui_texts::kToastDlNothingToCancel);
+            return;
+        }
+        // There is no download.cancel IPC action in contracts/ipc.json
+        // (and no cancel endpoint in the downloaders service), so the
+        // core cannot stop a running download — say so honestly
+        // instead of claiming a cancel that never happens. Needs a
+        // download.cancel action from the engines worker (see
+        // phase9/port-core.md).
+        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+        return;
+    }
+    if (verb == "fx") {
+        if (parts.size() < 5) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        if (!run) {
+            answerCb(cq, ui_texts::kToastDlNothingToCancel);
+            return;
+        }
+        std::string effect = parts[4];
+        std::string fx_effect;
+        if (effect == "orig") fx_effect = "original";
+        else if (effect == "slow") fx_effect = "slow-reverb";
+        else if (effect == "nightcore") fx_effect = "nightcore";
+        else if (effect == "bass") fx_effect = "bass-boost";
+        else if (effect == "8d") fx_effect = "8d";
+        else {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        // dlrun value: "<file_path>\n<chat_id>".
+        std::string input_path = run->substr(0, run->find('\n'));
+        answerCb(cq, ui_texts::kDlFxApplying);
+        IpcResult r = ipc_.post(cfg_.fx_url, "fx",
+                                Json::objectOf({
+                                    {"effect", Json(fx_effect)},
+                                    {"input_path", Json(input_path)},
+                                    {"requested_by", Json(cq.from.id)},
+                                }),
+                                120);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        const Json* out = r.data.find("output_path");
+        std::string out_path = out ? out->asString() : "";
+        if (out_path.empty()) {
+            answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+            return;
+        }
+        std::string err;
+        if (tg_.sendAudioFile(cq.chat_id, out_path, "", &err) < 0)
+            answerCb(cq, err, true);
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbBcast(const TgCallbackQuery& cq) {
+    // pl:bcast:cancel — owner-only; sets the flag the fan-out loop
+    // checks between targets.
+    if (!isOwner(cq.from.id)) {
+        answerCb(cq, ui_texts::kDenyOwner, true);
+        return;
+    }
+    if (!bcast_running_.load()) {
+        answerCb(cq, ui_texts::kBcastCancelled);
+        return;
+    }
+    bcast_cancel_.store(true);
+    answerCb(cq, ui_texts::kBcastCancelOk);
+}
+
+void Dispatcher::cbAuth(const TgCallbackQuery& cq,
+                        const std::vector<std::string>& parts) {
+    // pl:auth:del:<chat_id>:<user_id> — revoke one authorized user
+    // from the /authlist card. Admin-only.
+    if (parts.size() < 5 || parts[2] != "del") {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    int64_t chat_id = 0;
+    int64_t user_id = 0;
+    try {
+        chat_id = std::stoll(parts[3]);
+        user_id = std::stoll(parts[4]);
+    } catch (...) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (!isSudo(cq.from.id) && !isChatAdmin(chat_id, cq.from.id)) {
+        answerCb(cq, ui_texts::kDenyAdminCb, true);
+        return;
+    }
+    store_.srem("auth:" + std::to_string(chat_id),
+                std::to_string(user_id));
+    answerCb(cq, ui_texts::kToastAuthRevoked);
+    // Re-render the auth list in place. Names resolve best-effort
+    // (getUserMention falls back to the bare id); the limit shown is
+    // kAuthMaxUsers (25, the ArcMusic/TinaMusic/YukkiMusic-Go
+    // MAX_AUTH_USERS default).
+    auto members = store_.smembers("auth:" + std::to_string(chat_id));
+    std::vector<std::pair<std::string, int64_t>> users;
+    for (const auto& m : members) {
+        try {
+            int64_t id = std::stoll(m);
+            users.emplace_back(tg_.getUserMention(id), id);
+        } catch (...) {
+        }
+    }
+    editCbCard(cq, ui_texts::authlistText(
+                       users, static_cast<int>(kAuthMaxUsers)),
+               ui_texts::authlistKeyboard(chat_id, users));
+}
+
+void Dispatcher::cbSearch(const TgCallbackQuery& cq,
+                          const std::vector<std::string>& parts) {
+    // pl:search:<n>:<req_user_id>:<track_id> — pick result n.
+    // pl:search:page:<req_user_id>:<page>:<hash> — next/previous page.
+    if (parts.size() < 3) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (parts[2] == "page") {
+        if (parts.size() < 6) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        int64_t req_user = 0;
+        int page = 0;
+        try {
+            req_user = std::stoll(parts[3]);
+            page = std::stoi(parts[4]);
+        } catch (...) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        if (cq.from.id != req_user) {
+            answerCb(cq, ui_texts::kToastNotAllowed, true);
+            return;
+        }
+        std::string query;
+        Json results;
+        if (!loadSearchSession(req_user, query, results) ||
+            ui_texts::queryHash(query) != parts[5]) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        int total_pages =
+            static_cast<int>((results.size() + 9) / 10);
+        if (page < 1 || page > total_pages) {
+            answerCb(cq, ui_texts::kSearchNoMore, true);
+            return;
+        }
+        answerCb(cq, "");
+        editCbCard(cq, searchResultsText(query, results, page),
+                   searchResultsKeyboard(req_user, query, results, page));
+        return;
+    }
+    // Pick: pl:search:<n>:<req_user_id>:<track_id>
+    if (parts.size() < 5) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    int n = 0;
+    int64_t req_user = 0;
+    try {
+        n = std::stoi(parts[2]);
+        req_user = std::stoll(parts[3]);
+    } catch (...) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (cq.from.id != req_user) {
+        answerCb(cq, ui_texts::kToastNotAllowed, true);
+        return;
+    }
+    std::string query;
+    Json results;
+    if (!loadSearchSession(req_user, query, results)) {
+        answerCb(cq, ui_texts::kToastExpired, true);
+        editCbCard(cq, ui_texts::kSearchExpired, InlineKeyboard{});
+        return;
+    }
+    if (n < 1 || n > static_cast<int>(results.size())) {
+        answerCb(cq, ui_texts::kToastInvalidRequest, true);
+        return;
+    }
+    const Json& t = results.asArray()[static_cast<size_t>(n) - 1];
+    std::string id = t.find("id") ? t.find("id")->asString() : "";
+    // The button carries the queue token, not the raw id (§1).
+    if (!parts[4].empty() && ui_texts::trackToken(id) != parts[4]) {
+        answerCb(cq, ui_texts::kToastExpired, true);
+        editCbCard(cq, ui_texts::kSearchExpired, InlineKeyboard{});
+        return;
+    }
+    std::string err;
+    if (!playSearchPick(cq, req_user, n, err)) {
+        answerCb(cq,
+                 err == "expired" ? ui_texts::kToastExpired
+                                  : ui_texts::kToastInvalidRequest,
+                 true);
+        if (err == "expired")
+            editCbCard(cq, ui_texts::kSearchExpired, InlineKeyboard{});
+        return;
+    }
+    answerCb(cq, ui_texts::kSearchSuccessToast);
+}
+
+void Dispatcher::cbVote(const TgCallbackQuery& cq,
+                        const std::vector<std::string>& parts) {
+    // pl:vote:<approve|decline>:<track_id> (daslui §23). Only
+    // callbacks from the voting chat are handled; unknown or
+    // foreign-chat votes are silently ignored (no answer at all).
+    // The track id is rejoined from parts[3:] — ids are opaque and
+    // a ':' inside one must not truncate it.
+    if (parts.size() < 4) return;
+    const std::string& verdict = parts[2];
+    std::string track_id = parts[3];
+    for (size_t i = 4; i < parts.size(); ++i) track_id += ":" + parts[i];
+    if (verdict != "approve" && verdict != "decline") return;
+    auto chat = store_.get("vote:" + track_id);
+    if (!chat) return;  // no vote open for this track
+    int64_t vote_chat = 0;
+    try {
+        vote_chat = std::stoll(*chat);
+    } catch (...) {
+        return;
+    }
+    if (vote_chat != cq.chat_id) return;
+    if (verdict == "decline") {
+        editCbCard(cq, ui_texts::voteDeclinedText(displayName(cq.from), ""),
+                   InlineKeyboard{});
+        store_.del("vote:" + track_id);
+        return;
+    }
+    CommandContext ctx;
+    ctx.message.chat.id = vote_chat;
+    ctx.message.from = cq.from;
+    ctx.command = "vote";
+    IpcResult r = ipc_.post(cfg_.queue_url, "vote",
+                            Json::objectOf({
+                                {"chat_id", Json(vote_chat)},
+                                {"track_id", Json(track_id)},
+                                {"user_id", Json(cq.from.id)},
+                                {"verdict", Json("approve")},
+                            }),
+                            15);
+    if (!r.ok) {
+        editCbCard(cq, ui_texts::voteQueueFailText(r.error_message),
+                   InlineKeyboard{});
+        return;
+    }
+    editCbCard(cq,
+               ui_texts::voteAcceptedText(displayName(cq.from), ""),
+               InlineKeyboard{});
+    store_.del("vote:" + track_id);
+}
+
+void Dispatcher::cbShare(const TgCallbackQuery& cq,
+                         const std::vector<std::string>& parts) {
+    // pl:share:mylink | pl:share:cancel
+    // pl:share:feedback:<sender>:<msg>:<file_unique>
+    // pl:share:report:<sender>:<msg>
+    if (parts.size() < 3) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    const std::string& verb = parts[2];
+    if (verb == "mylink") {
+        auto link = store_.get("sharelink:" + std::to_string(cq.from.id));
+        if (!link) {
+            answerCb(cq, ui_texts::kShareNoLink, true);
+            return;
+        }
+        answerCb(cq, "");
+        editCbCard(cq, *link, InlineKeyboard{});
+        return;
+    }
+    if (verb == "cancel") {
+        if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
+        answerCb(cq, "");
+        return;
+    }
+    if (verb == "feedback") {
+        if (parts.size() < 6) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        // No dedup (ruling 8): a blocked user cannot send feedback,
+        // but there is no "already sent" gate — every tap opens the
+        // prompt and every text is forwarded.
+        if (store_.sismember("shareblocked", std::to_string(cq.from.id))) {
+            answerCb(cq, ui_texts::kShareFeedbackBlocked, true);
+            return;
+        }
+        store_.set("sharefb:" + std::to_string(cq.from.id),
+                   parts[3] + ":" + parts[4] + ":" + parts[5]);
+        answerCb(cq, "");
+        editCbCard(cq, ui_texts::kShareFeedbackPrompt, InlineKeyboard{});
+        return;
+    }
+    if (verb == "report") {
+        if (parts.size() < 5) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        // No dedup (ruling 8): reporting twice just re-blocks (the
+        // sadd is idempotent) and answers the same confirmation —
+        // never "already reported". kShareReportAlready is kept in
+        // ui_texts.hpp for the future dedup work.
+        store_.sadd("shareblocked", parts[3]);
+        answerCb(cq, ui_texts::kShareReported);
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbDel(const TgCallbackQuery& cq,
+                       const std::vector<std::string>& parts) {
+    // pl:del:yes:<id> / pl:del:no:<id> — the §25 delete confirm.
+    // There is no library.delete IPC action in contracts/ipc.json, so
+    // the core cannot execute the deletion (see phase9/port-core.md):
+    // "yes" is answered honestly instead of pretending.
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    const std::string& verdict = parts[2];
+    if (verdict == "no") {
+        answerCb(cq, ui_texts::kToastDelCancelled);
+        if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
+        return;
+    }
+    if (verdict == "yes") {
+        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbLossy(const TgCallbackQuery& cq,
+                         const std::vector<std::string>& parts) {
+    // pl:lossy:<accept|skip>:<id> — lossy re-encode prompt (§8).
+    // "accept" takes the lossy fallback (delivers the stored file);
+    // "skip" drops the download without delivering it.
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    const std::string& verdict = parts[2];
+    const std::string& id = parts[3];
+    if (verdict == "skip") {
+        // dlrun value: "<file_path>\n<chat_id>[\n<artist>\n<title>]".
+        std::string artist;
+        std::string title;
+        auto run = store_.get("dlrun:" + id);
+        if (run) {
+            size_t n1 = run->find('\n');
+            size_t n2 = n1 == std::string::npos
+                            ? std::string::npos
+                            : run->find('\n', n1 + 1);
+            size_t n3 = n2 == std::string::npos
+                            ? std::string::npos
+                            : run->find('\n', n2 + 1);
+            if (n2 != std::string::npos)
+                artist = n3 == std::string::npos
+                             ? run->substr(n2 + 1)
+                             : run->substr(n2 + 1, n3 - n2 - 1);
+            if (n3 != std::string::npos) title = run->substr(n3 + 1);
+        }
+        store_.del("dlrun:" + id);
+        answerCb(cq, artist.empty() && title.empty()
+                         ? ui_texts::kToastLossySkipped
+                         : ui_texts::lossySkippedText(artist, title));
+        if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
+        return;
+    }
+    if (verdict == "accept") {
+        // Accept the lossy fallback: deliver the stored file as-is.
+        auto run = store_.get("dlrun:" + id);
+        if (!run) {
+            answerCb(cq, ui_texts::kToastLossyExpired, true);
+            return;
+        }
+        std::string file_path = run->substr(0, run->find('\n'));
+        std::string err;
+        answerCb(cq, "");
+        if (tg_.sendAudioFile(cq.chat_id, file_path, "", &err) < 0) {
+            answerCb(cq, err, true);
+            return;
+        }
+        store_.del("dlrun:" + id);
+        if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbRestart(const TgCallbackQuery& cq,
+                           const std::vector<std::string>& parts) {
+    // pl:restart:<bot|replay>:<chat_id> — owner-only.
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (!isOwner(cq.from.id)) {
+        answerCb(cq, ui_texts::kDenyOwner, true);
+        return;
+    }
+    const std::string& what = parts[2];
+    int64_t chat_id = 0;
+    try {
+        chat_id = std::stoll(parts[3]);
+    } catch (...) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    if (what == "replay") {
+        std::string err;
+        if (!playerAction(chat_id, "replay", cq.from.id, &cq, err)) {
+            answerCb(cq, err, true);
+            return;
+        }
+        answerCb(cq, ui_texts::fmt(ui_texts::kToastReplayedBy,
+                                   {{"user", displayName(cq.from)}}));
+        refreshCard(cq, chat_id);
+        return;
+    }
+    if (what == "bot") {
+        answerCb(cq, ui_texts::kToastRestarting);
+        std::exit(42);  // the supervisor restarts the core (onRestart)
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbDlset(const TgCallbackQuery& cq,
+                         const std::vector<std::string>& parts) {
+    // pl:dlset:of|uy|pt|fmt:<fmt>|uy:1|0|back — /download-settings
+    // (per-user prefs in "dlset:<user>": format \n youtube \n template).
+    if (parts.size() < 3) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    auto load = [&]() {
+        std::string fmt = "mp3";
+        std::string yt = "1";
+        std::string tpl;
+        auto v = store_.get("dlset:" + std::to_string(cq.from.id));
+        if (v) {
+            size_t n1 = v->find('\n');
+            size_t n2 = n1 == std::string::npos
+                            ? std::string::npos
+                            : v->find('\n', n1 + 1);
+            if (n1 != std::string::npos) {
+                fmt = v->substr(0, n1);
+                yt = n2 == std::string::npos
+                         ? v->substr(n1 + 1)
+                         : v->substr(n1 + 1, n2 - n1 - 1);
+                if (n2 != std::string::npos) tpl = v->substr(n2 + 1);
+            }
+        }
+        return std::tuple<std::string, std::string, std::string>(fmt, yt,
+                                                                 tpl);
+    };
+    auto save = [&](const std::string& fmt, const std::string& yt,
+                    const std::string& tpl) {
+        store_.set("dlset:" + std::to_string(cq.from.id),
+                   fmt + "\n" + yt + "\n" + tpl);
+    };
+    const std::string& verb = parts[2];
+    auto [fmt, yt, tpl] = load();
+    if (verb == "of") {
+        answerCb(cq, "");
+        editCbCard(cq,
+                   ui_texts::fmt(ui_texts::kDlSettingsFormat,
+                                 {{"format", fmt}}),
+                   ui_texts::dlSettingsFormatKeyboard());
+        return;
+    }
+    if (verb == "uy" && parts.size() < 4) {
+        answerCb(cq, "");
+        editCbCard(cq,
+                   ui_texts::fmt(ui_texts::kDlSettingsYoutube,
+                                 {{"value", yt == "1" ? "True" : "False"}}),
+                   ui_texts::dlSettingsYoutubeKeyboard());
+        return;
+    }
+    if (verb == "uy" && parts.size() >= 4) {
+        yt = parts[3] == "1" ? "1" : "0";
+        save(fmt, yt, tpl);
+        answerCb(cq, ui_texts::kSettingsUpdated);
+        editCbCard(cq,
+                   ui_texts::fmt(ui_texts::kDlSettingsYoutube,
+                                 {{"value", yt == "1" ? "True" : "False"}}),
+                   ui_texts::dlSettingsYoutubeKeyboard());
+        return;
+    }
+    if (verb == "pt") {
+        store_.set("dlset_tpl_pending:" + std::to_string(cq.from.id), "1");
+        answerCb(cq, "");
+        editCbCard(cq, ui_texts::kDlSettingsTemplatePrompt,
+                   InlineKeyboard{});
+        return;
+    }
+    if (verb == "fmt") {
+        if (parts.size() < 4) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        static const char* kFmts[] = {"mp3", "m4a", "flac",
+                                      "opus", "ogg", "wav"};
+        bool ok = false;
+        for (const char* f : kFmts)
+            if (parts[3] == f) ok = true;
+        if (!ok) {
+            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            return;
+        }
+        fmt = parts[3];
+        save(fmt, yt, tpl);
+        answerCb(cq, ui_texts::kSettingsUpdated);
+        editCbCard(cq,
+                   ui_texts::fmt(ui_texts::kDlSettingsFormat,
+                                 {{"format", fmt}}),
+                   ui_texts::dlSettingsFormatKeyboard());
+        return;
+    }
+    if (verb == "back") {
+        answerCb(cq, "");
+        editCbCard(cq, ui_texts::kDlSettingsIndex,
+                   ui_texts::dlSettingsIndexKeyboard());
+        return;
+    }
+    answerCb(cq, ui_texts::kToastUnknownAction, true);
+}
+
+void Dispatcher::cbSpotify(const TgCallbackQuery& cq,
+                           const std::vector<std::string>& parts) {
+    // pl:spotify:<verb>… — companion cards owned by spotify-rust
+    // (engines worker). The core only owns the dislike action, which
+    // already has its IPC (spotify.dislike): pl:spotify:dislike:<id>.
+    if (parts.size() < 4 || parts[2] != "dislike") {
+        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+        return;
+    }
+    IpcResult r = ipc_.post(cfg_.spotify_url, "dislike",
+                            Json::objectOf({
+                                {"user_id", Json(cq.from.id)},
+                                {"track_id", Json(parts[3])},
+                            }),
+                            15);
+    if (!r.ok) {
+        answerCb(cq, r.error_message, true);
+        return;
+    }
+    answerCb(cq, ui_texts::kToastDisliked);
 }
 
 }  // namespace parlay

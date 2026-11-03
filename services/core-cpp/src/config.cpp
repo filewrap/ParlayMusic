@@ -106,6 +106,16 @@ Config Config::fromEnv() {
     c.duration_limit_min = static_cast<int>(envInt("DURATION_LIMIT", c.duration_limit_min));
     c.queue_limit = static_cast<int>(envInt("QUEUE_LIMIT", c.queue_limit));
     c.support_chat = envStr("SUPPORT_CHAT");
+    c.start_img = envStr("START_IMG");
+    c.ping_img = envStr("PING_IMG");
+    c.updates_url = envStr("PARLAY_UPDATES_URL");
+    c.support_url = envStr("PARLAY_SUPPORT_URL");
+    if (c.support_url.empty() && !c.support_chat.empty()) {
+        std::string sc = c.support_chat;
+        if (!sc.empty() && sc[0] == '@') sc = sc.substr(1);
+        c.support_url = "https://t.me/" + sc;
+    }
+    c.source_url = envStr("PARLAY_SOURCE_URL");
     return c;
 }
 

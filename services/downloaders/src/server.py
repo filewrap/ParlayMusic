@@ -20,14 +20,17 @@ import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 # Allow direct execution (`python src/server.py`) as well as module use
 # (`python -m src.main`): relative imports need the package parent on path.
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from src import progress as progress_mod  # noqa: E402
     from src import providers  # noqa: E402
     from src.util import ApiError, bad_request, err_envelope, ok_envelope  # noqa: E402
 else:
+    from . import progress as progress_mod  # noqa: E402
     from . import providers  # noqa: E402
     from .util import ApiError, bad_request, err_envelope, ok_envelope  # noqa: E402
 
@@ -98,10 +101,24 @@ def make_handler(config):
             if self.path == "/healthz":
                 self._send(200, {"ok": True, "service": SERVICE_NAME})
                 return
+            # IPC-4 (§29): GET /v1/download/progress?run_id= -> the
+            # live snapshot for that run; unknown run_id is a 404
+            # (the run is only created by a download POST).
+            if self.path.startswith("/v1/download/progress"):
+                query = parse_qs(urlsplit(self.path).query)
+                run_id = (query.get("run_id") or [""])[0]
+                snap = progress_mod.REGISTRY.snapshot(run_id)
+                if snap is None:
+                    self._send_error(ApiError(
+                        "not_found", "no download run: %r" % run_id, 404))
+                    return
+                self._send(200, ok_envelope(snap))
+                return
             self._send_error(ApiError("not_found",
                                       "no such route: GET %s" % self.path, 404))
 
         def do_POST(self):
+            run = None
             try:
                 self._check_auth()
                 handler = ROUTES.get(("POST", self.path))
@@ -110,7 +127,36 @@ def make_handler(config):
                                    "no such route: POST %s" % self.path, 404)
                 body = self._read_json()
                 body["_dl_dir"] = config.dl_dir
-                data = handler(body)
+                # IPC-4 (§29): every download POST opens a progress
+                # run first, so the core can poll it while the file
+                # transfers. The run_id rides back in the response
+                # data — that is the only way the core learns it.
+                if self.path.startswith("/v1/download/"):
+                    kind = self.path.rsplit("/", 1)[-1]
+                    title = (body.get("query") or body.get("url") or
+                             "%s - %s" % (body.get("artist") or "",
+                                          body.get("title") or "track"))
+                    run = progress_mod.REGISTRY.new_run(kind, str(title))
+                    body["_run_id"] = run.run_id
+                try:
+                    data = handler(body)
+                except ApiError as err:
+                    if run is not None:
+                        progress_mod.REGISTRY.finish(
+                            run.run_id, "failed", error=err.message)
+                    raise
+                except Exception as exc:
+                    # A raw exception also fails the run (with its
+                    # message humanised) — a run must never stick at
+                    # "searching"/"downloading" after its request died.
+                    if run is not None:
+                        progress_mod.REGISTRY.finish(
+                            run.run_id, "failed", error=str(exc))
+                    raise
+                if run is not None:
+                    progress_mod.REGISTRY.finish(run.run_id, "done")
+                    if isinstance(data, dict):
+                        data["run_id"] = run.run_id
                 self._send(200, ok_envelope(data))
             except ApiError as err:
                 self._send_error(err)

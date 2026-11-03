@@ -39,6 +39,44 @@ function parseDuration(value) {
   return Math.round(parts[0] * 3600 + parts[1] * 60 + parts[2]);
 }
 
+// IPC-3 (UI_INVENTORY.md §29): human duration for search-result
+// metadata rows — "M:SS" under an hour, "Xh Ym Zs" at/over an hour,
+// "∞" when the duration is unknown (sec <= 0) or the track is live.
+// Zero-valued hour/minute/second parts are dropped ("1h", "1h 2m").
+function formatDurationStr(sec, isLive) {
+  const n = Number(sec) || 0;
+  if (isLive || n <= 0) return "∞";
+  if (n < 3600) return `${Math.floor(n / 60)}:${String(n % 60).padStart(2, "0")}`;
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = n % 60;
+  let out = `${h}h`;
+  if (m > 0) out += ` ${m}m`;
+  if (s > 0) out += ` ${s}s`;
+  return out;
+}
+
+// IPC-3: yt-dlp upload_date ("YYYYMMDD") -> "YYYY-MM-DD" for the
+// search metadata rows. Anything else passes through unchanged.
+function formatUploadDate(yyyymmdd) {
+  const s = String(yyyymmdd || "");
+  if (!/^\d{8}$/.test(s)) return s;
+  return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
+}
+
+// IPC-3: fill a Track's enriched search fields from one yt-dlp info
+// object. duration_str is always derived; views/uploader/upload_time
+// /is_live only when the source reports them (all optional per §29).
+function enrichYtIPC3(track, info) {
+  const isLive = Boolean(info.is_live) || info.live_status === "is_live";
+  track.duration_str = formatDurationStr(track.duration_sec, isLive);
+  if (Number(info.view_count) > 0) track.views = Math.round(Number(info.view_count));
+  if (info.uploader || info.channel) track.uploader = info.uploader || info.channel;
+  if (info.upload_date) track.upload_time = formatUploadDate(info.upload_date);
+  if (isLive) track.is_live = true;
+  return track;
+}
+
 function ytDlpPath() {
   if (process.env.YT_DLP) return process.env.YT_DLP;
   try {
@@ -127,7 +165,7 @@ function extractYouTubeId(text) {
 }
 
 function ytTrackFromInfo(info, fallbackUrl) {
-  return {
+  const track = {
     id: `yt:${info.id}`,
     title: info.title || "Unknown title",
     artist: info.uploader || info.channel || "Unknown",
@@ -136,6 +174,7 @@ function ytTrackFromInfo(info, fallbackUrl) {
     thumbnail: info.thumbnail || null,
     source: "youtube",
   };
+  return enrichYtIPC3(track, info);
 }
 
 // Resolve a YouTube URL or a free-text query to one Track.
@@ -197,7 +236,7 @@ async function autoplayPick(lastTrack, excludeIds) {
     if (!e || !e.id) continue;
     const candId = `yt:${e.id}`;
     if (candId === lastTrack.id || exclude.has(candId)) continue;
-    return {
+    return enrichYtIPC3({
       id: candId,
       title: e.title || e.id,
       artist: e.uploader || e.channel || "Unknown",
@@ -205,7 +244,7 @@ async function autoplayPick(lastTrack, excludeIds) {
       url: e.webpage_url || `https://www.youtube.com/watch?v=${e.id}`,
       thumbnail: e.thumbnail || null,
       source: "youtube",
-    };
+    }, e);
   }
   return null;
 }
@@ -239,6 +278,11 @@ function jiosaavnTrack(r) {
   if (r.media_url || r.media_urls) {
     t.stream_url = r.media_urls?.["96_KBPS"] || r.media_url;
   }
+  // IPC-3: duration_str is always derivable; the JioSaavn search
+  // payload carries no view count, uploader or upload date, so those
+  // stay absent (optional per §29) rather than invented. JioSaavn
+  // tracks are never live streams.
+  t.duration_str = formatDurationStr(t.duration_sec, false);
   return t;
 }
 
@@ -256,6 +300,7 @@ async function enrichJioSaavnDurations(results) {
       try {
         const full = await resolveJioSaavnSong(id);
         track.duration_sec = full.duration_sec;
+        track.duration_str = formatDurationStr(full.duration_sec, false);
         track.stream_url = full.stream_url || track.stream_url;
         track.duration_source = "song-lookup";
       } catch {
@@ -372,6 +417,10 @@ function lemonicTrack(r) {
     title: r.title || r.name || "Unknown",
     artist: r.artist || (Array.isArray(r.artists) ? r.artists.join(", ") : "Unknown"),
     duration_sec: durationSec,
+    // IPC-3: duration_str always derivable; Spotify/Lemonic search
+    // payloads carry no views/uploader/upload date, so those stay
+    // absent (optional per §29). Lemonic tracks are never live.
+    duration_str: formatDurationStr(durationSec, false),
     url: r.url || r.perma_url || null,
     thumbnail: r.thumbnail || r.image || null,
     source: "lemonic",
@@ -432,6 +481,7 @@ async function spotifySearchTracks(query, limit = 5) {
     title: t.name || "Unknown",
     artist: (t.artists || []).map((a) => a.name).join(", ") || "Unknown",
     duration_sec: Math.round(Number(t.duration_ms || 0) / 1000),
+    duration_str: formatDurationStr(Math.round(Number(t.duration_ms || 0) / 1000), false),
     url: t.external_urls?.spotify || null,
     thumbnail: t.album?.images?.[0]?.url || null,
     source: "lemonic",
@@ -536,6 +586,30 @@ async function fetchLyrics(title, artist) {
   throw lastErr;
 }
 
+// --- Inline modes --------------------------------------------------------
+// Inline-query mode dispatch (UI_INVENTORY.md §13: navidrome np/s/l/
+// lib/del + Music163bot help/search). Pure: {mode, arg} where mode is
+// one of np|s|l|lib|del|help|search|hint. "np"/"s"/"l"/"help" match only
+// as the whole query; "lib"/"del"/"search" take an argument after a
+// space. Queries shorter than 3 chars (or empty) are hint queries —
+// the core renders the `np  s  l  lib  del — or type to search` hint
+// button for them. A bare "search" (no keyword) is a search with no
+// argument: the core renders the "Please enter a keyword" article.
+function inlineMode(query) {
+  const q = String(query || "").trim();
+  if (q === "") return { mode: "hint", arg: "" };
+  const lower = q.toLowerCase();
+  if (lower === "np") return { mode: "np", arg: "" };
+  if (lower === "s") return { mode: "s", arg: "" };
+  if (lower === "l") return { mode: "l", arg: "" };
+  if (lower === "help") return { mode: "help", arg: "" };
+  const m = q.match(/^(lib|del|search)\s+(.+)$/i);
+  if (m) return { mode: m[1].toLowerCase(), arg: m[2].trim() };
+  if (lower === "lib" || lower === "del" || lower === "search") return { mode: lower, arg: "" };
+  if (q.length < 3) return { mode: "hint", arg: q };
+  return { mode: "search", arg: q };
+}
+
 // --- Radio / raw-stream tracks -------------------------------------------
 // A raw http(s) audio URL (TGVCBot /radio, openradiobot raw streams) is
 // a track in its own right: no yt-dlp, no search. duration_sec stays 0
@@ -548,6 +622,9 @@ function radioTrackFromUrl(url, stationName) {
     title: stationName || "Radio stream",
     artist: "live stream",
     duration_sec: 0,
+    // IPC-3: a live radio stream has no duration ("∞") and is_live.
+    duration_str: "∞",
+    is_live: true,
     url,
     stream_url: url,
     thumbnail: null,
@@ -558,6 +635,9 @@ function radioTrackFromUrl(url, stationName) {
 module.exports = {
   EngineUnavailable,
   parseDuration,
+  formatDurationStr,
+  formatUploadDate,
+  enrichYtIPC3,
   ytDlpPath,
   ytDlpAvailable,
   isBotCheck,
@@ -573,5 +653,6 @@ module.exports = {
   searchLemonic,
   lemonicRawTrack,
   fetchLyrics,
+  inlineMode,
   radioTrackFromUrl,
 };

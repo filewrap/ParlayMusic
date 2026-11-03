@@ -1141,6 +1141,12 @@ mod tests {
             file_path: Some(tone.to_string_lossy().to_string()),
             downloaded: true,
             download_failed: false,
+            thumbnail: None,
+            duration_str: "0:05".to_string(),
+            views: None,
+            uploader: None,
+            upload_time: None,
+            is_live: false,
         }
     }
 

@@ -171,3 +171,43 @@ test("errors: unknown station 400, stop with no radio 404, /v1/radio action rout
   assert.equal(stop2.status, 200);
   assert.equal(stop2.json.data.vc_cleared.cleared, true);
 });
+
+// ------------------------------------------------ Phase 9: IPC-1/3, §21 --
+test("status carries the /manage card fields; now-playing carries IPC-1 + IPC-3", async () => {
+  const before = Date.now();
+  const r = await req(18119, "POST", "/v1/radio/start", { chat_id: CHAT, station: "fip" });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  // The start response's now_playing carries the card fields too.
+  const np0 = r.json.data.now_playing;
+  assert.equal(np0.is_paused, false);
+  assert.equal(np0.is_muted, false);
+  assert.equal(np0.loop_count, 0);
+  assert.equal(np0.speed, 1);
+  assert.equal(np0.autoplay_enabled, false);
+  assert.equal(np0.track.duration_str, "∞");
+  assert.equal(np0.track.is_live, true);
+
+  const st = await req(18119, "GET", `/v1/radio/status?chat_id=${CHAT}`);
+  assert.equal(st.status, 200, JSON.stringify(st.json));
+  const d = st.json.data;
+  assert.equal(d.station, "fip");
+  assert.equal(d.station_name, "FIP Paris");
+  assert.ok(typeof d.started_at_ms === "number" && d.started_at_ms >= before);
+  // No listener tracking exists (no web player) — always 0, honestly.
+  assert.equal(d.listeners, 0);
+  assert.equal(d.total_listeners, 0);
+  assert.equal(d.loop_type, "none");
+  assert.equal(d.autoplay_enabled, false);
+  assert.equal(d.queue_length, 0);
+  const np = d.now_playing;
+  assert.equal(np.is_paused, false);
+  assert.equal(np.is_muted, false);
+  assert.equal(np.loop_count, 0);
+  assert.equal(np.speed, 1);
+  assert.equal(np.autoplay_enabled, false);
+  assert.equal(np.track.duration_str, "∞");
+  assert.equal(np.track.is_live, true);
+  assert.equal(np.track.source, "radio");
+  const stop = await req(18119, "POST", "/v1/radio/stop", { chat_id: CHAT });
+  assert.equal(stop.status, 200);
+});

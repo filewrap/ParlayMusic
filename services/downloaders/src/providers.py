@@ -21,6 +21,28 @@ from .util import (MAX_BOT_API_BYTES, MAX_PLAYLIST_TRACKS, bad_request,
 OVERSIZE_LIMIT = MAX_BOT_API_BYTES
 
 
+def _run_for(body):
+    """The IPC-4 run the server created for this request (or None
+    when the handler runs outside the HTTP layer, e.g. in tests)."""
+    from . import progress as progress_mod
+
+    run_id = body.get("_run_id")
+    return progress_mod.REGISTRY.get(run_id) if run_id else None
+
+
+def _ytdlp_progress_cb(run):
+    """Fold yt-dlp's streaming progress numbers into an IPC-4 run."""
+    def _cb(percentage, done_bytes, total_bytes,
+            speed_bytes_per_sec, eta_sec):
+        if run is None:
+            return
+        run.update(percentage=percentage, done_bytes=done_bytes,
+                   total_bytes=total_bytes,
+                   speed_bytes_per_sec=speed_bytes_per_sec,
+                   eta_sec=eta_sec, phase="downloading")
+    return _cb
+
+
 def _file_result(file_path, track):
     size = os.path.getsize(file_path)
     return {"file_path": file_path, "track": track,
@@ -32,7 +54,9 @@ def youtube_download(body):
     if not query:
         raise bad_request("query is required")
     dest = body["_dl_dir"]
-    file_path, track = ytdlp_mod.download_youtube_audio(query, dest)
+    run = _run_for(body)
+    file_path, track = ytdlp_mod.download_youtube_audio(
+        query, dest, progress_cb=_ytdlp_progress_cb(run))
     return _file_result(file_path, track)
 
 
@@ -47,8 +71,10 @@ def spotify_download(body):
         raise bad_request(
             "use /v1/download/spotify-playlist for %s URLs" % kind)
     dest = body["_dl_dir"]
+    run = _run_for(body)
     track = spotify_mod.resolve_track(url)
-    file_path, track = spotify_mod.download_spotify_track(track, dest)
+    file_path, track = spotify_mod.download_spotify_track(
+        track, dest, progress_cb=_ytdlp_progress_cb(run))
     return _file_result(file_path, track)
 
 
@@ -66,8 +92,9 @@ def spotify_playlist_download(body):
         raise bad_request(
             "use /v1/download/spotify for single track URLs")
     dest = body["_dl_dir"]
+    run = _run_for(body)
     zip_path, tracks, files, truncated = \
-        spotify_mod.download_spotify_collection(url, dest, mode)
+        spotify_mod.download_spotify_collection(url, dest, mode, run=run)
     data = {"count": len(files), "tracks": tracks,
             "truncated": truncated,
             "truncated_to": len(tracks) if truncated else None}
@@ -138,6 +165,11 @@ def spotify_collection(body):
 
 
 def deezer_download(body):
+    run = _run_for(body)
+    if run is not None:
+        # Deezer's API calls are single-shot (no streaming progress);
+        # the run still reports the real phase transitions.
+        run.update(phase="downloading")
     result = deezer_mod.download_deezer(body)
     if "count" in result:
         # Album input: ZIP of previews.
@@ -153,11 +185,17 @@ def tiktok_download(body):
     if not url:
         raise bad_request("url is required")
     dest = body["_dl_dir"]
+    run = _run_for(body)
+    if run is not None:
+        run.update(phase="downloading")
     result = tiktok_mod.download_tiktok({**body, "url": url, "_dl_dir": dest})
     return _file_result(result["file_path"], result["track"])
 
 
 def navidrome_download(body):
+    run = _run_for(body)
+    if run is not None:
+        run.update(phase="downloading")
     result = navidrome_mod.download_navidrome(body)
     data = _file_result(result["file_path"], result["track"])
     data["imported"] = result.get("imported", True)
@@ -185,9 +223,16 @@ def soulseek_download(body):
             % slskd_client._base_url())
     dest = body["_dl_dir"]
     accept_lossy = bool(body.get("accept_lossy"))
+    run = _run_for(body)
     album = body.get("album")
     if isinstance(album, dict) and album.get("tracks"):
-        result = slskd_dl.download_album(album, dest)
+        if run is not None:
+            run.set_titles([
+                "%s - %s" % (t.get("artist") or album.get("artist") or "",
+                             t.get("title") or "track")
+                for t in album["tracks"]
+            ])
+        result = slskd_dl.download_album(album, dest, run=run)
         if not result["downloaded"]:
             raise download_failed(
                 "Soulseek album download found nothing usable: %s"
@@ -217,9 +262,11 @@ def soulseek_download(body):
             track["duration_sec"] = int(duration)
         except (TypeError, ValueError):
             pass
+    if run is not None:
+        run.set_titles(["%s - %s" % (artist or "soulseek", title)])
     try:
         path, _downloaded, fmt, peer = slskd_dl.download_single_track(
-            track, dest, accept_lossy=accept_lossy)
+            track, dest, accept_lossy=accept_lossy, run=run)
     except slskd_client.SearchError as exc:
         raise engine_unavailable("Soulseek search could not run: %s" % exc)
     track_out = {"id": "soulseek:%s - %s" % (artist, title),

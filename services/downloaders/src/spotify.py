@@ -302,8 +302,12 @@ def _spotdl_available():
     return bool(_SPOTDL)
 
 
-def download_spotify_track(track, dest_dir):
-    """Download one resolved Spotify track; returns (file_path, track)."""
+def download_spotify_track(track, dest_dir, progress_cb=None):
+    """Download one resolved Spotify track; returns (file_path, track).
+
+    ``progress_cb`` (optional) receives yt-dlp's own progress numbers
+    for this track — see ytdlp.download_youtube_audio.
+    """
     query = "%s %s" % (track.get("artist") or "", track.get("title") or "")
     query = query.strip()
     if not query:
@@ -311,11 +315,14 @@ def download_spotify_track(track, dest_dir):
     if _spotdl_available():
         return _download_via_spotdl(track, dest_dir)
     match = _pick_match(query)
-    file_path, yt_track = download_youtube_audio(match["url"], dest_dir)
+    file_path, yt_track = download_youtube_audio(
+        match["url"], dest_dir, progress_cb=progress_cb)
     merged = dict(track)
     merged["url"] = yt_track.get("url") or merged.get("url")
     if yt_track.get("duration_sec") is not None:
         merged["duration_sec"] = yt_track["duration_sec"]
+    if yt_track.get("duration_str") is not None:
+        merged["duration_str"] = yt_track["duration_str"]
     if yt_track.get("thumbnail"):
         merged["thumbnail"] = yt_track["thumbnail"]
     return file_path, merged
@@ -342,28 +349,65 @@ def _download_via_spotdl(track, dest_dir):
     return files[0], track
 
 
-def download_spotify_collection(url, dest_dir, mode="zip"):
+def download_spotify_collection(url, dest_dir, mode="zip", run=None):
     """Spotify-Loader flow: playlist/album -> ZIP or one-by-one files.
 
     Returns (file_path_or_None, tracks, downloaded_files, truncated).
     mode=zip -> a single .zip path; mode=files -> None + per-file list.
+
+    ``run`` is the IPC-4 DownloadRun (or None): the per-track
+    checklist plus the overall percentage, folded live from yt-dlp's
+    progress lines for the track currently transferring.
     """
     tracks = resolve_collection(url)
     truncated = False
     if len(tracks) > MAX_PLAYLIST_TRACKS:
         tracks = tracks[:MAX_PLAYLIST_TRACKS]
         truncated = True
+    total = len(tracks)
+    if run is not None:
+        # The checklist titles are only known once the collection
+        # resolves — build them here, before any track starts.
+        run.set_titles([
+            "%s - %s" % (t.get("artist") or "spotify",
+                         t.get("title") or "track")
+            for t in tracks
+        ])
     downloaded = []
     first_error = None
-    for track in tracks:
+    for idx, track in enumerate(tracks):
+        if run is not None:
+            run.set_track(idx, state="searching")
+            run.update(phase="downloading")
+
+        def _cb(percentage, done_bytes, total_bytes,
+                speed_bytes_per_sec, eta_sec, _idx=idx):
+            if run is None:
+                return
+            done = sum(1 for t in run.per_track if t["state"] == "done")
+            run.update(
+                percentage=(done + percentage / 100.0) / max(total, 1) * 100.0,
+                done_bytes=done_bytes,
+                total_bytes=total_bytes,
+                speed_bytes_per_sec=speed_bytes_per_sec,
+                eta_sec=eta_sec,
+                phase="downloading")
+            run.set_track(_idx, state="downloading", pct=percentage)
+
         try:
-            path, _ = download_spotify_track(track, dest_dir)
+            path, _ = download_spotify_track(track, dest_dir,
+                                             progress_cb=_cb)
             downloaded.append((track, path))
+            if run is not None:
+                run.set_track(idx, state="done", pct=100.0)
+                run.update(percentage=len(downloaded) / max(total, 1) * 100.0)
         except Exception as exc:
             # One bad track must not kill the whole playlist (same
             # behaviour as Spotify-Loader's per-file loop).
             if first_error is None:
                 first_error = str(exc)
+            if run is not None:
+                run.set_track(idx, state="failed", reason=str(exc))
             continue
     if not downloaded:
         raise download_failed(

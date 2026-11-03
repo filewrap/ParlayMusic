@@ -19,6 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .util import format_duration_str
+
 _TOKEN_URL = "https://accounts.spotify.com/api/token"
 _API_BASE = "https://api.spotify.com/v1"
 
@@ -87,12 +89,17 @@ def _track_dict(item):
     """Spotify track object -> contract Track dict (+ album/thumbnail)."""
     album = item.get("album") or {}
     images = album.get("images") or []
+    duration_sec = int((item.get("duration_ms") or 0) // 1000)
     track = {
         "id": str(item.get("id") or ""),
         "title": item.get("name") or "",
         "source": "spotify",
         "artist": _artists(item),
-        "duration_sec": int((item.get("duration_ms") or 0) // 1000),
+        "duration_sec": duration_sec,
+        # IPC-3 (§29): derived human duration; a Spotify track is
+        # never live, and the API reports no views/uploader/upload
+        # date (those stay absent, never invented).
+        "duration_str": format_duration_str(duration_sec, False),
         "url": (item.get("external_urls") or {}).get("spotify") or "",
         "album": album.get("name") or "",
     }

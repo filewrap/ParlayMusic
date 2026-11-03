@@ -26,6 +26,7 @@
 // the Store uses its JSON file backend in a temp dir.
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <string>
@@ -80,6 +81,136 @@ public:
         std::string caption;
     };
     std::vector<DocCall> docs;
+    // Phase 9 interactive layer: every new virtual records its call
+    // instead of hitting the network. sendMessageHtml / sendPhoto push
+    // the text (or caption) into replies so the existing replies[0]
+    // assertions keep working; markups are recorded in parallel.
+    std::vector<std::string> markups;  // reply_markup JSON per reply
+    std::vector<std::string> photos;   // photo URL/file_id per sendPhoto
+    struct EditCall {
+        int64_t chat;
+        int64_t msg;
+        std::string text;
+        std::string kind;  // text | caption | markup
+    };
+    std::vector<EditCall> edits;
+    struct ToastCall {
+        std::string id;
+        std::string text;
+        bool alert;
+    };
+    std::vector<ToastCall> toasts;
+    std::vector<std::pair<int64_t, int64_t>> deleted;
+    struct AudioCall {
+        int64_t chat;
+        std::string audio;  // file_id/URL (sendAudio) or path (sendAudioFile/sendFile)
+        std::string caption;
+        std::string kind;  // audio | audiofile | file
+    };
+    std::vector<AudioCall> audios;
+    int64_t next_id = 1000;
+    int64_t sendMessageHtml(int64_t chat_id, const std::string& text,
+                            const parlay::Json& reply_markup, int64_t reply_to = 0,
+                            std::string* error_out = nullptr) override {
+        (void)chat_id;
+        (void)reply_to;
+        (void)error_out;
+        replies.push_back(text);
+        markups.push_back(reply_markup.dump());
+        return static_cast<int64_t>(replies.size());
+    }
+    int64_t sendPhoto(int64_t chat_id, const std::string& photo,
+                      const std::string& caption, const parlay::Json& reply_markup,
+                      std::string* error_out = nullptr) override {
+        (void)chat_id;
+        (void)error_out;
+        photos.push_back(photo);
+        replies.push_back(caption);
+        markups.push_back(reply_markup.dump());
+        return static_cast<int64_t>(replies.size());
+    }
+    bool editMessageText(int64_t chat_id, int64_t message_id,
+                         const std::string& text, const parlay::Json& reply_markup,
+                         std::string* error_out = nullptr) override {
+        (void)reply_markup;
+        (void)error_out;
+        edits.push_back({chat_id, message_id, text, "text"});
+        return true;
+    }
+    bool editMessageCaption(int64_t chat_id, int64_t message_id,
+                            const std::string& caption,
+                            const parlay::Json& reply_markup,
+                            std::string* error_out = nullptr) override {
+        (void)reply_markup;
+        (void)error_out;
+        edits.push_back({chat_id, message_id, caption, "caption"});
+        return true;
+    }
+    bool editMessageReplyMarkup(int64_t chat_id, int64_t message_id,
+                                const parlay::Json& reply_markup,
+                                std::string* error_out = nullptr) override {
+        (void)error_out;
+        edits.push_back({chat_id, message_id, reply_markup.dump(), "markup"});
+        return true;
+    }
+    bool answerCallbackQuery(const std::string& callback_query_id,
+                             const std::string& text, bool show_alert,
+                             int cache_time_sec = 0,
+                             std::string* error_out = nullptr) override {
+        (void)cache_time_sec;
+        (void)error_out;
+        toasts.push_back({callback_query_id, text, show_alert});
+        return true;
+    }
+    // Inline answers (Phase 9 gaps, §13): the results JSON + cache
+    // time + switch_pm button are recorded for the assertions.
+    struct InlineCall {
+        std::string id;
+        std::string results_json;
+        int cache_time;
+        std::string switch_pm_text;
+        std::string switch_pm_parameter;
+    };
+    std::vector<InlineCall> inlines;
+    bool answerInlineQuery(const std::string& inline_query_id,
+                           const parlay::Json& results, int cache_time_sec,
+                           const std::string& switch_pm_text,
+                           const std::string& switch_pm_parameter,
+                           std::string* error_out = nullptr) override {
+        (void)error_out;
+        inlines.push_back({inline_query_id, results.dump(), cache_time_sec,
+                           switch_pm_text, switch_pm_parameter});
+        return true;
+    }
+    bool deleteMessage(int64_t chat_id, int64_t message_id) override {
+        deleted.emplace_back(chat_id, message_id);
+        return true;
+    }
+    int64_t sendAudioFile(int64_t chat_id, const std::string& file_path,
+                          const std::string& caption,
+                          std::string* error_out = nullptr) override {
+        (void)error_out;
+        audios.push_back({chat_id, file_path, caption, "audiofile"});
+        return ++next_id;
+    }
+    int64_t sendFile(int64_t chat_id, const std::string& file_path,
+                     const std::string& caption,
+                     std::string* error_out = nullptr) override {
+        (void)error_out;
+        audios.push_back({chat_id, file_path, caption, "file"});
+        return ++next_id;
+    }
+    int64_t sendAudio(int64_t chat_id, const std::string& audio,
+                      const std::string& caption, const parlay::Json& reply_markup,
+                      std::string* error_out = nullptr) override {
+        (void)reply_markup;
+        (void)error_out;
+        audios.push_back({chat_id, audio, caption, "audio"});
+        return ++next_id;
+    }
+    std::string getUserMention(int64_t user_id) override {
+        return "User " + std::to_string(user_id);
+    }
     bool forwardMessage(int64_t to_chat, int64_t from_chat,
                         int64_t message_id) override {
         (void)from_chat;
@@ -116,9 +247,13 @@ public:
         (void)chat_id;
         return admins;
     }
+    // Scripted member status for non-admin users (Phase 9 §K): the
+    // default "member" stands in for any non-admin state; tests set
+    // it to "kicked"/"restricted" to exercise the assistant checks.
+    std::string member_status_for_other = "member";
     std::string getChatMemberStatus(int64_t chat_id, int64_t user_id) override {
         (void)chat_id;
-        return user_id == 111 ? "administrator" : "member";
+        return user_id == 111 ? "administrator" : member_status_for_other;
     }
     bool downloadFile(const std::string& file_id,
                       const std::string& dest_dir,
@@ -154,6 +289,18 @@ public:
     mutable std::string skip_response;
     mutable std::string pause_response;
     mutable std::string resume_response;
+    // Scripted Phase 9-gaps answers (empty = fall through to the 404
+    // below, per the FakeIpc contract above): search.inline tracks,
+    // vc.lyrics text, NetEase search/lyrics, download POSTs, and the
+    // radio status GET. last_post_body records the most recent POST
+    // body so tests can assert the chat_id the core passed.
+    mutable std::string inline_response;
+    mutable std::string lyrics_response;
+    mutable std::string netease_search_response;
+    mutable std::string netease_lyrics_response;
+    mutable std::string download_response;
+    mutable std::string radio_status_response;
+    mutable std::string last_post_body;
     // Scripted playback state (Phase 6, B11 speed/bass engine path):
     // when true, GET now-playing returns a playing track and POST
     // seek succeeds; when false (default) the engines know nothing.
@@ -166,10 +313,43 @@ public:
     parlay::IpcResult post(const std::string& base_url,
                            const std::string& action, const parlay::Json& body,
                            int timeout_sec = 30) const override {
-        (void)body;
         (void)timeout_sec;
         posts.push_back(base_url + "|" + action);
+        last_post_body = body.dump();
         parlay::IpcResult r;
+        if (action == "inline" && !inline_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(inline_response);
+            return r;
+        }
+        if (action == "lyrics" && !lyrics_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(lyrics_response);
+            return r;
+        }
+        if (action == "netease/search" &&
+            !netease_search_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(netease_search_response);
+            return r;
+        }
+        if (action == "netease/lyrics" &&
+            !netease_lyrics_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(netease_lyrics_response);
+            return r;
+        }
+        if (action.rfind("download/", 0) == 0 &&
+            !download_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(download_response);
+            return r;
+        }
         if (action == "seek" && np_ok) {
             r.ok = true;
             r.http_status = 200;
@@ -187,6 +367,18 @@ public:
             r.ok = true;
             r.http_status = 200;
             r.data = parlay::Json::parse(skip_response);
+            return r;
+        }
+        // Queue actions (Phase 9 §K): list returns an empty queue,
+        // clear succeeds. Enough for /clear's empty-queue reply and
+        // for the queued-play fallback (which guards size() > 1).
+        if (action == "queue") {
+            const parlay::Json* a = body.find("action");
+            std::string act = a ? a->asString() : "";
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(
+                act == "list" ? R"({"queue":[]})" : R"({})");
             return r;
         }
         if (action == "pause" && !pause_response.empty()) {
@@ -232,6 +424,13 @@ public:
         (void)timeout_sec;
         gets.push_back(path);
         parlay::IpcResult r;
+        if (path.rfind("/v1/radio/status", 0) == 0 &&
+            !radio_status_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(radio_status_response);
+            return r;
+        }
         if (np_ok && path.rfind("/v1/now-playing", 0) == 0) {
             r.ok = true;
             r.http_status = 200;
@@ -383,7 +582,6 @@ struct Rig {
 }  // namespace
 
 int main() {
-    std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
 
     // --- A. parseMessage: reply media ------------------------------------
     {
@@ -479,9 +677,10 @@ int main() {
         Rig rig;
         parlay::TgMessage m = makeMsg(-1003, 111, "/play");
         rig.d.handleMessage(m);
+        // Phase 9: the usage error is the ported kNoSongQuery card.
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] ==
-                      "Usage: /play <song title, link or track id>",
+                  contains(rig.tg.replies[0], "Whoops! Nothing to play") &&
+                  contains(rig.tg.replies[0], "/play [song name or link]"),
               "play no media + no query: honest usage error");
         CHECK(rig.voice.plays.empty() && rig.ipc.posts.empty(),
               "play no media + no query: nothing played, no IPC");
@@ -529,7 +728,8 @@ int main() {
         rig.d.handleMessage(makeMsg(-1011, 111, "/mute"));
         CHECK(rig.voice.mutes.size() == 1,
               "mute core session: backend mute() called");
-        CHECK(rig.tg.replies.size() == 1 && rig.tg.replies[0] == "Muted.",
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "\U0001F507 | <b>Muted.</b>",
               "mute core session: Muted reply");
         auto v = rig.store.hget("chat:-1011", "muted");
         CHECK(v && *v == "1", "mute core session: flag stored");
@@ -542,7 +742,7 @@ int main() {
         CHECK(rig.voice.mutes.empty(),
               "mute when already muted: no backend call");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "Already muted.",
+                  rig.tg.replies[0] == "\u274C | <b>Already muted.</b>",
               "mute when already muted: Already muted reply");
     }
     {
@@ -552,7 +752,8 @@ int main() {
         rig.d.handleMessage(makeMsg(-1013, 111, "/unmute"));
         CHECK(rig.voice.unmutes.size() == 1,
               "unmute core session: backend unmute() called");
-        CHECK(rig.tg.replies.size() == 1 && rig.tg.replies[0] == "Unmuted.",
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "\U0001F50A | <b>Unmuted.</b>",
               "unmute core session: Unmuted reply");
     }
     {
@@ -597,7 +798,7 @@ int main() {
         CHECK(rig.voice.joins.size() == 1,
               "join: backend join() called");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "Joined the voice chat.",
+                  rig.tg.replies[0] == "\u2705 | <b>Joined the voice chat.</b>",
               "join: Joined reply");
         auto v = rig.store.hget("chat:-1021", "voice_owner");
         CHECK(v && *v == "core", "join: voice_owner recorded as core");
@@ -632,7 +833,8 @@ int main() {
         CHECK(rig.voice.joins.empty(),
               "join when already in call: no second join");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "Already in the voice chat.",
+                  rig.tg.replies[0] ==
+                      "\u274C | <b>Already in the voice chat.</b>",
               "join when already in call: Already reply");
     }
     {
@@ -1294,6 +1496,942 @@ int main() {
                            20.0, false, 0.0, 0, "curl timeout"),
                        "Upload probe failed (HTTP 0: curl timeout)"),
               "formatSpeedtest: failed upload reported honestly next to download");
+    }
+
+    // --- J. callback routing (Phase 9, pl: namespace) -------------------
+    auto makeCq = [](const std::string& data, int64_t chat = -1001,
+                     int64_t user = 111, int64_t msg_id = 7) {
+        parlay::TgCallbackQuery cq;
+        cq.id = "cq1";
+        cq.from.id = user;
+        cq.chat_id = chat;
+        cq.message_id = msg_id;
+        cq.has_message = true;
+        cq.data = data;
+        return cq;
+    };
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:unknown:thing"));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].alert &&
+                  contains(rig.tg.toasts[0].text, "Unknown"),
+              "callback: unknown domain gets a polite alert, no crash");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq(""));
+        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
+              "callback: empty data gets an alert, no crash");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:player:pause:" +
+                                    std::string(70, '9')));
+        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
+              "callback: over-64-byte data gets an alert, no crash");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("not-a-callback"));
+        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
+              "callback: non-pl data gets an alert, no crash");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:help:main"));
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Help") &&
+                  rig.tg.toasts.size() == 1 &&
+                  !rig.tg.toasts[0].alert,
+              "callback: pl:help:main re-renders the help menu in place");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:help:nosuchtopic"));
+        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
+              "callback: unknown help topic gets an alert");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:player:progress:-1001"));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text.empty() &&
+                  !rig.tg.toasts[0].alert && rig.tg.edits.empty(),
+              "callback: progress button is a silent no-op ack");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:close"));
+        CHECK(rig.tg.deleted.size() == 1 &&
+                  rig.tg.deleted[0].first == -1001 &&
+                  rig.tg.deleted[0].second == 7,
+              "callback: pl:close deletes the message");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:set:info:adminmode"));
+        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert &&
+                  contains(rig.tg.toasts[0].text, "Admin Mode"),
+              "callback: pl:set:info answers the explainer as an alert");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:player:pause:-1001"));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  contains(rig.tg.toasts[0].text, "Nothing playing"),
+              "callback: pause with nothing playing toasts, no crash");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:queue:more:-1001"));
+        CHECK(rig.tg.toasts.size() == 1,
+              "callback: queue more with no playback answers (no crash)");
+    }
+    {
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:lang:select:help"));
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Language"),
+              "callback: language picker renders in place");
+    }
+    {
+        // Panel presses are requester-only and silently ignored.
+        Rig rig;
+        rig.store.set("panelmsg:-1001", "7");
+        rig.store.set("paneluser:-1001", "111");
+        rig.d.handleCallback(makeCq("pl:player:pause:-1001", -1001, 222));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text.empty() && rig.tg.edits.empty(),
+              "callback: another user's panel press is silently ignored");
+    }
+    {
+        // /menu panel creation stores panelmsg/paneluser.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/menu"));
+        auto pm = rig.store.get("panelmsg:-1001");
+        auto pu = rig.store.get("paneluser:-1001");
+        CHECK(pm && *pm == "1" && pu && *pu == "111",
+              "menu: panel message + requester recorded");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Nothing streaming now"),
+              "menu: idle panel text");
+        CHECK(!rig.tg.markups.empty() &&
+                  contains(rig.tg.markups[0], "pl:player:pause:-1001"),
+              "menu: panel keyboard carries player callbacks");
+    }
+    {
+        // /start in a group renders the group card; /help in a group
+        // replies with the DM prompt (scope is Any now).
+        Rig rig;
+        parlay::TgMessage m = makeMsg(-1001, 111, "/start");
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Parlay"),
+              "start: group card renders");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 111, "/help"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "DM"),
+              "help: group reply points at the DM");
+    }
+    {
+        // /settings renders the panel with the settings keyboard.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/settings"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Chat Settings"),
+              "settings: panel text renders");
+        CHECK(!rig.tg.markups.empty() &&
+                  contains(rig.tg.markups[0], "pl:set:adminmode"),
+              "settings: panel keyboard carries set callbacks");
+    }
+    {
+        // /authlist with no authorized users renders the empty text.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/authlist"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "no authorized users"),
+              "authlist: empty list renders");
+    }
+    {
+        // /id renders the chat id.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/id"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "-1001"),
+              "id: chat id rendered");
+    }
+    {
+        // /speed range is 0.5–4.0 now (single atempo covers it).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/speed 3.5"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  !contains(rig.tg.replies[0], "0.5x to 2.0x"),
+              "speed: 3.5x accepted (range is 0.5-4.0)");
+    }
+
+    // --- K. Phase 9 wiring round 2: inventory strings in handlers -------
+    auto makeDm = [](int64_t chat, int64_t from, const std::string& text) {
+        parlay::TgMessage m = makeMsg(chat, from, text);
+        m.chat.type = "private";
+        return m;
+    };
+    {
+        // adminCheck denial uses the inventory card.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 222, "/settings"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Access Denied"),
+              "adminCheck: non-admin gets the denial card");
+    }
+    {
+        // canManageVc denial uses the admin-or-auth card.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 222, "/pause"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "authorized users"),
+              "canManageVc: non-admin gets the admin-or-auth denial");
+    }
+    {
+        // playAllowed denial uses the admin-only-play card.
+        Rig rig;
+        rig.store.hset("chat:-1001", "play_mode", "admin");
+        rig.d.handleMessage(makeMsg(-1001, 222, "/play test song"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Admin only play"),
+              "playAllowed: admin-only playmode denies non-admins");
+    }
+    {
+        // /eval with no input answers the inventory one-word reply.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/eval"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "What?"),
+              "eval: empty input answers What?");
+    }
+    {
+        // /eval runs and renders the HTML output form.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/eval echo hi"));
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[1], "Output:") &&
+                  contains(rig.tg.replies[1], "hi") &&
+                  contains(rig.tg.replies[1], "Exit: 0"),
+              "eval: output form renders input/output/exit");
+    }
+    {
+        // /logs with no log file falls back to the in-memory log, which
+        // already holds this very command (logged before dispatch).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/logs"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Recent commands") &&
+                  contains(rig.tg.replies[0], "/logs"),
+              "logs: memory log lists the recent commands");
+    }
+    {
+        // /logger usage shows the status; enable needs LOGGER_ID.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/logger"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /logger") &&
+                  contains(rig.tg.replies[0], "ON"),
+              "logger: usage shows current status");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/logger on"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "LOGGER_ID"),
+              "logger: enable without LOGGER_ID refuses");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/logger off"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Logger disabled"),
+              "logger: disable confirms");
+    }
+    {
+        // /admincache reloads once, then cools down for 10 minutes.
+        // One Rig per call: the dispatcher rate-limits to 1 cmd/s per
+        // chat, and the cooldown map is static (survives a fresh Rig).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/admincache"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "Administrator cache reloaded successfully"),
+              "admincache: first reload succeeds");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 111, "/admincache"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "Please wait"),
+              "admincache: immediate re-run cools down");
+    }
+    {
+        // /activevc + /ac with no calls, and with one call. The call
+        // flag lives in the file store, so it survives a fresh Rig
+        // (the store writes through on every set).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 999, "/activevc"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "active streams"),
+              "activevc: no streams renders the empty text");
+        rig.store.set("call:-1001", "1");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 999, "/activevc"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "List of active streams") &&
+                  contains(rig2.tg.replies[0], "-1001"),
+              "activevc: one call lists its chat");
+        Rig rig3;
+        rig3.d.handleMessage(makeMsg(-1001, 999, "/ac"));
+        CHECK(rig3.tg.replies.size() == 1 &&
+                  contains(rig3.tg.replies[0], "Active Chats:"),
+              "ac: count form renders the active-chats card");
+        rig3.store.del("call:-1001");
+    }
+    {
+        // /bug usage + a report to the owner (owner_id 999 in the Rig).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/bug"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /bug"),
+              "bug: empty report shows usage");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 111, "/bug the queue broke"));
+        CHECK(rig2.tg.replies.size() == 2 &&
+                  contains(rig2.tg.replies[0], "Bug report") &&
+                  contains(rig2.tg.replies[1], "Thank you"),
+              "bug: report delivered + thanks");
+    }
+    {
+        // /channelplay: usage, disable, invalid ids, inaccessible.
+        // One Rig per call (1 cmd/s per chat rate limit).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/channelplay"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /channelplay"),
+              "channelplay: bare shows usage");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 111, "/channelplay disable"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "Channel Play disabled"),
+              "channelplay: disable confirms");
+        Rig rig3;
+        rig3.d.handleMessage(makeMsg(-1001, 111, "/channelplay abc"));
+        CHECK(rig3.tg.replies.size() == 1 &&
+                  contains(rig3.tg.replies[0], "Invalid Target"),
+              "channelplay: bad id is an invalid target");
+        Rig rig4;
+        rig4.d.handleMessage(makeMsg(-1001, 111, "/channelplay 123"));
+        CHECK(rig4.tg.replies.size() == 1 &&
+                  contains(rig4.tg.replies[0], "Invalid Target"),
+              "channelplay: non-channel id is an invalid target");
+        Rig rig5;
+        rig5.d.handleMessage(makeMsg(-1001, 111, "/channelplay -10042"));
+        CHECK(rig5.tg.replies.size() == 1 &&
+                  contains(rig5.tg.replies[0], "Not Accessible"),
+              "channelplay: bot-not-admin is not accessible");
+    }
+    {
+        // /userbot: assistant already here / banned.
+        Rig rig;
+        rig.cfg.assistant_ids.insert(555);
+        rig.d.handleMessage(makeMsg(-1001, 111, "/userbot"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "already in this chat"),
+              "userbot: member assistant is already here");
+        Rig rig2;
+        rig2.cfg.assistant_ids.insert(555);
+        rig2.tg.member_status_for_other = "kicked";
+        rig2.d.handleMessage(makeMsg(-1001, 111, "/userbot"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "banned"),
+              "userbot: kicked assistant is restricted");
+    }
+    {
+        // /setrtmp is DM-only; bare / invalid / save / off in a DM.
+        // One Rig per call (1 cmd/s per chat); the RTMP target lives
+        // in the file store and survives a fresh Rig.
+        Rig rig;
+        rig.d.handleMessage(makeDm(111, 111, "/setrtmp"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "No RTMP target is set"),
+              "setrtmp: bare shows the unset text");
+        Rig rig2;
+        rig2.d.handleMessage(makeDm(111, 111, "/setrtmp http://x/app key"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "rtmp://"),
+              "setrtmp: non-rtmp URL refused");
+        Rig rig3;
+        rig3.d.handleMessage(
+            makeDm(111, 111, "/setrtmp rtmp://live.example.com/app key1"));
+        CHECK(rig3.tg.replies.size() == 1 &&
+                  contains(rig3.tg.replies[0], "RTMP target saved"),
+              "setrtmp: save confirms");
+        Rig rig4;
+        rig4.d.handleMessage(makeDm(111, 111, "/setrtmp off"));
+        CHECK(rig4.tg.replies.size() == 1 &&
+                  contains(rig4.tg.replies[0], "removed"),
+              "setrtmp: off removes the target");
+    }
+    {
+        // /stream / /streamstop / /streamstatus with no target/stream.
+        // One Rig per call (1 cmd/s per chat rate limit).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/stream"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "No RTMP target is set"),
+              "stream: no target refuses");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 111, "/streamstop"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "No stream is running"),
+              "streamstop: nothing running");
+        Rig rig3;
+        rig3.d.handleMessage(makeMsg(-1001, 111, "/streamstatus"));
+        CHECK(rig3.tg.replies.size() == 1 &&
+                  contains(rig3.tg.replies[0], "No active RTMP stream"),
+              "streamstatus: nothing active");
+        rig3.store.hset("chat:-1001", "rtmp_url", "rtmp://x/app");
+        rig3.store.hset("chat:-1001", "rtmp_key", "k");
+        Rig rig4;
+        rig4.d.handleMessage(makeMsg(-1001, 111, "/stream"));
+        CHECK(rig4.tg.replies.size() == 1 &&
+                  contains(rig4.tg.replies[0], "Usage:") &&
+                  contains(rig4.tg.replies[0], "/stream"),
+              "stream: no query + nothing playing shows usage");
+        rig4.store.hset("chat:-1001", "rtmp_url", "");
+        rig4.store.hset("chat:-1001", "rtmp_key", "");
+    }
+    {
+        // /queue help renders the ops card.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/queue help"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Queue Managing") &&
+                  contains(rig.tg.replies[0], "remove"),
+              "queue help: ops card renders");
+    }
+    {
+        // /myplaylists renders the named-playlist line format.
+        Rig rig;
+        rig.store.set(
+            "npl:111",
+            R"([{"id":"abc123","name":"Road","songs":[]}])");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/myplaylists"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Road (<code>abc123</code>)"),
+              "myplaylists: name + id line renders");
+    }
+    {
+        // /clear with an empty queue answers the already-empty text.
+        Rig rig;
+        rig.store.set("call:-1001", "1");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/clear"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "already empty"),
+              "clear: empty queue answers already-empty");
+    }
+    {
+        // delete: trigger validates the path before confirming.
+        // One Rig per call (1 cmd/s per chat rate limit).
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "delete:Song.mp3"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "top-level"),
+              "delete trigger: bare name is top-level");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1001, 111, "delete:../x.mp3"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0], "Invalid path"),
+              "delete trigger: traversal is an invalid path");
+        Rig rig3;
+        rig3.d.handleMessage(
+            makeMsg(-1001, 111, "delete:Artist/Album/song.mp3"));
+        CHECK(rig3.tg.replies.size() == 1 &&
+                  contains(rig3.tg.replies[0], "song.mp3"),
+              "delete trigger: library path shows the confirm card");
+    }
+    {
+        // pl:bcast:cancel: non-owner refused, owner with no run.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:bcast:cancel", -1001, 111));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  contains(rig.tg.toasts[0].text, "Only the bot owner"),
+              "bcast cancel: non-owner refused");
+        rig.d.handleCallback(makeCq("pl:bcast:cancel", -1001, 999));
+        CHECK(rig.tg.toasts.size() == 2 &&
+                  contains(rig.tg.toasts[1].text, "Cancelled"),
+              "bcast cancel: owner with no run gets the cancelled toast");
+    }
+    {
+        // pl:player:skip success toasts the pressing user by name.
+        // The skip re-checks now-playing after the engine call, so the
+        // fake needs a playing track + a core session to re-attach.
+        Rig rig;
+        rig.ipc.skip_response = skip_np;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.store.set("call:-1001", "1");
+        rig.store.hset("chat:-1001", "voice_owner", "core");
+        rig.store.hset("chat:-1001", "core_source",
+                       "https://example.invalid/audio.webm");
+        rig.store.hset("chat:-1001", "core_title", "Test Song");
+        rig.store.hset("chat:-1001", "core_video", "0");
+        rig.store.hset("chat:-1001", "core_track_id", "t1");
+        rig.store.hset("chat:-1001", "core_follow", "1");
+        rig.d.handleCallback(makeCq("pl:player:skip:-1001"));
+        CHECK(!rig.tg.toasts.empty() &&
+                  contains(rig.tg.toasts[0].text, "Skipped by"),
+              "player skip: success toasts the pressing user");
+    }
+    {
+        // pl:search pick with no session edits the message to expired.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:search:1:111:tok123"));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  contains(rig.tg.toasts[0].text, "expired") &&
+                  !rig.tg.edits.empty() &&
+                  contains(rig.tg.edits[0].text, "Search expired"),
+              "search pick: expired session edits the message");
+    }
+    {
+        // pl:set:page / pl:set:musicdl sub-screens + toggles.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:set:page", -1001, 111));
+        CHECK(!rig.tg.edits.empty() &&
+                  contains(rig.tg.edits[0].text,
+                           "Auto delete old messages"),
+              "set page: screen renders");
+        rig.d.handleCallback(makeCq("pl:set:page:0", -1001, 111));
+        auto v = rig.store.hget("chat:-1001", "page_purge");
+        CHECK(v && *v == "off" &&
+                  !rig.tg.toasts.empty() &&
+                  contains(rig.tg.toasts.back().text, "updated"),
+              "set page:0 persists off + confirms");
+        rig.d.handleCallback(makeCq("pl:set:musicdl", -1001, 111));
+        CHECK(contains(rig.tg.edits.back().text,
+                       "Download music via chat"),
+              "set musicdl: screen renders");
+    }
+
+    // --- L. Phase 9 gaps: inline queries, deep link, lrc_path, share
+    // --- dedup removal, radio card (coordinator rulings) --------------
+    auto makeIq = [](const std::string& query, int64_t user = 111,
+                     const std::string& id = "iq1") {
+        parlay::TgInlineQuery iq;
+        iq.id = id;
+        iq.from.id = user;
+        iq.query = query;
+        return iq;
+    };
+    auto posted = [](const Rig& rig, const std::string& action) {
+        for (const auto& p : rig.ipc.posts)
+            if (contains(p, "|" + action)) return true;
+        return false;
+    };
+    // Field of one inline result ("" when missing), and the message
+    // text of one article result.
+    auto resField = [](const parlay::Json& res, size_t i,
+                       const char* key) {
+        if (!res.isArray() || i >= res.size()) return std::string("");
+        const parlay::Json* v = res.asArray()[i].find(key);
+        return v ? v->asString() : std::string("");
+    };
+    auto artMsg = [](const parlay::Json& res, size_t i) {
+        if (!res.isArray() || i >= res.size()) return std::string("");
+        const parlay::Json* c =
+            res.asArray()[i].find("input_message_content");
+        if (!c) return std::string("");
+        const parlay::Json* m = c->find("message_text");
+        return m ? m->asString() : std::string("");
+    };
+    auto inlineResults = [](const Rig& rig) {
+        return parlay::Json::parse(rig.tg.inlines.back().results_json);
+    };
+    // A group text from this user records last_chat:<user> = -1001
+    // (the np/s/l chat), without touching the command rate limiter.
+    auto noteChat = [](Rig& rig, int64_t user) {
+        rig.d.handleMessage(makeMsg(-1001, user, "hello"));
+    };
+    {
+        // Hint: empty and 1-2-char queries get the hint button.
+        Rig rig;
+        rig.d.handleInlineQuery(makeIq(""));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]" &&
+                  rig.tg.inlines[0].switch_pm_text ==
+                      parlay::ui_texts::kInlineHintText &&
+                  rig.tg.inlines[0].switch_pm_parameter == "help" &&
+                  rig.tg.inlines[0].cache_time == 30,
+              "inline hint: empty query -> hint button, cache 30");
+        rig.d.handleInlineQuery(makeIq("ab"));
+        CHECK(rig.tg.inlines.size() == 2 &&
+                  rig.tg.inlines[1].switch_pm_text ==
+                      parlay::ui_texts::kInlineHintText,
+              "inline hint: 2-char query -> hint button");
+        CHECK(rig.ipc.posts.empty(),
+              "inline hint: no engine call for hint queries");
+    }
+    {
+        // Help articles + bare "search".
+        Rig rig;
+        rig.d.handleInlineQuery(makeIq("help"));
+        parlay::Json res = inlineResults(rig);
+        CHECK(res.size() == 2 &&
+                  resField(res, 0, "title") ==
+                      parlay::ui_texts::kInlineHelpTitle1 &&
+                  resField(res, 1, "title") ==
+                      parlay::ui_texts::kInlineHelpTitle2 &&
+                  artMsg(res, 0) == "Parlay v0.2.0" &&
+                  artMsg(res, 1) == "Parlay v0.2.0" &&
+                  rig.tg.inlines[0].cache_time == 3600,
+              "inline help: two articles sending the version line");
+        rig.d.handleInlineQuery(makeIq("search"));
+        res = inlineResults(rig);
+        CHECK(res.size() == 1 &&
+                  resField(res, 0, "title") ==
+                      parlay::ui_texts::kInlineNeedKeyword,
+              "inline search: bare search -> enter-a-keyword article");
+    }
+    {
+        // np with no known chat: empty results, no engine call.
+        Rig rig;
+        rig.d.handleInlineQuery(makeIq("np", 4242));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]" &&
+                  rig.ipc.posts.empty(),
+              "inline np: unknown chat -> empty, engine not called");
+    }
+    {
+        // np with a known chat: chat_id passed, audio result.
+        Rig rig;
+        noteChat(rig, 5001);
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","duration_sec":200,"stream_url":"https://example.invalid/audio.webm","thumbnail":"https://example.invalid/t.jpg","source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("np", 5001));
+        CHECK(posted(rig, "inline") &&
+                  contains(rig.ipc.last_post_body,
+                           "\"chat_id\":-1001"),
+              "inline np: chat_id passed to search.inline");
+        parlay::Json res = inlineResults(rig);
+        CHECK(res.size() == 1 && resField(res, 0, "type") == "audio" &&
+                  resField(res, 0, "audio_url") ==
+                      "https://example.invalid/audio.webm" &&
+                  resField(res, 0, "title") == "T" &&
+                  rig.tg.inlines[0].cache_time == 0,
+              "inline np: audio result from stream_url, cache 0");
+    }
+    {
+        // np with nothing playing: empty results.
+        Rig rig;
+        noteChat(rig, 5002);
+        rig.ipc.inline_response = R"({"results":[]})";
+        rig.d.handleInlineQuery(makeIq("np", 5002));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]",
+              "inline np: engine empty -> empty results");
+    }
+    {
+        // s: share article with the track URL.
+        Rig rig;
+        noteChat(rig, 5003);
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","url":"https://example.invalid/watch","source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("s", 5003));
+        parlay::Json res = inlineResults(rig);
+        CHECK(res.size() == 1 && resField(res, 0, "type") == "article" &&
+                  artMsg(res, 0) ==
+                      "A — T\nhttps://example.invalid/watch",
+              "inline s: share article with track URL");
+    }
+    {
+        // l: lyrics fetched via /v1/lyrics with the same chat_id.
+        Rig rig;
+        noteChat(rig, 5004);
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","source":"youtube"}]})";
+        rig.ipc.lyrics_response =
+            R"({"lyrics":"[00:01.00] la\n[00:02.00] la la\n","title":"T","artist":"A","source":"lrclib","truncated":false})";
+        rig.d.handleInlineQuery(makeIq("l", 5004));
+        CHECK(posted(rig, "inline") && posted(rig, "lyrics") &&
+                  contains(rig.ipc.last_post_body,
+                           "\"chat_id\":-1001"),
+              "inline l: lyrics fetched with the same chat_id");
+        parlay::Json res = inlineResults(rig);
+        CHECK(res.size() == 1 &&
+                  resField(res, 0, "title") == "Lyrics: T" &&
+                  resField(res, 0, "description") == "A — la\nla la" &&
+                  artMsg(res, 0) == "A — T\n\nla\nla la",
+              "inline l: lyrics article, timestamps stripped");
+    }
+    {
+        // l: long lyrics truncate to 4000 chars + "\n...".
+        Rig rig;
+        noteChat(rig, 5005);
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","source":"youtube"}]})";
+        rig.ipc.lyrics_response =
+            std::string("{\"lyrics\":\"") + std::string(5000, 'x') +
+            std::string("\",\"title\":\"T\",\"artist\":\"A\",\"source\":")
+            + "\"lrclib\",\"truncated\":false}";
+        rig.d.handleInlineQuery(makeIq("l", 5005));
+        parlay::Json res = inlineResults(rig);
+        std::string msg = artMsg(res, 0);
+        CHECK(contains(msg, "\n...") && !contains(msg, "…") &&
+                  msg.size() ==
+                      std::string("A — T\n\n").size() + 4000 + 4,
+              "inline l: 5000-char lyrics cut to 4000 + newline-ellipsis");
+    }
+    {
+        // l: no lyrics found -> empty results.
+        Rig rig;
+        noteChat(rig, 5006);
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("l", 5006));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]",
+              "inline l: lyrics 404 -> empty results");
+    }
+    {
+        // Search: audio result when a stream_url is known, article +
+        // Open button otherwise; results stored for the deep link.
+        Rig rig;
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"jsvn:1","title":"With Stream","artist":"A","duration_sec":180,"stream_url":"https://example.invalid/a.mp3","source":"jiosaavn"},{"id":"lemonic:9","title":"No Stream","artist":"B","duration_sec":200,"url":"https://example.invalid/watch9","source":"lemonic"}]})";
+        rig.d.handleInlineQuery(makeIq("bohemian"));
+        parlay::Json res = inlineResults(rig);
+        CHECK(res.size() == 2 &&
+                  resField(res, 0, "type") == "audio" &&
+                  resField(res, 1, "type") == "article" &&
+                  contains(rig.tg.inlines[0].results_json,
+                           "https://t.me/parlaybot?start=spotify----"
+                           "lemonic:9") &&
+                  rig.tg.inlines[0].cache_time == 3600,
+              "inline search: audio + article with Open deep link");
+    }
+    {
+        // Search with no matches -> "No results found" article.
+        Rig rig;
+        rig.ipc.inline_response = R"({"results":[]})";
+        rig.d.handleInlineQuery(makeIq("bohemian"));
+        parlay::Json res = inlineResults(rig);
+        CHECK(res.size() == 1 &&
+                  resField(res, 0, "title") ==
+                      parlay::ui_texts::kInlineNoResults &&
+                  artMsg(res, 0) == "No results found",
+              "inline search: no matches -> No results found article");
+    }
+    {
+        // lib/del: no library backend -> empty results (ruling 1).
+        Rig rig;
+        rig.ipc.inline_response = R"({"results":[]})";
+        rig.d.handleInlineQuery(makeIq("lib foo"));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]",
+              "inline lib: empty results, not rendered functional");
+        rig.d.handleInlineQuery(makeIq("del foo"));
+        CHECK(rig.tg.inlines.size() == 2 &&
+                  rig.tg.inlines[1].results_json == "[]",
+              "inline del: empty results, not rendered functional");
+    }
+    {
+        // Deep link: inline search stores the track; /start
+        // spotify----{id} downloads it via the stored URL.
+        std::string mp3 = "/tmp/parlay-dl-test.mp3";
+        {
+            std::ofstream out(mp3, std::ios::binary);
+            out << "FAKEMP3";
+        }
+        Rig rig;
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"lemonic:9","title":"No Stream","artist":"B","duration_sec":200,"url":"https://example.invalid/watch9","source":"lemonic"}]})";
+        rig.ipc.download_response =
+            std::string("{\"file_path\":\"") + mp3 +
+            std::string("\",\"track\":{\"id\":\"lemonic:9\",\"title\":")
+            + "\"No Stream\",\"artist\":\"B\",\"duration_sec\":200}}";
+        rig.d.handleInlineQuery(makeIq("bohemian"));
+        parlay::TgMessage pm = makeMsg(111, 111, "/start spotify----lemonic:9");
+        pm.chat.type = "private";
+        rig.d.handleMessage(pm);
+        CHECK(posted(rig, "download/youtube") &&
+                  contains(rig.ipc.last_post_body,
+                           "https://example.invalid/watch9"),
+              "deep link: downloads the stored inline track URL");
+        bool sent = false;
+        for (const auto& a : rig.tg.audios)
+            if (a.kind == "audiofile" && a.audio == mp3) sent = true;
+        CHECK(sent, "deep link: audio file sent");
+        CHECK(!rig.tg.edits.empty() &&
+                  rig.tg.edits.back().text ==
+                      parlay::ui_texts::kDlSuccess,
+              "deep link: progress edited to download success");
+    }
+    {
+        // Deep link: yt: prefix fallback when nothing was stored.
+        std::string mp3 = "/tmp/parlay-dl-test.mp3";
+        Rig rig;
+        rig.ipc.download_response =
+            std::string("{\"file_path\":\"") + mp3 +
+            std::string("\",\"track\":{\"id\":\"yt:dQw4w9WgXcQ\",")
+            + "\"title\":\"T\",\"artist\":\"A\",\"duration_sec\":200}}";
+        parlay::TgMessage pm =
+            makeMsg(111, 111, "/start spotify----yt:dQw4w9WgXcQ");
+        pm.chat.type = "private";
+        rig.d.handleMessage(pm);
+        CHECK(posted(rig, "download/youtube") &&
+                  contains(rig.ipc.last_post_body,
+                           "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+              "deep link: yt: id resolves to the watch URL");
+    }
+    {
+        // Deep link: lemonic: id with no stored result cannot resolve.
+        Rig rig;
+        parlay::TgMessage pm =
+            makeMsg(111, 111, "/start spotify----lemonic:zzz");
+        pm.chat.type = "private";
+        rig.d.handleMessage(pm);
+        CHECK(rig.ipc.posts.empty() &&
+                  !rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(),
+                           parlay::ui_texts::kDlDeepLinkExpired),
+              "deep link: unresolvable id -> expired, no download");
+    }
+    {
+        // lrc_path: /lyric sends the service-written .lrc file.
+        Rig rig;
+        rig.ipc.netease_search_response =
+            R"({"results":[{"id":"186016","title":"Test Song"}]})";
+        rig.ipc.netease_lyrics_response =
+            R"({"lyrics":"[00:01.00] la\n","track_id":"186016","title":"Test Song","artist":"A","source":"netease","truncated":false,"lrc_path":"/tmp/parlay-lrc-test.lrc"})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/lyric Test Song"));
+        bool sent = false;
+        for (const auto& a : rig.tg.audios)
+            if (a.kind == "file" &&
+                a.audio == "/tmp/parlay-lrc-test.lrc" &&
+                contains(a.caption, "<blockquote expandable>") &&
+                contains(a.caption, "la"))
+                sent = true;
+        CHECK(sent, "lyrics: lrc_path file sent with stripped caption");
+    }
+    {
+        // lrc_path absent: the core writes its own stripped .lrc.
+        Rig rig;
+        rig.ipc.netease_search_response =
+            R"({"results":[{"id":"186016","title":"Test Song"}]})";
+        rig.ipc.netease_lyrics_response =
+            R"({"lyrics":"[00:01.00] la\n","track_id":"186016","title":"Test Song","artist":"A","source":"netease","truncated":false})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/lyric Test Song"));
+        bool sent = false;
+        for (const auto& a : rig.tg.audios)
+            if (a.kind == "file" && contains(a.audio, "/lyrics/") &&
+                a.audio.size() > 4 &&
+                a.audio.substr(a.audio.size() - 4) == ".lrc")
+                sent = true;
+        CHECK(sent, "lyrics: no lrc_path -> core writes its own .lrc");
+    }
+    {
+        // Share feedback/report without dedup (ruling 8): the second
+        // feedback and the second report both go through — no
+        // "already sent" / "already reported" anywhere.
+        Rig rig;
+        auto pmText = [](const std::string& text) {
+            parlay::TgMessage m = makeMsg(111, 111, text);
+            m.chat.type = "private";
+            return m;
+        };
+        for (int round = 0; round < 2; ++round) {
+            rig.d.handleCallback(
+                makeCq("pl:share:feedback:777:55:FILEUID"));
+            rig.d.handleMessage(pmText("great track!"));
+        }
+        int sent = 0, already = 0;
+        for (const auto& r : rig.tg.replies) {
+            if (r == parlay::ui_texts::kShareFeedbackSent) ++sent;
+            if (r == parlay::ui_texts::kShareFeedbackAlready) ++already;
+        }
+        CHECK(sent == 2 && already == 0,
+              "share feedback: sent twice, never already-sent");
+        Rig rig2;
+        rig2.d.handleCallback(makeCq("pl:share:report:777:55"));
+        rig2.d.handleCallback(makeCq("pl:share:report:777:55"));
+        int reported = 0, already_rep = 0;
+        for (const auto& t : rig2.tg.toasts) {
+            if (t.text == parlay::ui_texts::kShareReported) ++reported;
+            if (t.text == parlay::ui_texts::kShareReportAlready)
+                ++already_rep;
+        }
+        CHECK(reported == 2 && already_rep == 0,
+              "share report: reported twice, never already-reported");
+    }
+    {
+        // Radio card omits listener counts (ruling 9).
+        Rig rig;
+        rig.ipc.radio_status_response =
+            R"({"now_playing":{"title":"Station Song"},"station":"Test FM","stream_url":"https://example.invalid/stream","reachable":true,"vc_handoff":false})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/manage"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies[0], "Your radio status") &&
+                  !contains(rig.tg.replies[0], "Listener"),
+              "radio manage: card has no listener counts");
+    }
+    {
+        // Blacklisted user: inline gets empty results, silently.
+        Rig rig;
+        rig.store.sadd("bl_users", "222");
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("bohemian", 222));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]" &&
+                  rig.ipc.posts.empty(),
+              "inline auth: blacklisted user -> empty, silent");
+    }
+    {
+        // Maintenance: non-sudo gets empty results; the owner goes
+        // through. (Last: it leaves the maintenance flag set.)
+        Rig rig;
+        rig.store.set("maintenance", "1");
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("bohemian", 111));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  rig.tg.inlines[0].results_json == "[]" &&
+                  rig.ipc.posts.empty(),
+              "inline auth: maintenance + non-sudo -> empty, silent");
+        rig.d.handleInlineQuery(makeIq("bohemian", 999));
+        CHECK(rig.ipc.posts.size() == 1 && posted(rig, "inline"),
+              "inline auth: maintenance + owner -> engine called");
+        rig.store.set("maintenance", "0");
+    }
+    {
+        // Auth limit is 25 (ArcMusic / TinaMusic / YukkiMusic-Go
+        // MAX_AUTH_USERS default — the 20 the core used before was
+        // an unverified assumption; NoxBeats defines no such limit).
+        // Pre-fill the store instead of driving 25 /auth commands
+        // through the per-chat rate limiter. Separate chats per
+        // sub-check: the file store is shared across Rigs.
+        Rig rig;
+        for (int i = 0; i < 25; ++i)
+            rig.store.sadd("auth:-1001", std::to_string(2000 + i));
+        rig.d.handleMessage(makeMsg(-1001, 111, "/auth 3000"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies[0],
+                           "maximum authorized users limit") &&
+                  contains(rig.tg.replies[0], "(25)"),
+              "auth limit: 25 users -> 26th refused with the 25 limit");
+        Rig rig2;
+        for (int i = 0; i < 24; ++i)
+            rig2.store.sadd("auth:-1002", std::to_string(2000 + i));
+        rig2.d.handleMessage(makeMsg(-1002, 111, "/auth 3000"));
+        CHECK(!rig2.tg.replies.empty() &&
+                  contains(rig2.tg.replies[0], "Now 25/25"),
+              "auth limit: 24 users -> 25th added, count shows 25/25");
     }
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");

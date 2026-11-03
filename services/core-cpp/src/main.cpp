@@ -197,6 +197,12 @@ int main() {
         for (const auto& u : updates) {
             offset = std::max(offset, u.update_id + 1);
             if (u.has_message) dispatcher.handleMessage(u.message);
+            if (u.has_callback_query)
+                dispatcher.handleCallback(u.callback);
+            if (u.has_my_chat_member)
+                dispatcher.handleMyChatMember(u.my_chat_member);
+            if (u.has_inline_query)
+                dispatcher.handleInlineQuery(u.inline_query);
         }
     }
     dispatcher.stopBackground();
