@@ -5,6 +5,10 @@
 // /play through an engine attaches core audio, skip/pause/resume/
 // seek/stop keep the core stream in step, watcher follow pass
 // (Phase 7, Worker A1b).
+// (Phase 1 telemetry, §J) Every /play emits one t_dispatch_to_ipc
+// line: dispatch_to_post_us + post_to_response_us == total, engine /
+// fell_back / ok, or ipc=none on the replied-file + usage-error
+// paths (no engine IPC exists there).
 //
 // - TelegramApi::parseMessage: reply with audio / document / video_note
 //   file_id is captured; a reply with no media captures nothing.
@@ -29,6 +33,7 @@
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -545,6 +550,47 @@ private:
 
 // --- helpers -----------------------------------------------------------------
 
+// --- helpers -----------------------------------------------------------------
+
+// Capture everything written to std::cout between construction and
+// destruction (telemetry lines go to std::cout, like [cmd]/[voice]).
+class CoutCapture {
+public:
+    CoutCapture() : old_(std::cout.rdbuf(ss_.rdbuf())) {}
+    ~CoutCapture() { std::cout.rdbuf(old_); }
+    std::string str() const { return ss_.str(); }
+
+private:
+    std::streambuf* old_;
+    std::ostringstream ss_;
+};
+
+// First "[telemetry] <name>_us=<n> ..." line in captured output.
+std::string telemetryLine(const std::string& out, const std::string& name) {
+    std::string needle = "[telemetry] " + name + "_us=";
+    size_t at = out.find(needle);
+    if (at == std::string::npos) return "";
+    size_t eol = out.find('\n', at);
+    return out.substr(at, eol == std::string::npos ? std::string::npos
+                                                   : eol - at);
+}
+
+// Integer value of field "key=" inside one telemetry line, or -1.
+int64_t fieldInt(const std::string& line, const std::string& key) {
+    std::string needle = key + "=";
+    size_t at = line.find(needle);
+    if (at == std::string::npos) return -1;
+    size_t b = at + needle.size();
+    size_t e = line.find(' ', b);
+    try {
+        return std::stoll(line.substr(b, e == std::string::npos
+                                             ? std::string::npos
+                                             : e - b));
+    } catch (...) {
+        return -1;
+    }
+}
+
 parlay::TgMessage makeMsg(int64_t chat, int64_t from,
                           const std::string& text) {
     parlay::TgMessage m;
@@ -897,7 +943,6 @@ int main() {
     // the source chat itself (only /start and /play record chats), so
     // the fan-out targets are exactly the seeded chats.
     {
-        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
         Rig rig;
         rig.store.sadd("chats", "-1036");
         rig.store.sadd("chats", "-1037");
@@ -2433,6 +2478,95 @@ int main() {
                   contains(rig2.tg.replies[0], "Now 25/25"),
               "auth limit: 24 users -> 25th added, count shows 25/25");
     }
+
+    // --- J. Phase 1 telemetry: t_dispatch_to_ipc on /play --------------
+    // The stubbed engine answers vc.play instantly, so the timer
+    // values are tiny — the checks assert the line's presence, its
+    // fields, and that dispatch_to_post + post_to_response == total.
+    // (Real magnitudes come from the live path; see
+    // phase1/timers-core.md.)
+    {
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        std::string out;
+        {
+            CoutCapture cap;
+            rig.d.handleMessage(makeMsg(-1070, 111, "/play Test Song"));
+            out = cap.str();
+        }
+        std::string line = telemetryLine(out, "t_dispatch_to_ipc");
+        CHECK(!line.empty(), "telemetry /play: t_dispatch_to_ipc emitted");
+        CHECK(contains(line, "action=play") &&
+                  contains(line, "chat_id=-1070") &&
+                  contains(line, "engine=go") &&
+                  contains(line, "fell_back=0") &&
+                  contains(line, "ok=1"),
+              "telemetry /play: line names the action, chat, engine, "
+              "no fallback, ok=1");
+        int64_t total = fieldInt(line, "t_dispatch_to_ipc_us");
+        int64_t d2p = fieldInt(line, "dispatch_to_post_us");
+        int64_t p2r = fieldInt(line, "post_to_response_us");
+        CHECK(total >= 0 && d2p >= 0 && p2r >= 0 && total == d2p + p2r,
+              "telemetry /play: dispatch_to_post + post_to_response "
+              "== total");
+    }
+    {
+        // Engine refuses vc.play (stub 404): the line still fires,
+        // with ok=0 and the exact error code.
+        Rig rig;
+        std::string out;
+        {
+            CoutCapture cap;
+            rig.d.handleMessage(makeMsg(-1071, 111, "/play Test Song"));
+            out = cap.str();
+        }
+        std::string line = telemetryLine(out, "t_dispatch_to_ipc");
+        CHECK(!line.empty() && contains(line, "ok=0") &&
+                  contains(line, "error=not_found"),
+              "telemetry /play engine 404: line emitted with ok=0 and "
+              "the exact error code");
+    }
+    {
+        // Replied-file /play: no engine IPC exists on this path, so
+        // the line carries ipc=none and the voice outcome.
+        Rig rig;
+        parlay::TgMessage m = makeMsg(-1072, 111, "/play");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 5;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "AUDIO123";
+        m.reply_media_kind = "audio";
+        m.reply_media_title = "Artist - Song";
+        std::string out;
+        {
+            CoutCapture cap;
+            rig.d.handleMessage(m);
+            out = cap.str();
+        }
+        std::string line = telemetryLine(out, "t_dispatch_to_ipc");
+        CHECK(!line.empty() && contains(line, "ipc=none") &&
+                  contains(line, "ok=1"),
+              "telemetry /play replied file: line emitted with "
+              "ipc=none, ok=1");
+    }
+    {
+        // /play with no query and no media: usage error, still timed.
+        Rig rig;
+        std::string out;
+        {
+            CoutCapture cap;
+            rig.d.handleMessage(makeMsg(-1073, 111, "/play"));
+            out = cap.str();
+        }
+        std::string line = telemetryLine(out, "t_dispatch_to_ipc");
+        CHECK(!line.empty() && contains(line, "ipc=none") &&
+                  contains(line, "ok=0") &&
+                  contains(line, "error=no_query"),
+              "telemetry /play no query: line emitted with ipc=none, "
+              "ok=0, error=no_query");
+    }
+
+    std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
     if (failures == 0) {

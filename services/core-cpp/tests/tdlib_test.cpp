@@ -24,6 +24,9 @@
 //      with the returned remote payload — and that the join reports
 //      joined:false with the exact connect error, never a fake
 //      joined:true (the mock payload is not a real Telegram answer).
+//      (Phase 1 telemetry) Every join attempt also emits one
+//      t_voice_join line: per-stage microseconds, ok=0, the failing
+//      stage, and the exact reason; stages that never ran are omitted.
 //   8. (Phase 7, A1) Config defaults: TD_SESSION_DIR defaults to
 //      <PARLAY_DATA_DIR>/tdlib in both Config::fromEnv and
 //      TdLibClient::Params::fromEnv; libtdjson/libntgcalls resolve
@@ -37,6 +40,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -131,6 +135,43 @@ const parlay::Json* findReq(const std::vector<parlay::Json>& seen,
         if (t && t->asString() == type) return &r;
     }
     return nullptr;
+}
+
+// Phase 1 telemetry helpers: capture std::cout (telemetry lines go
+// there, like [voice]) and pull one timer line + field values out.
+class CoutCapture {
+public:
+    CoutCapture() : old_(std::cout.rdbuf(ss_.rdbuf())) {}
+    ~CoutCapture() { std::cout.rdbuf(old_); }
+    std::string str() const { return ss_.str(); }
+
+private:
+    std::streambuf* old_;
+    std::ostringstream ss_;
+};
+
+std::string telemetryLine(const std::string& out, const std::string& name) {
+    std::string needle = "[telemetry] " + name + "_us=";
+    size_t at = out.find(needle);
+    if (at == std::string::npos) return "";
+    size_t eol = out.find('\n', at);
+    return out.substr(at, eol == std::string::npos ? std::string::npos
+                                                   : eol - at);
+}
+
+int64_t fieldInt(const std::string& line, const std::string& key) {
+    std::string needle = key + "=";
+    size_t at = line.find(needle);
+    if (at == std::string::npos) return -1;
+    size_t b = at + needle.size();
+    size_t e = line.find(' ', b);
+    try {
+        return std::stoll(line.substr(b, e == std::string::npos
+                                             ? std::string::npos
+                                             : e - b));
+    } catch (...) {
+        return -1;
+    }
 }
 
 int main() {
@@ -431,7 +472,57 @@ int main() {
                 parlay::TdLibVoiceCall vc(cfg, std::move(fake));
                 CHECK(vc.available(),
                       "mock-backed TdLibVoiceCall reports available");
-                bool ok = vc.join(-1001234567890LL);
+                // Phase 1 telemetry: capture the t_voice_join line
+                // for this attempt (fails at the real ntg.connect
+                // with the mock payload — never a fake join).
+                std::string tele_out;
+                bool ok = false;
+                {
+                    CoutCapture cap;
+                    ok = vc.join(-1001234567890LL);
+                    tele_out = cap.str();
+                }
+                std::string tele_line =
+                    telemetryLine(tele_out, "t_voice_join");
+                CHECK(!tele_line.empty(),
+                      "telemetry join: t_voice_join emitted on every "
+                      "join attempt");
+                CHECK(tele_line.find("authorize_us=") != std::string::npos &&
+                          tele_line.find("create_call_us=") !=
+                              std::string::npos &&
+                          tele_line.find("get_chat_us=") !=
+                              std::string::npos &&
+                          tele_line.find("join_video_chat_us=") !=
+                              std::string::npos &&
+                          tele_line.find("connect_us=") !=
+                              std::string::npos,
+                      "telemetry join: every stage reached is timed");
+                CHECK(tele_line.find("create_video_chat_us=") ==
+                          std::string::npos,
+                      "telemetry join: existing video chat means no "
+                      "create_video_chat stage ran (omitted, not zero)");
+                CHECK(tele_line.find("chat_id=-1001234567890") !=
+                          std::string::npos &&
+                          tele_line.find("backend=tdlib") !=
+                              std::string::npos &&
+                          tele_line.find("ok=0") != std::string::npos &&
+                          tele_line.find("failed_stage=connect") !=
+                              std::string::npos &&
+                          tele_line.find("error=ntgcalls_connect_failed") !=
+                              std::string::npos,
+                      "telemetry join: ok=0, failed_stage=connect, "
+                      "exact connect error, no fake join time");
+                {
+                    int64_t total = fieldInt(tele_line, "t_voice_join_us");
+                    int64_t sum = fieldInt(tele_line, "authorize_us") +
+                                  fieldInt(tele_line, "create_call_us") +
+                                  fieldInt(tele_line, "get_chat_us") +
+                                  fieldInt(tele_line, "join_video_chat_us") +
+                                  fieldInt(tele_line, "connect_us");
+                    CHECK(total > 0 && total >= sum,
+                          "telemetry join: total is time-to-failure and "
+                          "covers the stages");
+                }
                 std::cout << "mock join -> " << (ok ? "true" : "false")
                           << " error: " << vc.lastError() << "\n";
                 CHECK(!ok,
@@ -503,7 +594,22 @@ int main() {
                 fake->get_chat_group_call_id = 0;
                 FakeTdLib* fp = fake.get();
                 parlay::TdLibVoiceCall vc(cfg, std::move(fake));
-                bool ok = vc.join(-1001234567890LL);
+                std::string tele_out;
+                bool ok = false;
+                {
+                    CoutCapture cap;
+                    ok = vc.join(-1001234567890LL);
+                    tele_out = cap.str();
+                }
+                std::string tele_line =
+                    telemetryLine(tele_out, "t_voice_join");
+                CHECK(!tele_line.empty() &&
+                          tele_line.find("create_video_chat_us=") !=
+                              std::string::npos &&
+                          tele_line.find("failed_stage=connect") !=
+                              std::string::npos,
+                      "telemetry join no video chat: create_video_chat "
+                      "stage timed, still fails at the real connect");
                 CHECK(!ok &&
                           vc.lastError().find("ntgcalls connect failed") !=
                               std::string::npos,
@@ -536,7 +642,27 @@ int main() {
                 fake->error_message = "CHAT_NOT_FOUND mock";
                 FakeTdLib* fp = fake.get();
                 parlay::TdLibVoiceCall vc(cfg, std::move(fake));
-                bool ok = vc.join(-1001234567890LL);
+                std::string tele_out;
+                bool ok = false;
+                {
+                    CoutCapture cap;
+                    ok = vc.join(-1001234567890LL);
+                    tele_out = cap.str();
+                }
+                std::string tele_line =
+                    telemetryLine(tele_out, "t_voice_join");
+                CHECK(!tele_line.empty() &&
+                          tele_line.find("failed_stage=get_chat") !=
+                              std::string::npos &&
+                          tele_line.find("CHAT_NOT_FOUND") !=
+                              std::string::npos &&
+                          tele_line.find("join_video_chat_us=") ==
+                              std::string::npos &&
+                          tele_line.find("connect_us=") ==
+                              std::string::npos,
+                      "telemetry join getChat error: failed_stage=get_chat "
+                      "with the exact TDLib message; later stages "
+                      "omitted, never timed");
                 CHECK(!ok &&
                           vc.lastError().find(
                               "getChat failed: CHAT_NOT_FOUND mock") !=

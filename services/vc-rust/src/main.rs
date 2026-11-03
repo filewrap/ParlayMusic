@@ -1095,6 +1095,43 @@ fn resolve_spotify_track(id: &str) -> Result<Track, String> {
         .ok_or_else(|| format!("Spotify returned no usable track for {}", id))
 }
 
+/// Phase 1 telemetry: timed wrapper around `resolve_query_inner`.
+/// One `[telemetry] t_resolve_us=…` line per resolve attempt (success
+/// or failure), same format as vc-go / vc-ts / the core worker. The
+/// timer is monotonic (`Instant`) and covers query → Track (playable
+/// media URL + metadata); the source label comes from the returned
+/// track, or from the query shape (`classify_query_source`) when the
+/// resolve failed. Note: a Spotify resolve returns metadata only —
+/// the Spotify Web API gives no direct audio URL (`stream_url: None`).
+fn resolve_query(query: &str) -> Result<Track, String> {
+    let start = std::time::Instant::now();
+    let result = resolve_query_inner(query);
+    let source = match &result {
+        Ok(t) => t.source.clone(),
+        Err(_) => classify_query_source(query),
+    };
+    eprintln!(
+        "[telemetry] t_resolve_us={} source={} engine=rust",
+        start.elapsed().as_micros(),
+        source
+    );
+    result
+}
+
+/// Source label for a failed resolve: same dispatch order as
+/// `resolve_query_inner` (YouTube URL/ID → youtube, Spotify URL →
+/// spotify, anything else → youtube search).
+fn classify_query_source(query: &str) -> String {
+    let q = query.trim();
+    if yt_id_from_url(q).is_some() || is_yt_id(q) {
+        return "youtube".to_string();
+    }
+    if spotify_id_from_url(q).is_some() {
+        return "spotify".to_string();
+    }
+    "youtube".to_string()
+}
+
 /// Resolve a play query to a Track.
 ///
 /// Order: YouTube URL/ID (real yt-dlp resolve of the watch URL) ->
@@ -1106,7 +1143,7 @@ fn resolve_spotify_track(id: &str) -> Result<Track, String> {
 /// `engine_unavailable` (HTTP 502) so the core can fail over to
 /// another engine — a fake track (invented title, fake 180 s
 /// duration) would sit in the queue forever and hide the failure.
-fn resolve_query(query: &str) -> Result<Track, String> {
+fn resolve_query_inner(query: &str) -> Result<Track, String> {
     let q = query.trim();
     if let Some(id) = yt_id_from_url(q) {
         let url = format!("https://www.youtube.com/watch?v={}", id);

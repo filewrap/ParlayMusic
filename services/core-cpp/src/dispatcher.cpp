@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include "http.hpp"
+#include "telemetry.hpp"
 
 namespace parlay {
 namespace {
@@ -491,7 +492,46 @@ bool Dispatcher::forwardShareMedia(const TgMessage& msg) {
     return true;
 }
 
+// Phase 1 telemetry helpers (t_dispatch_to_ipc).
+// Receipt timestamp for a context, falling back to "now" when the
+// context was built outside handleMessage (no receipt recorded).
+static int64_t receiptUs(const CommandContext& ctx) {
+    return ctx.receipt_us != 0 ? ctx.receipt_us : telemetry::nowUs();
+}
+
+// One t_dispatch_to_ipc line for a /play. dispatch_to_post_us /
+// post_to_response_us are present only when an engine IPC post was
+// issued; paths with no IPC post (replied file, usage error) carry
+// ipc=none instead. engine/fell_back describe the vc.play outcome.
+static void emitDispatchToIpc(int64_t total_us, int64_t dispatch_to_post_us,
+                       int64_t post_to_response_us, int64_t chat_id,
+                       const std::string& engine, bool fell_back, bool ok,
+                       const std::string& error) {
+    std::vector<std::pair<std::string, std::string>> f;
+    if (dispatch_to_post_us >= 0) {
+        f.emplace_back("dispatch_to_post_us",
+                       std::to_string(dispatch_to_post_us));
+        f.emplace_back("post_to_response_us",
+                       std::to_string(post_to_response_us));
+    } else {
+        f.emplace_back("ipc", "none");
+    }
+    f.emplace_back("action", "play");
+    f.emplace_back("chat_id", std::to_string(chat_id));
+    if (!engine.empty()) {
+        f.emplace_back("engine", engine);
+        f.emplace_back("fell_back", fell_back ? "1" : "0");
+    }
+    f.emplace_back("ok", ok ? "1" : "0");
+    if (!error.empty()) f.emplace_back("error", telemetry::sanitize(error));
+    telemetry::emit("t_dispatch_to_ipc", total_us, f);
+}
+
 void Dispatcher::handleMessage(const TgMessage& msg) {
+    // Phase 1 telemetry: command receipt. The routing CommandContext
+    // below carries this into the handlers; t_dispatch_to_ipc
+    // measures from here to the engine IPC post.
+    const int64_t receipt_us = telemetry::nowUs();
     // Service messages first (NoxBeats on_new_members / on_video_chat).
     if (!msg.new_chat_members.empty()) {
         if (msg.chat.type != "supergroup") {
@@ -733,6 +773,7 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
     if (cmd.empty()) return;
 
     CommandContext ctx{msg, cmd, args, false};
+    ctx.receipt_us = receipt_us;
     // c-commands run the same handler against the linked channel.
     if (auto ch = channel_cmds_.find(cmd); ch != channel_cmds_.end()) {
         ctx.command = ch->second.first;
@@ -2285,9 +2326,19 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         }
         if (!file_id.empty()) {
             if (!playAllowed(ctx, force)) return;
-            playRepliedFile(ctx, file_id, title, kind);
+            bool replied_ok = playRepliedFile(ctx, file_id, title, kind);
+            // No engine IPC on this path: the core voice backend
+            // plays the downloaded file directly. The line still
+            // fires on every /play (ipc=none); the voice-join stages
+            // are timed by t_voice_join in voice_call.cpp. ok is
+            // the replied-file outcome (download + voice attach).
+            emitDispatchToIpc(telemetry::nowUs() - receiptUs(ctx), -1, -1,
+                              vcTarget(ctx), "", false, replied_ok,
+                              replied_ok ? "" : "replied_file_failed");
             return;
         }
+        emitDispatchToIpc(telemetry::nowUs() - receiptUs(ctx), -1, -1,
+                          vcTarget(ctx), "", false, false, "no_query");
         replyHtml(ctx, ui_texts::fmt(ui_texts::kNoSongQuery,
                                      {{"cmd", "/play"}}));
         return;
@@ -2324,7 +2375,21 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     });
     Engine used;
     bool fell_back = false;
+    // Phase 1 telemetry: dispatch -> IPC POST issued, and POST
+    // issued -> response received. "POST issued" is measured at the
+    // vcCall entry (the core handing the play to the IPC layer);
+    // the router's engine selection and its healthz pre-probes for
+    // a fallback engine run inside vcCall, so they fall in
+    // post_to_response_us; the total is exact either way. The line
+    // fires whether the engine answers or not (ok=0 + error).
+    const int64_t t_post = telemetry::nowUs();
     IpcResult r = vcCall(ctx, "play", body, used, fell_back);
+    const int64_t t_resp = telemetry::nowUs();
+    emitDispatchToIpc(t_resp - receiptUs(ctx), t_post - receiptUs(ctx),
+                      t_resp - t_post, vcTarget(ctx), engineName(used),
+                      fell_back, r.ok,
+                      r.ok ? ""
+                           : r.error_code + ": " + r.error_message);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2445,7 +2510,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
 }
 
 // --- /play from a replied-to Telegram file ----------------------------------
-void Dispatcher::playRepliedFile(const CommandContext& ctx,
+bool Dispatcher::playRepliedFile(const CommandContext& ctx,
                                  const std::string& file_id,
                                  const std::string& title,
                                  const std::string& kind) {
@@ -2453,7 +2518,7 @@ void Dispatcher::playRepliedFile(const CommandContext& ctx,
     std::string saved, err;
     if (!tg_.downloadFile(file_id, cfg_.data_dir + "/replied", saved, err)) {
         reply(ctx, "Could not fetch the replied file: " + err);
-        return;
+        return false;
     }
     // The downloaded file is the stream source for the core's own voice
     // backend (ffmpeg input): a local path, not a vc.play query — the
@@ -2471,7 +2536,7 @@ void Dispatcher::playRepliedFile(const CommandContext& ctx,
         std::string why = voice_.lastError();
         if (why.empty()) why = voice_.describe();
         reply(ctx, "Could not play the replied file: " + why);
-        return;
+        return false;
     }
     setChatField(chat, "last_track", track_title);
     setChatField(chat, "voice_owner", "core");
@@ -2488,6 +2553,7 @@ void Dispatcher::playRepliedFile(const CommandContext& ctx,
     reply(ctx, "▶ Now playing " + track_title +
                    " (replied file, via core voice).");
     deleteCommandMessage(ctx);
+    return true;
 }
 
 void Dispatcher::onPause(const CommandContext& ctx) {

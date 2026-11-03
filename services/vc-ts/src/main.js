@@ -321,7 +321,38 @@ setInterval(() => {
 
 const RAW_URL_RE = /^https?:\/\//i;
 
+// Phase 1 telemetry: timed wrapper around resolvePlayQueryUntimed.
+// One [telemetry] t_resolve_us=… line per resolve attempt (success
+// or failure), same format as vc-go / vc-rust / the core worker.
+// The source label comes from the returned track on success; on
+// failure (no track) it comes from playQuerySource(), which mirrors
+// resolvePlayQueryUntimed's dispatch order exactly.
 async function resolvePlayQuery(query) {
+  const startNs = R.telemetryNowNs();
+  let source = "youtube";
+  try {
+    const out = await resolvePlayQueryUntimed(query);
+    if (out && out.track && out.track.source) source = out.track.source;
+    return out;
+  } catch (e) {
+    source = playQuerySource(query);
+    throw e;
+  } finally {
+    R.telemetryLogResolve(source, startNs);
+  }
+}
+
+// Mirror of resolvePlayQueryUntimed's dispatch, used only to label
+// the source of a failed resolve. Keep in sync with it.
+function playQuerySource(query) {
+  const q = String(query);
+  if (/^radio:/i.test(q)) return "radio";
+  if (RAW_URL_RE.test(q.trim()) && !R.extractYouTubeId(q)) return "radio";
+  if (/^jiosaavn:/i.test(q) || /^jsvn:/i.test(q)) return "jiosaavn";
+  return "youtube";
+}
+
+async function resolvePlayQueryUntimed(query) {
   const q = String(query);
   if (/^radio:/i.test(q)) {
     const url = q.replace(/^radio:/i, "").trim();

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -310,7 +311,28 @@ func (r *Resolver) Related(ctx context.Context, last types.Track, exclude map[st
 // available; when yt-dlp is missing or the call fails it returns an
 // error (no degraded/pattern fallback any more, Phase 5 A9) — the
 // server maps it to 502 engine_unavailable so the core can fail over.
+//
+// Phase 1 telemetry: every call emits one structured log line with a
+// microsecond monotonic timer covering query → Track (playable media
+// URL + metadata), in the shared format used by vc-ts, vc-rust and
+// the core worker:
+//   [telemetry] t_resolve_us=<integer> source=<source> engine=go
+// The line is emitted for successes and failures alike; the source
+// label comes from the returned track (this resolver only resolves
+// YouTube, so it is "youtube" whenever a track is produced).
 func (r *Resolver) Resolve(ctx context.Context, query string) (*types.Track, error) {
+	start := time.Now()
+	track, err := r.resolve(ctx, query)
+	source := "youtube"
+	if track != nil && track.Source != "" {
+		source = track.Source
+	}
+	log.Printf("[telemetry] t_resolve_us=%d source=%s engine=go", time.Since(start).Microseconds(), source)
+	return track, err
+}
+
+// resolve is the untimed implementation of Resolve.
+func (r *Resolver) resolve(ctx context.Context, query string) (*types.Track, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, errors.New("empty query")

@@ -22,6 +22,25 @@ const YT_DLP_DEFAULT = path.join(
   __dirname, "..", "..", "downloaders", ".venv", "bin", "yt-dlp"
 );
 
+// --- Phase 1 telemetry -----------------------------------------------------
+// Microsecond monotonic timer for t_resolve, shared format across all
+// three engines and the core worker:
+//   [telemetry] t_resolve_us=<integer> source=<source> engine=ts
+// telemetryNowNs() is process.hrtime.bigint() (monotonic,
+// nanoseconds); telemetryLogResolve() emits one line per completed
+// resolve attempt (success or failure) for the query/URL -> playable
+// media URL + metadata step. The timer is applied at the play entry
+// point (resolvePlayQuery in main.js); search endpoints do not emit
+// it — a search returns metadata lists, not a playable stream URL.
+function telemetryNowNs() {
+  return process.hrtime.bigint();
+}
+
+function telemetryLogResolve(source, startNs) {
+  const us = Number((process.hrtime.bigint() - startNs) / 1000n);
+  console.log(`[telemetry] t_resolve_us=${us} source=${source} engine=ts`);
+}
+
 // Parse a duration in any shape the upstreams use: seconds as a
 // number (saavn.dev, yt-dlp), seconds as a numeric string, or a
 // "m:ss" / "h:mm:ss" clock string (jsvn-tgvc /song returns "4:28").
@@ -634,6 +653,8 @@ function radioTrackFromUrl(url, stationName) {
 
 module.exports = {
   EngineUnavailable,
+  telemetryNowNs,
+  telemetryLogResolve,
   parseDuration,
   formatDurationStr,
   formatUploadDate,

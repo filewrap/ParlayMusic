@@ -2,9 +2,13 @@
 #include "voice_call.hpp"
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -18,6 +22,7 @@
 #include <vector>
 
 #include "ntgcalls.h"
+#include "telemetry.hpp"
 
 namespace parlay {
 namespace {
@@ -47,6 +52,117 @@ std::string runCapture(const std::string& cmd, int* exit_code = nullptr) {
     int rc = pclose(p);
     if (exit_code) *exit_code = WEXITSTATUS(rc);
     return out;
+}
+
+// Phase 1 telemetry: run an ffmpeg command, teeing its stdout into a
+// file (empty path = discard), and timestamp the first Ogg audio page
+// leaving the encoder — the first 20 ms Opus packet. Ogg pages are
+// parsed incrementally as bytes arrive: "OggS" + 22-byte fixed header
+// + segment table + data. Header (BOS) pages carry granule_position 0;
+// the first page with granule_position > 0 is the first audio page
+// (granule = end sample of its last packet, 960 per 20 ms frame at
+// 48 kHz). Returns the child exit code (-1 when the spawn itself
+// failed); first_audio_us is -1 when no audio page ever arrived
+// (encode died first), first_byte_us -1 when nothing arrived at all.
+// Times are microseconds from `origin` (the caller's run start, so
+// they line up with the caller's own stage totals).
+struct FfmpegPipeResult {
+    int exit_code = -1;
+    int64_t first_byte_us = -1;
+    int64_t first_audio_us = -1;
+};
+
+// Parse complete Ogg pages out of `buf`, consuming them. Returns the
+// granule_position of the first audio page found, -1 when no audio
+// page is complete yet, or -2 when the stream is not Ogg at all (stop
+// parsing). `consumed` is set to the bytes parsed (a trailing partial
+// page stays buffered).
+int64_t scanOggAudioPage(std::string& buf, size_t& consumed) {
+    consumed = 0;
+    size_t i = 0;
+    while (i + 27 <= buf.size()) {
+        if (buf.compare(i, 4, "OggS") != 0) return -2;  // not Ogg
+        unsigned nseg = static_cast<unsigned char>(buf[i + 26]);
+        if (i + 27 + nseg > buf.size()) break;  // partial segment table
+        size_t dlen = 0;
+        for (size_t s = 0; s < nseg; ++s)
+            dlen += static_cast<unsigned char>(buf[i + 27 + s]);
+        if (i + 27 + nseg + dlen > buf.size()) break;  // partial page
+        int64_t granule = 0;
+        for (int b = 0; b < 8; ++b)
+            granule |= static_cast<int64_t>(
+                           static_cast<unsigned char>(buf[i + 6 + b]))
+                       << (8 * b);
+        i += 27 + nseg + dlen;
+        consumed = i;
+        if (granule > 0) return granule;
+    }
+    return -1;
+}
+
+FfmpegPipeResult runFfmpegPipe(const std::string& cmd,
+                               const std::string& tee_path,
+                               std::chrono::steady_clock::time_point origin) {
+    FfmpegPipeResult res;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return res;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return res;
+    }
+    if (pid == 0) {
+        // Child: stdout -> pipe, stderr inherited (the old
+        // runCapture encode leg did not suppress ffmpeg errors),
+        // then the shell command. _exit on exec failure.
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(pipefd[1]);
+    std::ofstream tee;
+    if (!tee_path.empty()) {
+        tee.open(tee_path, std::ios::binary | std::ios::trunc);
+    }
+    std::string buf;
+    bool parse_ogg = true;  // false once the first audio page is found
+                            // or the stream proves not to be Ogg
+    std::array<char, 65536> chunk{};
+    while (true) {
+        ssize_t n = read(pipefd[0], chunk.data(), chunk.size());
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;  // EOF: child closed stdout (exiting)
+        auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - origin)
+                          .count();
+        if (res.first_byte_us < 0) res.first_byte_us = now_us;
+        if (tee.is_open()) tee.write(chunk.data(), n);
+        if (!parse_ogg) continue;
+        buf.append(chunk.data(), static_cast<size_t>(n));
+        size_t consumed = 0;
+        int64_t granule = scanOggAudioPage(buf, consumed);
+        if (consumed > 0) buf.erase(0, consumed);
+        if (granule > 0) {
+            res.first_audio_us = now_us;
+            parse_ogg = false;
+        } else if (granule == -2) {
+            parse_ogg = false;  // not an Ogg stream: nothing to time
+        }
+    }
+    close(pipefd[0]);
+    if (tee.is_open()) tee.close();
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    res.exit_code =
+        WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return res;
 }
 
 }  // namespace
@@ -159,6 +275,34 @@ std::string ntgError(const char* what, ntg_result rc) {
         if (e && *e) msg += ": " + std::string(e);
     }
     return msg;
+}
+
+// Phase 1 telemetry: one t_voice_join line for a voice-join attempt.
+// `stages` are (name, us) in execution order; stages that never ran
+// are omitted by the caller. On failure the total is time-to-failure,
+// not a join time — the line always carries ok=0, the stage it
+// failed at, and the exact reason, never a fabricated join.
+void emitVoiceJoin(
+    int64_t chat_id, const std::string& backend, int64_t total_us,
+    const std::vector<std::pair<std::string, int64_t>>& stages, bool ok,
+    const std::string& failed_stage, const std::string& error) {
+    std::vector<std::pair<std::string, std::string>> f;
+    for (const auto& [name, us] : stages)
+        f.emplace_back(name + "_us", std::to_string(us));
+    f.emplace_back("chat_id", std::to_string(chat_id));
+    f.emplace_back("backend", backend);
+    f.emplace_back("ok", ok ? "1" : "0");
+    if (!ok) {
+        f.emplace_back("failed_stage", failed_stage);
+        f.emplace_back("error", telemetry::sanitize(error));
+    }
+    telemetry::emit("t_voice_join", total_us, f);
+}
+
+int64_t stageUs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
 }
 }  // namespace
 
@@ -304,29 +448,53 @@ bool NtgCallsVoiceCall::setSources(int64_t chat_id,
     return true;
 }
 
-bool NtgCallsVoiceCall::join(int64_t /*chat_id*/) {
+bool NtgCallsVoiceCall::join(int64_t chat_id) {
     // This backend has no MTProto session: it can build the local SDP
     // offer (createOffer) and attach sources (setSources), but the
     // join itself — phone.joinGroupCall — needs TDLib. Say so with
     // the exact reason instead of the base class's silent false.
+    // Phase 1 telemetry: the attempt is still timed and emitted
+    // (ok=0, failed_stage=join) — a blocked join is data, not silence.
+    auto t0 = std::chrono::steady_clock::now();
     last_error_ =
         "no MTProto session: this backend can build a local SDP offer "
         "and attach sources, but only the tdlib backend can join a "
         "Telegram voice chat (TD_API_ID/TD_API_HASH/TD_SESSION_DIR + "
         "libtdjson.so)";
+    emitVoiceJoin(chat_id, "ntgcalls-dlopen", stageUs(t0), {}, false,
+                  "join", last_error_);
     return false;
 }
 
 bool NtgCallsVoiceCall::play(int64_t chat_id, const std::string& stream_url,
                              const std::string&, bool video, int seek_sec,
                              double speed, int bass) {
-    if (!available()) return false;
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::string, int64_t>> stages;
+    if (!available()) {
+        // last_error_ already holds the constructor's dlopen reason.
+        emitVoiceJoin(chat_id, "ntgcalls-dlopen", stageUs(t0), stages,
+                      false, "available", last_error_);
+        return false;
+    }
     // TinaMusic Play() step 1-2: create the call (local SDP offer),
     // attach the ffmpeg shell command as the audio source.
     std::string offer;
-    if (!createOffer(chat_id, offer)) return false;
-    if (!setSources(chat_id, stream_url, video, seek_sec, speed, bass))
+    {
+        auto ts = std::chrono::steady_clock::now();
+        if (!createOffer(chat_id, offer)) {
+            stages.emplace_back("create_call", stageUs(ts));
+            emitVoiceJoin(chat_id, "ntgcalls-dlopen", stageUs(t0), stages,
+                          false, "create_call", last_error_);
+            return false;
+        }
+        stages.emplace_back("create_call", stageUs(ts));
+    }
+    if (!setSources(chat_id, stream_url, video, seek_sec, speed, bass)) {
+        emitVoiceJoin(chat_id, "ntgcalls-dlopen", stageUs(t0), stages,
+                      false, "set_sources", last_error_);
         return false;
+    }
     // Step 3 (TinaMusic): the caller must now phone.joinGroupCall with
     // this offer via MTProto and call connect() with the remote
     // transport. Without an MTProto session this backend can create
@@ -336,6 +504,8 @@ bool NtgCallsVoiceCall::play(int64_t chat_id, const std::string& stream_url,
         " bytes) but no MTProto join happened: call connect() with the "
         "remote transport from joinVideoChat, or use the tdlib "
         "backend which does the join in-process";
+    emitVoiceJoin(chat_id, "ntgcalls-dlopen", stageUs(t0), stages, false,
+                  "join", last_error_);
     return false;
 }
 
@@ -436,24 +606,82 @@ std::string OpusPipeline::resolveUrl(const std::string& url) {
 OpusStats OpusPipeline::run(const std::string& source,
                             const std::string& opus_out,
                             const std::string& rtp_sink) {
+    // Phase 1 telemetry (t_first_frame): every run emits one line,
+    // success or failure, with the stages reached. Headline value =
+    // stream open -> first 20 ms Opus packet out of the encoder
+    // (first Ogg audio page on the encode leg's stdout pipe). -1
+    // means the stage never produced (encode died first). The RTP
+    // leg reports its own wall time + ok flag; the sender cannot
+    // observe a UDP packet on the wire, so no RTP first-packet time
+    // is fabricated — in production with working UDP the first RTP
+    // packet leaves ~first_packet_us after the RTP leg spawns (same
+    // encoder, same input, same settings as the encode leg).
+    auto t0 = std::chrono::steady_clock::now();
+    auto us_since = [&]() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - t0)
+            .count();
+    };
     OpusStats st;
+    int64_t resolve_us = -1;        // yt-dlp -g, URL inputs only
+    int64_t stream_open_us = -1;    // origin -> first output byte
+    int64_t first_packet_us = -1;   // origin -> first Ogg audio page
+    int64_t encode_total_us = -1;   // origin -> encode process exit
+    int64_t rtp_us = -1;            // RTP leg wall time
+    auto emit_line = [&]() {
+        std::vector<std::pair<std::string, std::string>> f;
+        if (resolve_us >= 0)
+            f.emplace_back("resolve_us", std::to_string(resolve_us));
+        if (stream_open_us >= 0)
+            f.emplace_back("stream_open_us",
+                           std::to_string(stream_open_us));
+        if (first_packet_us >= 0)
+            f.emplace_back("first_packet_us",
+                           std::to_string(first_packet_us));
+        if (encode_total_us >= 0)
+            f.emplace_back("encode_total_us",
+                           std::to_string(encode_total_us));
+        if (rtp_us >= 0) {
+            f.emplace_back("rtp_us", std::to_string(rtp_us));
+            f.emplace_back("rtp_ok", st.rtp_ok ? "1" : "0");
+        }
+        f.emplace_back("frames", std::to_string(st.frames));
+        f.emplace_back("bytes", std::to_string(st.bytes));
+        f.emplace_back("ok", st.ok ? "1" : "0");
+        if (!st.error.empty())
+            f.emplace_back("error", telemetry::sanitize(st.error));
+        else if (!st.rtp_error.empty())
+            f.emplace_back("rtp_error", telemetry::sanitize(st.rtp_error));
+        telemetry::emit("t_first_frame", first_packet_us, f);
+    };
+
     std::string input = source;
     if (source.rfind("http://", 0) == 0 || source.rfind("https://", 0) == 0) {
+        auto t_resolve = std::chrono::steady_clock::now();
         st.resolved_url = resolveUrl(source);
+        resolve_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t_resolve)
+                         .count();
         if (!st.resolved_url.empty()) input = st.resolved_url;
     }
     std::error_code ec;
     std::filesystem::create_directories(
         std::filesystem::path(opus_out).parent_path(), ec);
+    // Encode leg: same ffmpeg invocation as before, but the Ogg
+    // output goes to a pipe (teed into opus_out) so the first audio
+    // page — the first 20 ms Opus packet — can be timestamped as it
+    // leaves the encoder. The file bytes are identical.
     std::string cmd = "ffmpeg -y -v error -i " + shellQuote(input) +
                       " -map 0:a -c:a libopus -b:a 128k -ar 48000 -ac 2 -f "
-                      "opus " +
-                      shellQuote(opus_out);
-    int rc = 0;
-    runCapture(cmd, &rc);
-    if (rc != 0 || !std::filesystem::exists(opus_out)) {
-        st.error = "ffmpeg opus encode failed (exit " + std::to_string(rc) +
-                   ")";
+                      "opus pipe:1";
+    FfmpegPipeResult enc = runFfmpegPipe(cmd, opus_out, t0);
+    encode_total_us = us_since();
+    stream_open_us = enc.first_byte_us;
+    first_packet_us = enc.first_audio_us;
+    if (enc.exit_code != 0 || !std::filesystem::exists(opus_out)) {
+        st.error = "ffmpeg opus encode failed (exit " +
+                   std::to_string(enc.exit_code) + ")";
+        emit_line();
         return st;
     }
     if (!rtp_sink.empty()) {
@@ -468,8 +696,12 @@ OpusStats OpusPipeline::run(const std::string& source,
             "ffmpeg -y -v error -i " + shellQuote(input) +
             " -map 0:a -c:a libopus -b:a 128k -ar 48000 -ac 2 -f rtp rtp://" +
             sink + " 2>/dev/null";
+        auto t_rtp = std::chrono::steady_clock::now();
         int rtp_rc = 0;
         runCapture(rtp_cmd, &rtp_rc);
+        rtp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - t_rtp)
+                     .count();
         st.rtp_ok = (rtp_rc == 0);
         if (!st.rtp_ok)
             st.rtp_error = "ffmpeg rtp output failed (exit " +
@@ -499,6 +731,7 @@ OpusStats OpusPipeline::run(const std::string& source,
     }
     st.ok = st.frames > 0 && st.bytes > 0;
     if (!st.ok) st.error = "opus file has no frames";
+    emit_line();
     return st;
 }
 
@@ -632,45 +865,96 @@ std::string TdLibVoiceCall::joinVideoChat(int32_t group_call_id,
     return text->asString();
 }
 
-bool TdLibVoiceCall::join(int64_t chat_id) {
+// Phase 1 telemetry: the join sequence shared by join() and play()
+// — authorize -> ntgcalls create_call (local SDP offer) ->
+// getChat / createVideoChat -> joinVideoChat -> ntg.connect — timed
+// stage by stage and emitted as one t_voice_join line on every
+// attempt, success or failure. On failure the line carries the
+// stages reached, ok=0, the failing stage, and the exact reason;
+// the total is time-to-failure, never a fabricated join time.
+bool TdLibVoiceCall::joinCall(int64_t chat_id, const std::string& title,
+                              bool video) {
+    auto t0 = std::chrono::steady_clock::now();
+    auto us_since = [&]() { return stageUs(t0); };
+    std::vector<std::pair<std::string, int64_t>> stages;
+    auto fail = [&](const std::string& stage, const std::string& err) {
+        emitVoiceJoin(chat_id, "tdlib", us_since(), stages, false, stage,
+                      err);
+        return false;
+    };
     if (!available()) {
         last_error_ = describe();
-        return false;
+        return fail("available", last_error_);
     }
+    // 1. Authorize the TDLib session (honest stop without credentials).
     {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (joined_.count(chat_id)) return true;  // already in the call
+        auto ts = std::chrono::steady_clock::now();
+        if (!tdlib_->authorized() && !tdlib_->authorize(60.0)) {
+            last_error_ = tdlib_->lastError();
+            stages.emplace_back("authorize", stageUs(ts));
+            return fail("authorize", last_error_);
+        }
+        stages.emplace_back("authorize", stageUs(ts));
     }
-    // Same steps as play() minus the audio source: authorize ->
-    // ntgcalls create_call (local SDP offer) -> resolve/create the
-    // video chat -> joinVideoChat -> ntgcalls connect. No setSources:
-    // the call is joined silent until a track plays.
-    if (!tdlib_->authorized() && !tdlib_->authorize(60.0)) {
-        last_error_ = tdlib_->lastError();
-        return false;
-    }
+    // 2. ntgcalls create_call -> local SDP offer.
     std::string offer;
-    if (!ntg_.createOffer(chat_id, offer)) {
-        last_error_ = "ntgcalls create failed: " + ntg_.lastError();
-        return false;
+    {
+        auto ts = std::chrono::steady_clock::now();
+        if (!ntg_.createOffer(chat_id, offer)) {
+            last_error_ = "ntgcalls create failed: " + ntg_.lastError();
+            stages.emplace_back("create_call", stageUs(ts));
+            return fail("create_call", last_error_);
+        }
+        stages.emplace_back("create_call", stageUs(ts));
     }
-    int32_t gcid = groupCallId(chat_id);
-    if (gcid < 0) return false;
-    if (gcid == 0) {
-        gcid = createVideoChat(chat_id, "Parlay");
-        if (gcid == 0) return false;
+    // 3. Resolve the chat's video chat; create one when none exists.
+    int32_t gcid = 0;
+    {
+        auto ts = std::chrono::steady_clock::now();
+        gcid = groupCallId(chat_id);
+        stages.emplace_back("get_chat", stageUs(ts));
+        if (gcid < 0) return fail("get_chat", last_error_);
+        if (gcid == 0) {
+            auto ts2 = std::chrono::steady_clock::now();
+            gcid = createVideoChat(chat_id, title);
+            stages.emplace_back("create_video_chat", stageUs(ts2));
+            if (gcid == 0) return fail("create_video_chat", last_error_);
+        }
     }
-    std::string remote = joinVideoChat(gcid, offer, false);
-    if (remote.empty()) return false;
-    if (!ntg_.connect(chat_id, remote)) {
-        last_error_ = "ntgcalls connect failed: " + ntg_.lastError();
-        return false;
+    // 4. joinVideoChat(local SDP) -> remote transport payload.
+    std::string remote;
+    {
+        auto ts = std::chrono::steady_clock::now();
+        remote = joinVideoChat(gcid, offer, video);
+        stages.emplace_back("join_video_chat", stageUs(ts));
+        if (remote.empty()) return fail("join_video_chat", last_error_);
+    }
+    // 5. ntgcalls connect(remote).
+    {
+        auto ts = std::chrono::steady_clock::now();
+        if (!ntg_.connect(chat_id, remote)) {
+            last_error_ = "ntgcalls connect failed: " + ntg_.lastError();
+            stages.emplace_back("connect", stageUs(ts));
+            return fail("connect", last_error_);
+        }
+        stages.emplace_back("connect", stageUs(ts));
     }
     {
         std::lock_guard<std::mutex> lk(mu_);
         joined_[chat_id] = gcid;
     }
+    emitVoiceJoin(chat_id, "tdlib", us_since(), stages, true, "", "");
     return true;
+}
+
+bool TdLibVoiceCall::join(int64_t chat_id) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (joined_.count(chat_id)) return true;  // already in the call
+    }
+    // Same steps as play() minus the audio source: the call is joined
+    // silent until a track plays. joinCall times + emits t_voice_join.
+    return joinCall(chat_id, "Parlay", false);
 }
 
 bool TdLibVoiceCall::play(int64_t chat_id, const std::string& stream_url,
@@ -678,6 +962,8 @@ bool TdLibVoiceCall::play(int64_t chat_id, const std::string& stream_url,
                           double speed, int bass) {
     if (!available()) {
         last_error_ = describe();
+        emitVoiceJoin(chat_id, "tdlib", 0, {}, false, "available",
+                      last_error_);
         return false;
     }
     // Already in this chat's call (via /join)? Skip the join steps and
@@ -688,36 +974,8 @@ bool TdLibVoiceCall::play(int64_t chat_id, const std::string& stream_url,
         already_joined = joined_.count(chat_id) != 0;
     }
     if (!already_joined) {
-        // 1. Authorize the TDLib session (honest stop without credentials).
-        if (!tdlib_->authorized() && !tdlib_->authorize(60.0)) {
-            last_error_ = tdlib_->lastError();
-            return false;
-        }
-        // 2. ntgcalls create_call -> local SDP offer.
-        std::string offer;
-        if (!ntg_.createOffer(chat_id, offer)) {
-            last_error_ = "ntgcalls create failed: " + ntg_.lastError();
-            return false;
-        }
-        // 3. Resolve the chat's video chat; create one when none exists.
-        int32_t gcid = groupCallId(chat_id);
-        if (gcid < 0) return false;
-        if (gcid == 0) {
-            gcid = createVideoChat(chat_id, title);
-            if (gcid == 0) return false;
-        }
-        // 4. joinVideoChat(local SDP) -> remote transport payload.
-        std::string remote = joinVideoChat(gcid, offer, video);
-        if (remote.empty()) return false;
-        // 5. ntgcalls connect(remote).
-        if (!ntg_.connect(chat_id, remote)) {
-            last_error_ = "ntgcalls connect failed: " + ntg_.lastError();
-            return false;
-        }
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            joined_[chat_id] = gcid;
-        }
+        // 1-5. The join sequence (joinCall), timed as t_voice_join.
+        if (!joinCall(chat_id, title, video)) return false;
     }
     // 6. set_stream_sources(ffmpeg cmd).
     if (!ntg_.setSources(chat_id, stream_url, video, seek_sec, speed,

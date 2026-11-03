@@ -41,6 +41,7 @@
 #include "config.hpp"
 #include "ntgcalls.h"  // generated 3.0.5 C header — ntg_instance* is opaque
 #include "tdlib_client.hpp"
+#include "telemetry.hpp"
 
 namespace parlay {
 
@@ -89,8 +90,25 @@ class UnavailableVoiceCall final : public VoiceCall {
 public:
     explicit UnavailableVoiceCall(std::string reason)
         : reason_(std::move(reason)) {}
-    bool play(int64_t, const std::string&, const std::string&, bool, int,
-              double, int) override {
+    bool play(int64_t chat_id, const std::string&, const std::string&, bool,
+              int, double, int) override {
+        // Phase 1 telemetry: the attempt is timed and emitted
+        // (ok=0, failed_stage=available) — a blocked join is data.
+        telemetry::emit("t_voice_join", 0,
+                        {{"chat_id", std::to_string(chat_id)},
+                         {"backend", "unavailable"},
+                         {"ok", "0"},
+                         {"failed_stage", "available"},
+                         {"error", telemetry::sanitize(reason_)}});
+        return false;
+    }
+    bool join(int64_t chat_id) override {
+        telemetry::emit("t_voice_join", 0,
+                        {{"chat_id", std::to_string(chat_id)},
+                         {"backend", "unavailable"},
+                         {"ok", "0"},
+                         {"failed_stage", "available"},
+                         {"error", telemetry::sanitize(reason_)}});
         return false;
     }
     bool stop(int64_t) override { return false; }
@@ -217,6 +235,12 @@ public:
     std::string lastError() const override { return last_error_; }
 
 private:
+    // The join sequence shared by join() and play() (voice_call.cpp):
+    // authorize -> create_call -> getChat/createVideoChat ->
+    // joinVideoChat -> connect. Timed stage by stage, emitted as one
+    // t_voice_join line on every attempt. Records the chat in
+    // joined_ on success.
+    bool joinCall(int64_t chat_id, const std::string& title, bool video);
     // Resolve the chat's group call id (0 = none). -1 + error on failure.
     int32_t groupCallId(int64_t chat_id);
     // Create the chat's video chat; returns the new group call id, 0 on

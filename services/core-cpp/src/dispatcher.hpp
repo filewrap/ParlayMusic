@@ -38,6 +38,11 @@ struct CommandContext {
     std::string command;  // lowercased, without leading '/' or @bot suffix
     std::string args;     // raw argument text after the command
     bool via_channel = false;  // c-command: run against the linked channel
+    // Phase 1 telemetry: steady-clock microseconds when
+    // Dispatcher::handleMessage received this command (0 = unknown,
+    // e.g. a context built outside handleMessage). t_dispatch_to_ipc
+    // measures from here to the engine IPC post.
+    int64_t receipt_us = 0;
 };
 
 class Dispatcher {
@@ -498,7 +503,8 @@ private:
     void onJoin(const CommandContext& ctx);
     // Play a replied-to (or captioned) Telegram file: download via
     // getFile, then play through the core's in-process voice backend.
-    void playRepliedFile(const CommandContext& ctx,
+    // Returns true only after the voice backend accepted the file.
+    bool playRepliedFile(const CommandContext& ctx,
                          const std::string& file_id,
                          const std::string& title, const std::string& kind);
     void onReplay(const CommandContext& ctx);
