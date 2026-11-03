@@ -9,7 +9,7 @@
 # Usage:
 #   ./install.sh [--from-repo] [--dir <path>]
 #
-# Default mode downloads the v0.2.0 release tarball and extracts it here.
+# Default mode downloads the v0.3.0 release tarball and extracts it here.
 # --from-repo clones https://github.com/filewrap/ParlayMusic.git instead
 # (use when no release asset exists yet, or you want the live tree).
 # If this directory is already a Parlay checkout (tarball root or repo
@@ -26,8 +26,8 @@
 #   PARLAY_TARBALL_URL, PARLAY_REPO_URL, SLSKD_LOCAL_ZIP
 set -euo pipefail
 
-PARLAY_VERSION="v0.2.0"
-TARBALL_URL="${PARLAY_TARBALL_URL:-https://github.com/filewrap/ParlayMusic/releases/download/v0.2.0/parlay-v0.2.0-linux-x86_64.tar.gz}"
+PARLAY_VERSION="v0.3.0"
+TARBALL_URL="${PARLAY_TARBALL_URL:-https://github.com/filewrap/ParlayMusic/releases/download/v0.3.0/parlay-v0.3.0-linux-x86_64.tar.gz}"
 REPO_URL="${PARLAY_REPO_URL:-https://github.com/filewrap/ParlayMusic.git}"
 SLSKD_VERSION="0.26.2"
 SLSKD_URL="https://github.com/slskd/slskd/releases/download/${SLSKD_VERSION}/slskd-${SLSKD_VERSION}-linux-x64.zip"
@@ -168,9 +168,9 @@ else
     fi
 fi
 if ! is_checkout; then
-    # The v0.2.0 release tarball predates the unified engine (no
-    # services/backend-go, no bin/parlay-backend): it cannot be
-    # installed by this script. Use --from-repo until a release is
+    # An old (pre-v0.3.0) release tarball predates the unified engine
+    # (no services/backend-go, no bin/parlay-backend): it cannot be
+    # installed by this script. Use --from-repo, or a v0.3.0+ release
     # cut from the unified tree.
     if [ -x "$ROOT/bin/parlay-core" ]; then
         die "the tree at $ROOT predates the unified engine (bin/parlay-core present but no backend-go / bin/parlay-backend) — re-run with --from-repo, or wait for a release cut from the unified tree."

@@ -6,12 +6,11 @@ and an embedded bbolt store — no inter-service HTTP, no Mongo/Redis.
 See `FINAL-ARCHITECTURE.md` for the locked architecture. This guide
 covers the **repo-checkout install** on a plain Linux VPS.
 
-> The v0.2.0 release tarball installs the **old** 12-service topology
-> and predates this architecture — do not use it for a fresh install.
-> There is no newer release tarball yet; build from the repo (main at
-> `f1a7211`, Phase 3). `install.sh` / `start.sh` / `stop.sh` /
-> `status.sh` still describe the old topology and are being rewritten
-> — until then, start the two processes by hand as below.
+> The v0.3.0 release tarball installs this architecture (2-process
+> engine, prebuilt) — one-click: download it from
+> https://github.com/filewrap/ParlayMusic/releases/tag/v0.3.0,
+> extract, `./install.sh && ./start.sh`. The guide below covers the
+> **repo-checkout install** instead.
 
 ## Prereqs
 
@@ -60,8 +59,8 @@ connects to), core second:
 ./services/core-cpp/build/parlay-core
 ```
 
-Stop with Ctrl-C / `kill` on each process (no `stop.sh` yet — the
-launcher rewrite is pending). Both processes log to stdout/stderr;
+Stop with `./stop.sh` (or Ctrl-C / `kill` on each process when run by
+hand). Both processes log to stdout/stderr when run by hand;
 redirect to files if you want persistent logs.
 
 ## Manual notes
@@ -111,12 +110,10 @@ until the launcher rewrite restores `logs/<service>.log` files.
 
 ## systemd
 
-> Pending the launcher rewrite: `start.sh` / `stop.sh` do not exist
-> in their new form yet, so the unit below is a sketch, not a tested
-> unit. The shape that fits the new layout is a oneshot unit that
-> stays "active" after the start script exits, with `stop.sh` as the
-> stop action — the same shape as before, because the start script
-> still backgrounds processes itself and then exits (there are two
+> The unit below is a sketch, not a tested unit. The shape that fits
+> the new layout is a oneshot unit that stays "active" after the
+> start script exits, with `stop.sh` as the stop action — the start
+> script backgrounds processes itself and then exits (there are two
 > processes + the daemon now, not twelve services).
 
 ```ini

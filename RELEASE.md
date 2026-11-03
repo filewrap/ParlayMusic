@@ -1,3 +1,52 @@
+# Parlay — v0.3.0 Release (2-process engine, Phases 1–6)
+
+Date: 2026-11-04. Branch: `main`. Tag: `v0.3.0`.
+
+One-click install (VPS, Ubuntu 22.04+/Debian 12 x86_64):
+
+```bash
+curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.3.0/parlay-v0.3.0-linux-x86_64.tar.gz
+tar -xzf parlay-v0.3.0-linux-x86_64.tar.gz
+cd parlay-v0.3.0-linux-x86_64 && ./install.sh && ./start.sh
+```
+
+This is the first release of the locked 2-process engine
+(`FINAL-ARCHITECTURE.md`): C++20 core + unified Go backend over one
+Unix Domain Socket, bbolt store, no Mongo/Redis, no inter-service
+HTTP. All 6 phases: telemetry + benchmark, persistent IPC + dual-
+TDLib core, unified backend (65 IPC actions), cache + lookahead
+prefetch, parlay-dsp Rust engine + patched ntgcalls Opus (320k
+ceiling, 192k default), TypeScript lossless Mini App with FLAC
+streaming. `vc.join` deadlock fixed (65/65 dispatch). No initData
+validation in-tree — the Mini App binds loopback-only by default;
+put a trusted reverse proxy with TLS + initData check in front of
+it on a VPS.
+
+## Release artifact
+
+- `release/parlay-v0.3.0-linux-x86_64.tar.gz` — 57,584,859 bytes (55M),
+  26 tar entries.
+- SHA256:
+  `76faed638f8b5c699a65182ccd18b688c2ed4350eae54799095ddabf8a266c5f`
+  (sidecar `.sha256` next to the tarball; `SHA256SUMS` inside it,
+  verified).
+- Contents: `bin/parlay-core`, `bin/parlay-backend`,
+  `lib/libtdjson.so.1.8.69` (50,166,944 B, prebuilt) +
+  `lib/libntgcalls.so` (98,123,704 B, PATCHED Phase 5 Opus build) +
+  `lib/libparlay_dsp.so` (2,552,488 B, Rust DSP engine),
+  `services/miniapp/dist/` (built bundle), `scripts/yt_dlp_worker.py`,
+  `install.sh`, `start.sh`, `stop.sh`, `status.sh`, `.env.example`,
+  `parlay.toml.example`, `README.md`, `INSTALL.md`, `VERSION`,
+  `SHA256SUMS`. No `.env`, no tokens, no session files, no `refs/`,
+  no build dirs, no venvs. slskd is NOT in the tarball —
+  `install.sh` fetches it from upstream (pinned 0.26.2).
+- Secret scan clean (package-release.sh step 7).
+
+Expected release URL once published:
+https://github.com/filewrap/ParlayMusic/releases/tag/v0.3.0
+
+---
+
 # Parlay — v0.2.0 Release (one-click install/start)
 
 > **Superseded note (2026-11-03, Phase 3):** this report documents

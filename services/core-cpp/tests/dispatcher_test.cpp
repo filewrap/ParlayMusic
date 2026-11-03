@@ -2339,8 +2339,8 @@ int main() {
                       parlay::ui_texts::kInlineHelpTitle1 &&
                   resField(res, 1, "title") ==
                       parlay::ui_texts::kInlineHelpTitle2 &&
-                  artMsg(res, 0) == "Parlay v0.2.0" &&
-                  artMsg(res, 1) == "Parlay v0.2.0" &&
+                  artMsg(res, 0) == "Parlay v0.3.0" &&
+                  artMsg(res, 1) == "Parlay v0.3.0" &&
                   rig.tg.inlines[0].cache_time == 3600,
               "inline help: two articles sending the version line");
         rig.d.handleInlineQuery(makeIq("search"));

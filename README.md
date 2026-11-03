@@ -11,11 +11,18 @@ Go, Rust, C++, JavaScript / TypeScript — in one Telegram music bot.**
 - **Audio FX** — Slow+Reverb, Nightcore, Bass Boost, 8D
 - **Spotify intelligence** — profanity / AI-lyrics filter, auto-skip disliked tracks
 
-## Install (repo checkout, current architecture)
+## Install
 
-The v0.2.0 release tarball installs the **old** 12-service topology and
-predates the locked 2-process architecture below — do not use it for a
-fresh install. Build from the repo instead (main at `f1a7211`, Phase 3):
+One-click, from the v0.3.0 release tarball (prebuilt 2-process engine —
+core-cpp + backend-go over UDS, bbolt store, parlay-dsp, Mini App):
+
+```bash
+curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.3.0/parlay-v0.3.0-linux-x86_64.tar.gz
+tar -xzf parlay-v0.3.0-linux-x86_64.tar.gz
+cd parlay-v0.3.0-linux-x86_64 && ./install.sh && ./start.sh
+```
+
+Or build from the repo (main, Phase 6):
 
 ```bash
 git clone https://github.com/filewrap/ParlayMusic.git && cd ParlayMusic
@@ -24,15 +31,12 @@ cp parlay.toml.example parlay.toml   # optional: defaults apply without it
 python3 -m venv scripts/yt-dlp-venv && scripts/yt-dlp-venv/bin/pip install yt-dlp
 
 # backend first (it creates the UDS socket the core connects to)
-cd services/backend-go && go build -o parlay-backend ./cmd/backend && ./parlay-backend &
+cd services/backend-go && go build -tags parlaydsp -o parlay-backend ./cmd/backend && ./parlay-backend &
 # core second
 cd ../core-cpp && cmake -B build && cmake --build build && ./build/parlay-core
 ```
 
-`install.sh` / `start.sh` / `stop.sh` / `status.sh` still describe the
-old 12-service topology and are being rewritten for the new layout —
-until then, start the two processes by hand as above. Full guide
-(prereqs, systemd, troubleshooting): [INSTALL.md](INSTALL.md).
+Full guide (prereqs, systemd, troubleshooting): [INSTALL.md](INSTALL.md).
 
 ## Architecture (one line each)
 

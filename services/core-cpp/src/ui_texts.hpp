@@ -1985,7 +1985,7 @@ inline const char* kInlineHelpTitle1 =
     "1. Paste a music share URL or enter a Music ID";
 inline const char* kInlineHelpTitle2 =
     "2. Enter search + keyword to search songs";
-inline const char* kInlineHelpMessage = "Parlay v0.2.0";
+inline const char* kInlineHelpMessage = "Parlay v0.3.0";
 // Bare "search" with no keyword (Music163bot §6.8).
 inline const char* kInlineNeedKeyword = "Please enter a keyword";
 // A keyword search with no matches (Music163bot §6.8).
