@@ -87,8 +87,6 @@ type BackendConfig struct {
 	DataDir             string `toml:"data_dir"`
 	UDSPath             string `toml:"uds_path"`
 	SlskdURL            string `toml:"slskd_url"`
-	SlskdUser           string `toml:"slskd_user"`
-	SlskdPass           string `toml:"slskd_pass"`
 	DeezerARL           string `toml:"deezer_arl"`
 	NetEaseMusicU       string `toml:"netease_music_u"`
 	SpotifyClientID     string `toml:"spotify_client_id"`
@@ -99,12 +97,23 @@ type BackendConfig struct {
 	NavidromeUser       string `toml:"navidrome_user"`
 	NavidromePass       string `toml:"navidrome_pass"`
 	GeminiAPIKey        string `toml:"gemini_api_key"`
-	YTDLPPath           string `toml:"ytdlp_path"`
 	// AuddAPIToken is the AudD music-recognition API token
 	// (audio.recognize, Phase 3 Wave 2). Empty = recognition is not
 	// configured and the action answers an honest 502; the token is
 	// never logged. Env override AUDD_API_TOKEN.
 	AuddAPIToken string `toml:"audd_api_token"`
+}
+
+// IPCConfig is the core-owned [ipc] table (Q6, Phase 4): the UDS
+// socket the core uses to reach the backend. The backend parses it
+// only so the shared parlay.toml loads cleanly under both parsers —
+// the core ignores tables it does not own, and the Go parser must do
+// the same for core-owned tables. The value is NOT dead: SocketPath
+// falls back to it when [backend] uds_path is unset, so a socket
+// path set only in [ipc] is honoured by both sides instead of
+// splitting them (the core never reads [backend]).
+type IPCConfig struct {
+	SocketPath string `toml:"socket_path"`
 }
 
 // Config is the whole effective configuration.
@@ -117,6 +126,7 @@ type Config struct {
 	Quality  QualityConfig `toml:"quality"`
 	Limits   LimitConfig   `toml:"limits"`
 	Backend  BackendConfig `toml:"backend"`
+	IPC      IPCConfig     `toml:"ipc"`
 
 	// Source is the parlay.toml path that was loaded, or the
 	// "(defaults: ...)" note when no file was found. FileFound
@@ -125,12 +135,23 @@ type Config struct {
 	FileFound bool   `toml:"-"`
 }
 
-// SocketPath returns the UDS path the backend listens on: the
-// explicit uds_path when set, else <data_dir>/parlay-backend.sock
-// (contracts/uds-protocol.md §1).
+// SocketPath returns the UDS path the backend listens on
+// (contracts/uds-protocol.md §1). Precedence — the two parsers must
+// agree, or the core connects where the backend does not listen:
+// PARLAY_UDS_PATH env (folded into Backend.UDSPath by the env pass)
+// wins; then [backend] uds_path, the backend's own key; then [ipc]
+// socket_path, the core's key (Q6 — the core never reads [backend],
+// so a path set only in [ipc] must still be honoured here); else
+// <data_dir>/parlay-backend.sock. Setting [backend] uds_path and
+// [ipc] socket_path to DIFFERENT values is a misconfiguration: the
+// backend listens on the former while the core connects to the
+// latter. Set at most one file key (prefer [ipc]).
 func (c *Config) SocketPath() string {
 	if c.Backend.UDSPath != "" {
 		return c.Backend.UDSPath
+	}
+	if c.IPC.SocketPath != "" {
+		return c.IPC.SocketPath
 	}
 	return filepath.Join(c.Backend.DataDir, "parlay-backend.sock")
 }
@@ -157,9 +178,8 @@ func defaults() *Config {
 	}
 	c.Limits = LimitConfig{MaxDurationMinutes: 60, MaxQueueSize: 20, PrefetchLeadTimeSec: 30, URLCacheTTLsec: 120}
 	c.Backend = BackendConfig{
-		DataDir:   "data",
-		SlskdURL:  "http://127.0.0.1:5030",
-		YTDLPPath: "yt-dlp",
+		DataDir:  "data",
+		SlskdURL: "http://127.0.0.1:5030",
 	}
 	return c
 }
@@ -391,8 +411,6 @@ func applyEnv(c *Config) {
 	}
 	setStr("PARLAY_UDS_PATH", &c.Backend.UDSPath)
 	setStr("SLSKD_URL", &c.Backend.SlskdURL)
-	setStr("SLSKD_USER", &c.Backend.SlskdUser)
-	setStr("SLSKD_PASS", &c.Backend.SlskdPass)
 	setStr("DEEZER_ARL", &c.Backend.DeezerARL)
 	setStr("NETEASE_MUSIC_U", &c.Backend.NetEaseMusicU)
 	setStr("SPOTIFY_CLIENT_ID", &c.Backend.SpotifyClientID)
@@ -401,8 +419,16 @@ func applyEnv(c *Config) {
 	setStr("PARLAY_SPOTIFY_OAUTH_KEY", &c.Backend.SpotifyOAuthKey)
 	setStr("NAVIDROME_URL", &c.Backend.NavidromeURL)
 	setStr("NAVIDROME_USER", &c.Backend.NavidromeUser)
-	setStr("NAVIDROME_PASS", &c.Backend.NavidromePass)
+	// The Navidrome password env var is NAVIDROME_PASSWORD (what
+	// the resolver reads); NAVIDROME_PASS is a legacy alias from
+	// the pre-Phase 4 .env.example — it still works, but the
+	// canonical name wins when both are set. A set-but-empty
+	// canonical name counts as unset (Q10 name trap).
+	if v, ok := os.LookupEnv("NAVIDROME_PASSWORD"); ok && strings.TrimSpace(v) != "" {
+		c.Backend.NavidromePass = strings.TrimSpace(v)
+	} else if v, ok := os.LookupEnv("NAVIDROME_PASS"); ok {
+		c.Backend.NavidromePass = strings.TrimSpace(v)
+	}
 	setStr("GEMINI_API_KEY", &c.Backend.GeminiAPIKey)
-	setStr("YTDLP_PATH", &c.Backend.YTDLPPath)
 	setStr("AUDD_API_TOKEN", &c.Backend.AuddAPIToken)
 }

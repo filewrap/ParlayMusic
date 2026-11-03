@@ -140,11 +140,14 @@ func TestMissingExplicitFileIsAnError(t *testing.T) {
 
 func TestExampleFileLoads(t *testing.T) {
 	// The repo example is the shared schema: it must load under
-	// this parser exactly as the core loads it.
-	if _, err := os.Stat("/home/hatch/workspace/parlay/parlay.toml.example"); err != nil {
+	// this parser exactly as the core loads it. Resolved relative
+	// to this package (go test always runs with the package dir
+	// as its working directory) — never a hardcoded user home.
+	example := filepath.Join("..", "..", "..", "..", "parlay.toml.example")
+	if _, err := os.Stat(example); err != nil {
 		t.Skip("parlay.toml.example not present")
 	}
-	cfg, err := LoadFrom("/home/hatch/workspace/parlay/parlay.toml.example")
+	cfg, err := LoadFrom(example)
 	if err != nil {
 		t.Fatalf("parlay.toml.example must load cleanly: %v", err)
 	}

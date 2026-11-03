@@ -114,19 +114,45 @@ func startFFmpegFeed(ctx context.Context, client *Client, chatID int64, source s
 	if strings.TrimSpace(source) == "" {
 		return nil, errors.New("voice: ffmpeg feed: empty audio source")
 	}
+	return startFeed(ctx, client, chatID, source, nil, onEOF)
+}
+
+// startFFmpegFeedFromReader starts the decode feed with ffmpeg
+// reading its input from r (stdin, "-i pipe:0") instead of a URL
+// or file path: the Phase 4 prefetch path (Manager.PlayStream).
+// The reader must yield the whole stream (buffered prefix first,
+// then the live body); EOF on it ends the track exactly like EOF
+// on a URL/file feed, and the pump's real-time pacing is
+// unchanged.
+func startFFmpegFeedFromReader(ctx context.Context, client *Client, chatID int64, r io.ReadCloser, onEOF func(error)) (*ffmpegFeed, error) {
+	if r == nil {
+		return nil, errors.New("voice: ffmpeg feed: nil stream reader")
+	}
+	return startFeed(ctx, client, chatID, "pipe:0", r, onEOF)
+}
+
+// startFeed is the shared feed construction: ffmpeg decodes input
+// (a URL/file path, or stdin when stdin != nil) to s16le 48 kHz
+// stereo PCM on stdout and the pump pushes 10 ms frames to
+// ntgcalls. source is passed to ffmpeg as argv, never through a
+// shell, so a hostile stream URL cannot inject shell syntax.
+func startFeed(ctx context.Context, client *Client, chatID int64, input string, stdin io.Reader, onEOF func(error)) (*ffmpegFeed, error) {
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		return nil, fmt.Errorf("voice: ffmpeg feed: ffmpeg not found in PATH: %w", err)
 	}
 	feedCtx, cancel := context.WithCancel(ctx)
 	args := []string{"-hide_banner", "-loglevel", "error"}
-	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+	if stdin == nil && (strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")) {
 		args = append(args, "-reconnect", "1", "-reconnect_at_eof", "1",
 			"-reconnect_streamed", "1", "-reconnect_delay_max", "2")
 	}
-	args = append(args, "-i", source, "-vn",
+	args = append(args, "-i", input, "-vn",
 		"-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1")
 	cmd := exec.CommandContext(feedCtx, ffmpegPath, args...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -141,7 +167,7 @@ func startFFmpegFeed(ctx context.Context, client *Client, chatID int64, source s
 	feed := &ffmpegFeed{
 		client:   client,
 		chatID:   chatID,
-		source:   source,
+		source:   input,
 		ctx:      feedCtx,
 		cancel:   cancel,
 		cmd:      cmd,

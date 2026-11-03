@@ -85,7 +85,12 @@ const (
 var deezerURLRe = regexp.MustCompile(`(?:https?://(?:www\.)?deezer\.com/(?:[a-z]{2}/)?)(track|album|playlist|artist)/(\d+)`)
 
 // DeezerResolver resolves Deezer URLs/ids and free text.
-type DeezerResolver struct{}
+type DeezerResolver struct {
+	// arl is the Deezer ARL session cookie wired from [backend]
+	// deezer_arl by Registry.Configure (Q10); empty means "read
+	// $DEEZER_ARL directly", the Phase 3 behaviour.
+	arl string
+}
 
 // NewDeezerResolver builds a Deezer resolver.
 func NewDeezerResolver() *DeezerResolver { return &DeezerResolver{} }
@@ -103,10 +108,18 @@ func ExtractDeezerURL(input string) string {
 	return m[1] + ":" + m[2]
 }
 
-// arlConfigured reports whether a Deezer ARL cookie is present.
-func deezerARLConfigured() bool { return strings.TrimSpace(os.Getenv("DEEZER_ARL")) != "" }
+// arlValue returns the configured ARL cookie: the [backend]
+// deezer_arl value when Registry.Configure set one, else
+// $DEEZER_ARL (Q10 — the file key now does what the env var did).
+func (d *DeezerResolver) arlValue() string {
+	if d.arl != "" {
+		return d.arl
+	}
+	return strings.TrimSpace(os.Getenv("DEEZER_ARL"))
+}
 
-func deezerARL() string { return strings.TrimSpace(os.Getenv("DEEZER_ARL")) }
+// arlConfigured reports whether a Deezer ARL cookie is present.
+func (d *DeezerResolver) arlConfigured() bool { return d.arlValue() != "" }
 
 // missingARLError is the honest failure for every ARL-gated path.
 func missingARLError(what string) error {
@@ -174,7 +187,7 @@ func (d *DeezerResolver) resolveTrack(ctx context.Context, id string) (Track, er
 	if t.Thumbnail == "" {
 		t.Thumbnail = data.Album.Cover
 	}
-	if deezerARLConfigured() {
+	if d.arlConfigured() {
 		if u, _, err := d.fullTrackURL(ctx, id); err == nil && u != "" {
 			t.StreamURL = u
 			return t, nil
@@ -241,7 +254,7 @@ func (d *DeezerResolver) Search(ctx context.Context, query string, limit int) ([
 // an ARL, the 30-second preview. Returns the file path + track.
 func (d *DeezerResolver) Download(ctx context.Context, track Track, destDir string, onProgress ProgressFunc) (DownloadResult, error) {
 	runID := NewRunID()
-	if deezerARLConfigured() {
+	if d.arlConfigured() {
 		u, format, err := d.fullTrackURL(ctx, track.ID)
 		if err != nil {
 			return DownloadResult{}, err
@@ -277,7 +290,7 @@ func (d *DeezerResolver) Download(ctx context.Context, track Track, destDir stri
 // fullTrackURL runs the ARL gw flow and returns the CDN URL plus the
 // chosen format name. Format ladder: FLAC -> MP3_320 -> MP3_128.
 func (d *DeezerResolver) fullTrackURL(ctx context.Context, trackID string) (string, string, error) {
-	arl := deezerARL()
+	arl := d.arlValue()
 	if arl == "" {
 		return "", "", missingARLError("Deezer full-track URL")
 	}

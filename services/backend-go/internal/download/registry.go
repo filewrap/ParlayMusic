@@ -11,24 +11,27 @@
 // on failure. Runs are kept for late polls; the registry caps at 200
 // finished runs, oldest first; live runs are never evicted.
 //
-// Persistence note: the inventory (§4.6) wants run records in a
-// bbolt "downloads" bucket and prefs in a "dlprefs" bucket, but
-// internal/store has neither bucket yet (it ships rooms, queue, votes,
-// shares, spotify, settings, radio only). Until the store gains those
-// buckets, runs and prefs live in memory in this package — a backend
-// restart loses finished-run snapshots (a later poll for a pre-restart
-// run_id answers not_found honestly) and resets prefs to defaults.
-// The Registry and PrefsStore types are the seam: when the buckets
-// land, they gain a store-backed implementation behind the same
-// methods. Nothing here opens a second bbolt file.
+// Persistence note: finished runs live in the bbolt "downloads"
+// bucket (internal/store) since Phase 4: Registry.AttachStore
+// loads them on boot, and retire() persists each run as it
+// finishes, so a backend restart keeps the finished-run history
+// (a later poll for a pre-restart run_id still answers). Live runs
+// cannot persist — they hold a live context, a cancel func and
+// channels — so a restart loses in-flight runs honestly (their
+// run_id answers not_found). Prefs live in the "dlprefs" bucket
+// the same way (see prefs.go). Nothing here opens a second bbolt
+// file: the store is passed in, never opened.
 package download
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
+	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
+	"parlay/backend-go/internal/store"
 )
 
 // MaxBotAPIBYTES is the 50 MB Bot API send cap (downloaders
@@ -89,6 +92,11 @@ type Run struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	once   sync.Once
+	// restored marks a run rebuilt from the store (AttachStore):
+	// it is already terminal, its done channel is already closed,
+	// and Finish/Fail are no-ops for it — finishing it again would
+	// close the channel twice.
+	restored bool
 }
 
 // Registry holds live and finished download runs.
@@ -96,11 +104,87 @@ type Registry struct {
 	mu       sync.Mutex
 	live     map[string]*Run
 	finished []*Run // oldest first, capped at MaxFinishedRuns
+	// store is the embedded store finished runs persist into
+	// (nil = memory-only, the pre-Phase 4 behaviour).
+	store *store.Store
 }
 
 // NewRegistry builds an empty run registry.
 func NewRegistry() *Registry {
 	return &Registry{live: map[string]*Run{}}
+}
+
+// AttachStore wires the embedded store in and loads the finished
+// runs it holds, oldest first, capped at MaxFinishedRuns (older
+// records are dropped from the store). A nil store is a no-op.
+func (r *Registry) AttachStore(st *store.Store) error {
+	if st == nil {
+		return nil
+	}
+	recs, err := st.ListDownloadRuns()
+	if err != nil {
+		return err
+	}
+	sort.Slice(recs, func(i, j int) bool { return recs[i].StartedAt < recs[j].StartedAt })
+	if len(recs) > MaxFinishedRuns {
+		for _, extra := range recs[:len(recs)-MaxFinishedRuns] {
+			_ = st.DeleteDownloadRun(extra.ID)
+		}
+		recs = recs[len(recs)-MaxFinishedRuns:]
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.store = st
+	for _, rec := range recs {
+		r.finished = append(r.finished, restoreRun(rec))
+	}
+	return nil
+}
+
+// record renders the run's persisted snapshot (finished runs only).
+func (run *Run) record() model.DownloadRunRecord {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	perTrack := make([]model.DownloadTrackProgress, len(run.perTrack))
+	for i, tp := range run.perTrack {
+		perTrack[i] = model.DownloadTrackProgress{
+			Title: tp.Title, State: tp.State, Pct: tp.Pct,
+			Peer: tp.Peer, Reason: tp.Reason,
+		}
+	}
+	return model.DownloadRunRecord{
+		ID: run.ID, Kind: run.Kind, Title: run.Title,
+		StartedAt: run.StartedAt.Unix(), Phase: string(run.phase),
+		ErrReason: run.errReason, Percentage: run.percentage,
+		DoneBytes: run.doneBytes, TotalBytes: run.totalBytes,
+		SpeedBytesPerSec: run.speed, ETASeconds: run.etaSeconds,
+		PerTrack: perTrack, LossyAvailable: run.lossyAvailable,
+		LossySummary: run.lossySummary, FilePath: run.filePath,
+	}
+}
+
+// restoreRun rebuilds a finished run from its persisted record:
+// terminal phase, done channel already closed, Finish/Fail inert.
+func restoreRun(rec model.DownloadRunRecord) *Run {
+	perTrack := make([]TrackProgress, len(rec.PerTrack))
+	for i, tp := range rec.PerTrack {
+		perTrack[i] = TrackProgress{
+			Title: tp.Title, State: tp.State, Pct: tp.Pct,
+			Peer: tp.Peer, Reason: tp.Reason,
+		}
+	}
+	done := make(chan struct{})
+	close(done)
+	return &Run{
+		ID: rec.ID, Kind: rec.Kind, Title: rec.Title,
+		StartedAt: time.Unix(rec.StartedAt, 0),
+		phase:     RunPhase(rec.Phase), errReason: rec.ErrReason,
+		percentage: rec.Percentage, doneBytes: rec.DoneBytes,
+		totalBytes: rec.TotalBytes, speed: rec.SpeedBytesPerSec,
+		etaSeconds: rec.ETASeconds, perTrack: perTrack,
+		lossyAvailable: rec.LossyAvailable, lossySummary: rec.LossySummary,
+		filePath: rec.FilePath, done: done, restored: true,
+	}
 }
 
 // sharedRegistry is the process-wide registry used by Register. One
@@ -273,8 +357,13 @@ func (run *Run) ErrReason() string {
 }
 
 // finish moves the run to its terminal phase exactly once and
-// retires it into the finished list (cap 200, oldest first).
+// retires it into the finished list (cap 200, oldest first). A
+// restored run is already terminal: finishing it again is a no-op
+// (its done channel is already closed).
 func (run *Run) finish(registry *Registry, phase RunPhase, reason string) {
+	if run.restored {
+		return
+	}
 	run.once.Do(func() {
 		run.mu.Lock()
 		run.phase = phase
@@ -306,8 +395,24 @@ func (r *Registry) retire(run *Run) {
 	defer r.mu.Unlock()
 	delete(r.live, run.ID)
 	r.finished = append(r.finished, run)
+	var evicted []*Run
 	for len(r.finished) > MaxFinishedRuns {
+		evicted = append(evicted, r.finished[0])
 		r.finished = r.finished[1:]
+	}
+	if r.store == nil {
+		return
+	}
+	// Persist the finished run (and drop evicted records) outside
+	// the registry's in-memory bookkeeping above; a store failure
+	// is swallowed here — the run is already finished in memory,
+	// and a failed write must not fail the download it records.
+	// The failure surfaces nowhere else; the next restart simply
+	// lacks that run. (bbolt write errors are near-impossible
+	// short of a full disk, which the backend cannot fix.)
+	_ = r.store.PutDownloadRun(run.record())
+	for _, old := range evicted {
+		_ = r.store.DeleteDownloadRun(old.ID)
 	}
 }
 

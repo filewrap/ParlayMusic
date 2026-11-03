@@ -6,9 +6,11 @@
 // empty and every record in it was written by this backend.
 //
 // Buckets: rooms, queue (per room), votes, shares, spotify (oauth,
-// watch, dislikes, skipcheck), settings, radio. Values are JSON
-// encodings of the model structs, so the on-disk form stays readable
-// and the store never needs a schema version.
+// watch, dislikes, skipcheck), settings, radio, cache (resolved
+// stream URLs + metadata, TTL-aware), downloads (finished download
+// runs), dlprefs (per-user download prefs), library (cached-file
+// index). Values are JSON encodings of the model structs, so the
+// on-disk form stays readable and the store never needs a schema version.
 package store
 
 import (
@@ -27,18 +29,23 @@ import (
 )
 
 var (
-	bucketRooms    = []byte("rooms")
-	bucketQueue    = []byte("queue")
-	bucketVotes    = []byte("votes")
-	bucketShares   = []byte("shares")
-	bucketSpotify  = []byte("spotify")
-	bucketSettings = []byte("settings")
-	bucketRadio    = []byte("radio")
+	bucketRooms     = []byte("rooms")
+	bucketQueue     = []byte("queue")
+	bucketVotes     = []byte("votes")
+	bucketShares    = []byte("shares")
+	bucketSpotify   = []byte("spotify")
+	bucketSettings  = []byte("settings")
+	bucketRadio     = []byte("radio")
+	bucketCache     = []byte("cache")
+	bucketDownloads = []byte("downloads")
+	bucketDLPrefs   = []byte("dlprefs")
+	bucketLibrary   = []byte("library")
 )
 
 var topBuckets = [][]byte{
 	bucketRooms, bucketQueue, bucketVotes, bucketShares,
 	bucketSpotify, bucketSettings, bucketRadio,
+	bucketCache, bucketDownloads, bucketDLPrefs, bucketLibrary,
 }
 
 // Store is a bbolt-backed key-value store for every model struct.
@@ -443,5 +450,191 @@ func (s *Store) GetRadio(chatID int64) (model.RadioState, bool, error) {
 func (s *Store) DeleteRadio(chatID int64) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucketRadio).Delete(chatKey(chatID))
+	})
+}
+
+// --- cache: TTL-aware resolved tracks -------------------------------
+//
+// One entry per canonical key "<source>:<track_id>" (see
+// resolver.CacheKeyForTrack). The store is dumb storage here: it
+// does NOT enforce expiry — the resolver cache layer owns the
+// clock and never serves an expired entry (it deletes the entry
+// lazily on read). ExpiresAt is unix seconds; 0 means "no expiry
+// known" (the cache layer never writes 0 — it always resolves an
+// expiry from the CDN signature or the configured fallback TTL).
+
+// CacheEntry is one cached resolved track.
+type CacheEntry struct {
+	Track     model.Track `json:"track"`
+	ExpiresAt int64       `json:"expires_at"` // unix seconds
+	CachedAt  int64       `json:"cached_at"`  // unix seconds
+}
+
+// PutCacheEntry stores (or replaces) the cache entry for key.
+func (s *Store) PutCacheEntry(key string, e CacheEntry) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return putJSON(tx.Bucket(bucketCache), []byte(key), e)
+	})
+}
+
+// GetCacheEntry returns the cache entry for key, or false when the
+// key has no entry.
+func (s *Store) GetCacheEntry(key string) (CacheEntry, bool, error) {
+	var e CacheEntry
+	found := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		found, err = getJSON(tx.Bucket(bucketCache), []byte(key), &e)
+		return err
+	})
+	return e, found, err
+}
+
+// DeleteCacheEntry removes the cache entry for key.
+func (s *Store) DeleteCacheEntry(key string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketCache).Delete([]byte(key))
+	})
+}
+
+// --- downloads: finished download runs ------------------------------
+//
+// Only finished runs are stored (see model.DownloadRunRecord): a
+// live run cannot survive a restart, so the registry persists a
+// run when it retires and restores the finished history on boot.
+
+// PutDownloadRun stores (or replaces) a finished run record.
+func (s *Store) PutDownloadRun(rec model.DownloadRunRecord) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return putJSON(tx.Bucket(bucketDownloads), []byte(rec.ID), rec)
+	})
+}
+
+// GetDownloadRun returns a finished run record by id.
+func (s *Store) GetDownloadRun(id string) (model.DownloadRunRecord, bool, error) {
+	var rec model.DownloadRunRecord
+	found := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		found, err = getJSON(tx.Bucket(bucketDownloads), []byte(id), &rec)
+		return err
+	})
+	return rec, found, err
+}
+
+// ListDownloadRuns returns every stored finished run record.
+func (s *Store) ListDownloadRuns() ([]model.DownloadRunRecord, error) {
+	var out []model.DownloadRunRecord
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDownloads).ForEach(func(_, v []byte) error {
+			var rec model.DownloadRunRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return fmt.Errorf("store: corrupt download run: %w", err)
+			}
+			out = append(out, rec)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// DeleteDownloadRun removes a finished run record.
+func (s *Store) DeleteDownloadRun(id string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDownloads).Delete([]byte(id))
+	})
+}
+
+// --- dlprefs: per-user download prefs --------------------------------
+
+// PutDownloadPrefs stores a user's download prefs (key
+// dlpref:<user_id>).
+func (s *Store) PutDownloadPrefs(p model.DownloadPrefs) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return putJSON(tx.Bucket(bucketDLPrefs), []byte("dlpref:"+strconv.FormatInt(p.UserID, 10)), p)
+	})
+}
+
+// GetDownloadPrefs returns a user's stored prefs, or false.
+func (s *Store) GetDownloadPrefs(userID int64) (model.DownloadPrefs, bool, error) {
+	var p model.DownloadPrefs
+	found := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		found, err = getJSON(tx.Bucket(bucketDLPrefs), []byte("dlpref:"+strconv.FormatInt(userID, 10)), &p)
+		return err
+	})
+	return p, found, err
+}
+
+// ListDownloadPrefs returns every stored user's prefs.
+func (s *Store) ListDownloadPrefs() ([]model.DownloadPrefs, error) {
+	var out []model.DownloadPrefs
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketDLPrefs).ForEach(func(_, v []byte) error {
+			var p model.DownloadPrefs
+			if err := json.Unmarshal(v, &p); err != nil {
+				return fmt.Errorf("store: corrupt download prefs: %w", err)
+			}
+			out = append(out, p)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// --- library: cached-file index --------------------------------------
+
+// PutLibraryEntry stores (or replaces) one library index entry
+// (key = track id).
+func (s *Store) PutLibraryEntry(e model.LibraryEntry) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return putJSON(tx.Bucket(bucketLibrary), []byte(e.ID), e)
+	})
+}
+
+// GetLibraryEntry returns the index entry for a track id.
+func (s *Store) GetLibraryEntry(id string) (model.LibraryEntry, bool, error) {
+	var e model.LibraryEntry
+	found := false
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		var err error
+		found, err = getJSON(tx.Bucket(bucketLibrary), []byte(id), &e)
+		return err
+	})
+	return e, found, err
+}
+
+// DeleteLibraryEntry removes the index entry for a track id.
+func (s *Store) DeleteLibraryEntry(id string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketLibrary).Delete([]byte(id))
+	})
+}
+
+// ListLibraryEntries returns every stored index entry.
+func (s *Store) ListLibraryEntries() ([]model.LibraryEntry, error) {
+	var out []model.LibraryEntry
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketLibrary).ForEach(func(_, v []byte) error {
+			var e model.LibraryEntry
+			if err := json.Unmarshal(v, &e); err != nil {
+				return fmt.Errorf("store: corrupt library entry: %w", err)
+			}
+			out = append(out, e)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// ClearLibrary drops every stored index entry.
+func (s *Store) ClearLibrary() error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		if err := tx.DeleteBucket(bucketLibrary); err != nil {
+			return err
+		}
+		_, err := tx.CreateBucket(bucketLibrary)
+		return err
 	})
 }

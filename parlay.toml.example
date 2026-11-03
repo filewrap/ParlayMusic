@@ -83,6 +83,19 @@ max_queue_size = 20
 prefetch_lead_time_sec = 30
 url_cache_ttl_sec = 120
 
+# --- IPC: the UDS socket to the unified backend -----------------------
+# socket_path: where the core finds the backend's socket. Default:
+# <data_dir>/parlay-backend.sock (data_dir is the backend's [backend]
+# data_dir). The PARLAY_UDS_PATH env var always wins over this key.
+# The backend listens on this path too when [backend] uds_path is
+# unset (PARLAY_UDS_PATH > [backend] uds_path > [ipc] socket_path >
+# default) — never set uds_path and socket_path to different values:
+# the backend would listen on one while the core connects to the
+# other. Set at most one file key (prefer this one).
+# Env: PARLAY_UDS_PATH
+[ipc]
+# socket_path = "data/parlay-backend.sock"
+
 # --- Backend-only keys ------------------------------------------------------
 # The Go backend reads these from the [backend] table
 # (services/backend-go/internal/config/config.go). The C++ core ignores
@@ -90,34 +103,29 @@ url_cache_ttl_sec = 120
 # (PARLAY_DATA_DIR, PARLAY_UDS_PATH, SLSKD_URL, SPOTIFY_*, ... — see
 # .env.example). Secrets must NEVER be committed with real values.
 #
-# LIVE keys — honored from this file: data_dir, uds_path,
+# All keys below are LIVE — honored from this file (Q10, Phase 4):
+# data_dir, uds_path, slskd_url, deezer_arl, netease_music_u,
 # spotify_client_id, spotify_client_secret, spotify_redirect_uri,
-# spotify_oauth_key, gemini_api_key, audd_api_token.
-# PARSED-BUT-UNPLUGGED keys — accepted here but currently IGNORED at
-# runtime: the resolvers read the env vars directly and never look at
-# these fields (see phase3/wiring-audit-b-config.md §3). Until that
-# wiring lands, set the env var, not the file key: slskd_url (SLSKD_URL),
-# slskd_user / slskd_pass (unused — slskd auth is API-key only),
-# deezer_arl (DEEZER_ARL), netease_music_u (NETEASE_MUSIC_U),
-# navidrome_url / navidrome_user / navidrome_pass (NAVIDROME_URL /
-# NAVIDROME_USER / NAVIDROME_PASSWORD — note the resolver reads
-# NAVIDROME_PASSWORD, not NAVIDROME_PASS), ytdlp_path (use
-# PARLAY_YTDLP_PYTHON / PARLAY_YTDLP_WORKER instead).
+# spotify_oauth_key, navidrome_url / navidrome_user / navidrome_pass,
+# gemini_api_key, audd_api_token. Env overrides still win over the
+# file values. Navidrome password: the canonical env name is
+# NAVIDROME_PASSWORD (NAVIDROME_PASS is a legacy alias).
+# DELETED keys — no longer in the schema; a file that sets one fails
+# loudly instead of silently ignoring it: slskd_user / slskd_pass
+# (slskd auth is API-key only, no consumer) and ytdlp_path (the
+# daemon uses PARLAY_YTDLP_PYTHON / PARLAY_YTDLP_WORKER instead).
 [backend]
 data_dir = "data"
-# uds_path = "data/parlay-backend.sock"  # default: <data_dir>/parlay-backend.sock
-# slskd_url = "http://127.0.0.1:5030"  # parsed but unplugged; set SLSKD_URL
-# slskd_user = ""  # parsed but unplugged; slskd auth is API-key only
-# slskd_pass = ""  # parsed but unplugged; slskd auth is API-key only
-# deezer_arl = ""  # parsed but unplugged; set DEEZER_ARL
-# netease_music_u = ""  # parsed but unplugged; set NETEASE_MUSIC_U
+# uds_path = "data/parlay-backend.sock"  # default: <data_dir>/parlay-backend.sock; precedence: PARLAY_UDS_PATH env > [backend] uds_path > [ipc] socket_path > default — never set uds_path and [ipc] socket_path to different values
+# slskd_url = "http://127.0.0.1:5030"
+# deezer_arl = ""
+# netease_music_u = ""
 # spotify_client_id = ""  # Spotify app client id (metadata + per-user OAuth)
 # spotify_client_secret = ""  # never commit a real value
 spotify_redirect_uri = "http://127.0.0.1:8080/callback"  # must match the Spotify app registration exactly; never "localhost"
 # spotify_oauth_key = ""  # base64 of 32 random bytes (PARLAY_SPOTIFY_OAUTH_KEY); unset = generated once, stored <data_dir>/spotify-user-key (0600)
-# navidrome_url = ""  # parsed but unplugged; set NAVIDROME_URL
-# navidrome_user = ""  # parsed but unplugged; set NAVIDROME_USER
-# navidrome_pass = ""  # parsed but unplugged; the resolver reads NAVIDROME_PASSWORD
+# navidrome_url = ""
+# navidrome_user = ""
+# navidrome_pass = ""  # env: NAVIDROME_PASSWORD (canonical) or NAVIDROME_PASS (legacy alias)
 # gemini_api_key = ""  # AI lyrics classifier (GEMINI_API_KEY)
-# ytdlp_path = "yt-dlp"  # parsed but unplugged; use PARLAY_YTDLP_PYTHON / PARLAY_YTDLP_WORKER
 # audd_api_token = ""  # AudD music recognition (AUDD_API_TOKEN)

@@ -353,6 +353,10 @@ public:
     mutable std::string netease_lyrics_response;
     mutable std::string download_response;
     mutable std::string radio_status_response;
+    // Scripted Phase 4 (Q4) answers (empty = fall through to the 404
+    // below): download.cancel / library.delete success payloads.
+    mutable std::string download_cancel_response;
+    mutable std::string library_delete_response;
     mutable std::string last_post_body;
     // Every POST body, in order (last_post_body keeps the latest).
     mutable std::vector<std::string> post_bodies;
@@ -438,6 +442,20 @@ public:
             r.ok = true;
             r.http_status = 200;
             r.data = parlay::Json::parse(play_file_response);
+            return r;
+        }
+        if (action == "download.cancel" &&
+            !download_cancel_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(download_cancel_response);
+            return r;
+        }
+        if (action == "library.delete" &&
+            !library_delete_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(library_delete_response);
             return r;
         }
         if (action == "fx" && !fx_response.empty()) {
@@ -1604,7 +1622,7 @@ int main() {
     {
         // playAllowed denial uses the admin-only-play card.
         Rig rig;
-        rig.store.hset("chat:-1001", "play_mode", "admin");
+        rig.store.hset("chat:-1001", "play_mode", "admins");
         rig.d.handleMessage(makeMsg(-1001, 222, "/play test song"));
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Admin only play"),
@@ -2974,6 +2992,89 @@ int main() {
         CHECK(rig.tg.audios.size() == 1 &&
                   rig.tg.audios[0].audio == "/tmp/in.ogg",
               "cbDl FX applied:true (original): file still sent");
+    }
+
+    // cbDl cancel / cbDel delete wired to the backend (Phase 4, Q4).
+    {
+        Rig rig;
+        rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
+        rig.ipc.download_cancel_response =
+            R"({"cancelled":true,"run_id":"run1","phase":"cancelled"})";
+        rig.d.handleCallback(makeCq("pl:dl:cancel:run1"));
+        CHECK(has_post(rig, "download.cancel"),
+              "cbDl cancel: download.cancel POST issued");
+        CHECK(!rig.store.get("dlrun:run1"),
+              "cbDl cancel: dlrun key cleared on success");
+        CHECK(!rig.tg.toasts.empty() &&
+                  rig.tg.toasts.back().text ==
+                      parlay::ui_texts::kToastDlCancelled,
+              "cbDl cancel: cancelled toast");
+        CHECK(!rig.tg.edits.empty() &&
+                  rig.tg.edits.back().text ==
+                      parlay::ui_texts::kToastDlCancelled,
+              "cbDl cancel: progress message retired in place");
+    }
+    {
+        // Finished run: backend answers cancelled:false (200) — the
+        // core says so honestly and clears the stale key.
+        Rig rig;
+        rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
+        rig.ipc.download_cancel_response =
+            R"({"cancelled":false,"run_id":"run1","phase":"done"})";
+        rig.d.handleCallback(makeCq("pl:dl:cancel:run1"));
+        CHECK(!rig.store.get("dlrun:run1"),
+              "cbDl cancel finished: stale dlrun key cleared");
+        CHECK(!rig.tg.toasts.empty() &&
+                  rig.tg.toasts.back().text ==
+                      parlay::ui_texts::kToastDlNothingToCancel,
+              "cbDl cancel finished: nothing-to-cancel toast");
+    }
+    {
+        // No run at all: nothing to cancel, no backend call.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:dl:cancel:run1"));
+        CHECK(!has_post(rig, "download.cancel"),
+              "cbDl cancel no-run: no backend call");
+        CHECK(!rig.tg.toasts.empty() &&
+                  rig.tg.toasts.back().text ==
+                      parlay::ui_texts::kToastDlNothingToCancel,
+              "cbDl cancel no-run: nothing-to-cancel toast");
+    }
+    {
+        // Backend 404 (unknown run): the exact backend error is the toast.
+        Rig rig;
+        rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
+        rig.d.handleCallback(makeCq("pl:dl:cancel:run1"));
+        CHECK(has_post(rig, "download.cancel"),
+              "cbDl cancel 404: download.cancel POST issued");
+        CHECK(!rig.tg.toasts.empty() && rig.tg.toasts.back().alert,
+              "cbDl cancel 404: error toast (alert)");
+    }
+    {
+        Rig rig;
+        rig.ipc.library_delete_response =
+            R"({"deleted":true,"id":"track123"})";
+        rig.d.handleCallback(makeCq("pl:del:yes:track123"));
+        CHECK(has_post(rig, "library.delete"),
+              "cbDel yes: library.delete POST issued");
+        CHECK(!rig.tg.toasts.empty() &&
+                  rig.tg.toasts.back().text ==
+                      parlay::ui_texts::kToastDelDeleted,
+              "cbDel yes: Deleted toast");
+        CHECK(rig.tg.deleted.size() == 1 &&
+                  rig.tg.deleted[0].second == 7,
+              "cbDel yes: confirm card deleted");
+    }
+    {
+        // Backend 404 (unknown id): exact backend error, card stays.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:del:yes:track123"));
+        CHECK(has_post(rig, "library.delete"),
+              "cbDel yes 404: library.delete POST issued");
+        CHECK(!rig.tg.toasts.empty() && rig.tg.toasts.back().alert,
+              "cbDel yes 404: error toast (alert)");
+        CHECK(rig.tg.deleted.empty(),
+              "cbDel yes 404: confirm card kept");
     }
 
     // cbSpotify details/analyze (E8).

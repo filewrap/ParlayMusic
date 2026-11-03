@@ -8,18 +8,20 @@ import (
 
 	"parlay/backend-go/internal/app"
 	"parlay/backend-go/internal/model"
+	"parlay/backend-go/internal/room"
 	"parlay/backend-go/internal/store"
 	"parlay/backend-go/internal/uds"
 )
 
-func testService(t *testing.T) (*Service, *store.Store) {
+func testService(t *testing.T) (*Service, *store.Store, *room.Manager) {
 	t.Helper()
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return &Service{store: st, files: map[string]fileRecord{}}, st
+	rooms := room.NewManager(st, 0)
+	return &Service{rooms: rooms, files: map[string]fileRecord{}}, st, rooms
 }
 
 func testInputFile(t *testing.T) string {
@@ -32,7 +34,7 @@ func testInputFile(t *testing.T) string {
 }
 
 func TestApplyRecordOnly(t *testing.T) {
-	svc, st := testService(t)
+	svc, st, _ := testService(t)
 	in := testInputFile(t)
 	payload, _ := json.Marshal(map[string]any{
 		"effect": "nightcore", "input_path": in, "chat_id": -100,
@@ -65,7 +67,7 @@ func TestApplyRecordOnly(t *testing.T) {
 }
 
 func TestApplyOriginalIsNoop(t *testing.T) {
-	svc, _ := testService(t)
+	svc, _, _ := testService(t)
 	in := testInputFile(t)
 	payload, _ := json.Marshal(map[string]any{"effect": "original", "input_path": in})
 	data, err := svc.handleApply(t.Context(), uds.Request{Payload: payload})
@@ -79,7 +81,7 @@ func TestApplyOriginalIsNoop(t *testing.T) {
 }
 
 func TestApplyValidation(t *testing.T) {
-	svc, _ := testService(t)
+	svc, _, _ := testService(t)
 	in := testInputFile(t)
 	cases := []map[string]any{
 		{"effect": "flanger", "input_path": in},
@@ -100,7 +102,7 @@ func TestApplyValidation(t *testing.T) {
 }
 
 func TestApplyAllEffects(t *testing.T) {
-	svc, _ := testService(t)
+	svc, _, _ := testService(t)
 	in := testInputFile(t)
 	for _, effect := range []string{"slow-reverb", "nightcore", "bass-boost", "8d", "original"} {
 		payload, _ := json.Marshal(map[string]any{"effect": effect, "input_path": in})
@@ -126,6 +128,103 @@ func TestRegisterDoesNotPanic(t *testing.T) {
 	}
 	defer st.Close()
 	server := uds.NewServer(t.TempDir() + "/s.sock")
-	Register(server, &app.Deps{Store: st})
+	Register(server, &app.Deps{Store: st, Room: room.NewManager(st, 0)})
 	_ = model.DefaultRoomState
+}
+
+// TestApplySurvivesRestart is the Phase 4 persistence proof: an
+// fx.apply survives a store close + reopen and a fresh Manager
+// Restore — the preset and params come back both from the
+// Manager's read seam (Manager.FX, the seam the Phase 5 DSP will
+// use) and from the raw bbolt record.
+func TestApplySurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	rooms := room.NewManager(st, 0)
+	svc := &Service{rooms: rooms, files: map[string]fileRecord{}}
+	in := testInputFile(t)
+	payload, _ := json.Marshal(map[string]any{
+		"effect": "nightcore", "input_path": in, "chat_id": -100,
+		"params": map[string]float64{"rate": 1.25},
+	})
+	if _, err := svc.handleApply(t.Context(), uds.Request{ChatID: -100, Payload: payload}); err != nil {
+		t.Fatalf("fx.apply: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	st2, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("store reopen: %v", err)
+	}
+	defer st2.Close()
+	// The raw bbolt record survived the restart.
+	raw, found, err := st2.GetRoom(-100)
+	if err != nil || !found {
+		t.Fatalf("reopened store room: found=%v err=%v", found, err)
+	}
+	if raw.FXPreset != "nightcore" || raw.FXParams["rate"] != 1.25 {
+		t.Fatalf("reopened store room fx = %q %v", raw.FXPreset, raw.FXParams)
+	}
+	// And a fresh Manager restores it into the live seam.
+	rooms2 := room.NewManager(st2, 0)
+	if err := rooms2.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	effect, params, ok := rooms2.FX(-100)
+	if !ok || effect != "nightcore" || params["rate"] != 1.25 {
+		t.Fatalf("restored Manager FX = %q %v ok=%v", effect, params, ok)
+	}
+}
+
+// TestApplyDoesNotClobberLiveRoom pins the exact staleness shape
+// the Phase 3 audit flagged: fx writing the store directly was
+// invisible to the Manager, so the next Manager mutation persisted
+// the in-memory copy and clobbered the FX fields. With the fix,
+// fx.apply on a playing room leaves the live track intact, the FX
+// visible through the Manager, and a later Manager mutation
+// (Pause → persist) still leaves the FX in the store.
+func TestApplyDoesNotClobberLiveRoom(t *testing.T) {
+	svc, st, rooms := testService(t)
+	track := model.Track{ID: "yt:a", Title: "A", DurationSec: 300}
+	if _, err := rooms.Play(-100, track, 7); err != nil {
+		t.Fatalf("rooms.Play: %v", err)
+	}
+	in := testInputFile(t)
+	payload, _ := json.Marshal(map[string]any{
+		"effect": "bass-boost", "input_path": in, "chat_id": -100,
+		"params": map[string]float64{"gain": 6},
+	})
+	if _, err := svc.handleApply(t.Context(), uds.Request{ChatID: -100, Payload: payload}); err != nil {
+		t.Fatalf("fx.apply: %v", err)
+	}
+	// The live room is untouched by the apply.
+	snap, ok := rooms.Snapshot(-100)
+	if !ok || snap.Track == nil || snap.Track.ID != "yt:a" {
+		t.Fatalf("snapshot after fx.apply: %+v ok=%v", snap, ok)
+	}
+	// The FX is visible through the Manager seam immediately.
+	effect, params, ok := rooms.FX(-100)
+	if !ok || effect != "bass-boost" || params["gain"] != 6 {
+		t.Fatalf("Manager FX after apply = %q %v ok=%v", effect, params, ok)
+	}
+	// A later Manager mutation persists the room — and must NOT
+	// clobber the FX (this is the assertion the old direct-write
+	// code failed: Pause persisted the pre-fx in-memory copy).
+	if _, err := rooms.Pause(-100); err != nil {
+		t.Fatalf("rooms.Pause: %v", err)
+	}
+	stored, found, err := st.GetRoom(-100)
+	if err != nil || !found {
+		t.Fatalf("store room after Pause: found=%v err=%v", found, err)
+	}
+	if stored.FXPreset != "bass-boost" || stored.FXParams["gain"] != 6 {
+		t.Fatalf("store room fx after Pause = %q %v (fx clobbered by Manager persist)", stored.FXPreset, stored.FXParams)
+	}
+	if stored.Current == nil || stored.Current.ID != "yt:a" {
+		t.Fatalf("store room current after Pause = %+v (fx clobbered the live track)", stored.Current)
+	}
 }

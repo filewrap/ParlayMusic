@@ -59,9 +59,9 @@ Wire spec: `contracts/uds-protocol.md`.
   HTTP, no per-call subprocess, no `/healthz` polling, no
   `X-Parlay-Token` header. The backend creates and listens on the
   socket; the core connects (reconnects with backoff if it drops).
-  UDS round-trip median 142 µs (Phase 2). `ipc.json` is frozen as the
-  parity reference for request/response shapes; the HTTP wire protocol
-  it describes is deleted.
+  UDS round-trip median 142 µs (Phase 2). `ipc.json` is the live
+  contract for request/response shapes (retargeted to the unified
+  backend in Phase 4); the HTTP wire protocol it described is deleted.
 - **Auth:** `PARLAY_TOKEN` is still required for the core to start
   (`missingRequired()` also requires `BOT_TOKEN`), but it is no longer
   sent per call — there is no HTTP header anymore. The socket lives

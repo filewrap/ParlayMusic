@@ -128,6 +128,7 @@ func (h *Handlers) vcPlay(ctx context.Context, req uds.Request) (any, error) {
 	h.applyMuteIfNeeded(chatID)
 	h.events.TrackStarted(chatID, track)
 	snap, _ = h.rooms.Snapshot(chatID)
+	h.maybePrefetch(chatID, snap)
 	return map[string]any{
 		"now_playing": snap, "queued": false,
 		"resolved_by": track.Source,
@@ -232,6 +233,7 @@ func (h *Handlers) vcStop(ctx context.Context, req uds.Request) (any, error) {
 		return nil, mapRoomErr(err)
 	}
 	h.clearFeeding(chatID)
+	h.prefetchCancel(chatID)
 	if _, ok := h.deps.Voice.Get(chatID); ok {
 		if verr := h.deps.Voice.Stop(chatID); verr != nil {
 			log.Printf("handlers: vc.stop leave call chat %d: %v", chatID, verr)
@@ -476,6 +478,7 @@ func (h *Handlers) vcAutoplaySkip(ctx context.Context, req uds.Request) (any, er
 	h.applyMuteIfNeeded(chatID)
 	h.events.TrackStarted(chatID, pick)
 	snap, _ = h.rooms.Snapshot(chatID)
+	h.maybePrefetch(chatID, snap)
 	return nowPlayingResp(snap), nil
 }
 

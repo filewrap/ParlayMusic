@@ -51,8 +51,9 @@ no subprocess per call. See [FINAL-ARCHITECTURE.md](FINAL-ARCHITECTURE.md)
 The core and the backend talk over one persistent Unix Domain Socket,
 `data/parlay-backend.sock` (length-prefixed binary frames carrying JSON
 envelopes, `contracts/uds-protocol.md`). The contract is
-`contracts/ipc.json` v0.3.1 — **65 actions** (56 + 9 OD-3) — frozen as
-the parity reference for request/response shapes; the transport is UDS,
+`contracts/ipc.json` v0.3.1 — **65 actions** (56 + 9 OD-3) — the live
+contract for request/response shapes, retargeted to the unified
+backend in Phase 4; the transport is UDS,
 not HTTP. See [ARCHITECTURE.md](ARCHITECTURE.md) and
 [PORT_MAP.md](PORT_MAP.md).
 

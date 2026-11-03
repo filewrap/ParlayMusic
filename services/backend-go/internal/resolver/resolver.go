@@ -150,6 +150,13 @@ type Registry struct {
 	resolvers   map[Source]Resolver
 	downloaders map[Source]Downloader
 	ytdlp       *YtDlpClient
+	cache       *Cache
+	// Typed handles for the resolvers Configure() wires [backend]
+	// values into (Q10); the map above is the dispatch table.
+	deezer    *DeezerResolver
+	navidrome *NavidromeResolver
+	soulseek  *SoulseekResolver
+	netease   *NetEaseResolver
 }
 
 // NewRegistry builds the full resolver set. The yt-dlp daemon client
@@ -170,6 +177,10 @@ func NewRegistry() *Registry {
 	nv := NewNavidromeResolver()
 	sl := NewSoulseekResolver()
 	rd := NewRadioResolver()
+	r.deezer = dz
+	r.navidrome = nv
+	r.soulseek = sl
+	r.netease = ne
 	for _, res := range []Resolver{yt, js, dz, ne, sp, tt, nv, sl, rd} {
 		r.resolvers[res.Source()] = res
 	}
@@ -191,22 +202,11 @@ func NewRegistry() *Registry {
 // YtDlp returns the shared persistent yt-dlp daemon client.
 func (r *Registry) YtDlp() *YtDlpClient { return r.ytdlp }
 
-// Close stops the persistent yt-dlp daemon if it was started.
-func (r *Registry) Close() error {
-	if r.ytdlp != nil {
-		return r.ytdlp.Close()
-	}
-	return nil
-}
-
-// ResolverFor returns the resolver for a source, or an honest error.
-func (r *Registry) ResolverFor(src Source) (Resolver, error) {
-	res, ok := r.resolvers[src]
-	if !ok {
-		return nil, engineUnavailable(src, "no resolver registered for source %q", src)
-	}
-	return res, nil
-}
+// SetCache installs the TTL-aware resolved-track cache (nil
+// disables caching). main.go installs it once at boot, after the
+// store opens; a Registry without a cache resolves every query
+// live, exactly as Phase 3 did.
+func (r *Registry) SetCache(c *Cache) { r.cache = c }
 
 // Resolve dispatches a play query to the right resolver by shape,
 // mirroring vc-rust classify_query_source plus the source-prefixed
@@ -222,16 +222,70 @@ func (r *Registry) ResolverFor(src Source) (Resolver, error) {
 //	radio:<ref>     -> radio (station id/name or raw stream URL)
 //	soulseek:<query>-> soulseek
 //	anything else   -> youtube search
+//
+// When a cache is installed, a direct query (URL or id) checks it
+// first: a hit returns the cached track without touching the
+// network, and a miss stores the resolved track afterwards (only
+// cacheable entries — resolved stream URLs with a known expiry).
+// Free-text queries skip the lookup (no stable key) but still
+// store their result under the resolved track's key.
 func (r *Registry) Resolve(ctx context.Context, query string) (Track, error) {
 	start := time.Now()
+	if r.cache != nil {
+		if key, ok := CacheKeyForQuery(query); ok {
+			if track, hit := r.cache.Get(key); hit {
+				LogResolve(ClassifyQuery(query), start, nil)
+				return track, nil
+			}
+		}
+	}
 	src := ClassifyQuery(query)
 	res, err := r.ResolverFor(src)
 	if err != nil {
+		LogResolve(src, start, err)
 		return Track{}, err
 	}
 	track, err := res.Resolve(ctx, query)
+	if err == nil && r.cache != nil {
+		r.cache.Put(track)
+	}
 	LogResolve(src, start, err)
 	return track, err
+}
+
+// ResolveTrack re-resolves a known track (the prefetch path): the
+// cache is checked first, and on a miss the track is re-resolved
+// from its own URL / source-prefixed id, which yields a fresh
+// stream URL when the queued copy has expired. A track with no
+// re-resolvable form (soulseek, radio, file) is an honest error.
+func (r *Registry) ResolveTrack(ctx context.Context, track Track) (Track, error) {
+	if r.cache != nil {
+		if t, hit := r.cache.Get(CacheKeyForTrack(track)); hit {
+			return t, nil
+		}
+	}
+	q, err := resolveQueryFor(track)
+	if err != nil {
+		return Track{}, err
+	}
+	return r.Resolve(ctx, q)
+}
+
+// Close stops the persistent yt-dlp daemon if it was started.
+func (r *Registry) Close() error {
+	if r.ytdlp != nil {
+		return r.ytdlp.Close()
+	}
+	return nil
+}
+
+// ResolverFor returns the resolver for a source, or an honest error.
+func (r *Registry) ResolverFor(src Source) (Resolver, error) {
+	res, ok := r.resolvers[src]
+	if !ok {
+		return nil, engineUnavailable(src, "no resolver registered for source %q", src)
+	}
+	return res, nil
 }
 
 // Search dispatches a search to one source (or all resolvers that
@@ -437,18 +491,18 @@ func SanitizeFilename(name string) string {
 	return s
 }
 
-// DataDir returns the Parlay data directory (PARLAY_DATA_DIR, or
-// ~/.local/share/parlay). Download targets live under
+// DataDir returns the Parlay data directory: $PARLAY_DATA_DIR,
+// else "data" (the repo-relative default, matching
+// config.Backend.DataDir and the core's PARLAY_DATA_DIR/data —
+// Q12: the old ~/.local/share/parlay fallback split resolver
+// downloads away from the store, the socket and every other
+// download into a second root). Download targets live under
 // <PARLAY_DATA_DIR>/downloads/.
 func DataDir() string {
 	if d := strings.TrimSpace(os.Getenv("PARLAY_DATA_DIR")); d != "" {
 		return d
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".", "data")
-	}
-	return filepath.Join(home, ".local", "share", "parlay")
+	return "data"
 }
 
 // DefaultDownloadDir is <PARLAY_DATA_DIR>/downloads/.

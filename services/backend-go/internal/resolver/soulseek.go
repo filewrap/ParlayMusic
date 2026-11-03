@@ -76,7 +76,11 @@ func envInt(name string, def int) int {
 
 // SoulseekResolver resolves/downloads via slskd.
 type SoulseekResolver struct {
-	mu                sync.Mutex
+	mu sync.Mutex
+	// baseURL is the slskd base URL wired from [backend] slskd_url
+	// by Registry.Configure (Q10); empty means "read $SLSKD_URL /
+	// $SLSKD_HOST directly", the Phase 3 behaviour.
+	baseURL           string
 	nextSearchAt      time.Time
 	zeroStreak        int
 	zeroVerifiedUntil time.Time
@@ -88,7 +92,14 @@ func NewSoulseekResolver() *SoulseekResolver { return &SoulseekResolver{} }
 // Source implements Resolver.
 func (s *SoulseekResolver) Source() Source { return SourceSoulseek }
 
-func slskdBaseURL() string {
+// slskdBaseURL returns the slskd base URL: the [backend]
+// slskd_url value when Registry.Configure set one, else $SLSKD_URL
+// / $SLSKD_HOST, else the local default (Q10 — the file key now
+// does what the env var did).
+func (s *SoulseekResolver) slskdBaseURL() string {
+	if s.baseURL != "" {
+		return s.baseURL
+	}
 	if v := strings.TrimSpace(os.Getenv("SLSKD_URL")); v != "" {
 		return strings.TrimRight(v, "/")
 	}
@@ -118,7 +129,7 @@ func slskdDownloadTimeout() time.Duration {
 
 // slskdRequest performs one slskd API call. A transport failure
 // maps to the honest "slskd unreachable" error.
-func slskdRequest(ctx context.Context, method, path string, payload any) (json.RawMessage, int, error) {
+func (s *SoulseekResolver) slskdRequest(ctx context.Context, method, path string, payload any) (json.RawMessage, int, error) {
 	var body []byte
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -127,7 +138,7 @@ func slskdRequest(ctx context.Context, method, path string, payload any) (json.R
 		}
 		body = b
 	}
-	req, err := http.NewRequestWithContext(ctx, method, slskdBaseURL()+"/api/v0"+path, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, method, s.slskdBaseURL()+"/api/v0"+path, strings.NewReader(string(body)))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -141,7 +152,7 @@ func slskdRequest(ctx context.Context, method, path string, payload any) (json.R
 	resp, err := httpClient(slskdTimeout()).Do(req)
 	if err != nil {
 		return nil, 0, &EngineUnavailable{Source: SourceSoulseek,
-			Why: fmt.Sprintf("slskd unreachable at %s (%v)", slskdBaseURL(), err)}
+			Why: fmt.Sprintf("slskd unreachable at %s (%v)", s.slskdBaseURL(), err)}
 	}
 	defer resp.Body.Close()
 	raw := readAllLimit(resp.Body, 32<<20)
@@ -162,8 +173,8 @@ func (e *slskdHTTPError) Error() string {
 
 // slskdAvailable reports whether slskd answers at all (any HTTP
 // response — even an auth error — counts as "the daemon is there").
-func slskdAvailable(ctx context.Context) bool {
-	_, _, err := slskdRequest(ctx, http.MethodGet, "/application", nil)
+func (s *SoulseekResolver) slskdAvailable(ctx context.Context) bool {
+	_, _, err := s.slskdRequest(ctx, http.MethodGet, "/application", nil)
 	if err == nil {
 		return true
 	}
@@ -235,9 +246,9 @@ func (s *SoulseekResolver) Search(ctx context.Context, query string, limit int) 
 // dir (copied into destDir when it differs).
 func (s *SoulseekResolver) Download(ctx context.Context, track Track, destDir string, onProgress ProgressFunc) (DownloadResult, error) {
 	runID := NewRunID()
-	if !slskdAvailable(ctx) {
+	if !s.slskdAvailable(ctx) {
 		return DownloadResult{}, &EngineUnavailable{Source: SourceSoulseek,
-			Why: fmt.Sprintf("slskd unreachable at %s", slskdBaseURL())}
+			Why: fmt.Sprintf("slskd unreachable at %s", s.slskdBaseURL())}
 	}
 	acceptLossy := false
 	candidates, err := s.searchAndScore(ctx, track.Artist+" "+track.Title, track.Artist, track.Title, int(track.DurationSec), acceptLossy)
@@ -341,9 +352,9 @@ func (f slskdFile) IsLossless() bool { return f.Extension() == "flac" }
 // searchAndScore runs one slskd search and returns scored,
 // match-floor-filtered candidates (best first, copies grouped).
 func (s *SoulseekResolver) searchAndScore(ctx context.Context, query, artist, title string, durationSec int, acceptLossy bool) ([]scoredTrack, error) {
-	if !slskdAvailable(ctx) {
+	if !s.slskdAvailable(ctx) {
 		return nil, &EngineUnavailable{Source: SourceSoulseek,
-			Why: fmt.Sprintf("slskd unreachable at %s", slskdBaseURL())}
+			Why: fmt.Sprintf("slskd unreachable at %s", s.slskdBaseURL())}
 	}
 	responses, err := s.search(ctx, query, 20, 200)
 	if err != nil {
@@ -373,7 +384,7 @@ func (s *SoulseekResolver) search(ctx context.Context, query string, timeoutSecs
 	searchID := newUUID()
 	var state map[string]any
 	for _, backoff := range append(append([]float64{}, slskd429Backoffs...), -1) {
-		raw, _, rerr := slskdRequest(ctx, http.MethodPost, "/searches", map[string]any{
+		raw, _, rerr := s.slskdRequest(ctx, http.MethodPost, "/searches", map[string]any{
 			"id": searchID, "searchText": query,
 			"searchTimeout": timeoutSecs * 1000, "responseLimit": responseLimit,
 			"fileLimit": 10000, "filterResponses": true,
@@ -415,7 +426,7 @@ func (s *SoulseekResolver) search(ctx context.Context, query string, timeoutSecs
 			return nil, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
-		raw, _, rerr := slskdRequest(ctx, http.MethodGet, "/searches/"+url.PathEscape(searchID), nil)
+		raw, _, rerr := s.slskdRequest(ctx, http.MethodGet, "/searches/"+url.PathEscape(searchID), nil)
 		if rerr != nil {
 			continue
 		}
@@ -436,14 +447,14 @@ func (s *SoulseekResolver) search(ctx context.Context, query string, timeoutSecs
 		}
 	}
 	// Force a flush so /responses populates.
-	_, _, _ = slskdRequest(ctx, http.MethodPut, "/searches/"+url.PathEscape(searchID), nil)
+	_, _, _ = s.slskdRequest(ctx, http.MethodPut, "/searches/"+url.PathEscape(searchID), nil)
 	for i := 0; i < 8; i++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(250 * time.Millisecond):
 		}
-		raw, _, rerr := slskdRequest(ctx, http.MethodGet, "/searches/"+url.PathEscape(searchID), nil)
+		raw, _, rerr := s.slskdRequest(ctx, http.MethodGet, "/searches/"+url.PathEscape(searchID), nil)
 		if rerr != nil {
 			break
 		}
@@ -455,11 +466,11 @@ func (s *SoulseekResolver) search(ctx context.Context, query string, timeoutSecs
 		}
 	}
 	var responses []slskdSearchResponse
-	raw, _, rerr := slskdRequest(ctx, http.MethodGet, "/searches/"+url.PathEscape(searchID)+"/responses", nil)
+	raw, _, rerr := s.slskdRequest(ctx, http.MethodGet, "/searches/"+url.PathEscape(searchID)+"/responses", nil)
 	if rerr == nil {
 		_ = json.Unmarshal(raw, &responses)
 	}
-	_, _, _ = slskdRequest(ctx, http.MethodDelete, "/searches/"+url.PathEscape(searchID), nil)
+	_, _, _ = s.slskdRequest(ctx, http.MethodDelete, "/searches/"+url.PathEscape(searchID), nil)
 	return responses, nil
 }
 
@@ -784,7 +795,7 @@ func (s *SoulseekResolver) enqueue(ctx context.Context, username string, files [
 	for _, f := range files {
 		payload = append(payload, map[string]any{"filename": f.Filename, "size": f.Size})
 	}
-	_, _, err := slskdRequest(ctx, http.MethodPost, "/transfers/downloads/"+url.PathEscape(username), payload)
+	_, _, err := s.slskdRequest(ctx, http.MethodPost, "/transfers/downloads/"+url.PathEscape(username), payload)
 	return err
 }
 
@@ -851,7 +862,7 @@ func (s *SoulseekResolver) waitForFile(ctx context.Context, username, filename, 
 
 // getDownloads returns the flattened download rows for a user.
 func (s *SoulseekResolver) getDownloads(ctx context.Context, username string) ([]map[string]any, error) {
-	raw, _, err := slskdRequest(ctx, http.MethodGet, "/transfers/downloads/"+url.PathEscape(username), nil)
+	raw, _, err := s.slskdRequest(ctx, http.MethodGet, "/transfers/downloads/"+url.PathEscape(username), nil)
 	if err != nil {
 		return nil, err
 	}

@@ -34,7 +34,7 @@ import (
 // false, error: "wrong credentials"}; server unreachable -> 502
 // engine_unavailable "Library scan failed."
 func (s *Service) handleScan(ctx context.Context, _ uds.Request) (any, error) {
-	client, err := newSubsonicClient()
+	client, err := s.newSubsonicClient()
 	if err != nil {
 		// Env unset: the inventory's not-configured 200.
 		return map[string]any{"triggered": false, "error": "not configured"}, nil
@@ -70,10 +70,26 @@ type subsonicClient struct {
 	http     *http.Client
 }
 
-func newSubsonicClient() (*subsonicClient, error) {
-	base := strings.TrimRight(strings.TrimSpace(os.Getenv("NAVIDROME_URL")), "/")
-	user := os.Getenv("NAVIDROME_USER")
-	password := os.Getenv("NAVIDROME_PASSWORD")
+// newSubsonicClient builds the scan client from the effective
+// [backend] navidrome_* values when the service has config (Q10 —
+// the file keys now do what the env vars did), else the
+// NAVIDROME_URL / NAVIDROME_USER / NAVIDROME_PASSWORD env vars.
+func (s *Service) newSubsonicClient() (*subsonicClient, error) {
+	base, user, password := "", "", ""
+	if s.deps != nil && s.deps.Config != nil {
+		base = strings.TrimRight(strings.TrimSpace(s.deps.Config.Backend.NavidromeURL), "/")
+		user = s.deps.Config.Backend.NavidromeUser
+		password = s.deps.Config.Backend.NavidromePass
+	}
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(os.Getenv("NAVIDROME_URL")), "/")
+	}
+	if user == "" {
+		user = os.Getenv("NAVIDROME_USER")
+	}
+	if password == "" {
+		password = os.Getenv("NAVIDROME_PASSWORD")
+	}
 	var missing []string
 	if base == "" {
 		missing = append(missing, "NAVIDROME_URL")

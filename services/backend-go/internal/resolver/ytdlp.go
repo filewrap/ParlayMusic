@@ -18,7 +18,8 @@
 // The worker python is located as: $PARLAY_YTDLP_PYTHON, else the
 // yt-dlp venv python (scripts/yt-dlp-venv/bin/python — moved there
 // with the Phase 3 service deletions, next to the worker script it
-// runs; found by walking up from the working directory), else
+// runs; found by walking up from the working directory and the
+// executable directory, never a hardcoded user home), else
 // python3 — and in every case the python must import yt_dlp (system
 // python3 does NOT have it; the venv does, yt-dlp 2026.10.26).
 package resolver
@@ -64,19 +65,35 @@ func NewYtDlpClient() *YtDlpClient {
 	return &YtDlpClient{pending: map[int64]chan rpcResponse{}}
 }
 
-// findYtDlpPython locates a python with yt_dlp importable.
-func findYtDlpPython() (string, error) {
-	if p := strings.TrimSpace(os.Getenv("PARLAY_YTDLP_PYTHON")); p != "" {
-		return p, nil
+// candidateRoots returns the directories to walk up from when
+// locating repo files: the working directory first, then the
+// backend executable's directory. The binary lives in <repo>/bin
+// (repo layout) or <repo>/services/backend-go (go run), so the
+// repo root — and its scripts/ — is an ancestor of the exe dir in
+// every supported layout, including the VPS tarball (where the CWD
+// walk-up alone fails). No hardcoded user home is ever consulted:
+// the old absolute home fallback silently degraded to system
+// python3 (no yt_dlp) on any other host.
+func candidateRoots() []string {
+	var roots []string
+	if wd, err := os.Getwd(); err == nil {
+		roots = append(roots, wd)
 	}
-	// Walk up from the working directory looking for the
-	// yt-dlp venv python.
-	dir, err := os.Getwd()
-	if err == nil {
+	if exe, err := os.Executable(); err == nil {
+		roots = append(roots, filepath.Dir(exe))
+	}
+	return roots
+}
+
+// walkUp looks for rel (relative to each candidate root, walking
+// up to the filesystem root) and returns the first existing file.
+func walkUp(rel string) string {
+	for _, root := range candidateRoots() {
+		dir := root
 		for {
-			cand := filepath.Join(dir, "scripts", "yt-dlp-venv", "bin", "python")
+			cand := filepath.Join(dir, rel)
 			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-				return cand, nil
+				return cand
 			}
 			parent := filepath.Dir(dir)
 			if parent == dir {
@@ -85,13 +102,20 @@ func findYtDlpPython() (string, error) {
 			dir = parent
 		}
 	}
-	// Repo-relative fallback for the sandbox layout.
-	for _, cand := range []string{
-		"/home/hatch/workspace/parlay/scripts/yt-dlp-venv/bin/python",
-	} {
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			return cand, nil
-		}
+	return ""
+}
+
+// findYtDlpPython locates a python with yt_dlp importable.
+func findYtDlpPython() (string, error) {
+	if p := strings.TrimSpace(os.Getenv("PARLAY_YTDLP_PYTHON")); p != "" {
+		return p, nil
+	}
+	// The yt-dlp venv python (scripts/yt-dlp-venv/bin/python —
+	// moved there with the Phase 3 service deletions, next to the
+	// worker script it runs; found by walking up from the working
+	// directory and the executable directory).
+	if cand := walkUp(filepath.Join("scripts", "yt-dlp-venv", "bin", "python")); cand != "" {
+		return cand, nil
 	}
 	return "python3", nil
 }
@@ -101,19 +125,8 @@ func findWorkerScript() (string, error) {
 	if p := strings.TrimSpace(os.Getenv("PARLAY_YTDLP_WORKER")); p != "" {
 		return p, nil
 	}
-	dir, err := os.Getwd()
-	if err == nil {
-		for {
-			cand := filepath.Join(dir, "scripts", "yt_dlp_worker.py")
-			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-				return cand, nil
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
+	if cand := walkUp(filepath.Join("scripts", "yt_dlp_worker.py")); cand != "" {
+		return cand, nil
 	}
 	return "", fmt.Errorf("yt-dlp worker script not found (set PARLAY_YTDLP_WORKER or run from the parlay repo)")
 }

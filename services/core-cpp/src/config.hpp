@@ -144,31 +144,18 @@ struct Config {
     int64_t api_id = 0;       // API_ID (MTProto, reserved for the voice path)
     std::string api_hash;     // API_HASH (MTProto, reserved for the voice path)
 
-    // Shared state: Store (MongoDB wire protocol > Redis RESP > JSON
-    // file — see store.hpp). Mongo/Redis are live backends when
-    // MONGO_URI / REDIS_URL are set, not "later wiring".
-    std::string mongo_uri;    // MONGO_URI
-    std::string redis_url;    // REDIS_URL
+    // Shared state: the JSON-file Store (see store.hpp) is the
+    // core's only durable store. There are no database backends
+    // (the old database env vars were deleted in Phase 4, Q1) — the
+    // backend's bbolt store is the single home for shared state.
 
-    // IPC auth shared with every service (contracts/ipc.json).
+    // IPC auth shared with the backend (contracts/ipc.json).
     std::string parlay_token;  // PARLAY_TOKEN
 
-    // IPC service base URLs (defaults match the deleted docker-compose
-    // topology). NOTE: all 10 HTTP services are deleted by the locked
-    // architecture (Phase 3); the UDS IpcClient ignores these URLs
-    // (signature compat only — see ipc.cpp). The fields are dead and
-    // kept only until the 26 dispatcher call sites are re-pointed at
-    // the no-URL helpers; they are NOT in parlay.toml.
-    std::string vc_go_url = "http://vc-go:8001";       // VC_GO_URL
-    std::string vc_ts_url = "http://vc-ts:8002";       // VC_TS_URL
-    std::string vc_rust_url = "http://vc-rust:8003";   // VC_RUST_URL
-    std::string fx_url = "http://audio-fx-rust:8004";  // FX_URL
-    std::string share_url = "http://share-rust:8005";  // SHARE_URL
-    std::string queue_url = "http://queue-rust:8006";  // QUEUE_URL
-    std::string spotify_url = "http://spotify-rust:8007";  // SPOTIFY_URL
-    std::string radio_url = "http://radio-js:8008";    // RADIO_URL
-    std::string dl_url = "http://downloaders:8009";    // DL_URL / DOWNLOADERS_URL
-    std::string netease_url = "http://netease-go:8010";  // NETEASE_URL
+    // UDS socket to the unified backend. Empty = default
+    // <data_dir>/parlay-backend.sock. Set from parlay.toml [ipc]
+    // socket_path, or from the PARLAY_UDS_PATH env var (env wins).
+    std::string ipc_socket_path;  // [ipc] socket_path / PARLAY_UDS_PATH
 
     int port = 8080;  // PORT — core HTTP port (GUI /api surface, Phase 6 A2)
 

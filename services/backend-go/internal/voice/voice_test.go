@@ -1,10 +1,13 @@
 package voice
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -347,6 +350,52 @@ func TestFeedEndToEnd(t *testing.T) {
 	// 2 s of audio is 200 ten-millisecond frames; allow a small
 	// shortfall for the trailing partial frame and scheduling.
 	t.Logf("feed sent %d frames for a 2s tone (expect ~200)", sent)
+	if sent < 180 || sent > 220 {
+		t.Errorf("frames sent = %d, want ~200 for 2s of audio", sent)
+	}
+}
+
+// TestFeedFromReaderEndToEnd proves the Phase 4 prefetch feed
+// path: ffmpeg decodes from a stdin reader (the PrebufferedStream
+// reader) instead of a URL/file, pushes the same 10 ms frames to
+// ntgcalls, and ends cleanly at EOF. The reader here is a tone
+// file's bytes — the same bytes the prefetch reader yields (buffered
+// prefix first, then the live body).
+func TestFeedFromReaderEndToEnd(t *testing.T) {
+	c := newTestClient(t)
+	chatID := int64(-1001234567897)
+	if _, err := c.CreateCall(chatID); err != nil {
+		t.Fatalf("CreateCall failed: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Stop(chatID) })
+	if err := c.SetExternalAudioSource(chatID); err != nil {
+		t.Fatalf("SetExternalAudioSource failed: %v", err)
+	}
+	tone := makeTone(t, 2)
+	data, err := os.ReadFile(tone)
+	if err != nil {
+		t.Fatalf("read tone: %v", err)
+	}
+	ended := make(chan error, 1)
+	feed, err := startFFmpegFeedFromReader(context.Background(), c, chatID, io.NopCloser(bytes.NewReader(data)), func(feedErr error) {
+		ended <- feedErr
+	})
+	if err != nil {
+		t.Fatalf("startFFmpegFeedFromReader failed: %v", err)
+	}
+	t.Cleanup(feed.Stop)
+	select {
+	case feedErr := <-ended:
+		if feedErr != nil {
+			t.Fatalf("feed ended with an error: %v", feedErr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("feed did not reach end of stream within 15s (frames sent: %d)", feed.FramesSent())
+	}
+	sent := feed.FramesSent()
+	// 2 s of audio is 200 ten-millisecond frames; allow a small
+	// shortfall for the trailing partial frame and scheduling.
+	t.Logf("stdin feed sent %d frames for a 2s tone (expect ~200)", sent)
 	if sent < 180 || sent > 220 {
 		t.Errorf("frames sent = %d, want ~200 for 2s of audio", sent)
 	}

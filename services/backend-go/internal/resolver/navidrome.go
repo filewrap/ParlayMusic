@@ -36,6 +36,10 @@ import (
 type NavidromeResolver struct {
 	mu       sync.Mutex
 	authMode string // "token" | "password"; sticky per process
+	// Endpoint wired from [backend] navidrome_url / navidrome_user /
+	// navidrome_pass by Registry.Configure (Q10); empty means "read
+	// the NAVIDROME_* env vars directly", the Phase 3 behaviour.
+	base, user, password string
 }
 
 // NewNavidromeResolver builds a Navidrome resolver.
@@ -46,12 +50,27 @@ func NewNavidromeResolver() *NavidromeResolver {
 // Source implements Resolver.
 func (n *NavidromeResolver) Source() Source { return SourceNavidrome }
 
-// navidromeEnv returns (base, user, password) or the honest
-// missing-config error naming every missing var.
-func navidromeEnv() (string, string, string, error) {
-	base := strings.TrimRight(strings.TrimSpace(os.Getenv("NAVIDROME_URL")), "/")
-	user := os.Getenv("NAVIDROME_USER")
-	password := os.Getenv("NAVIDROME_PASSWORD")
+// endpoints returns (base, user, password) or the honest
+// missing-config error naming every missing var. The [backend]
+// navidrome_* values win when Registry.Configure set them; else
+// the NAVIDROME_URL / NAVIDROME_USER / NAVIDROME_PASSWORD env vars
+// are read (Q10 — the file keys now do what the env vars did).
+// Note the name trap the audit found: the env var is
+// NAVIDROME_PASSWORD, while config's legacy alias is
+// NAVIDROME_PASS; the resolver only ever reads NAVIDROME_PASSWORD.
+func (n *NavidromeResolver) endpoints() (string, string, string, error) {
+	base := n.base
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(os.Getenv("NAVIDROME_URL")), "/")
+	}
+	user := n.user
+	if user == "" {
+		user = os.Getenv("NAVIDROME_USER")
+	}
+	password := n.password
+	if password == "" {
+		password = os.Getenv("NAVIDROME_PASSWORD")
+	}
 	var missing []string
 	if base == "" {
 		missing = append(missing, "NAVIDROME_URL")
@@ -89,7 +108,7 @@ func (n *NavidromeResolver) authParams(user, password string) map[string]string 
 // On 401/403 in token mode it flips to password mode (sticky) and
 // retries once.
 func (n *NavidromeResolver) call(ctx context.Context, path string, params map[string]string) ([]byte, error) {
-	base, user, password, err := navidromeEnv()
+	base, user, password, err := n.endpoints()
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +294,7 @@ func (n *NavidromeResolver) songToTrack(ctx context.Context, song map[string]any
 		DurationSec: int64(duration),
 		DurationStr: FormatDurationStr(duration, false),
 	}
-	base, user, password, err := navidromeEnv()
+	base, user, password, err := n.endpoints()
 	if err == nil {
 		query := url.Values{}
 		query.Set("v", "1.16.1")
@@ -295,7 +314,7 @@ func (n *NavidromeResolver) songToTrack(ctx context.Context, song map[string]any
 // transcode) into destDir.
 func (n *NavidromeResolver) Download(ctx context.Context, track Track, destDir string, onProgress ProgressFunc) (DownloadResult, error) {
 	runID := NewRunID()
-	base, user, password, err := navidromeEnv()
+	base, user, password, err := n.endpoints()
 	if err != nil {
 		return DownloadResult{}, err
 	}

@@ -6,11 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # No external libraries are downloaded at build time. JSON is hand-rolled
-# (src/json.*), Redis speaks RESP over a raw socket and MongoDB speaks
-# the OP_MSG wire protocol (src/store.cpp) — both hand-rolled, both
-# tested against real servers. SCRAM-SHA-1/256 auth (src/scram.cpp) is
-# likewise self-contained: SHA-1, SHA-256, HMAC and PBKDF2 are
-# implemented in-tree, no OpenSSL needed.
+# (src/json.*). The core store is a JSON file (src/store.cpp) — the
+# hand-rolled database wire-protocol clients were deleted
+# in Phase 4 (Q1). The crypto primitives (src/scram.cpp) are likewise
+# self-contained: SHA-1, SHA-256, HMAC and PBKDF2 are implemented
+# in-tree, no OpenSSL needed.
 #
 # TDLib 1.8.69 is linked at BUILD TIME (Phase 2): libtdjson.so.1.8.69
 # from the phase4 build output is a link dependency of parlay-core —
@@ -83,9 +83,9 @@ message(STATUS "libtdjson: ${TDJSON_LIB} (all 14 td_ exports present)")
 # TDLib bot session (TdLibTelegramSender in src/dispatcher.cpp) and
 # joins via the duplex JoinRequest handshake on the shared assistant
 # session. Config + rate limiting come from src/toml.cpp /
-# src/rate_limiter.cpp (Worker C). http_server.cpp, core_api.cpp,
-# store.cpp and scram.cpp stay in the build — they die in Phase 3/6,
-# NOT here.
+# src/rate_limiter.cpp. http_server.cpp and core_api.cpp stay in the
+# build for the core's own HTTP API (/healthz, /api/* GUI surface,
+# Phase 6 A2) — they are not inter-service HTTP.
 add_executable(parlay-core
     src/main.cpp
     src/json.cpp
@@ -238,10 +238,6 @@ add_test(NAME ui_test COMMAND ui_test)
 add_executable(scram_test
     tests/scram_test.cpp
     src/scram.cpp
-    src/store.cpp
-    src/json.cpp
-    src/config.cpp
-    src/toml.cpp
 )
 target_include_directories(scram_test PRIVATE src)
 target_compile_options(scram_test PRIVATE -Wall -Wextra -Wpedantic)
@@ -253,7 +249,6 @@ add_executable(store_test
     src/json.cpp
     src/config.cpp
     src/toml.cpp
-    src/scram.cpp
 )
 target_include_directories(store_test PRIVATE src)
 target_compile_options(store_test PRIVATE -Wall -Wextra -Wpedantic)

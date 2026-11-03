@@ -1411,6 +1411,7 @@ inline std::string lossySkippedText(const std::string& artist,
 // Cancel final tallies (navidrome §7.6.2, §8).
 inline const char* kToastDlNothingToCancel =
     "Nothing to cancel — already finished.";
+inline const char* kToastDlCancelled = "Download cancelled.";
 inline const char* kToastDlWrongChat =
     "Only the chat that requested this can cancel it.";
 
@@ -1489,7 +1490,7 @@ inline InlineKeyboard settingsKeyboard(const ChatSettings& s) {
                                  : s.admin_mode == 2 ? "Everyone"
                                                      : "Auth Users";
     std::string play_mode =
-        s.play_mode == "admin" ? "Admins" : "Everyone";
+        s.play_mode == "admins" ? "Admins" : "Everyone";
     std::string delay = s.clean_delay_min == 0
                             ? "15m"
                             : std::to_string(s.clean_delay_min) + "m";
@@ -2268,7 +2269,11 @@ inline const char* kRadioManageCard =
     "Now Playing: {nowPlaying}\n"
     "Autoplay Enabled?: <code>{autoplay}</code>\n"
     "Total Queue: <code>{queueLen}</code>\n"
-    "Live on: <a href=\"{host}/{chatId}\">{host}/{chatId}</a>\n"
+    // "Live on" names the station itself (Phase 4, Q3): there is no
+    // per-chat live page in the locked topology (no radio web UI), so
+    // the old radio-js host URL rendered a dead link. The dispatcher
+    // passes the station name as {host}.
+    "Live on: <code>{host}</code>\n"
     "\n"
     "To check song queue, type /queue";
 inline std::string radioNowPlayingText(const std::string& title,
@@ -2369,6 +2374,8 @@ inline InlineKeyboard deleteConfirmKeyboard(const std::string& id) {
              B::callback("Cancel", cbDel("no", id))}};
 }
 inline const char* kToastDelCancelled = "Cancelled.";
+inline const char* kToastDelDeleted = "Deleted.";
+inline const char* kToastDelNothing = "Nothing to delete.";
 inline const char* kDelInvalidPath = "Invalid path.";
 inline const char* kDelTopLevel = "Cannot delete top-level directories.";
 

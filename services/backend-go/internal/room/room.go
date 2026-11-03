@@ -317,6 +317,24 @@ func (m *Manager) Current(chatID int64) (model.Track, bool) {
 	return *rs.st.Current, true
 }
 
+// FX returns the stored FX preset + parameters for a chat, or false
+// when the chat has no room. The returned params are a copy: the
+// caller's map never aliases the room's. This is the read side of
+// the seam the Phase 5 DSP uses at stream time.
+func (m *Manager) FX(chatID int64) (string, map[string]float64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs, ok := m.rooms[chatID]
+	if !ok {
+		return "", nil, false
+	}
+	params := make(map[string]float64, len(rs.st.FXParams))
+	for k, v := range rs.st.FXParams {
+		params[k] = v
+	}
+	return rs.st.FXPreset, params, true
+}
+
 // HasRoom reports whether the chat has a room at all.
 func (m *Manager) HasRoom(chatID int64) bool {
 	m.mu.Lock()
@@ -955,6 +973,33 @@ func (m *Manager) SetBass(chatID int64, bass int) (model.NowPlaying, error) {
 	defer m.mu.Unlock()
 	rs := m.getOrCreateLocked(chatID)
 	rs.st.Bass = bass
+	if err := m.persistLocked(rs); err != nil {
+		return model.NowPlaying{}, err
+	}
+	return snapshotLocked(rs), nil
+}
+
+// SetFX stores the FX preset + parameters for a chat (fx.apply,
+// record-only in Phase 3; the Phase 5 DSP reads them at stream
+// time via FX). Like SetSpeed/SetBass it creates the room when the
+// chat has none — fx.apply on a chat with no room still records
+// the preset. The write goes through persistLocked, so the
+// in-memory room and the bbolt record can never diverge: this is
+// the seam fx must use instead of writing the store directly (a
+// direct store write is invisible to the Manager, and the next
+// Manager mutation persists the in-memory copy and clobbers the
+// FX fields — the same staleness shape the vote/gui seams had
+// before Wave 2 rewired them).
+func (m *Manager) SetFX(chatID int64, effect string, params map[string]float64) (model.NowPlaying, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs := m.getOrCreateLocked(chatID)
+	rs.st.FXPreset = effect
+	cp := make(map[string]float64, len(params))
+	for k, v := range params {
+		cp[k] = v
+	}
+	rs.st.FXParams = cp
 	if err := m.persistLocked(rs); err != nil {
 		return model.NowPlaying{}, err
 	}

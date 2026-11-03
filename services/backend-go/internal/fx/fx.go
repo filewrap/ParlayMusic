@@ -12,6 +12,15 @@
 // definition ({applied: true, pending_dsp: false}). The effect is
 // NEVER claimed applied when it was only recorded. The DSP (Phase 5)
 // reads the room's fx field at stream time.
+//
+// Persistence (Phase 4): the room's fx field is written ONLY
+// through the shared room.Manager (Manager.SetFX), never by a
+// direct store write. The Manager is the single owner of room
+// state: a direct store.GetRoom/PutRoom round-trip is invisible to
+// it, so the next Manager mutation persists the in-memory copy and
+// clobbers the FX fields (and a concurrent Manager mutation between
+// the Get and the Put is lost the other way). The store has no fx
+// bucket — the rooms bucket, via the Manager seam, is the fx home.
 package fx
 
 import (
@@ -23,11 +32,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"parlay/backend-go/internal/app"
-	"parlay/backend-go/internal/model"
-	"parlay/backend-go/internal/store"
+	"parlay/backend-go/internal/room"
 	"parlay/backend-go/internal/uds"
 )
 
@@ -41,9 +48,9 @@ var effects = map[string]bool{
 	"original":    true,
 }
 
-// fileRecord is the per-file FX record (in-memory; the durable
-// record is the room's fx field — the store has no fx bucket, see
-// the report).
+// fileRecord is the per-file FX record (in-memory only; the
+// durable record is the room's fx field, written through the room
+// Manager — the store has no fx bucket).
 type fileRecord struct {
 	effect     string
 	params     map[string]float64
@@ -54,7 +61,7 @@ type fileRecord struct {
 
 // Service owns the fx.apply handler.
 type Service struct {
-	store *store.Store
+	rooms *room.Manager
 
 	mu    sync.Mutex
 	files map[string]fileRecord
@@ -62,10 +69,10 @@ type Service struct {
 
 // Register registers fx.apply on s.
 func Register(s *uds.Server, d *app.Deps) {
-	if d == nil || d.Store == nil {
+	if d == nil || d.Room == nil {
 		panic("fx: Register called with nil deps")
 	}
-	svc := &Service{store: d.Store, files: map[string]fileRecord{}}
+	svc := &Service{rooms: d.Room, files: map[string]fileRecord{}}
 	s.Register("fx.apply", svc.handleApply)
 }
 
@@ -141,17 +148,11 @@ func (s *Service) handleApply(ctx context.Context, req uds.Request) (any, error)
 		chatID = req.ChatID
 	}
 	if chatID != 0 {
-		room, found, err := s.store.GetRoom(chatID)
-		if err != nil {
-			return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("fx room lookup failed: %v", err))
-		}
-		if !found {
-			room = model.DefaultRoomState(chatID)
-		}
-		room.FXPreset = body.Effect
-		room.FXParams = params
-		room.UpdatedAt = time.Now().Unix()
-		if err := s.store.PutRoom(room); err != nil {
+		// Through the shared room Manager only: the Manager owns
+		// the in-memory room and persists it to the rooms bucket
+		// in the same lock hold, so this write can neither
+		// clobber nor be clobbered by any other room mutation.
+		if _, err := s.rooms.SetFX(chatID, body.Effect, params); err != nil {
 			return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("fx room store failed: %v", err))
 		}
 	}

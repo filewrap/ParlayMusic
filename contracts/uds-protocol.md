@@ -3,8 +3,8 @@
 Status: **Phase 2, implemented** (core side: `services/core-cpp/src/ipc.*`;
 test peer: `services/core-cpp/tests/stub_backend.cpp`).
 Replaces the HTTP wire protocol described in `contracts/ipc.json`
-(FROZEN parity reference — the 56 actions and their payload shapes
-are unchanged; only the transport changes). `ipc.json` stays the
+(live contract since Phase 4 — the 65 actions and their payload shapes,
+retargeted to the unified backend; only the transport changes). `ipc.json` stays the
 authority for request/response field shapes; this document is the
 authority for how those shapes move over the wire.
 
@@ -142,8 +142,9 @@ Payload/response shapes are exactly `contracts/ipc.json`
 the UDS envelope and records the core-side legacy name it replaces
 (the core translates legacy slash-form names — `search`,
 `download/youtube`, `radio/start`, `share`, `fx`, `vote`,
-`dislike`, vc short names — to these dotted names; that shim dies
-with the dispatcher/engine-router rewrite in Wave 2).
+`dislike`, vc short names — to these dotted names via
+`IpcClient::canonicalAction`; the shim still exists, because the
+dispatcher still posts legacy names).
 
 Rows 57–65 are the nine OD-3 actions (Phase 3, Wave 2): they had
 no IPC action before (their buttons answered "unavailable"). Rows
@@ -423,8 +424,8 @@ Per-action budgets, in milliseconds, from the core's deadline
 table (defaults = the old hardcoded 30/10/5 s values, so the
 transport swap changes no timing). Resolution order for a call:
 (1) the table entry for the action, when set; (2) the legacy
-`timeout_sec` call-site parameter (download POSTs pass 120 s,
-search 15–20 s, netease 20 s, GETs 10 s). The table is the source
+`timeout_sec` call-site parameter (download calls pass 120 s,
+search 15–20 s, netease 20 s, reads 10 s). The table is the source
 of truth once the config rewrite (Worker C) populates it from
 `parlay.toml [timeouts]` (`resolve_ms`, `join_ms`, `ipc_cmd_ms`,
 `download_ms`) via `IpcClient::setDeadline()`.
@@ -432,7 +433,7 @@ of truth once the config rewrite (Worker C) populates it from
 | Class | Default |
 |---|---|
 | General (all actions not listed below) | 30,000 ms |
-| GET-style: `vc.now_playing`, `vc.progress`, `vc.panel`, `vc.lyrics`, `radio.list`, `radio.status`, `download.progress`, `share.resolve`, `chat.settings`, `spotify.details`, `spotify.now_playing`, `spotify.watches`, `spotify.status`, `gui.now_playing`, `gui.queue` | 10,000 ms |
+| Read-style (fast reads): `vc.now_playing`, `vc.progress`, `vc.panel`, `vc.lyrics`, `radio.list`, `radio.status`, `download.progress`, `share.resolve`, `chat.settings`, `spotify.details`, `spotify.now_playing`, `spotify.watches`, `spotify.status`, `gui.now_playing`, `gui.queue` | 10,000 ms |
 | `ping` (healthz) | 5,000 ms |
 
 On deadline expiry the core fails the call with

@@ -36,6 +36,17 @@ func NewNetEaseResolver() *NetEaseResolver {
 	return &NetEaseResolver{client: netease.New()}
 }
 
+// SetMusicU rebuilds the client with an explicit MUSIC_U login
+// cookie, wired from [backend] netease_music_u by
+// Registry.Configure (Q10). An empty cookie is a no-op: the
+// resolver keeps its $NETEASE_MUSIC_U client.
+func (n *NetEaseResolver) SetMusicU(u string) {
+	if strings.TrimSpace(u) == "" {
+		return
+	}
+	n.client = netease.NewWithMusicU(strings.TrimSpace(u))
+}
+
 // Source implements Resolver.
 func (n *NetEaseResolver) Source() Source { return SourceNetEase }
 

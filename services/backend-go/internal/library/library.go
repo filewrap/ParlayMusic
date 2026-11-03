@@ -5,16 +5,13 @@
 // — the Navidrome library count); search results and now-playing
 // tracks are enriched with size_bytes from it (§9-E10/E11).
 //
-// Persistence note: the inventory (§4.6) wants this index in a bbolt
-// "library" bucket, but internal/store has no such bucket yet (it
-// ships rooms, queue, votes, shares, spotify, settings, radio only).
-// Until the store gains it, the index lives in memory in this package
-// — a backend restart empties it (downloads re-record as they
-// complete; a library.scan re-counts the Navidrome library). The
-// Index type is the seam: when the bucket lands, it gains a
-// store-backed implementation behind the same methods. Nothing here
-// opens a second bbolt file. The files on disk are the durable part:
-// an entry whose file is gone is dropped lazily on read (§9-E10).
+// Persistence note: the index lives in the bbolt "library" bucket
+// since Phase 4: Index.AttachStore loads it on boot and every
+// mutation persists, so a backend restart keeps the index (the
+// files on disk are the durable part either way: an entry whose
+// file is gone is dropped lazily on read — and from the store too).
+// Nothing here opens a second bbolt file: the store is passed in,
+// never opened.
 package library
 
 import (
@@ -27,30 +24,67 @@ import (
 	"parlay/backend-go/internal/app"
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
+	"parlay/backend-go/internal/store"
 	"parlay/backend-go/internal/uds"
 )
 
-// Entry is one cached file in the library index.
-type Entry struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Artist    string `json:"artist"`
-	Source    string `json:"source"`
-	FilePath  string `json:"file_path"`
-	SizeBytes int64  `json:"size_bytes"`
-	AddedAt   int64  `json:"added_at"`
-}
+// Entry is one cached file in the library index
+// (model.LibraryEntry; the store owns the persisted form).
+type Entry = model.LibraryEntry
 
-// Index is the in-memory library index (see the package doc).
+// Index is the library index: an in-memory map, persisted into the
+// store's library bucket when AttachStore has wired one in (nil
+// store = memory-only, the pre-Phase 4 behaviour).
 type Index struct {
 	mu     sync.RWMutex
 	byID   map[string]*Entry
 	byPath map[string]*Entry
+	store  *store.Store
 }
 
 // NewIndex builds an empty index.
 func NewIndex() *Index {
 	return &Index{byID: map[string]*Entry{}, byPath: map[string]*Entry{}}
+}
+
+// AttachStore wires the embedded store in and loads the stored
+// index, dropping entries whose file is already gone (and deleting
+// those stale records from the store). A nil store is a no-op.
+func (idx *Index) AttachStore(st *store.Store) error {
+	if st == nil {
+		return nil
+	}
+	entries, err := st.ListLibraryEntries()
+	if err != nil {
+		return err
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.store = st
+	for _, e := range entries {
+		e := e
+		if !fileExists(e.FilePath) {
+			_ = st.DeleteLibraryEntry(e.ID)
+			continue
+		}
+		idx.byID[e.ID] = &e
+		idx.byPath[e.FilePath] = &e
+	}
+	return nil
+}
+
+// persistLocked writes e to the store (caller holds idx.mu).
+func (idx *Index) persistLocked(e *Entry) {
+	if idx.store != nil {
+		_ = idx.store.PutLibraryEntry(*e)
+	}
+}
+
+// dropStoredLocked removes id from the store (caller holds idx.mu).
+func (idx *Index) dropStoredLocked(id string) {
+	if idx.store != nil {
+		_ = idx.store.DeleteLibraryEntry(id)
+	}
 }
 
 // sharedIndex is the process-wide index used by Register and by the
@@ -77,6 +111,7 @@ func (idx *Index) Record(track model.Track, filePath string, size int64) {
 	}
 	idx.byID[track.ID] = e
 	idx.byPath[filePath] = e
+	idx.persistLocked(e)
 }
 
 // lookupKey returns the index keys to try for a track id: the id
@@ -104,6 +139,7 @@ func (idx *Index) Get(id string) (*Entry, bool) {
 			if !fileExists(e.FilePath) {
 				delete(idx.byID, k)
 				delete(idx.byPath, e.FilePath)
+				idx.dropStoredLocked(k)
 				continue
 			}
 			return e, true
@@ -121,6 +157,7 @@ func (idx *Index) GetByPath(path string) (*Entry, bool) {
 		if !fileExists(e.FilePath) {
 			delete(idx.byID, e.ID)
 			delete(idx.byPath, path)
+			idx.dropStoredLocked(e.ID)
 			return nil, false
 		}
 		return e, true
@@ -139,6 +176,7 @@ func (idx *Index) Search(q string) []*Entry {
 		if !fileExists(e.FilePath) {
 			delete(idx.byID, e.ID)
 			delete(idx.byPath, e.FilePath)
+			idx.dropStoredLocked(e.ID)
 			continue
 		}
 		if q == "" || strings.Contains(strings.ToLower(e.Title), q) || strings.Contains(strings.ToLower(e.Artist), q) {
@@ -158,6 +196,7 @@ func (idx *Index) Delete(id string) (*Entry, bool) {
 		if e, ok := idx.byID[k]; ok {
 			delete(idx.byID, k)
 			delete(idx.byPath, e.FilePath)
+			idx.dropStoredLocked(k)
 			return e, true
 		}
 	}
@@ -171,6 +210,7 @@ func (idx *Index) DeleteByPath(path string) (*Entry, bool) {
 	if e, ok := idx.byPath[path]; ok {
 		delete(idx.byID, e.ID)
 		delete(idx.byPath, path)
+		idx.dropStoredLocked(e.ID)
 		return e, true
 	}
 	return nil, false
@@ -186,6 +226,9 @@ func (idx *Index) Clear() []*Entry {
 	}
 	idx.byID = map[string]*Entry{}
 	idx.byPath = map[string]*Entry{}
+	if idx.store != nil {
+		_ = idx.store.ClearLibrary()
+	}
 	return out
 }
 

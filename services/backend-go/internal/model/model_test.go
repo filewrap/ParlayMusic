@@ -90,9 +90,12 @@ func TestChatSettingsHasAll15Keys(t *testing.T) {
 		}
 	}
 	// Defaults pinned to the legacy values (dispatcher chatSettings).
+	// autoplay_lang is "" (any language): the wire-visible default
+	// (settings.go defaults() + settings_test.go) — the core has no
+	// autoplay_lang legacy value, so "en" here would be ungrounded.
 	if s.AdminMode != 0 || s.PlayMode != "everyone" || s.Thumbnails != true ||
 		s.Language != "en" || s.AutoDeleteMin != 5 || s.PaginatePurgeOld != true ||
-		s.ChatMusicDownload != true || s.AutoplayLang != "en" {
+		s.ChatMusicDownload != true || s.AutoplayLang != "" {
 		t.Errorf("ChatSettings defaults drifted: %+v", s)
 	}
 }

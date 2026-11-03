@@ -5,7 +5,7 @@ Sources (all read, not assumed): `services/core-cpp/src/ui_texts.hpp`
 (callback builders `cb*`, `kCb*` consts, every `*Keyboard` builder),
 `services/core-cpp/src/dispatcher.cpp` (`Dispatcher::handleCallback` +
 all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
-`handleInlineQuery`), `contracts/ipc.json` v0.3.1 (56 actions, frozen),
+`handleInlineQuery`), `contracts/ipc.json` v0.3.1 (65 actions),
 `UI_INVENTORY.md` / `phase9/` (inventory cross-check).
 
 ## How to read this table
@@ -26,10 +26,10 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
   toast with empty text — the callback query is still answered.
 - `Status`:
   - `Live` — routed end-to-end today.
-  - `Phase 3` — OD-3 (decided: implement all, no cuts). The button /
-    command exists and is answered honestly today, but the backend
-    action does not exist yet; Phase 3 implements it. The row records
-    the verdict and the Phase 3 action needed.
+  - `Phase 3` — OD-3 (decided: implement all, no cuts). The backend
+    action exists since Phase 3; a row still marked `Phase 3` records
+    the remaining core-side wiring (Q4), an unrouted command, or an
+    inline gap — not a missing action.
   - `Gap` — a known §7.5 deviation recorded here, not hidden: the route
     exists but the rendered update violates "zero unrouted buttons /
     zero unhandled callbacks / zero dead ends" in a specific, named way.
@@ -124,7 +124,7 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A60 | Language picker | Back (origin `help` / `settings`) | `pl:lang:select:help` / `pl:lang:select:settings` | `handleCallback` → `cbLang` | none | silent ack + edit to language picker with `langPickerKeyboard(<origin>)`; the picker's Back button then returns to the origin menu (A1 / A43) | Live |
 | A61 | Language picker | English | `pl:lang:en` / `pl:lang:en:<origin>` | `handleCallback` → `cbLang` | none | toast `You're already using this language.` (already English) or `Language successfully updated to English.` + edit back to the origin menu: start card (`start`, default), help menu (`help`), or settings panel (`settings`) | Live |
 | A62 | n/a — no button emits it | n/a | `pl:lang:<code>` (any code other than `en`) | `handleCallback` → `cbLang` | none | alert `This feature is not available yet.`; Parlay is English-only, the picker offers English alone | No button |
-| A63 | Download progress message; lossy-fallback prompt | Cancel Downloading / Cancel | `pl:dl:cancel:<run_id>` | `handleCallback` → `cbDl` | none — no `download.cancel` action exists in `contracts/ipc.json` | alert `This feature is not available yet.`; no run recorded → toast `Nothing to cancel — already finished.` (not an alert) | Phase 3 |
+| A63 | Download progress message; lossy-fallback prompt | Cancel Downloading / Cancel | `pl:dl:cancel:<run_id>` | `handleCallback` → `cbDl` | `download.cancel` (`{run_id}` → `{cancelled, run_id, phase}`) | toast `Download cancelled.` + progress message edited to `Download cancelled.` (keyboard removed); finished run or no run recorded → toast `Nothing to cancel — already finished.`; wrong chat → alert `Only the chat that requested this can cancel it.`; backend error → alert with the backend's error | Live |
 | A64 | Audio-effect picker | Original | `pl:dl:fx:<run_id>:orig` | `handleCallback` → `cbDl` | `fx.apply` effect `original` | toast `Downloading and applying effect...`, then the processed audio file is sent as a new message (`applied:true` — original is a no-op by definition); backend error answers the error as an alert; no run → toast `Nothing to cancel — already finished.` | Live |
 | A65 | Audio-effect picker | Slow + Reverb | `pl:dl:fx:<run_id>:slow` | `handleCallback` → `cbDl` | `fx.apply` effect `slow-reverb` | toast `Downloading and applying effect...`, then alert `slow-reverb recorded — live DSP filtering lands in Phase 5. The file is unprocessed, so nothing was sent.` (`applied:false`, record-only until Phase 5 — the returned path is the unprocessed input and is never sent as processed audio); backend error answers the error as an alert | Live |
 | A66 | Audio-effect picker | Nightcore | `pl:dl:fx:<run_id>:nightcore` | `handleCallback` → `cbDl` | `fx.apply` effect `nightcore` | toast `Downloading and applying effect...`, then alert `nightcore recorded — live DSP filtering lands in Phase 5. The file is unprocessed, so nothing was sent.` (`applied:false`, record-only until Phase 5 — no file sent); backend error answers the error as an alert | Live |
@@ -136,13 +136,13 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A72 | Authorized-users list card | ⨯ <name> | `pl:auth:del:<chat_id>:<user_id>` | `handleCallback` → `cbAuth` | none (local auth store) | toast `Authorization revoked.` + edit to rebuilt auth list (`authlistText` + `authlistKeyboard()`); non-admin tap → alert `Only admins can do these actions.` | Live |
 | A73 | Search results card | 1 … 10 (number buttons) | `pl:search:<n>:<user_id>:<token>` | `handleCallback` → `cbSearch` → `playSearchPick` | `vc.play` (via `/play` on the picked track) | toast `Success`; the search message is deleted and the now-playing card is sent as a new message; wrong user → alert `You aren't allowed`; expired session → alert `This button has expired.` + edit to `Search expired, please search again`; token mismatch → alert `This button has expired.` + edit to expired text | Live |
 | A74 | Search results card | Previous page / Next page | `pl:search:page:<user_id>:<page>:<hash>` | `handleCallback` → `cbSearch` | none (cached search session, no new IPC) | silent ack + edit to the requested results page (`searchResultsText` + `searchResultsKeyboard` + `searchPageKeyboard`); out of range → alert `No more results.`; wrong user → alert `You aren't allowed`; expired session or hash mismatch → alert `This button has expired.` | Live |
-| A75 | Voting queue card (queue-rust service, daslui §23 — no in-core builder) | Approve | `pl:vote:approve:<track_id>` | `handleCallback` → `cbVote` | `queue.vote` approve | edit to `voteAcceptedText` card (`{voter} has added to queue:`), keyboard removed, then toast `Vote recorded.`; backend failure → edit to `Failed to queue track: {error}` card + alert with the same text; unknown vote (none open / malformed) → alert `Unknown action.`; foreign-chat vote → alert `You aren't allowed` | Live |
-| A76 | Voting queue card (queue-rust service, daslui §23 — no in-core builder) | Decline | `pl:vote:decline:<track_id>` | `handleCallback` → `cbVote` | none | edit to `voteDeclinedText` card (`{voter} declined.`), keyboard removed, then toast `Vote recorded.`; unknown vote (none open / malformed) → alert `Unknown action.`; foreign-chat vote → alert `You aren't allowed` | Live |
+| A75 | Voting queue card (backend-go:vote, daslui §23 — no in-core builder) | Approve | `pl:vote:approve:<track_id>` | `handleCallback` → `cbVote` | `queue.vote` approve | edit to `voteAcceptedText` card (`{voter} has added to queue:`), keyboard removed, then toast `Vote recorded.`; backend failure → edit to `Failed to queue track: {error}` card + alert with the same text; unknown vote (none open / malformed) → alert `Unknown action.`; foreign-chat vote → alert `You aren't allowed` | Live |
+| A76 | Voting queue card (backend-go:vote, daslui §23 — no in-core builder) | Decline | `pl:vote:decline:<track_id>` | `handleCallback` → `cbVote` | none | edit to `voteDeclinedText` card (`{voter} declined.`), keyboard removed, then toast `Vote recorded.`; unknown vote (none open / malformed) → alert `Unknown action.`; foreign-chat vote → alert `You aren't allowed` | Live |
 | A77 | Share help card | My Link | `pl:share:mylink` | `handleCallback` → `cbShare` | none (local share-link store) | silent ack + edit to the stored share link text (keyboard removed); no link stored → alert `You haven't shared anything yet — use /share first.` | Live |
 | A78 | n/a — no button emits it (the share send prompt's Cancel button is `pl:close`, row A19) | n/a | `pl:share:cancel` | `handleCallback` → `cbShare` | none | message deleted + silent ack (empty toast) | No button |
 | A79 | Received shared-audio card | Feedback | `pl:share:feedback:<sender>:<msg>:<file_unique>` | `handleCallback` → `cbShare` | none | silent ack + edit to `Send Feedback Text` prompt (keyboard removed); the user's next DM text is forwarded to the sender as feedback; blocked user → alert `You can't send Feedback\nYou are blocked` | Live |
 | A80 | Received shared-audio card | Report User | `pl:share:report:<sender>:<msg>` | `handleCallback` → `cbShare` | none (local blocklist) | toast `User is reported and blocked`; reporting twice re-blocks (idempotent) and answers the same toast | Live |
-| A81 | Library delete confirm card | Delete | `pl:del:yes:<id>` | `handleCallback` → `cbDel` | none — no `library.delete` action exists in `contracts/ipc.json` | alert `This feature is not available yet.`; the message stays, nothing is deleted | Phase 3 |
+| A81 | Library delete confirm card | Delete | `pl:del:yes:<id>` | `handleCallback` → `cbDel` | `library.delete` (`{id}` → `{deleted, id}`) | toast `Deleted.` + confirm message deleted (the backend deletes the record and the file on disk); unknown id → alert `Nothing to delete.`; backend error → alert with the backend's error | Live |
 | A82 | Library delete confirm card | Cancel | `pl:del:no:<id>` | `handleCallback` → `cbDel` | none | toast `Cancelled.` + message deleted | Live |
 | A83 | Lossy-fallback prompt | Accept <summary> | `pl:lossy:accept:<id>` | `handleCallback` → `cbLossy` | none (delivers the stored lossy file) | silent ack + stored audio file sent as a new message + prompt message deleted; expired run → alert `Prompt expired.`; send failure answers the error as an alert | Live |
 | A84 | Lossy-fallback prompt | Skip | `pl:lossy:skip:<id>` | `handleCallback` → `cbLossy` | none | toast `Skipped.` (or `Skipped — FLAC not available for {artist} — {title}` when artist/title are known) + prompt message deleted | Live |
@@ -154,8 +154,8 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A90 | Download-settings format screen | MP3 / M4A / FLAC / OPUS / OGG / WAV | `pl:dlset:fmt:<fmt>` (`mp3`, `m4a`, `flac`, `opus`, `ogg`, `wav`) | `handleCallback` → `cbDlset` | none (per-user prefs in local store) | toast `Settings updated!` + edit to the format screen with the new format; unknown format → alert `Unknown action.` | Live |
 | A91 | Download-settings YouTube screen | True / False | `pl:dlset:uy:1` / `pl:dlset:uy:0` | `handleCallback` → `cbDlset` | none (per-user prefs in local store) | toast `Settings updated!` + edit to the YouTube screen with the new value | Live |
 | A92 | Download-settings sub-screens | Back | `pl:dlset:back` | `handleCallback` → `cbDlset` | none | silent ack + edit to `Select one of the settings below!` with `dlSettingsIndexKeyboard()` | Live |
-| A93 | Spotify companion card (spotify-rust service — no in-core builder) | Dislike | `pl:spotify:dislike:<id>` | `handleCallback` → `cbSpotify` | `spotify.dislike` | toast `Disliked.`; backend error answers the error as an alert | Live |
-| A94 | Spotify companion cards (spotify-rust service — no in-core builder) | Details / Analyze (companion surfaces) | `pl:spotify:details:<id>`, `pl:spotify:analyze:<id>` | `handleCallback` → `cbSpotify` | `spotify.details` (details) / `spotify.analyze` (analyze) | details: card edited in place with track, album, features (key/mode/tempo), disliked/ignored counts, genres, profanity, language, lyrics + `[Analyze text]` button; analyze: analysis card edited in place; any other verb → alert `This feature is not available yet.` | Live |
+| A93 | Spotify companion card (backend-go:spotify — no in-core builder) | Dislike | `pl:spotify:dislike:<id>` | `handleCallback` → `cbSpotify` | `spotify.dislike` | toast `Disliked.`; backend error answers the error as an alert | Live |
+| A94 | Spotify companion cards (backend-go:spotify — no in-core builder) | Details / Analyze (companion surfaces) | `pl:spotify:details:<id>`, `pl:spotify:analyze:<id>` | `handleCallback` → `cbSpotify` | `spotify.details` (details) / `spotify.analyze` (analyze) | details: card edited in place with track, album, features (key/mode/tempo), disliked/ignored counts, genres, profanity, language, lyrics + `[Analyze text]` button; analyze: analysis card edited in place; any other verb → alert `This feature is not available yet.` | Live |
 | A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | alert `Unknown action.` (`kToastUnknownAction`); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
 
 ## §B. Reply-keyboard buttons and non-callback buttons
@@ -306,8 +306,8 @@ from the core's local store / state only.
 
 ## §D. Inline mode + deep links
 
-Router: `Dispatcher::handleInlineQuery` (`inlineModeOf` mirrors
-vc-ts `resolvers.js` `inlineMode` exactly). Non-allowed users (blocklist
+Router: `Dispatcher::handleInlineQuery` (`inlineModeOf` ports the
+`inlineMode` parsing from the vc-ts reference `resolvers.js`, Phase 9). Non-allowed users (blocklist
 or maintenance + non-sudo) get no results at all, silently. `np` / `s` /
 `l` need the user's most recent group chat (`last_chat:<user>`, recorded
 on group activity and on callback taps); with no known chat they answer
@@ -321,7 +321,7 @@ rather than leaving the query hanging.
 | D3 | Inline query (any chat) | `<keyword>` (3+ chars) / `search <keyword>` | inline query `<keyword>` | `handleInlineQuery` → mode `search` | `search.inline` | inline answer: one result per track — audio result when a `stream_url` is known (title, performer, duration, thumbnail, caption, `[Open in Parlay Bot]` button → row D12), article otherwise (title, artist, duration, `[Open in Parlay Bot]` button); no matches → article `No results found`; bare `search` with no keyword → article `Please enter a keyword` | Live |
 | D4 | Inline query (any chat) | `np` | inline query `np` | `handleInlineQuery` → mode `np` | `search.inline` | inline answer: one audio/article result for the current track (no `[Open in Parlay Bot]` button); no known chat → empty results; no track → empty results | Live |
 | D5 | Inline query (any chat) | `s` | inline query `s` | `handleInlineQuery` → mode `s` | `search.inline` | inline answer: one share article (`{artist} — {title}` + track URL as the message text); no known chat → empty results; no title → empty results | Live |
-| D6 | Inline query (any chat) | `l` | inline query `l` | `handleInlineQuery` → mode `l` | `search.inline` + `vc.lyrics` (POST `/v1/lyrics`, body `{chat_id}` — the contract's GET form 404s, the POST form is the working one, §6-R5) | inline answer: one lyrics article (`Lyrics: <title>`, description `{artist} — <first 100 chars>`, message `{artist} — {title}` + lyrics truncated to 4000 chars + `...`); no lyrics → empty results; no known chat → empty results | Live |
+| D6 | Inline query (any chat) | `l` | inline query `l` | `handleInlineQuery` → mode `l` | `search.inline` + `vc.lyrics` (UDS `vc.lyrics`, payload `{chat_id}`, §6-R5) | inline answer: one lyrics article (`Lyrics: <title>`, description `{artist} — <first 100 chars>`, message `{artist} — {title}` + lyrics truncated to 4000 chars + `...`); no lyrics → empty results; no known chat → empty results | Live |
 | D7 | Inline query (any chat) | `lib` / `lib <arg>` | inline query `lib` | `handleInlineQuery` → mode `lib` | none (no library backend) | inline answer: empty results (no library backend — ruling 1, future work) | Live |
 | D8 | Inline query (any chat) | `del` / `del <arg>` | inline query `del` | `handleInlineQuery` → mode `del` | none (no library backend) | inline answer: empty results (no library backend — ruling 1, future work); the `delete:<path>` text trigger (row C96) is the working delete path | Live |
 | D9 | Inline query (any chat) | Search result with a cached audio file | inline query `<keyword>`, result with a cached file | `handleInlineQuery` → `inlineTrackResult` | `search.inline` | inline answer: a cached-audio result is NOT produced — the Track carries no `file_id`, so the result is a plain audio result from the direct stream URL (or an article). The `Song not cached` article does not exist yet | Phase 3 |
@@ -338,8 +338,8 @@ the row's Status to `Live`.
 
 | # | Item | Row(s) | Phase 3 action needed |
 |---|---|---|---|
-| E1 | `download.cancel` | A63 | New backend action `download.cancel` (cancel a running download by `run_id`); the core already routes `pl:dl:cancel:<run_id>` to `cbDl` and answers honestly until then |
-| E2 | `library.delete` | A81, A82, C96 | New backend action `library.delete` (delete a library track by id/path); the core already routes `pl:del:yes/no:<id>` to `cbDel` and the `delete:<path>` text trigger to the confirm card |
+| E1 | `download.cancel` | A63 | Live: backend action `download.cancel` registered since Phase 3; the core posts it from `cbDl` (Q4 wiring) — cancel answers `Download cancelled.` and retires the progress message |
+| E2 | `library.delete` | A81, A82, C96 | Live: backend action `library.delete` registered since Phase 3; the core posts it from `cbDel` (Q4 wiring) — `yes` deletes the record and the file and answers `Deleted.` |
 | E3 | `/mix` | C87 | Register the command + new backend action (mix generation); today it answers the unknown-command card |
 | E4 | `/recognize` | C88 | Register the command + new backend action (audio recognition); today it answers the unknown-command card |
 | E5 | `/scan` | C89 | Register the command + new backend action (library scan); today it answers the unknown-command card |
@@ -382,8 +382,8 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
   the picker offers English alone). These are recorded, not dropped.
 - **Buttons built outside the core.** Two callback families are emitted
   by other services, not by `ui_texts.hpp`: `pl:vote:approve/decline`
-  (rows A75–A76, queue-rust voting card) and `pl:spotify:dislike`
-  (row A93, spotify-rust companion card). Both have in-core handlers.
+  (rows A75–A76, backend-go:vote voting card) and `pl:spotify:dislike`
+  (row A93, backend-go:spotify companion card). Both have in-core handlers.
   The routing test covers them by calling their `cb*` builders
   directly (§H).
 - **Reply keyboards.** One persistent keyboard (`persistentKeyboard()`),

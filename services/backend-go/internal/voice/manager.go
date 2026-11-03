@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 )
 
@@ -302,6 +303,59 @@ func (m *Manager) Play(ctx context.Context, chatID int64, source string) error {
 		m.mu.Unlock()
 		feed.Stop()
 		return fmt.Errorf("voice: play chat %d: call ended while the feed was starting", chatID)
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// PlayStream starts playback of a pre-buffered stream (the
+// Phase 4 prefetch handle) in chatID's live call. It is the same
+// interim ffmpeg-decode-to-PCM path as Play, but the decode input
+// is the prefetch reader — the opening seconds are already in
+// memory, so the first frames need no fresh HTTP open — instead of
+// a URL or file path. Like Play it requires a connected call, binds
+// the external audio source, and (re)starts the room's persistent
+// feed on track change. Phase 5 replaces the ffmpeg decode with
+// parlay-dsp frames from this same handle type.
+func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser) error {
+	m.mu.Lock()
+	call, ok := m.calls[chatID]
+	if !ok || call.State != StateConnected {
+		state := "no call"
+		if ok {
+			state = call.State.String()
+		}
+		m.mu.Unlock()
+		return fmt.Errorf("voice: play stream chat %d: no connected call (state %s); call Join first", chatID, state)
+	}
+	oldFeed := call.feed
+	call.feed = nil
+	call.FeedEnded = false
+	call.FeedErr = nil
+	m.mu.Unlock()
+
+	// Stop the previous track's feed outside the manager lock: the
+	// feed's pump goroutine must never block on this lock.
+	if oldFeed != nil {
+		oldFeed.Stop()
+	}
+	if err := m.client.SetExternalAudioSource(chatID); err != nil {
+		return fmt.Errorf("voice: play stream chat %d: set external audio source: %w", chatID, err)
+	}
+	feed, err := startFFmpegFeedFromReader(ctx, m.client, chatID, r, func(feedErr error) {
+		m.onFeedEnd(chatID, feedErr)
+	})
+	if err != nil {
+		return fmt.Errorf("voice: play stream chat %d: %w", chatID, err)
+	}
+	m.mu.Lock()
+	// The call may have been stopped while the feed was starting.
+	if current, ok := m.calls[chatID]; ok && current == call && current.State == StateConnected {
+		call.feed = feed
+	} else {
+		m.mu.Unlock()
+		feed.Stop()
+		return fmt.Errorf("voice: play stream chat %d: call ended while the feed was starting", chatID)
 	}
 	m.mu.Unlock()
 	return nil

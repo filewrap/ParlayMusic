@@ -201,6 +201,8 @@ void applyToml(const toml::Document& doc, Config& c) {
     checkKnownKeys(doc, "limits",
                    {"max_duration_minutes", "max_queue_size",
                     "prefetch_lead_time_sec", "url_cache_ttl_sec"});
+    // [ipc] holds the UDS socket path (Q6, Phase 4): the only key.
+    checkKnownKeys(doc, "ipc", {"socket_path"});
 
     if (doc.has("rate_limit.chat.capacity"))
         c.rate_limit.chat.capacity =
@@ -247,6 +249,9 @@ void applyToml(const toml::Document& doc, Config& c) {
     if (doc.has("limits.url_cache_ttl_sec"))
         c.limits.url_cache_ttl_sec =
             static_cast<int>(tomlInt(doc, "limits.url_cache_ttl_sec"));
+
+    if (doc.has("ipc.socket_path"))
+        c.ipc_socket_path = tomlString(doc, "ipc.socket_path");
 }
 
 // --- env overrides (win over the file) -------------------------------
@@ -316,6 +321,9 @@ void applyEnvOverrides(Config& c) {
     if (envPresent("PARLAY_URL_CACHE_TTL_SEC", raw))
         c.limits.url_cache_ttl_sec =
             static_cast<int>(envStrictInt("PARLAY_URL_CACHE_TTL_SEC"));
+    // UDS socket path: env wins over [ipc] socket_path in the file.
+    // (envPresent treats set-but-empty as absent, like PARLAY_DATA_DIR.)
+    if (envPresent("PARLAY_UDS_PATH", raw)) c.ipc_socket_path = trim(raw);
 }
 
 void syncMirrors(Config& c) {
@@ -323,26 +331,14 @@ void syncMirrors(Config& c) {
     c.queue_limit = c.limits.max_queue_size;
 }
 
-// Legacy env fields (credentials, service URLs, auth lists, TDLib).
+// Legacy env fields (credentials, auth lists, TDLib).
 // Unchanged from the pre-unification fromEnv(), except that the
 // duration/queue limits now flow through limits (above).
 void applyLegacyEnv(Config& c) {
     c.bot_token = envStr("BOT_TOKEN");
     c.api_id = envInt("API_ID");
     c.api_hash = envStr("API_HASH");
-    c.mongo_uri = envStr("MONGO_URI");
-    c.redis_url = envStr("REDIS_URL");
     c.parlay_token = envStr("PARLAY_TOKEN");
-    c.vc_go_url = envStr("VC_GO_URL", c.vc_go_url);
-    c.vc_ts_url = envStr("VC_TS_URL", c.vc_ts_url);
-    c.vc_rust_url = envStr("VC_RUST_URL", c.vc_rust_url);
-    c.fx_url = envStr("FX_URL", c.fx_url);
-    c.share_url = envStr("SHARE_URL", c.share_url);
-    c.queue_url = envStr("QUEUE_URL", c.queue_url);
-    c.spotify_url = envStr("SPOTIFY_URL", c.spotify_url);
-    c.dl_url = envStr("DL_URL", envStr("DOWNLOADERS_URL", c.dl_url));
-    c.radio_url = envStr("RADIO_URL", c.radio_url);
-    c.netease_url = envStr("NETEASE_URL", c.netease_url);
     c.port = static_cast<int>(envInt("PORT", c.port));
     c.owner_id = envInt("OWNER_ID");
     c.sudo_ids = envIdSet("SUDO_IDS");
@@ -587,7 +583,8 @@ std::string Config::summary() const {
          "min queue:" + std::to_string(limits.max_queue_size) +
          " prefetch:" + std::to_string(limits.prefetch_lead_time_sec) +
          "s cache_ttl:" + std::to_string(limits.url_cache_ttl_sec) + "s";
-    s += " vc_go=" + vc_go_url + " vc_ts=" + vc_ts_url + " vc_rust=" + vc_rust_url;
+    s += " ipc_socket=" +
+         (ipc_socket_path.empty() ? std::string("(default)") : ipc_socket_path);
     s += " owner_id=" + (owner_id ? std::to_string(owner_id) : std::string("(unset)"));
     s += " sudo_ids=" + std::to_string(sudo_ids.size());
     s += " logger_id=" + (logger_id ? std::to_string(logger_id) : std::string("(unset)"));
@@ -599,8 +596,6 @@ std::string Config::summary() const {
                                          !td_session_dir.empty()
                                      ? "configured"
                                      : "unset");
-    s += " mongo=" + std::string(mongo_uri.empty() ? "unset" : "set");
-    s += " redis=" + std::string(redis_url.empty() ? "unset" : "set");
     return s;
 }
 

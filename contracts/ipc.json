@@ -3,7 +3,7 @@
   "actions": {
     "audio.recognize": {
       "from": "phase3/actions-inventory.md §9-E4 (OD-3); provider AudD per OD-10 (user decision 2026-11-03)",
-      "method": "POST /v1/audio/recognize",
+      "method": "UDS audio.recognize",
       "request": {
         "file_path": "string (path under the data dir)",
         "file_id": "string (Telegram file id, optional)"
@@ -16,12 +16,12 @@
         "album": "string",
         "source": "string (spotify|deezer|audd)"
       },
-      "service": "backend-go",
+      "service": "backend-go:recognize",
       "ported": "Phase 3 Wave 2 (OD-3) — env-gated on AUDD_API_TOKEN, honest 502 while unconfigured"
     },
     "cache.clear": {
       "from": "phase3/actions-inventory.md §9-E7 (OD-3)",
-      "method": "POST /v1/cache/clear",
+      "method": "UDS cache.clear",
       "request": {
         "scope": "track|all",
         "name": "string (track scope: cached track name)"
@@ -30,28 +30,28 @@
         "cleared": "boolean",
         "names": ["string"]
       },
-      "service": "backend-go",
+      "service": "backend-go:library",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "chat.settings": {
       "from": "UI_INVENTORY.md §29 IPC-6 (Phase 9)",
-      "method": "GET /v1/chat/settings?chat_id= | POST /v1/chat/settings",
+      "method": "UDS chat.settings",
       "request": {
         "chat_id": "ChatId",
-        "key": "string (POST only: admin_mode|play_mode|cmd_delete|clean_mode|clean_delay_min|thumbnails|autoplay|autoplay_lang|autoplay_mood|silent_mode|auto_delete|auto_delete_min|language|paginate_purge_old|chat_music_download)",
-        "value": "string|boolean|integer (POST only)"
+        "key": "string (set only: admin_mode|play_mode|cmd_delete|clean_mode|clean_delay_min|thumbnails|autoplay|autoplay_lang|autoplay_mood|silent_mode|auto_delete|auto_delete_min|language|paginate_purge_old|chat_music_download)",
+        "value": "string|boolean|integer (set only)"
       },
       "response": {
         "chat_id": "ChatId",
         "settings": {
           "admin_mode": "integer",
-          "play_mode": "string",
+          "play_mode": "string (everyone|admins; default everyone)",
           "cmd_delete": "boolean",
           "clean_mode": "boolean",
           "clean_delay_min": "integer",
           "thumbnails": "boolean",
           "autoplay": "boolean",
-          "autoplay_lang": "string",
+          "autoplay_lang": "string (default \"\" — any language)",
           "autoplay_mood": "string",
           "silent_mode": "boolean",
           "auto_delete": "boolean",
@@ -61,11 +61,11 @@
           "chat_music_download": "boolean"
         }
       },
-      "service": "core-cpp"
+      "service": "backend-go:settings"
     },
     "download.cancel": {
       "from": "phase3/actions-inventory.md §9-E1 (OD-3)",
-      "method": "POST /v1/download/cancel",
+      "method": "UDS download.cancel",
       "request": {
         "run_id": "string"
       },
@@ -74,11 +74,11 @@
         "run_id": "string",
         "phase": "string"
       },
-      "service": "backend-go",
+      "service": "backend-go:download",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "download.deezer": {
-      "method": "POST /v1/download/deezer",
+      "method": "UDS download.deezer",
       "request": {
         "query": "string",
         "requested_by": "UserId"
@@ -88,11 +88,11 @@
         "track": "Track",
         "run_id": "string"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.navidrome": {
       "from": "music-bot-navidrome src/navidrome.py, src/soulseek/*",
-      "method": "POST /v1/download/navidrome",
+      "method": "UDS download.navidrome",
       "request": {
         "requested_by": "UserId",
         "url": "string"
@@ -102,16 +102,16 @@
         "track": "Track",
         "run_id": "string"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.prefs": {
       "from": "phase3/actions-inventory.md §9-E9 (OD-3)",
-      "method": "GET /v1/download/prefs | POST /v1/download/prefs",
+      "method": "UDS download.prefs",
       "request": {
         "user_id": "UserId",
-        "format": "string (POST only: mp3|aac|flac|opus|m4a|wav)",
-        "use_youtube": "boolean (POST only)",
-        "path_template": "string (POST only, must contain {ext})"
+        "format": "string (set only: mp3|m4a|flac|opus|ogg|wav)",
+        "use_youtube": "boolean (set only)",
+        "path_template": "string (set only, must contain {ext})"
       },
       "response": {
         "user_id": "UserId",
@@ -119,12 +119,12 @@
         "use_youtube": "boolean",
         "path_template": "string"
       },
-      "service": "backend-go",
+      "service": "backend-go:download",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "download.progress": {
-      "from": "UI_INVENTORY.md §29 IPC-4 (Phase 9); downloaders server.py",
-      "method": "GET /v1/download/progress?run_id=",
+      "from": "UI_INVENTORY.md §29 IPC-4 (Phase 9)",
+      "method": "UDS download.progress",
       "request": {
         "run_id": "string"
       },
@@ -149,11 +149,11 @@
         "lossy_available": "boolean",
         "lossy_summary": "string|null"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.soulseek": {
       "from": "Navidrome music-bot src/soulseek/{client,downloader,matcher,scorer}, via slskd",
-      "method": "POST /v1/download/soulseek",
+      "method": "UDS download.soulseek",
       "request": {
         "query": "string",
         "artist": "string",
@@ -185,11 +185,11 @@
         "engine_unavailable": "slskd unreachable at SLSKD_URL, or search could not run (e.g. slskd not logged in)",
         "download_failed": "search ran but found nothing usable (honest reason in message)"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.spotify": {
       "from": "Spotify-Loader bot.py",
-      "method": "POST /v1/download/spotify",
+      "method": "UDS download.spotify",
       "request": {
         "requested_by": "UserId",
         "url": "string"
@@ -199,11 +199,11 @@
         "track": "Track",
         "run_id": "string"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.spotify_playlist": {
       "from": "Spotify-Loader bot.py",
-      "method": "POST /v1/download/spotify-playlist",
+      "method": "UDS download.spotify_playlist",
       "request": {
         "mode": "zip|files",
         "requested_by": "UserId",
@@ -217,11 +217,11 @@
         ],
         "run_id": "string"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.tiktok": {
       "from": "telegram-music-bot-rust main.rs",
-      "method": "POST /v1/download/tiktok",
+      "method": "UDS download.tiktok",
       "request": {
         "requested_by": "UserId",
         "url": "string"
@@ -231,11 +231,11 @@
         "track": "Track",
         "run_id": "string"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "download.youtube": {
       "from": "sanila Telegram-Song-Downloader-Bot bot.py",
-      "method": "POST /v1/download/youtube",
+      "method": "UDS download.youtube",
       "request": {
         "query": "string",
         "requested_by": "UserId"
@@ -247,11 +247,11 @@
         "track": "Track",
         "run_id": "string"
       },
-      "service": "downloaders"
+      "service": "backend-go:download"
     },
     "fx.apply": {
       "from": "telegram-music-bot-rust main.rs (FFmpeg filter chains)",
-      "method": "POST /v1/fx",
+      "method": "UDS fx.apply",
       "request": {
         "effect": "slow-reverb|nightcore|bass-boost|8d|original",
         "input_path": "string",
@@ -260,27 +260,27 @@
       "response": {
         "output_path": "string"
       },
-      "service": "audio-fx-rust"
+      "service": "backend-go:fx"
     },
     "gui.now_playing": {
       "from": "wavetune app/(player)/, components/music-provider.jsx",
-      "method": "GET /api/now-playing?chat_id=",
+      "method": "UDS gui.now_playing",
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "core-cpp -> gui-js"
+      "service": "backend-go:gui"
     },
     "gui.queue": {
-      "method": "GET /api/queue?chat_id=",
+      "method": "UDS gui.queue",
       "response": {
         "queue": [
           "QueueItem"
         ]
       },
-      "service": "core-cpp -> gui-js"
+      "service": "backend-go:gui"
     },
     "lemonic.download": {
-      "method": "POST /v1/lemonic/download",
+      "method": "UDS lemonic.download",
       "request": {
         "track_id": "string"
       },
@@ -288,11 +288,11 @@
         "file_path": "string",
         "track": "Track"
       },
-      "service": "vc-ts"
+      "service": "backend-go:search"
     },
     "lemonic.search": {
       "from": "lemonic modules/lemonic.ts",
-      "method": "POST /v1/lemonic/search",
+      "method": "UDS lemonic.search",
       "request": {
         "query": "string"
       },
@@ -301,11 +301,11 @@
           "Track"
         ]
       },
-      "service": "vc-ts"
+      "service": "backend-go:search"
     },
     "library.delete": {
       "from": "phase3/actions-inventory.md §9-E2 (OD-3)",
-      "method": "POST /v1/library/delete",
+      "method": "UDS library.delete",
       "request": {
         "id": "string (one of id / path required)",
         "path": "string (one of id / path required)"
@@ -314,35 +314,35 @@
         "deleted": "boolean",
         "id": "string"
       },
-      "service": "backend-go",
+      "service": "backend-go:library",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "library.scan": {
       "from": "phase3/actions-inventory.md §9-E5 (OD-3)",
-      "method": "POST /v1/library/scan",
+      "method": "UDS library.scan",
       "request": {},
       "response": {
         "triggered": "boolean",
         "error": "string (empty when triggered)",
         "tracks_found": "integer"
       },
-      "service": "backend-go",
+      "service": "backend-go:library",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "library.sharescan": {
       "from": "phase3/actions-inventory.md §9-E6 (OD-3)",
-      "method": "POST /v1/library/sharescan",
+      "method": "UDS library.sharescan",
       "request": {},
       "response": {
         "triggered": "boolean",
         "scheduled_in_min": "integer (omitted: slskd exposes no estimate)"
       },
-      "service": "backend-go",
+      "service": "backend-go:library",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "mix.generate": {
       "from": "phase3/actions-inventory.md §9-E3 (OD-3)",
-      "method": "POST /v1/mix/generate",
+      "method": "UDS mix.generate",
       "request": {
         "chat_id": "ChatId",
         "query": "string (optional: explicit seed query)",
@@ -352,12 +352,12 @@
         "tracks": ["Track"],
         "source_track": "Track"
       },
-      "service": "backend-go",
+      "service": "backend-go:download",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
     "netease.download": {
       "from": "Music163bot-Go handlers_music.go",
-      "method": "POST /v1/netease/download",
+      "method": "UDS netease.download",
       "request": {
         "track_id": "string"
       },
@@ -366,11 +366,11 @@
         "track": "Track",
         "auth": "music_u|anonymous"
       },
-      "service": "netease-go"
+      "service": "backend-go:netease"
     },
     "netease.lyrics": {
       "from": "Music163bot-Go handlers_lyric.go",
-      "method": "POST /v1/netease/lyrics",
+      "method": "UDS netease.lyrics",
       "request": {
         "track_id": "string"
       },
@@ -383,11 +383,11 @@
         "truncated": "boolean",
         "lrc_path": "string"
       },
-      "service": "netease-go"
+      "service": "backend-go:netease"
     },
     "netease.search": {
       "from": "Music163bot-Go handlers_search.go",
-      "method": "POST /v1/netease/search",
+      "method": "UDS netease.search",
       "request": {
         "query": "string"
       },
@@ -396,11 +396,11 @@
           "Track"
         ]
       },
-      "service": "netease-go"
+      "service": "backend-go:netease"
     },
     "queue.vote": {
       "from": "daslui src/spotify.rs",
-      "method": "POST /v1/queue/vote",
+      "method": "UDS queue.vote",
       "request": {
         "track": "Track",
         "vote": "approve|decline",
@@ -409,20 +409,20 @@
       "response": {
         "queued": "boolean"
       },
-      "service": "queue-rust"
+      "service": "backend-go:vote"
     },
     "radio.list": {
       "from": "openradiobot index.js",
-      "method": "GET /v1/radio/stations",
+      "method": "UDS radio.list",
       "response": {
         "stations": [
           "string"
         ]
       },
-      "service": "radio-js"
+      "service": "backend-go:radio"
     },
     "radio.start": {
-      "method": "POST /v1/radio/start",
+      "method": "UDS radio.start",
       "request": {
         "chat_id": "ChatId",
         "station": "string"
@@ -430,11 +430,11 @@
       "response": {
         "stream_url": "string"
       },
-      "service": "radio-js"
+      "service": "backend-go:radio"
     },
     "radio.status": {
-      "from": "openradiobot, radio-js src/main.js",
-      "method": "GET /v1/radio/status?chat_id=",
+      "from": "openradiobot (reference implementation; the radio-js service was deleted in the Phase 3 unification)",
+      "method": "UDS radio.status",
       "response": {
         "now_playing": "object|null",
         "station": "string",
@@ -442,22 +442,22 @@
         "reachable": "boolean|null",
         "vc_handoff": "object|null"
       },
-      "service": "radio-js"
+      "service": "backend-go:radio"
     },
     "radio.stop": {
-      "from": "openradiobot, radio-js src/main.js",
-      "method": "POST /v1/radio/stop",
+      "from": "openradiobot (reference implementation; the radio-js service was deleted in the Phase 3 unification)",
+      "method": "UDS radio.stop",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {
         "stopped": "boolean"
       },
-      "service": "radio-js"
+      "service": "backend-go:radio"
     },
     "search.inline": {
       "from": "lemonic handlers/inline_query.ts",
-      "method": "POST /v1/inline",
+      "method": "UDS search.inline",
       "request": {
         "query": "string",
         "user_id": "UserId",
@@ -468,11 +468,11 @@
           "Track"
         ]
       },
-      "service": "vc-ts"
+      "service": "backend-go:search"
     },
     "search.query": {
       "from": "lemonic modules/lemonic.ts, Music163bot-Go handlers_search.go, remix handlers/search.ts",
-      "method": "POST /v1/search",
+      "method": "UDS search.query",
       "request": {
         "limit": "integer",
         "query": "string",
@@ -483,11 +483,11 @@
           "Track"
         ]
       },
-      "service": "vc-ts | downloaders | netease-go"
+      "service": "backend-go:search"
     },
     "share.create": {
       "from": "feel-me src/main.rs, src/models.rs",
-      "method": "POST /v1/share",
+      "method": "UDS share.create",
       "request": {
         "created_by": "UserId",
         "track": "Track"
@@ -496,18 +496,18 @@
         "link": "string",
         "token": "string"
       },
-      "service": "share-rust"
+      "service": "backend-go:share"
     },
     "share.resolve": {
-      "method": "GET /v1/share/:token",
+      "method": "UDS share.resolve",
       "response": {
         "track": "Track"
       },
-      "service": "share-rust"
+      "service": "backend-go:share"
     },
     "spotify.analyze": {
       "from": "UI_INVENTORY.md §29 IPC-7 (Phase 9)",
-      "method": "POST /v1/spotify/analyze",
+      "method": "UDS spotify.analyze",
       "request": {
         "user_id": "integer",
         "track_id": "string"
@@ -518,11 +518,11 @@
           "string"
         ]
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.details": {
       "from": "UI_INVENTORY.md §29 IPC-7 (Phase 9)",
-      "method": "GET /v1/spotify/details?user_id=&track_id=",
+      "method": "UDS spotify.details",
       "request": {
         "user_id": "UserId",
         "track_id": "string"
@@ -555,11 +555,11 @@
         "lyrics": "string|null",
         "lyrics_link": "string|null"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.auth": {
       "from": "rustify src/spotify/auth.rs + Manager token_refresh + tick/user.rs check",
-      "method": "POST /v1/spotify/auth",
+      "method": "UDS spotify.auth",
       "request": {
         "action": "login|callback|refresh|revoke",
         "user_id": "integer",
@@ -570,7 +570,7 @@
           "authorized": "boolean",
           "user_id": "integer",
           "authorize_url": "string",
-          "note": "complete the URL in a browser, then POST action:callback with the returned code"
+          "note": "complete the URL in a browser, then call spotify.auth with action:callback and the returned code"
         },
         "callback": {
           "authorized": "boolean",
@@ -594,11 +594,11 @@
         "401 unauthorized": "refresh token rejected by Spotify (invalid_grant); token dropped, login again",
         "502 download_failed": "authorization code exchange failed (bad/expired code, or Spotify rejected the client)"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.dislike": {
       "from": "rustify src/queue/* (disliked-track auto-skip)",
-      "method": "POST /v1/spotify/dislike",
+      "method": "UDS spotify.dislike",
       "request": {
         "action": "add|remove",
         "track_id": "string",
@@ -607,11 +607,11 @@
       "response": {
         "disliked": "boolean"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.now_playing": {
       "from": "rustify tick/user.rs check, polled currently-playing state",
-      "method": "GET /v1/spotify/now-playing?user_id=",
+      "method": "UDS spotify.now_playing",
       "request": {
         "user_id": "integer"
       },
@@ -624,10 +624,10 @@
         "last_reason": "string|null",
         "classifier_verdict": "clean|profanity|ai_generated|unknown"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.resolve": {
-      "method": "POST /v1/spotify/resolve",
+      "method": "UDS spotify.resolve",
       "request": {
         "url": "string (open.spotify.com/<kind>/<id> or spotify:<kind>:<id>)"
       },
@@ -637,11 +637,11 @@
         "track_id": "string",
         "url": "string"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.skip_check": {
       "from": "rustify src/profanity.rs, src/lyrics/*",
-      "method": "POST /v1/spotify/skip-check",
+      "method": "UDS spotify.skip_check",
       "request": {
         "track": "Track"
       },
@@ -653,31 +653,31 @@
         "classifier_confidence": "number 0..1",
         "classifier_detail": "string (matched word / Gemini note)"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.watch": {
       "from": "rustify src/spotify/*, src/queue/*",
-      "method": "POST /v1/spotify/watch",
+      "method": "UDS spotify.watch",
       "request": {
         "action": "start|stop",
         "user_id": "UserId"
       },
       "response": {},
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "spotify.watches": {
-      "method": "GET /v1/spotify/watches",
+      "method": "UDS spotify.watches",
       "request": {},
       "response": {
         "watches": [
           "UserId"
         ]
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "vc.join": {
-      "from": "core-cpp TdLibVoiceCall::join (TDLib + dlopen'd ntgcalls, in-process)",
-      "method": "POST /v1/join",
+      "from": "core-cpp TdLibVoiceCall::join (TDLib + build-time-linked ntgcalls, in-process; the backend owns the call via the JoinRequest handshake)",
+      "method": "UDS vc.join",
       "request": {
         "chat_id": "ChatId"
       },
@@ -685,11 +685,11 @@
         "joined": "boolean",
         "now_playing": "NowPlaying"
       },
-      "service": "core-cpp"
+      "service": "backend-go:handlers"
     },
     "vc.lyrics": {
-      "from": "vc-ts src/main.js lyrics panel",
-      "method": "GET /v1/lyrics",
+      "from": "vc-ts src/main.js lyrics panel (reference; the vc-ts service was deleted in the Phase 3 unification)",
+      "method": "UDS vc.lyrics",
       "request": {
         "chat_id": "ChatId"
       },
@@ -701,11 +701,11 @@
         "artist": "string",
         "truncated": "boolean"
       },
-      "service": "vc-ts"
+      "service": "backend-go:handlers"
     },
     "vc.mute": {
-      "from": "core-cpp TdLibVoiceCall mute (TDLib + dlopen'd ntgcalls, in-process)",
-      "method": "POST /v1/mute",
+      "from": "core-cpp TdLibVoiceCall mute (TDLib + build-time-linked ntgcalls, in-process)",
+      "method": "UDS vc.mute",
       "request": {
         "chat_id": "ChatId",
         "muted": "boolean"
@@ -714,18 +714,18 @@
         "muted": "boolean",
         "now_playing": "NowPlaying"
       },
-      "service": "core-cpp"
+      "service": "backend-go:handlers"
     },
     "vc.now_playing": {
-      "method": "GET /v1/now-playing?chat_id=",
+      "method": "UDS vc.now_playing",
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.progress": {
       "from": "UI_INVENTORY.md §29 IPC-2 (Phase 9)",
-      "method": "GET /v1/progress?chat_id=",
+      "method": "UDS vc.progress",
       "request": {
         "chat_id": "ChatId"
       },
@@ -738,32 +738,32 @@
         "now": "Track|null",
         "next": "Track|null"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.panel": {
-      "from": "YukkiMusic panel callbacks, vc-ts src/main.js",
-      "method": "GET /v1/panel | POST /v1/panel",
+      "from": "YukkiMusic panel callbacks (reference; the vc-ts service was deleted in the Phase 3 unification)",
+      "method": "UDS vc.panel",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-ts"
+      "service": "backend-go:handlers"
     },
     "vc.pause": {
-      "method": "POST /v1/pause",
+      "method": "UDS vc.pause",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.play": {
       "from": "YukkiMusic-Go internal/core/queue.go, TGVCBot handlers/play.ts, ParvatiMusic modules/play.rs",
-      "method": "POST /v1/play",
+      "method": "UDS vc.play",
       "request": {
         "chat_id": "ChatId",
         "query": "string (title, URL or track id)",
@@ -774,11 +774,11 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.play_file": {
       "from": "phase3/actions-inventory.md §3.3 + §9-E12 (OD-3); core posts it for replied media (dispatcher.cpp playRepliedFile)",
-      "method": "POST /v1/play_file",
+      "method": "UDS vc.play_file",
       "request": {
         "chat_id": "ChatId",
         "file_path": "string (path under the data dir)",
@@ -796,11 +796,11 @@
           "detail": "string (\"local file — audio path lands with the DSP\")"
         }
       },
-      "service": "backend-go",
+      "service": "backend-go:handlers",
       "ported": "Phase 3 Wave 2 (OD-3) — record-only per inventory §3.3; the only implementation is internal/handlers"
     },
     "vc.queue": {
-      "method": "POST /v1/queue",
+      "method": "UDS vc.queue",
       "request": {
         "action": "add|remove|clear|list",
         "chat_id": "ChatId",
@@ -812,11 +812,11 @@
           "QueueItem"
         ]
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.radio": {
       "from": "openradiobot index.js",
-      "method": "POST /v1/radio",
+      "method": "UDS vc.radio",
       "request": {
         "action": "start|stop",
         "chat_id": "ChatId",
@@ -825,20 +825,20 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "radio-js -> vc-*"
+      "service": "backend-go:handlers"
     },
     "vc.resume": {
-      "method": "POST /v1/resume",
+      "method": "UDS vc.resume",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.seek": {
-      "method": "POST /v1/seek",
+      "method": "UDS vc.seek",
       "request": {
         "chat_id": "ChatId",
         "position_sec": "integer"
@@ -846,29 +846,29 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.skip": {
-      "method": "POST /v1/skip",
+      "method": "UDS vc.skip",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.stop": {
-      "method": "POST /v1/stop",
+      "method": "UDS vc.stop",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {},
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.loop": {
       "from": "ParvatiMusic bot/src/modules/vc.rs handle_loop, bot/src/room.rs loop_n",
-      "method": "POST /v1/loop",
+      "method": "UDS vc.loop",
       "request": {
         "chat_id": "ChatId",
         "count": "integer 0..=10"
@@ -876,11 +876,11 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.shuffle": {
       "from": "ParvatiMusic bot/src/modules/vc.rs handle_shuffle, bot/src/room.rs shuffle_queue",
-      "method": "POST /v1/shuffle",
+      "method": "UDS vc.shuffle",
       "request": {
         "chat_id": "ChatId",
         "enabled": "boolean"
@@ -888,11 +888,11 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.autoplay": {
       "from": "ParvatiMusic bot/src/modules/lists.rs autoplay_handler, bot/src/monitor.rs advance_locked",
-      "method": "POST /v1/autoplay",
+      "method": "UDS vc.autoplay",
       "request": {
         "chat_id": "ChatId",
         "enabled": "boolean"
@@ -900,22 +900,22 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "vc.autoplay_skip": {
       "from": "ParvatiMusic bot/src/modules/vc.rs handle_autoplay_skip",
-      "method": "POST /v1/autoplay-skip",
+      "method": "UDS vc.autoplay_skip",
       "request": {
         "chat_id": "ChatId"
       },
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-go | vc-ts | vc-rust"
+      "service": "backend-go:handlers"
     },
     "spotify.collection": {
       "from": "Spotify Web API (client credentials) + Spotify-Loader bot.py",
-      "method": "POST /v1/spotify/collection",
+      "method": "UDS spotify.collection",
       "request": {
         "url": "string (open.spotify.com/<album|playlist|artist>/<id> or spotify:<kind>:<id>)"
       },
@@ -928,21 +928,21 @@
         ],
         "truncated": "boolean"
       },
-      "service": "spotify-rust | downloaders"
+      "service": "backend-go:spotify"
     },
     "spotify.status": {
-      "method": "GET /v1/spotify/status",
+      "method": "UDS spotify.status",
       "request": {},
       "response": {
         "api": "string",
         "credentials_configured": "boolean",
         "token_cached": "boolean"
       },
-      "service": "spotify-rust"
+      "service": "backend-go:spotify"
     },
     "vc.volume": {
-      "from": "vc-ts src/main.js volume control",
-      "method": "POST /v1/volume",
+      "from": "vc-ts src/main.js volume control (reference; the vc-ts service was deleted in the Phase 3 unification)",
+      "method": "UDS vc.volume",
       "request": {
         "chat_id": "ChatId",
         "volume": "integer 0..200"
@@ -950,19 +950,20 @@
       "response": {
         "now_playing": "NowPlaying"
       },
-      "service": "vc-ts"
+      "service": "backend-go:handlers"
     }
   },
-  "description": "Single contract for all Parlay services. HTTP + JSON. Every service: POST /v1/<action> with header X-Parlay-Token: $PARLAY_TOKEN. Health: GET /healthz -> {ok, service}. Error envelope everywhere: {ok:false, error:{code, message}}. Success: {ok:true, data:{...}}.",
+  "description": "Single contract for all Parlay actions. UDS + JSON: the core calls each action by name over one persistent Unix domain socket (data/parlay-backend.sock); there are no HTTP routes and no per-service endpoints. Error envelope everywhere: {ok:false, error:{code, message}}. Success: {ok:true, data:{...}}.",
   "notes": [
     "Files over the 50 MB Bot API cap: download.* returns oversize=true; the core queues them for a later MTProto pass instead of failing.",
-    "New actions are added here first, then in the service, then in the core handler.",
+    "New actions are added here first, then in the backend package, then in the core handler.",
     "v0.3.0 (Phase 9): IPC-1 vc.now_playing UI fields, IPC-2 vc.progress, IPC-3 search Track fields, IPC-4 download.progress, IPC-5 lyrics fields, IPC-6 chat.settings, IPC-7 spotify.details/analyze. download.spotify_playlist gains file_paths (files mode). radio.status response corrected to the radio-js shape.",
-    "v0.3.1 (Phase 9 gaps): search.inline request gains optional chat_id (np/s/l modes only — the core passes the chat the inline user is playing in; without it those modes return empty results); netease.lyrics response gains lrc_path (the .lrc file the service wrote under the download dir, empty string when the write fails); every download.* POST response gains run_id (12-hex progress-run id — the core reads it from the response for the IPC-4 snapshot. Live polling DURING the transfer is still not possible: the downloaders POST blocks until the transfer completes, so the run_id is only known after the POST returns.)"
+    "v0.3.1 (Phase 9 gaps): search.inline request gains optional chat_id (np/s/l modes only — the core passes the chat the inline user is playing in; without it those modes return empty results); netease.lyrics response gains lrc_path (the .lrc file the service wrote under the download dir, empty string when the write fails); every download.* POST response gains run_id (12-hex progress-run id — the core reads it from the response for the IPC-4 snapshot. Live polling DURING the transfer is still not possible: the downloaders POST blocks until the transfer completes, so the run_id is only known after the POST returns.)",
+    "Phase 4 (2026-11-03, Worker C): retargeted to the unified backend — every action's service is backend-go:<package> (the 12-service HTTP mesh is gone); method is the UDS action name; protocol is UDS + JSON. Action set and request/response shapes unchanged (still 65 actions, 56 contract + 9 OD-3). chat.settings records the canonical values: play_mode everyone|admins (default everyone), autoplay_lang default \"\" (any language)."
   ],
   "title": "Parlay IPC contract",
   "transport": {
-    "auth_header": "X-Parlay-Token",
+    "auth": "No token: filesystem permissions are the access control (socket 0600 in a 0700 data dir). See contracts/uds-protocol.md §7.",
     "envelope_err": {
       "error": {
         "code": "string",
@@ -983,7 +984,7 @@
       "rate_limited",
       "internal"
     ],
-    "protocol": "HTTP/1.1 + JSON",
+    "protocol": "UDS (Unix domain socket) + JSON — length-prefixed frames, see contracts/uds-protocol.md",
     "timeout_ms": 30000
   },
   "types": {

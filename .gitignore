@@ -1,5 +1,6 @@
 # Parlay — never commit secrets or reference clones
 .env
+bin/
 .env.*
 !.env.example
 *.session

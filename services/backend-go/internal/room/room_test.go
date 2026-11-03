@@ -641,3 +641,34 @@ func TestSnapshotQueueOnlyRoom(t *testing.T) {
 		t.Fatalf("Snapshot unknown chat returned a room")
 	}
 }
+
+// TestSetFX pins the fx seam: SetFX stores the preset + params
+// through persistLocked (bbolt rooms bucket) and FX reads them
+// back; the params map is copied on both sides, so later caller
+// mutation cannot corrupt the room.
+func TestSetFX(t *testing.T) {
+	m := newTestManager(t)
+	if _, _, ok := m.FX(1); ok {
+		t.Fatalf("FX on unknown chat returned a room")
+	}
+	params := map[string]float64{"rate": 1.25}
+	if _, err := m.SetFX(1, "nightcore", params); err != nil {
+		t.Fatalf("SetFX: %v", err)
+	}
+	params["rate"] = 9 // mutating the caller's map must not leak in
+	effect, got, ok := m.FX(1)
+	if !ok || effect != "nightcore" || got["rate"] != 1.25 {
+		t.Fatalf("FX = %q %v ok=%v", effect, got, ok)
+	}
+	got["rate"] = 9 // mutating the returned map must not leak in either
+	if _, got2, _ := m.FX(1); got2["rate"] != 1.25 {
+		t.Fatalf("FX params aliased the room: %v", got2)
+	}
+	// "original" overwrites like any other preset.
+	if _, err := m.SetFX(1, "original", nil); err != nil {
+		t.Fatalf("SetFX original: %v", err)
+	}
+	if effect, _, _ := m.FX(1); effect != "original" {
+		t.Fatalf("FX after original = %q", effect)
+	}
+}

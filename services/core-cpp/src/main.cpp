@@ -12,7 +12,7 @@
 //
 // Config comes from parlay.toml (file) + environment (see config.hpp);
 // no secrets are read from files and none are logged. State lives in
-// Store (MongoDB wire protocol > Redis RESP > JSON file). Playback and
+// Store is one JSON file (data/state.json). Playback and
 // voice go through the single unified backend over the persistent UDS
 // socket (IpcClient); the core never touches ntgcalls or audio, and
 // voice joins arrive as duplex JoinRequests the core answers with

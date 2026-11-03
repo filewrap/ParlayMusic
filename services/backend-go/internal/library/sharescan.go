@@ -11,10 +11,17 @@ import (
 	"parlay/backend-go/internal/uds"
 )
 
-// slskdBaseURL returns the slskd base URL (SLSKD_URL wins, SLSKD_HOST
-// is the alias, default http://127.0.0.1:5030 — the same rule as the
-// resolver's Soulseek client).
-func slskdBaseURL() string {
+// slskdBaseURL returns the slskd base URL: the [backend]
+// slskd_url value when the service has config (Q10 — the file key
+// now does what the env var did), else SLSKD_URL / SLSKD_HOST,
+// else the local default — the same rule as the resolver's
+// Soulseek client.
+func (s *Service) slskdBaseURL() string {
+	if s.deps != nil && s.deps.Config != nil {
+		if v := strings.TrimRight(strings.TrimSpace(s.deps.Config.Backend.SlskdURL), "/"); v != "" {
+			return v
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("SLSKD_URL")); v != "" {
 		return strings.TrimRight(v, "/")
 	}
@@ -26,8 +33,8 @@ func slskdBaseURL() string {
 
 // slskdPost performs one slskd POST with the API key when set. A
 // transport failure is an engine_unavailable naming SLSKD_URL.
-func slskdPost(ctx context.Context, path string) (int, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, slskdBaseURL()+"/api/v0"+path, nil)
+func (s *Service) slskdPost(ctx context.Context, path string) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.slskdBaseURL()+"/api/v0"+path, nil)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -38,7 +45,7 @@ func slskdPost(ctx context.Context, path string) (int, []byte, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("slskd unreachable at %s (%v)", slskdBaseURL(), err)
+		return 0, nil, fmt.Errorf("slskd unreachable at %s (%v)", s.slskdBaseURL(), err)
 	}
 	defer resp.Body.Close()
 	body := make([]byte, 0, 4096)
@@ -67,7 +74,7 @@ func slskdPost(ctx context.Context, path string) (int, []byte, error) {
 // queued scan, so scheduled_in_min is omitted in that case (the
 // field is optional) rather than invented.
 func (s *Service) handleShareScan(ctx context.Context, _ uds.Request) (any, error) {
-	status, body, err := slskdPost(ctx, "/options/shares/scan")
+	status, body, err := s.slskdPost(ctx, "/options/shares/scan")
 	if err != nil {
 		return nil, uds.NewHandlerError(uds.ErrEngineUnavailable, fmt.Sprintf("slskd share scan failed: %v", err))
 	}

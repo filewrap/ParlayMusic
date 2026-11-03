@@ -1096,7 +1096,7 @@ bool Dispatcher::canManageVc(const CommandContext& ctx) {
 
 bool Dispatcher::playAllowed(const CommandContext& ctx, bool force) {
     int64_t chat = vcTarget(ctx);
-    bool admin_only = chatField(chat, "play_mode", "everyone") == "admin";
+    bool admin_only = chatField(chat, "play_mode", "everyone") == "admins";
     if (!admin_only && !force) return true;
     int64_t user = ctx.message.from.id;
     if (isSudo(user) || isChatAdmin(chat, user) || isAuthUser(chat, user))
@@ -1345,10 +1345,6 @@ void Dispatcher::saveChatSettings(int64_t chat_id,
     setChatField(chat_id, "clean_mode", std::to_string(s.clean_delay_min));
     setChatField(chat_id, "thumb", s.thumbnails ? "on" : "off");
     setChatField(chat_id, "autoplay", s.autoplay ? "on" : "off");
-    if (s.autoplay)
-        store_.set("autoplay:" + std::to_string(chat_id), "1");
-    else
-        store_.set("autoplay:" + std::to_string(chat_id), "0");
     setChatField(chat_id, "silent", s.silent ? "on" : "off");
     setChatField(chat_id, "autodelete", s.auto_delete ? "on" : "off");
     setChatField(chat_id, "autodelete_min",
@@ -1708,23 +1704,23 @@ void Dispatcher::deleteCommandMessage(const CommandContext& ctx) {
 }
 
 // One POST to the single unified backend over the persistent UDS
-// socket (contracts/uds-protocol.md). The base_url argument is gone:
-// there is exactly one backend, and IpcClient::post ignores the URL
-// anyway. No fallback, no /healthz pre-probe — a failed call reports
-// the backend's exact error, never a silent retry elsewhere.
+// socket (contracts/uds-protocol.md). There is exactly one backend,
+// so there is no per-service URL. No fallback, no /healthz pre-probe
+// — a failed call reports the backend's exact error, never a silent
+// retry elsewhere.
 IpcResult Dispatcher::vcCall(const CommandContext& ctx, const std::string& action,
                              const Json& body) {
     (void)ctx;
-    return ipc_.post("", action, body, 30);
+    return ipc_.post(action, body, 30);
 }
 
 IpcResult Dispatcher::vcGet(const CommandContext& ctx, const std::string& action) {
     // GET /v1/<action>?chat_id=... on the one backend (10 s budget).
     // IpcClient::get translates the legacy path to the dotted contract
-    // action; the base URL is ignored.
+    // action.
     std::string path = "/v1/" + action +
                        "?chat_id=" + std::to_string(vcTarget(ctx));
-    return ipc_.get("", path, 10);
+    return ipc_.get(path, 10);
 }
 
 bool Dispatcher::nowPlaying(int64_t chat_id, Json& np_out, Json& track_out) {
@@ -2329,9 +2325,8 @@ void Dispatcher::onStart(const CommandContext& ctx) {
                 }
             }
             // (2) Otherwise it is a track token: resolve it via
-            // share-rust and present the track.
-            IpcResult r = ipc_.get(cfg_.share_url,
-                                   "/v1/share/" + token, 15);
+            // the backend (share.resolve) and present the track.
+            IpcResult r = ipc_.get("/v1/share/" + token, 15);
             if (r.ok) {
                 const Json* track = r.data.find("track");
                 if (track) {
@@ -3513,7 +3508,7 @@ void Dispatcher::onLyrics(const CommandContext& ctx) {
         {"query", Json(query)},
         {"limit", Json(static_cast<int64_t>(1))},
     });
-    IpcResult s = ipc_.post(cfg_.netease_url, "netease/search", sbody, 20);
+    IpcResult s = ipc_.post("netease/search", sbody, 20);
     if (!s.ok) {
         replyError(ctx, s);
         return;
@@ -3532,7 +3527,7 @@ void Dispatcher::onLyrics(const CommandContext& ctx) {
         return;
     }
     Json lbody = Json::objectOf({{"track_id", Json(tid)}});
-    IpcResult l = ipc_.post(cfg_.netease_url, "netease/lyrics", lbody, 20);
+    IpcResult l = ipc_.post("netease/lyrics", lbody, 20);
     if (!l.ok) {
         replyHtml(ctx, ui_texts::kLyricsFail);
         return;
@@ -3734,14 +3729,14 @@ void Dispatcher::onSearch(const CommandContext& ctx) {
             {"query", Json(q)},
             {"limit", Json(static_cast<int64_t>(10))},
         });
-        r = ipc_.post(cfg_.netease_url, "netease/search", body, 20);
+        r = ipc_.post("netease/search", body, 20);
     } else {
         body = Json::objectOf({
             {"query", Json(q)},
             {"source", Json("all")},
             {"limit", Json(static_cast<int64_t>(10))},
         });
-        r = ipc_.post(cfg_.vc_ts_url, "search", body, 20);
+        r = ipc_.post("search", body, 20);
     }
     if (!r.ok) {
         replyError(ctx, r);
@@ -3867,7 +3862,7 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
                                        : kb,
                             &err);
     };
-    IpcResult r = ipc_.post(cfg_.dl_url, action, body, 120);
+    IpcResult r = ipc_.post(action, body, 120);
     if (!r.ok) {
         edit_progress(ui_texts::dlFailedText(r.error_message),
                       InlineKeyboard{});
@@ -3902,8 +3897,7 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
     bool lossy = false;
     std::string lossy_summary;
     if (!server_run.empty()) {
-        IpcResult snap = ipc_.get(cfg_.dl_url,
-                                  "/v1/download/progress?run_id=" +
+        IpcResult snap = ipc_.get("/v1/download/progress?run_id=" +
                                       server_run,
                                   10);
         if (snap.ok) {
@@ -4047,7 +4041,7 @@ void Dispatcher::deepLinkDownload(const CommandContext& ctx,
         tg_.editMessageText(ctx.message.chat.id, progress_msg, text,
                             InlineKeyboard{}, &err);
     };
-    IpcResult r = ipc_.post(cfg_.dl_url, action, body, 120);
+    IpcResult r = ipc_.post(action, body, 120);
     if (!r.ok) {
         edit_progress(ui_texts::dlFailedText(r.error_message));
         return;
@@ -4097,7 +4091,7 @@ void Dispatcher::deliverSpotifyCollection(const TgCallbackQuery& cq,
         {"mode", Json(mode)},
         {"requested_by", Json(cq.from.id)},
     });
-    IpcResult r = ipc_.post(cfg_.dl_url, "download/spotify-playlist", body,
+    IpcResult r = ipc_.post("download/spotify-playlist", body,
                             300);
     if (!r.ok) {
         answerCb(cq, r.error_message, true);
@@ -4169,7 +4163,7 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
     if (station.empty()) {
         // List stations (radio.list). The service returns objects
         // (id/name/genre/stream_url), not bare strings.
-        IpcResult r = ipc_.get(cfg_.radio_url, "/v1/radio/stations", 10);
+        IpcResult r = ipc_.get("/v1/radio/stations", 10);
         if (!r.ok) {
             replyError(ctx, r);
             return;
@@ -4195,7 +4189,7 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"station", Json(station)},
     });
-    IpcResult r = ipc_.post(cfg_.radio_url, "radio/start", body, 15);
+    IpcResult r = ipc_.post("radio/start", body, 15);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -4235,8 +4229,7 @@ void Dispatcher::onNewRadio(const CommandContext& ctx) {
         return;
     }
     // A radio already exists for this chat -> point at /manage.
-    IpcResult st = ipc_.get(cfg_.radio_url,
-                            "/v1/radio/status?chat_id=" +
+    IpcResult st = ipc_.get("/v1/radio/status?chat_id=" +
                                 std::to_string(vcTarget(ctx)),
                             10);
     if (st.ok) {
@@ -4247,7 +4240,7 @@ void Dispatcher::onNewRadio(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"station", Json(station)},
     });
-    IpcResult r = ipc_.post(cfg_.radio_url, "radio/start", body, 15);
+    IpcResult r = ipc_.post("radio/start", body, 15);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -4271,7 +4264,7 @@ void Dispatcher::onDestroyRadio(const CommandContext& ctx) {
     }
     if (!canManageVc(ctx)) return;
     Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-    IpcResult r = ipc_.post(cfg_.radio_url, "radio/stop", body, 15);
+    IpcResult r = ipc_.post("radio/stop", body, 15);
     if (!r.ok) {
         if (r.error_code == "not_found") {
             replyHtml(ctx, ui_texts::kRadioNoRadio);
@@ -4289,8 +4282,7 @@ void Dispatcher::onManageRadio(const CommandContext& ctx) {
         return;
     }
     if (!canManageVc(ctx)) return;
-    IpcResult r = ipc_.get(cfg_.radio_url,
-                           "/v1/radio/status?chat_id=" +
+    IpcResult r = ipc_.get("/v1/radio/status?chat_id=" +
                                std::to_string(vcTarget(ctx)),
                            10);
     if (!r.ok) {
@@ -4312,6 +4304,18 @@ void Dispatcher::onManageRadio(const CommandContext& ctx) {
         if (const Json* s = r.data.find("station"))
             now_playing = s->asString();
     }
+    // "Live on" is the station itself: there is no per-chat live
+    // page in the locked topology (no radio web UI), so the old
+    // radio-js host URL rendered a dead link. The backend's status
+    // response carries the station name.
+    std::string station_name = "—";
+    if (const Json* sn = r.data.find("station_name"))
+        station_name = sn->asString();
+    if (station_name == "—" || station_name.empty()) {
+        if (const Json* stn = r.data.find("station"))
+            station_name = stn->asString();
+    }
+    if (station_name.empty()) station_name = "—";
     replyHtml(ctx, ui_texts::fmt(ui_texts::kRadioManageCard,
                                  {{"loopType", "—"},
                                   {"created", "—"},
@@ -4319,9 +4323,8 @@ void Dispatcher::onManageRadio(const CommandContext& ctx) {
                                    ui_texts::htmlEscape(now_playing)},
                                   {"autoplay", "—"},
                                   {"queueLen", "—"},
-                                  {"host", cfg_.radio_url},
-                                  {"chatId", std::to_string(
-                                                 ctx.message.chat.id)}}));
+                                  {"host",
+                                   ui_texts::htmlEscape(station_name)}}));
 }
 
 void Dispatcher::onShare(const CommandContext& ctx) {
@@ -4338,7 +4341,7 @@ void Dispatcher::onShare(const CommandContext& ctx) {
         {"created_by", Json(ctx.message.from.id)},
         {"track", track},
     });
-    IpcResult r = ipc_.post(cfg_.share_url, "share", body, 15);
+    IpcResult r = ipc_.post("share", body, 15);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -4482,7 +4485,7 @@ void Dispatcher::onAddPlaylist(const CommandContext& ctx) {
         {"source", Json("all")},
         {"limit", Json(static_cast<int64_t>(1))},
     });
-    IpcResult r = ipc_.post(cfg_.vc_ts_url, "search", body, 20);
+    IpcResult r = ipc_.post("search", body, 20);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -4719,7 +4722,7 @@ void Dispatcher::onAddToPlaylist(const CommandContext& ctx) {
         {"source", Json("all")},
         {"limit", Json(static_cast<int64_t>(1))},
     });
-    IpcResult r = ipc_.post(cfg_.vc_ts_url, "search", body, 20);
+    IpcResult r = ipc_.post("search", body, 20);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -4875,7 +4878,7 @@ void Dispatcher::onPlaymode(const CommandContext& ctx) {
         return;
     }
     if (!adminCheck(ctx)) return;
-    setChatField(chat, "play_mode", admins ? "admin" : "everyone");
+    setChatField(chat, "play_mode", admins ? "admins" : "everyone");
     replyHtml(ctx, admins ? ui_texts::kPlayModeAdmin
                           : ui_texts::kPlayModeEveryone);
 }
@@ -5028,12 +5031,10 @@ void Dispatcher::onAutoplay(const CommandContext& ctx) {
     std::string a = lowerStr(args[0]);
     if (a == "on" || a == "enable" || a == "start") {
         setChatField(chat, "autoplay", "on");
-        store_.set("autoplay:" + std::to_string(chat), "1");
         replyKb(ctx, ui_texts::autoplayCardText(true),
                 ui_texts::autoplayCardKeyboard(true));
     } else if (a == "off" || a == "disable" || a == "stop") {
         setChatField(chat, "autoplay", "off");
-        store_.set("autoplay:" + std::to_string(chat), "0");
         replyKb(ctx, ui_texts::autoplayCardText(false),
                 ui_texts::autoplayCardKeyboard(false));
     } else if ((a == "lang" || a == "language") && args.size() >= 2 &&
@@ -5802,8 +5803,9 @@ void Dispatcher::onStats(const CommandContext& ctx) {
     std::snprintf(b, sizeof b, "%.1f", rss_mb);
     memory_block += std::string(b) + " MB";
     std::snprintf(b, sizeof b, "%.1f", disk_pct);
-    std::string server_block = "Disk: " + std::string(b) +
-                               "%\nStore: " + store_.backend();
+    // (No "Store:" line: the core's only store is the JSON file —
+    // see store.hpp. There is no database backend to report.)
+    std::string server_block = "Disk: " + std::string(b) + "%";
     std::string bot_block =
         "Chats: " + std::to_string(store_.smembers("chats").size()) +
         "\nUsers: " + std::to_string(store_.smembers("users").size()) +
@@ -6099,7 +6101,7 @@ void Dispatcher::onStream(const CommandContext& ctx) {
         {"query", Json(query)},
         {"requested_by", Json(ctx.message.from.id)},
     });
-    IpcResult r = ipc_.post(cfg_.dl_url, "download/youtube", body, 120);
+    IpcResult r = ipc_.post("download/youtube", body, 120);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -6479,7 +6481,7 @@ void Dispatcher::handleInlineQuery(const TgInlineQuery& iq) {
         {"user_id", Json(iq.from.id)},
     });
     if (need_chat) body.set("chat_id", Json(chat_id));
-    IpcResult r = ipc_.post(cfg_.vc_ts_url, "inline", body, 15);
+    IpcResult r = ipc_.post("inline", body, 15);
     if (!r.ok) {
         // Engine down: answer empty rather than leaving the query
         // hanging (Telegram shows "no results" instead of an error).
@@ -6515,7 +6517,7 @@ void Dispatcher::handleInlineQuery(const TgInlineQuery& iq) {
         // — the route sits behind vc-ts's POST-only gate (main.js).
         // Flagged for the coordinator in phase9/port-core.md.
         Json lbody = Json::objectOf({{"chat_id", Json(chat_id)}});
-        IpcResult lr = ipc_.post(cfg_.vc_ts_url, "lyrics", lbody, 15);
+        IpcResult lr = ipc_.post("lyrics", lbody, 15);
         std::string lyrics;
         if (lr.ok) {
             const Json* lx = lr.data.find("lyrics");
@@ -6756,8 +6758,6 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
     if (verb == "autoplay") {
         bool on = chatField(chat_id, "autoplay", "off") != "on";
         setChatField(chat_id, "autoplay", on ? "on" : "off");
-        store_.set("autoplay:" + std::to_string(chat_id),
-                   on ? "1" : "0");
         IpcResult r = vcCall(ctx, "autoplay",
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
@@ -6766,8 +6766,6 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         if (!r.ok) {
             // The engine refused: roll the toggle back, honestly.
             setChatField(chat_id, "autoplay", on ? "off" : "on");
-            store_.set("autoplay:" + std::to_string(chat_id),
-                       on ? "0" : "1");
             error = r.error_message;
             return false;
         }
@@ -7259,7 +7257,7 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
     } else if (key == "adminmode") {
         s.admin_mode = (s.admin_mode + 1) % 3;
     } else if (key == "playmode") {
-        s.play_mode = s.play_mode == "admin" ? "everyone" : "admin";
+        s.play_mode = s.play_mode == "admins" ? "everyone" : "admins";
     } else if (key == "cmddelete") {
         s.cmd_delete = !s.cmd_delete;
     } else if (key == "cleanmode") {
@@ -7370,13 +7368,42 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
             answerCb(cq, ui_texts::kToastDlNothingToCancel);
             return;
         }
-        // There is no download.cancel IPC action in contracts/ipc.json
-        // (and no cancel endpoint in the downloaders service), so the
-        // core cannot stop a running download — say so honestly
-        // instead of claiming a cancel that never happens. Needs a
-        // download.cancel action from the engines worker (see
-        // phase9/port-core.md).
-        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+        // Only the chat that requested the download may cancel it
+        // (same guard as the zip/1by1 branch below). The run value
+        // is "<path|pending>\n<chat_id>"; a value with no parsable
+        // chat does not block the cancel.
+        size_t nl = run->find('\n');
+        if (nl != std::string::npos) {
+            try {
+                if (std::stoll(run->substr(nl + 1)) != cq.chat_id) {
+                    answerCb(cq, ui_texts::kToastDlWrongChat, true);
+                    return;
+                }
+            } catch (...) {
+            }
+        }
+        // download.cancel (Phase 3, OD-3): {run_id} ->
+        // {cancelled, run_id, phase}. Unknown run_id is a 404; a
+        // finished run answers cancelled:false (200, not an error).
+        IpcResult r = ipc_.post("download.cancel",
+                                Json::objectOf({{"run_id", Json(run_id)}}),
+                                30);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        store_.del("dlrun:" + run_id);
+        bool cancelled = true;
+        if (const Json* c = r.data.find("cancelled"))
+            cancelled = c->asBool();
+        if (cancelled) {
+            answerCb(cq, ui_texts::kToastDlCancelled);
+            // Retire the progress message the button sits on so the
+            // dead Cancel button does not linger.
+            editCbCard(cq, ui_texts::kToastDlCancelled, InlineKeyboard{});
+        } else {
+            answerCb(cq, ui_texts::kToastDlNothingToCancel);
+        }
         return;
     }
     if (verb == "fx") {
@@ -7402,7 +7429,7 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
         // dlrun value: "<file_path>\n<chat_id>".
         std::string input_path = run->substr(0, run->find('\n'));
         answerCb(cq, ui_texts::kDlFxApplying);
-        IpcResult r = ipc_.post(cfg_.fx_url, "fx",
+        IpcResult r = ipc_.post("fx",
                                 Json::objectOf({
                                     {"effect", Json(fx_effect)},
                                     {"input_path", Json(input_path)},
@@ -7645,7 +7672,7 @@ void Dispatcher::cbVote(const TgCallbackQuery& cq,
     ctx.message.chat.id = vote_chat;
     ctx.message.from = cq.from;
     ctx.command = "vote";
-    IpcResult r = ipc_.post(cfg_.queue_url, "vote",
+    IpcResult r = ipc_.post("vote",
                             Json::objectOf({
                                 {"chat_id", Json(vote_chat)},
                                 {"track_id", Json(track_id)},
@@ -7728,9 +7755,9 @@ void Dispatcher::cbShare(const TgCallbackQuery& cq,
 void Dispatcher::cbDel(const TgCallbackQuery& cq,
                        const std::vector<std::string>& parts) {
     // pl:del:yes:<id> / pl:del:no:<id> — the §25 delete confirm.
-    // There is no library.delete IPC action in contracts/ipc.json, so
-    // the core cannot execute the deletion (see phase9/port-core.md):
-    // "yes" is answered honestly instead of pretending.
+    // "yes" posts library.delete (Phase 3, OD-3) and deletes the
+    // confirm card on success; a backend refusal is answered with
+    // the backend's exact error instead of pretending.
     if (parts.size() < 4) {
         answerCb(cq, ui_texts::kToastUnknownAction, true);
         return;
@@ -7742,7 +7769,25 @@ void Dispatcher::cbDel(const TgCallbackQuery& cq,
         return;
     }
     if (verdict == "yes") {
-        answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
+        // library.delete (Phase 3, OD-3): {id} -> {deleted, id}.
+        // Unknown id is a 404; the backend deletes the record AND
+        // the file on disk when it has one.
+        IpcResult r = ipc_.post("library.delete",
+                                Json::objectOf({{"id", Json(parts[3])}}),
+                                30);
+        if (!r.ok) {
+            answerCb(cq, r.error_message, true);
+            return;
+        }
+        bool deleted = true;
+        if (const Json* d = r.data.find("deleted"))
+            deleted = d->asBool();
+        if (!deleted) {
+            answerCb(cq, ui_texts::kToastDelNothing, true);
+            return;
+        }
+        answerCb(cq, ui_texts::kToastDelDeleted);
+        if (cq.has_message) tg_.deleteMessage(cq.chat_id, cq.message_id);
         return;
     }
     answerCb(cq, ui_texts::kToastUnknownAction, true);
@@ -7962,7 +8007,7 @@ void Dispatcher::cbSpotify(const TgCallbackQuery& cq,
     }
     const std::string& verb = parts[2];
     if (verb == "dislike") {
-        IpcResult r = ipc_.post(cfg_.spotify_url, "dislike",
+        IpcResult r = ipc_.post("dislike",
                                 Json::objectOf({
                                     {"user_id", Json(cq.from.id)},
                                     {"track_id", Json(parts[3])},
@@ -7984,7 +8029,7 @@ void Dispatcher::cbSpotify(const TgCallbackQuery& cq,
         std::string path = "/v1/spotify/details?user_id=" +
                            std::to_string(cq.from.id) +
                            "&track_id=" + track_id;
-        IpcResult r = ipc_.get(cfg_.spotify_url, path, 10);
+        IpcResult r = ipc_.get(path, 10);
         if (!r.ok) {
             answerCb(cq, r.error_message, true);
             return;
@@ -7996,7 +8041,7 @@ void Dispatcher::cbSpotify(const TgCallbackQuery& cq,
         return;
     }
     if (verb == "analyze") {
-        IpcResult r = ipc_.post(cfg_.spotify_url, "spotify.analyze",
+        IpcResult r = ipc_.post("spotify.analyze",
                                 Json::objectOf({
                                     {"user_id", Json(cq.from.id)},
                                     {"track_id", Json(track_id)},

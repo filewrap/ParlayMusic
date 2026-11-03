@@ -334,6 +334,12 @@ bool IpcClient::getPathToAction(const std::string& path,
 
 namespace {
 std::string defaultSocketPath(const Config& cfg) {
+    // Precedence (Q6, Phase 4): [ipc] socket_path / PARLAY_UDS_PATH
+    // (already folded into cfg.ipc_socket_path by the config load
+    // paths) wins; the env var is re-checked here so clients built
+    // from a bare Config::defaults() still honour it; otherwise the
+    // socket lives next to the state file.
+    if (!cfg.ipc_socket_path.empty()) return cfg.ipc_socket_path;
     const char* env = std::getenv("PARLAY_UDS_PATH");
     if (env && *env) return std::string(env);
     std::string dir = cfg.data_dir.empty() ? std::string("data") : cfg.data_dir;
@@ -656,12 +662,21 @@ IpcResult IpcClient::call(const std::string& action, const Json& payload,
     return result;
 }
 
+IpcResult IpcClient::post(const std::string& action, const Json& body,
+                          int timeout_sec) const {
+    return post("", action, body, timeout_sec);
+}
+
 IpcResult IpcClient::post(const std::string& base_url,
                           const std::string& action, const Json& body,
                           int timeout_sec) const {
     (void)base_url;  // single backend: the URL is signature compat only
     std::string canonical = canonicalAction(action);
     return call(canonical, body, deadlineMsFor(canonical, timeout_sec));
+}
+
+IpcResult IpcClient::get(const std::string& path, int timeout_sec) const {
+    return get("", path, timeout_sec);
 }
 
 IpcResult IpcClient::get(const std::string& base_url,
@@ -677,6 +692,10 @@ IpcResult IpcClient::get(const std::string& base_url,
         return out;
     }
     return call(action, payload, deadlineMsFor(action, timeout_sec));
+}
+
+bool IpcClient::healthz(int timeout_sec) const {
+    return healthz("", timeout_sec);
 }
 
 bool IpcClient::healthz(const std::string& base_url, int timeout_sec) const {

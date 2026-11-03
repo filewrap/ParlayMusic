@@ -217,7 +217,7 @@ func DefaultChatSettings() ChatSettings {
 		CleanDelayMin:     0,
 		Thumbnails:        true,
 		Autoplay:          false,
-		AutoplayLang:      "en",
+		AutoplayLang:      "",
 		AutoplayMood:      "",
 		SilentMode:        false,
 		AutoDelete:        false,
@@ -239,4 +239,65 @@ type RadioState struct {
 	Reachable  *bool  `json:"reachable"`
 	NowPlaying *Track `json:"now_playing"`
 	UpdatedAt  int64  `json:"updated_at"`
+}
+
+// DownloadTrackProgress is one per-track checklist entry in a
+// persisted download run (bucket "downloads"). It mirrors
+// download.TrackProgress; the conversion lives in the download
+// package so model stays free of transport types.
+type DownloadTrackProgress struct {
+	Title  string  `json:"title"`
+	State  string  `json:"state"`
+	Pct    float64 `json:"pct"`
+	Peer   *string `json:"peer,omitempty"`
+	Reason *string `json:"reason,omitempty"`
+}
+
+// DownloadRunRecord is the persisted snapshot of one FINISHED
+// download run (bucket "downloads", key = run id). Only finished
+// runs persist: a live run holds a live context, a cancel func and
+// channels that cannot survive a restart, so a restart restores
+// the finished-run history (for late download.progress polls) and
+// live runs are simply gone. Phase is one of searching |
+// downloading | uploading | done | failed. StartedAt is unix
+// seconds.
+type DownloadRunRecord struct {
+	ID               string                  `json:"id"`
+	Kind             string                  `json:"kind"`
+	Title            string                  `json:"title"`
+	StartedAt        int64                   `json:"started_at"`
+	Phase            string                  `json:"phase"`
+	ErrReason        string                  `json:"err_reason,omitempty"`
+	Percentage       float64                 `json:"percentage"`
+	DoneBytes        int64                   `json:"done_bytes"`
+	TotalBytes       *int64                  `json:"total_bytes,omitempty"`
+	SpeedBytesPerSec float64                 `json:"speed_bytes_per_sec"`
+	ETASeconds       *int64                  `json:"eta_sec,omitempty"`
+	PerTrack         []DownloadTrackProgress `json:"per_track,omitempty"`
+	LossyAvailable   bool                    `json:"lossy_available"`
+	LossySummary     *string                 `json:"lossy_summary,omitempty"`
+	FilePath         string                  `json:"file_path,omitempty"`
+}
+
+// DownloadPrefs is one user's download preferences (bucket
+// "dlprefs", key dlpref:<user_id>). download.Prefs is an alias for
+// this type; the store owns the persisted form.
+type DownloadPrefs struct {
+	UserID       int64  `json:"user_id"`
+	Format       string `json:"format"`
+	UseYouTube   bool   `json:"use_youtube"`
+	PathTemplate string `json:"path_template"`
+}
+
+// LibraryEntry is one cached file in the library index (bucket
+// "library", key = track id). library.Entry is an alias for this
+// type; the store owns the persisted form. AddedAt is unix seconds.
+type LibraryEntry struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Artist    string `json:"artist"`
+	Source    string `json:"source"`
+	FilePath  string `json:"file_path"`
+	SizeBytes int64  `json:"size_bytes"`
+	AddedAt   int64  `json:"added_at"`
 }

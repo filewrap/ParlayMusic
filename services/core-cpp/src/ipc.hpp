@@ -10,6 +10,14 @@
 // the FakeIpc test doubles keep compiling — the fallback router itself
 // is deleted in Wave 2, not here.
 //
+//   * post(action, body, timeout_sec): the no-URL form — every call
+//     goes to the one backend on the UDS socket. This is the form the
+//     dispatcher uses (Phase 4, Q2: the dead per-service base URLs
+//     are gone). The base_url forms below are kept only for the
+//     FakeIpc test doubles, which override the virtuals; they forward
+//     to the same call with the URL ignored.
+//   * get(path, timeout_sec): the no-URL form of the legacy GET.
+//   * healthz(timeout_sec): the no-URL form of the ping.
 //   * post(base_url, action, body, timeout_sec): the base_url argument
 //     is accepted for signature compatibility and IGNORED — every call
 //     goes to the one backend on the UDS socket. Legacy slash-form
@@ -32,17 +40,17 @@
 // JoinResponse data {remote_sdp, group_call_id}. Wave 2 wires the real
 // TDLib joinVideoChat handler; this file only provides the hook.
 //
-// Deadlines (CONFIG SEAM — Worker C is rewriting config.* in parallel):
-// the per-action deadline table lives here with defaults equal to the
-// old hardcoded values (30 s general, 10 s GET-style, 5 s ping) so
-// behaviour does not change. The config rewrite should populate it from
-// parlay.toml [timeouts] (resolve_ms, join_ms, ipc_cmd_ms, download_ms)
-// via setDeadline()/setDefaultDeadlineMs(). Until then the table is the
-// source of truth; the legacy timeout_sec parameter governs only actions
-// with no table entry. The socket path likewise has no config field yet:
-// default is <data_dir>/parlay-backend.sock (Config::data_dir exists
-// today), overridable with the PARLAY_UDS_PATH env var until Worker C
-// adds an ipc_socket_path config key.
+// Deadlines (CONFIG SEAM — resolved in Phase 4, Q6): the socket
+// path comes from Config::ipc_socket_path — parlay.toml [ipc]
+// socket_path, overridable with the PARLAY_UDS_PATH env var — and
+// falls back to <data_dir>/parlay-backend.sock (see defaultSocketPath
+// in ipc.cpp). The per-action deadline table lives here with defaults
+// equal to the old hardcoded values (30 s general, 10 s GET-style,
+// 5 s ping) so behaviour does not change. The config rewrite should
+// populate it from parlay.toml [timeouts] (resolve_ms, join_ms,
+// ipc_cmd_ms, download_ms) via setDeadline()/setDefaultDeadlineMs().
+// Until then the table is the source of truth; the legacy timeout_sec
+// parameter governs only actions with no table entry.
 //
 // Threading: one reader thread per connection. Calls block on a
 // std::future until their deadline; a timed-out or failed call tears
@@ -144,8 +152,9 @@ struct IpcResult {
 
 class IpcClient {
 public:
-    // Socket path: <cfg.data_dir>/parlay-backend.sock unless the
-    // PARLAY_UDS_PATH env var is set (interim seam — see header note).
+    // Socket path: Config::ipc_socket_path when set ([ipc]
+    // socket_path in parlay.toml, or the PARLAY_UDS_PATH env var),
+    // else <cfg.data_dir>/parlay-backend.sock.
     explicit IpcClient(const Config& cfg);
     IpcClient(const Config& cfg, std::string socket_path);
     ~IpcClient();
@@ -153,6 +162,17 @@ public:
     IpcClient& operator=(const IpcClient&) = delete;
     IpcClient(IpcClient&&) = delete;
     IpcClient& operator=(IpcClient&&) = delete;
+
+    // POST an action to the backend — the no-URL form (Phase 4, Q2).
+    // Forwards to the virtual base_url form with "" (ignored).
+    IpcResult post(const std::string& action, const Json& body,
+                   int timeout_sec = 30) const;
+
+    // GET a legacy "/v1/<action>?..." path — the no-URL form.
+    IpcResult get(const std::string& path, int timeout_sec = 30) const;
+
+    // "ping" over the socket — the no-URL form. True only on {ok:true}.
+    bool healthz(int timeout_sec = 5) const;
 
     // POST an action to the backend. `base_url` is ignored (single
     // backend); `action` may be a legacy slash-form name or a dotted

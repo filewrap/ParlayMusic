@@ -52,6 +52,7 @@ import (
 	"parlay/backend-go/internal/events"
 	"parlay/backend-go/internal/lyrics"
 	"parlay/backend-go/internal/model"
+	"parlay/backend-go/internal/prefetch"
 	"parlay/backend-go/internal/room"
 	"parlay/backend-go/internal/uds"
 	"parlay/backend-go/internal/voice"
@@ -59,11 +60,12 @@ import (
 
 // Handlers owns the vc.* actions and the playback orchestration.
 type Handlers struct {
-	deps   *app.Deps
-	rooms  *room.Manager
-	events *events.Emitter
-	lyrics *lyrics.Fetcher
-	picker room.Picker
+	deps     *app.Deps
+	rooms    *room.Manager
+	events   *events.Emitter
+	lyrics   *lyrics.Fetcher
+	picker   room.Picker
+	prefetch *prefetch.Prefetcher
 
 	mu        sync.Mutex
 	chatLocks map[int64]*sync.Mutex
@@ -93,6 +95,17 @@ func New(d *app.Deps) *Handlers {
 	}
 	h.picker = newMixPicker(d.Registry)
 	d.Room.SetPicker(h.picker)
+	// Phase 4 lookahead prefetch: N+1 is pre-resolved and
+	// pre-buffered when a track starts. A zero lead time disables
+	// it (limits.prefetch_lead_time_sec, 0..3600); the resolve
+	// timeout is the configured resolve budget.
+	if d.Config != nil && d.Config.Limits.PrefetchLeadTimeSec > 0 {
+		h.prefetch = prefetch.New(
+			d.Registry.ResolveTrack,
+			prefetch.PrefixBytesForLeadTime(d.Config.Limits.PrefetchLeadTimeSec),
+			time.Duration(d.Config.Timeouts.ResolveMs)*time.Millisecond,
+		)
+	}
 	if err := d.Room.Restore(); err != nil {
 		log.Printf("handlers: room restore failed (%v); starting with empty rooms", err)
 	}
@@ -271,17 +284,50 @@ func (h *Handlers) ensureCall(ctx context.Context, chatID int64) error {
 	return err
 }
 
+// maybePrefetch starts the background prefetch of the queue top
+// (N+1) for chatID, from a snapshot taken right after a track
+// started. It returns immediately — the prefetch never blocks the
+// playing track — and is a no-op when prefetch is disabled, the
+// queue is empty, or the next track is not prefetchable (live,
+// radio, file, soulseek). Callers must hold no locks the
+// prefetcher needs (it takes none).
+func (h *Handlers) maybePrefetch(chatID int64, snap model.NowPlaying) {
+	if h.prefetch == nil || len(snap.Queue) == 0 {
+		return
+	}
+	next := snap.Queue[0].Track
+	if next.IsLive {
+		return
+	}
+	switch next.Source {
+	case "radio", "file", "soulseek":
+		return
+	}
+	h.prefetch.Prefetch(chatID, next)
+}
+
+// prefetchCancel drops the pending prefetch for chatID (stop/idle).
+func (h *Handlers) prefetchCancel(chatID int64) {
+	if h.prefetch != nil {
+		h.prefetch.Cancel(chatID)
+	}
+}
+
 // bindTrack binds the feed for track in chatID (voice.Manager.Play
-// — the interim ffmpeg-decode-to-PCM path). When no call record
-// exists at all the bind is skipped and (false, nil) is returned:
-// the room is the source of truth and the audio simply is not
-// flowing. When a call record exists, the bind is attempted and
-// its error returned. The bool reports whether a feed is now
-// running. In both non-running cases the feeding record is
-// cleared: Manager.Play stops the old feed before starting the
-// new one, so a failed bind leaves no feed running, and a stale
-// feeding id would make a later feed-end look like the wrong
-// track ended.
+// — the interim ffmpeg-decode-to-PCM path). When a ready prefetch
+// handle exists for the track it is consumed first
+// (voice.Manager.PlayStream — the opening seconds are already
+// buffered); a missing, failed, or still-in-flight prefetch falls
+// back to the direct stream URL, never delaying the bind. When no
+// call record exists at all the bind is skipped and (false, nil)
+// is returned: the room is the source of truth and the audio
+// simply is not flowing. When a call record exists, the bind is
+// attempted and its error returned. The bool reports whether a
+// feed is now running. In both non-running cases the feeding
+// record is cleared: Manager.Play stops the old feed before
+// starting the new one, so a failed bind leaves no feed running,
+// and a stale feeding id would make a later feed-end look like
+// the wrong track ended.
 func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Track) (bool, error) {
 	if _, ok := h.deps.Voice.Get(chatID); !ok {
 		h.clearFeeding(chatID)
@@ -290,6 +336,19 @@ func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Trac
 	if track.StreamURL == "" {
 		h.clearFeeding(chatID)
 		return false, fmt.Errorf("track %s has no playable stream URL", track.ID)
+	}
+	if h.prefetch != nil {
+		if stream, ok := h.prefetch.Take(chatID, track.ID); ok {
+			if err := h.deps.Voice.PlayStream(ctx, chatID, stream.Reader()); err != nil {
+				// Prefetched handle failed: fall back to the
+				// direct URL rather than failing the track.
+				_ = stream.Close()
+				log.Printf("handlers: prefetch play chat %d track %s failed (%v); falling back to direct URL", chatID, track.ID, err)
+			} else {
+				h.setFeeding(chatID, track.ID)
+				return true, nil
+			}
+		}
 	}
 	if err := h.deps.Voice.Play(ctx, chatID, track.StreamURL); err != nil {
 		h.clearFeeding(chatID)
@@ -407,6 +466,15 @@ func (h *Handlers) advancePlayback(ctx context.Context, chatID int64, endedID st
 		}
 	}
 	snap, _ := h.rooms.Snapshot(chatID)
+	// Lookahead: a track just started, so N+1 (the new queue top)
+	// is prefetched in the background; an idle room drops any
+	// pending prefetch.
+	switch out.Kind {
+	case room.AdvanceNext, room.AdvanceAutoplay:
+		h.maybePrefetch(chatID, snap)
+	case room.AdvanceIdle:
+		h.prefetchCancel(chatID)
+	}
 	return out, snap, nil
 }
 

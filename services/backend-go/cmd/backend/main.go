@@ -82,6 +82,26 @@ func run() error {
 	log.Printf("backend-go: store open at %s", st.Path())
 
 	reg := resolver.NewRegistry()
+	// Phase 4: the [backend] file keys reach the resolvers (Q10),
+	// and the TTL-aware resolved-track cache sits on the store
+	// (canonical "<source>:<track_id>", expiry from the CDN
+	// signature or limits.url_cache_ttl_sec).
+	reg.Configure(cfg.Backend)
+	reg.SetCache(resolver.NewCache(st, cfg.Limits.URLCacheTTLsec))
+	// Phase 4: finished download runs, download prefs and the
+	// library index persist in the store (new buckets), so a
+	// restart keeps them. Each AttachStore is best-effort: a
+	// failure is logged loudly and the backend keeps running
+	// memory-only for that piece rather than refusing to start.
+	if err := download.SharedRegistry().AttachStore(st); err != nil {
+		log.Printf("backend-go: WARNING download runs not persisted (%v); finished runs are memory-only until restart", err)
+	}
+	if err := download.SharedPrefs().AttachStore(st); err != nil {
+		log.Printf("backend-go: WARNING download prefs not persisted (%v); prefs are memory-only until restart", err)
+	}
+	if err := library.SharedIndex().AttachStore(st); err != nil {
+		log.Printf("backend-go: WARNING library index not persisted (%v); the index is memory-only until restart", err)
+	}
 	defer func() {
 		if err := reg.Close(); err != nil {
 			log.Printf("backend-go: registry close: %v", err)

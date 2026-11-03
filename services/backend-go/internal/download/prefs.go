@@ -1,12 +1,12 @@
 // download.prefs (actions-inventory §9-E9): per-user download
 // preferences. Today the core keeps them in store key dlset:<user> =
 // "<format>\n<youtube 0|1>\n<template>"; in Phase 3 the backend owns
-// them in the bbolt dlprefs bucket (key dlpref:<user_id>). That bucket
-// does not exist in internal/store yet (see registry.go), so prefs
-// live in memory here until it lands — a restart resets every user to
-// defaults, honestly (GET for a fresh user returns defaults, never
-// 404). The PrefsStore type is the seam for the store-backed
-// implementation.
+// them in the bbolt dlprefs bucket (key dlpref:<user_id>), and since
+// Phase 4 that bucket exists: PrefsStore.AttachStore loads it on
+// boot and Set persists every change, so a restart keeps every
+// user's prefs (GET for a fresh user still returns defaults,
+// never 404). Nothing here opens a second bbolt file: the store is
+// passed in, never opened.
 //
 // The download.* handlers apply prefs:
 //   - format: the output container. The yt-dlp daemon extracts mp3
@@ -29,7 +29,9 @@ import (
 	"strings"
 	"sync"
 
+	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
+	"parlay/backend-go/internal/store"
 )
 
 // DownloadFormats is the accepted format enum (§9-E9).
@@ -38,13 +40,9 @@ var DownloadFormats = []string{"mp3", "m4a", "flac", "opus", "ogg", "wav"}
 // DefaultPathTemplate is the filename template spotdl already uses.
 const DefaultPathTemplate = "{artist} - {title}.{ext}"
 
-// Prefs is one user's download preferences.
-type Prefs struct {
-	UserID       int64  `json:"user_id"`
-	Format       string `json:"format"`
-	UseYouTube   bool   `json:"use_youtube"`
-	PathTemplate string `json:"path_template"`
-}
+// Prefs is one user's download preferences (model.DownloadPrefs;
+// the store owns the persisted form).
+type Prefs = model.DownloadPrefs
 
 // DefaultPrefs returns the defaults for a user (format mp3,
 // use_youtube true, template "{artist} - {title}.{ext}").
@@ -52,15 +50,36 @@ func DefaultPrefs(userID int64) Prefs {
 	return Prefs{UserID: userID, Format: "mp3", UseYouTube: true, PathTemplate: DefaultPathTemplate}
 }
 
-// PrefsStore is the per-user prefs store (in-memory until the
-// dlprefs bucket lands — see the package doc on prefs.go).
+// PrefsStore is the per-user prefs store: in-memory map, persisted
+// into the store's dlprefs bucket when AttachStore has wired one
+// in (nil store = memory-only, the pre-Phase 4 behaviour).
 type PrefsStore struct {
 	mu    sync.Mutex
 	prefs map[int64]Prefs
+	store *store.Store
 }
 
 // NewPrefsStore builds an empty prefs store.
 func NewPrefsStore() *PrefsStore { return &PrefsStore{prefs: map[int64]Prefs{}} }
+
+// AttachStore wires the embedded store in and loads every stored
+// user's prefs. A nil store is a no-op.
+func (s *PrefsStore) AttachStore(st *store.Store) error {
+	if st == nil {
+		return nil
+	}
+	all, err := st.ListDownloadPrefs()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = st
+	for _, p := range all {
+		s.prefs[p.UserID] = p
+	}
+	return nil
+}
 
 // sharedPrefs is the process-wide prefs store used by Register.
 var sharedPrefs = NewPrefsStore()
@@ -108,6 +127,15 @@ func (s *PrefsStore) Set(p Prefs) (Prefs, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.store != nil {
+		// Persist before the in-memory write: a store failure is
+		// reported and the old prefs stand, in memory and on
+		// disk (a prefs Set is a user-visible write, so a silent
+		// drop would lie).
+		if err := s.store.PutDownloadPrefs(p); err != nil {
+			return Prefs{}, fmt.Errorf("download prefs: persist user %d: %w", p.UserID, err)
+		}
+	}
 	s.prefs[p.UserID] = p
 	return p, nil
 }

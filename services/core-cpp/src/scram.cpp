@@ -1,5 +1,9 @@
-// scram.cpp — self-contained SHA-1 / SHA-256 / HMAC / PBKDF2 / base64 and
-// the SCRAM client side (RFC 5802, RFC 7677). No external crypto library.
+// scram.cpp — self-contained SHA-1 / SHA-256 / HMAC / PBKDF2 / base64.
+// No external crypto library. The SCRAM client side (RFC 5802, RFC 7677)
+// that used to live here was deleted in Phase 4 (Q1) with the database
+// client it authenticated; the hash/HMAC/PBKDF2/base64 primitives stay:
+// sha256 digests track ids (ui_texts.hpp) and base64 encodes TDLib
+// `bytes` fields (dispatcher.cpp).
 #include "scram.hpp"
 
 #include <unistd.h>
@@ -8,7 +12,6 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
-#include <map>
 #include <sstream>
 
 namespace parlay::scram {
@@ -153,93 +156,6 @@ std::string sha1Impl(const std::string& data) {
     return out;
 }
 
-// --- MD5 (RFC 1321) ------------------------------------------------------
-// Only used for MongoDB's SCRAM-SHA-1 password derivation (below); the
-// SCRAM hashes themselves are SHA-1 / SHA-256.
-std::string md5Impl(const std::string& data) {
-    auto lrot = [](uint32_t x, int c) { return (x << c) | (x >> (32 - c)); };
-    static constexpr std::array<uint32_t, 64> kK = {
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf,
-        0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af,
-        0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e,
-        0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
-        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6,
-        0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8,
-        0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
-        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039,
-        0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97,
-        0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d,
-        0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
-    static constexpr std::array<int, 64> kS = {
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
-    std::string msg = data;
-    uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8;
-    msg.push_back('\x80');
-    while (msg.size() % 64 != 56) msg.push_back('\0');
-    for (int i = 0; i < 8; ++i)
-        msg.push_back(static_cast<char>((bit_len >> (i * 8)) & 0xff));
-    uint32_t a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe,
-             d0 = 0x10325476;
-    for (size_t off = 0; off < msg.size(); off += 64) {
-        std::array<uint32_t, 16> m{};
-        for (int i = 0; i < 16; ++i) {
-            const auto* p =
-                reinterpret_cast<const unsigned char*>(msg.data() + off +
-                                                       i * 4);
-            m[i] = static_cast<uint32_t>(p[0]) |
-                   (static_cast<uint32_t>(p[1]) << 8) |
-                   (static_cast<uint32_t>(p[2]) << 16) |
-                   (static_cast<uint32_t>(p[3]) << 24);
-        }
-        uint32_t a = a0, b = b0, c = c0, d = d0;
-        for (int i = 0; i < 64; ++i) {
-            uint32_t f = 0;
-            int g = 0;
-            if (i < 16) {
-                f = (b & c) | ((~b) & d);
-                g = i;
-            } else if (i < 32) {
-                f = (d & b) | ((~d) & c);
-                g = (5 * i + 1) % 16;
-            } else if (i < 48) {
-                f = b ^ c ^ d;
-                g = (3 * i + 5) % 16;
-            } else {
-                f = c ^ (b | (~d));
-                g = (7 * i) % 16;
-            }
-            f = f + a + kK[i] + m[g];
-            a = d;
-            d = c;
-            c = b;
-            b = b + lrot(f, kS[i]);
-        }
-        a0 += a;
-        b0 += b;
-        c0 += c;
-        d0 += d;
-    }
-    std::string out;
-    for (uint32_t v : {a0, b0, c0, d0})
-        for (int i = 0; i < 4; ++i)
-            out.push_back(static_cast<char>((v >> (i * 8)) & 0xff));
-    return out;
-}
-
-std::string hexEncode(const std::string& raw) {
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string out;
-    for (unsigned char c : raw) {
-        out.push_back(kHex[c >> 4]);
-        out.push_back(kHex[c & 0xf]);
-    }
-    return out;
-}
 std::string hmacImpl(const std::string& key, const std::string& msg,
                      std::string (*hashFn)(const std::string&),
                      size_t block_size, size_t hash_len) {
@@ -279,51 +195,10 @@ std::string pbkdf2Impl(const std::string& password, const std::string& salt,
     return out;
 }
 
-// --- SCRAM message helpers --------------------------------------------------
-// Split "k=v,k=v,..." on commas that are not inside a value (SCRAM values
-// never contain ',' or '=' unescaped here; '=' in a value is base64
-// padding, which only ever appears at the end of a value).
-bool parseAttrs(const std::string& msg,
-                std::map<std::string, std::string>& out) {
-    size_t pos = 0;
-    while (pos < msg.size()) {
-        size_t eq = msg.find('=', pos);
-        if (eq == std::string::npos || eq == pos) return false;
-        std::string key = msg.substr(pos, eq - pos);
-        size_t comma = msg.find(',', eq + 1);
-        std::string val = msg.substr(
-            eq + 1, comma == std::string::npos ? std::string::npos
-                                               : comma - eq - 1);
-        out[key] = val;
-        if (comma == std::string::npos) break;
-        pos = comma + 1;
-    }
-    return true;
-}
-
-std::string xorBytes(const std::string& a, const std::string& b) {
-    std::string out(a.size(), '\0');
-    for (size_t i = 0; i < a.size(); ++i)
-        out[i] = static_cast<char>(a[i] ^ b[i]);
-    return out;
-}
-
 }  // namespace
 
 std::string sha1(const std::string& data) { return sha1Impl(data); }
 std::string sha256(const std::string& data) { return sha256Impl(data); }
-std::string md5(const std::string& data) { return md5Impl(data); }
-
-std::string mongoSha1Password(const std::string& username,
-                              const std::string& password) {
-    // MongoDB derives SCRAM-SHA-1 credentials from the legacy MONGODB-CR
-    // digest, not the raw password (verified live against mongod 8.0.4:
-    // raw password fails, this digest authenticates). SCRAM-SHA-256
-    // uses the raw password. This is a MongoDB quirk, not part of RFC
-    // 5802 — the scram::Client itself stays pure-RFC and takes the
-    // effective password as given.
-    return hexEncode(md5Impl(username + ":mongo:" + password));
-}
 
 std::string hmacSha1(const std::string& key, const std::string& msg) {
     return hmacImpl(key, msg, sha1Impl, 64, 20);
@@ -415,141 +290,6 @@ std::string randomNonceBase64(std::size_t n_bytes) {
                                        static_cast<char>(i * 31));
     }
     return base64Encode(raw);
-}
-
-const char* mechanismName(Mechanism m) {
-    return m == Mechanism::kSha256 ? "SCRAM-SHA-256" : "SCRAM-SHA-1";
-}
-
-bool parseMechanism(const std::string& name, Mechanism& out) {
-    if (name == "SCRAM-SHA-256") {
-        out = Mechanism::kSha256;
-        return true;
-    }
-    if (name == "SCRAM-SHA-1") {
-        out = Mechanism::kSha1;
-        return true;
-    }
-    return false;
-}
-
-// --- Client ------------------------------------------------------------------
-Client::Client(Mechanism mechanism, std::string username,
-               std::string password, std::string nonce_b64)
-    : mechanism_(mechanism),
-      username_(std::move(username)),
-      password_(std::move(password)) {
-    // SCRAM username escaping: '=' -> "=3D", ',' -> "=2C" (RFC 5802 §5.1).
-    // (Passwords are not escaped; they go through PBKDF2, not the message.)
-    std::string escaped;
-    for (char c : username_) {
-        if (c == '=') escaped += "=3D";
-        else if (c == ',') escaped += "=2C";
-        else escaped += c;
-    }
-    std::string nonce = nonce_b64.empty() ? randomNonceBase64() : nonce_b64;
-    client_first_bare_ = "n=" + escaped + ",r=" + nonce;
-}
-
-std::string Client::clientFirst() const {
-    return "n,," + client_first_bare_;
-}
-
-bool Client::serverFirst(const std::string& server_first,
-                         std::string& error_out) {
-    error_out.clear();
-    std::map<std::string, std::string> attrs;
-    if (!parseAttrs(server_first, attrs) || !attrs.count("r") ||
-        !attrs.count("s") || !attrs.count("i")) {
-        error_out = "malformed SCRAM server-first-message: " + server_first;
-        return false;
-    }
-    full_nonce_ = attrs["r"];
-    // The server nonce must extend our client nonce (RFC 5802 §5.1).
-    std::string client_nonce =
-        client_first_bare_.substr(client_first_bare_.find("r=") + 2);
-    if (full_nonce_.rfind(client_nonce, 0) != 0) {
-        error_out = "SCRAM server nonce does not start with client nonce";
-        return false;
-    }
-    std::string salt;
-    if (!base64Decode(attrs["s"], salt)) {
-        error_out = "SCRAM server-first-message has invalid base64 salt";
-        return false;
-    }
-    int iterations = 0;
-    try {
-        size_t used = 0;
-        iterations = std::stoi(attrs["i"], &used);
-        if (used != attrs["i"].size() || iterations < 1) throw 0;
-    } catch (...) {
-        error_out = "SCRAM server-first-message has invalid iteration count";
-        return false;
-    }
-    // Cap iterations at a sane bound so a hostile server cannot make us
-    // PBKDF2-loop forever (MongoDB defaults to 10,000).
-    if (iterations > 1000000) {
-        error_out = "SCRAM iteration count unreasonably large";
-        return false;
-    }
-    const bool use256 = mechanism_ == Mechanism::kSha256;
-    salted_password_ =
-        use256 ? pbkdf2Sha256(password_, salt, iterations, 32)
-               : pbkdf2Sha1(password_, salt, iterations, 20);
-    std::string client_final_wo_proof = "c=biws,r=" + full_nonce_;
-    auth_message_ = client_first_bare_ + "," + server_first + "," +
-                    client_final_wo_proof;
-    have_server_first_ = true;
-    return true;
-}
-
-std::string Client::clientFinal() const {
-    if (!have_server_first_) return "";
-    const bool use256 = mechanism_ == Mechanism::kSha256;
-    std::string client_key = use256
-        ? hmacSha256(salted_password_, "Client Key")
-        : hmacSha1(salted_password_, "Client Key");
-    std::string stored_key =
-        use256 ? sha256(client_key) : sha1(client_key);
-    std::string client_sig = use256 ? hmacSha256(stored_key, auth_message_)
-                                    : hmacSha1(stored_key, auth_message_);
-    std::string proof = xorBytes(client_key, client_sig);
-    return "c=biws,r=" + full_nonce_ + ",p=" + base64Encode(proof);
-}
-
-bool Client::serverFinal(const std::string& server_final,
-                         std::string& error_out) {
-    error_out.clear();
-    if (!have_server_first_) {
-        error_out = "SCRAM server-final received before server-first";
-        return false;
-    }
-    std::map<std::string, std::string> attrs;
-    if (!parseAttrs(server_final, attrs)) {
-        error_out = "malformed SCRAM server-final-message: " + server_final;
-        return false;
-    }
-    if (attrs.count("e")) {
-        error_out = "SCRAM authentication failed (server error): " +
-                    attrs["e"];
-        return false;
-    }
-    if (!attrs.count("v")) {
-        error_out = "SCRAM server-final-message has no verifier (v=)";
-        return false;
-    }
-    const bool use256 = mechanism_ == Mechanism::kSha256;
-    std::string server_key = use256
-        ? hmacSha256(salted_password_, "Server Key")
-        : hmacSha1(salted_password_, "Server Key");
-    std::string expected = use256
-        ? base64Encode(hmacSha256(server_key, auth_message_))
-        : base64Encode(hmacSha1(server_key, auth_message_));
-    if (attrs["v"] != expected) {
-        error_out = "SCRAM server signature mismatch (possible MITM)";
-        return false;
-    }
-    return true;
 }
 
 }  // namespace parlay::scram
