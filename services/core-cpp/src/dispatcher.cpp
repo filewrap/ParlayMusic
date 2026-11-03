@@ -7446,21 +7446,34 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
             answerCb(cq, ui_texts::kToastFeatureUnavailable, true);
             return;
         }
-        // §7.8 / §10-D16: fx.apply is record-only in Phase 3 (no
-        // ffmpeg subprocess — the DSP is Phase 5). Only `original`
-        // answers applied:true (a no-op by definition); every other
-        // effect answers applied:false with the INPUT path as
-        // output_path. The file is unprocessed and must never be
-        // sent as processed audio: say so honestly instead.
-        // `applied` absent is treated the same way — only an
-        // explicit true means the file was really processed.
+        // §7.8 / §10-D16 (Phase 5: the DSP is live). fx.apply
+        // answers one of three ways, and the file at output_path
+        // is sent ONLY in the third:
+        //   - live_applied:true — the effect was applied live to
+        //     the voice-chat stream (applied:true). No file was
+        //     written: output_path is the unprocessed input and
+        //     must never be sent as processed audio.
+        //   - applied:false — no live stream to apply to; the
+        //     effect is recorded for the next track. The file is
+        //     unprocessed: say so honestly instead of sending it.
+        //   - applied:true, live_applied absent/false — `original`
+        //     only (a no-op by definition): the input file IS the
+        //     output, so sending it is correct.
+        // `applied` absent is treated as false — only an explicit
+        // true means the effect is in force somewhere.
         bool applied = false;
         if (const Json* a = r.data.find("applied")) applied = a->asBool();
+        bool live_applied = false;
+        if (const Json* l = r.data.find("live_applied")) live_applied = l->asBool();
+        if (live_applied) {
+            answerCb(cq, fx_effect + " applied live to the voice chat.",
+                     true);
+            return;
+        }
         if (!applied) {
             answerCb(cq, fx_effect +
-                             " recorded — live DSP filtering lands in "
-                             "Phase 5. The file is unprocessed, so "
-                             "nothing was sent.",
+                             " recorded for the next track. The file "
+                             "is unprocessed, so nothing was sent.",
                      true);
             return;
         }

@@ -239,6 +239,21 @@ func (p *Prefetcher) Take(chatID int64, trackID string) (*PrebufferedStream, boo
 	return s, true
 }
 
+// Peek returns the pending prefetch for chatID's track WITHOUT
+// removing it, or false when there is none or it is for another
+// track. The loadNextWhenReady waiter uses it to wait on Ready
+// and then claim the handle through Take (single ownership with
+// the advance-time Take in bindTrack).
+func (p *Prefetcher) Peek(chatID int64, trackID string) (*PrebufferedStream, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := p.pending[chatID]
+	if !ok || s.Track.ID != trackID {
+		return nil, false
+	}
+	return s, true
+}
+
 // Cancel drops the pending prefetch for chatID, if any.
 func (p *Prefetcher) Cancel(chatID int64) {
 	p.mu.Lock()

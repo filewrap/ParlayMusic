@@ -21,22 +21,24 @@
 //     (the transition is irreversible — the queue pop is consumed)
 //     and then bind; a bind failure there surfaces as VoiceError
 //     plus the action error, with the room standing advanced.
-//   - Track advance is event-driven only: the voice feeder's EOF
-//     (Manager.OnFeedEnd) advances the room. There is NO polling
-//     ticker and NO watcher. OnFeedEnd never blocks the pump
-//     goroutine: it captures the ended track id and dispatches the
-//     advance to a worker goroutine (blocking there while a skip
-//     waits in feed.Stop() for the pump to return would deadlock).
+//   - Track advance is event-driven only: the voice feed's EOF
+//     (Manager.OnFeedEnd) or its gapless slot promotion
+//     (Manager.OnTransition) advances the room. There is NO polling
+//     ticker and NO watcher. OnFeedEnd/OnTransition never block the
+//     pump goroutine: they capture the ended/transitioned track id
+//     and dispatch the advance to a worker goroutine (blocking
+//     there while a skip waits in feed.Stop() for the pump to
+//     return would deadlock).
 //   - One per-chat lock serialises every operation that changes
 //     the current track and binds voice for a chat, so a feed-end
 //     advance and a user skip can never interleave into a
 //     double-advance or a bind of the wrong track.
 //
-// Frame path (interim, Phase 5 replacement target): audio reaches
-// ntgcalls through voice.Manager.Play's existing ffmpeg-decode-to-
-// PCM path (internal/voice/feeder.go — one persistent ffmpeg
-// process per room, 10 ms s16le frames over the external source).
-// No other frame path is invented here.
+// Frame path (Phase 5): audio reaches ntgcalls through the
+// parlay-dsp engine (internal/dsp) — the DSP decodes the stream,
+// applies the room's FX/speed/bass/volume, and this package's
+// bindTrack hands it the PrefbufferedStream reader or the direct
+// stream URL. No ffmpeg subprocess exists anywhere in the path.
 package handlers
 
 import (
@@ -49,6 +51,7 @@ import (
 	"time"
 
 	"parlay/backend-go/internal/app"
+	"parlay/backend-go/internal/dsp"
 	"parlay/backend-go/internal/events"
 	"parlay/backend-go/internal/lyrics"
 	"parlay/backend-go/internal/model"
@@ -118,9 +121,11 @@ func New(d *app.Deps) *Handlers {
 // *app.Deps).
 func Register(s *uds.Server, d *app.Deps) {
 	h := New(d)
-	// Voice callbacks: the feed-end advance is the ONLY track
-	// advance trigger (no polling, no watcher).
+	// Voice callbacks: the feed-end advance and the gapless slot
+	// promotion are the ONLY track advance triggers (no polling,
+	// no watcher).
 	d.Voice.OnFeedEnd(h.onFeedEnd)
+	d.Voice.OnTransition(h.onTransition)
 	d.Voice.OnStreamEnd(func(chatID int64, streamType voice.StreamType, device voice.StreamDevice) {
 		// The ntgcalls stream-end is not an advance trigger (the
 		// external source never ends by itself; the feeder's EOF
@@ -284,18 +289,36 @@ func (h *Handlers) ensureCall(ctx context.Context, chatID int64) error {
 	return err
 }
 
-// maybePrefetch starts the background prefetch of the queue top
-// (N+1) for chatID, from a snapshot taken right after a track
-// started. It returns immediately — the prefetch never blocks the
-// playing track — and is a no-op when prefetch is disabled, the
-// queue is empty, or the next track is not prefetchable (live,
-// radio, file, soulseek). Callers must hold no locks the
-// prefetcher needs (it takes none).
+// maybePrefetch starts the background prefetch of the next track
+// for chatID, from a snapshot taken right after a track started.
+// It returns immediately — the prefetch never blocks the playing
+// track. What "next" means depends on the loop state:
+//
+//   - Loop > 0: the next track IS the current track (a loop replay).
+//     The current track is prefetched so the replay goes through
+//     the DSP's gapless dual-slot path (loadNextWhenReady loads it
+//     as the next slot) instead of a rebind gap.
+//   - Otherwise: the queue top (N+1), as before.
+//
+// It is a no-op when prefetch is disabled, there is no next track,
+// or the next track is not prefetchable (live, radio, file,
+// soulseek — the prefetcher itself skips those; a file/loop replay
+// degrades to the normal rebind path). Callers must hold no locks
+// the prefetcher needs (it takes none).
 func (h *Handlers) maybePrefetch(chatID int64, snap model.NowPlaying) {
-	if h.prefetch == nil || len(snap.Queue) == 0 {
+	if h.prefetch == nil {
 		return
 	}
-	next := snap.Queue[0].Track
+	var next model.Track
+	if snap.Loop > 0 && snap.Track != nil {
+		// Loop replay: the current track is next.
+		next = *snap.Track
+	} else {
+		if len(snap.Queue) == 0 {
+			return
+		}
+		next = snap.Queue[0].Track
+	}
 	if next.IsLive {
 		return
 	}
@@ -304,6 +327,44 @@ func (h *Handlers) maybePrefetch(chatID int64, snap model.NowPlaying) {
 		return
 	}
 	h.prefetch.Prefetch(chatID, next)
+	// When the prefetch becomes ready, load it into the running
+	// DSP feed's next slot so the transition is gapless. The
+	// waiter claims the handle through Take (single ownership
+	// with the advance-time Take in bindTrack — exactly one of
+	// them wins), so a track that advances before its prefetch
+	// is ready still binds normally.
+	go h.loadNextWhenReady(chatID, next)
+}
+
+// loadNextWhenReady waits for the prefetch of track to become
+// ready, then loads it into the running DSP feed's next slot. It
+// is best-effort throughout: any failure (prefetch replaced or
+// failed, no live feed, next slot already loaded) just leaves the
+// advance-time bindTrack path to do its normal rebind.
+func (h *Handlers) loadNextWhenReady(chatID int64, track model.Track) {
+	stream, ok := h.prefetch.Peek(chatID, track.ID)
+	if !ok {
+		return
+	}
+	<-stream.Ready()
+	taken, ok := h.prefetch.Take(chatID, track.ID)
+	if !ok {
+		return
+	}
+	r := taken.Reader()
+	if err := h.deps.Voice.LoadNext(chatID, r, h.rooms.DSPOptions(chatID), track.ID); err != nil {
+		// The handle is consumed; close the reader so the body
+		// is not leaked. The advance-time Take finds nothing
+		// and falls back to the direct URL.
+		_ = r.Close()
+		log.Printf("handlers: load next slot chat %d track %s failed (%v); gapless transition unavailable, rebind on advance", chatID, track.ID, err)
+	}
+}
+
+// dspOptions returns the DSP parameters for chatID from the room
+// (speed, bass, volume, FX preset + parameters) in a single read.
+func (h *Handlers) dspOptions(chatID int64) dsp.Options {
+	return h.rooms.DSPOptions(chatID)
 }
 
 // prefetchCancel drops the pending prefetch for chatID (stop/idle).
@@ -314,13 +375,16 @@ func (h *Handlers) prefetchCancel(chatID int64) {
 }
 
 // bindTrack binds the feed for track in chatID (voice.Manager.Play
-// — the interim ffmpeg-decode-to-PCM path). When a ready prefetch
-// handle exists for the track it is consumed first
-// (voice.Manager.PlayStream — the opening seconds are already
-// buffered); a missing, failed, or still-in-flight prefetch falls
-// back to the direct stream URL, never delaying the bind. When no
-// call record exists at all the bind is skipped and (false, nil)
-// is returned: the room is the source of truth and the audio
+// — the DSP path, decoding the direct stream URL — or
+// voice.Manager.PlayStream for a ready prefetch handle, decoding
+// the PrefbufferedStream reader). When a ready prefetch handle
+// exists for the track it is consumed first (the opening seconds
+// are already buffered); a missing, failed, or still-in-flight
+// prefetch falls back to the direct stream URL, never delaying the
+// bind. The room's DSP parameters (speed, bass, volume, FX
+// preset) are read once per bind and applied from the first frame.
+// When no call record exists at all the bind is skipped and (false,
+// nil) is returned: the room is the source of truth and the audio
 // simply is not flowing. When a call record exists, the bind is
 // attempted and its error returned. The bool reports whether a
 // feed is now running. In both non-running cases the feeding
@@ -337,9 +401,10 @@ func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Trac
 		h.clearFeeding(chatID)
 		return false, fmt.Errorf("track %s has no playable stream URL", track.ID)
 	}
+	opts := h.dspOptions(chatID)
 	if h.prefetch != nil {
 		if stream, ok := h.prefetch.Take(chatID, track.ID); ok {
-			if err := h.deps.Voice.PlayStream(ctx, chatID, stream.Reader()); err != nil {
+			if err := h.deps.Voice.PlayStream(ctx, chatID, stream.Reader(), opts); err != nil {
 				// Prefetched handle failed: fall back to the
 				// direct URL rather than failing the track.
 				_ = stream.Close()
@@ -350,7 +415,7 @@ func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Trac
 			}
 		}
 	}
-	if err := h.deps.Voice.Play(ctx, chatID, track.StreamURL); err != nil {
+	if err := h.deps.Voice.Play(ctx, chatID, track.StreamURL, opts); err != nil {
 		h.clearFeeding(chatID)
 		return false, err
 	}
@@ -421,6 +486,18 @@ func (h *Handlers) resumeFeed(ctx context.Context, chatID int64) error {
 // the room standing advanced. The returned snapshot is the room
 // after the advance.
 func (h *Handlers) advancePlayback(ctx context.Context, chatID int64, endedID string, fromSkip bool) (room.AdvanceOutcome, model.NowPlaying, error) {
+	return h.advancePlaybackMode(ctx, chatID, endedID, fromSkip, true)
+}
+
+// advancePlaybackMode is advancePlayback with the rebind switch.
+// rebind=true is the normal path: the advanced-to track is bound
+// with a fresh feed. rebind=false is the gapless-transition path
+// (advanceFromTransition): the DSP already promoted the next slot
+// and the audio is flowing, so no bind happens — the caller
+// verifies the room advanced to the track the DSP is playing and
+// rebinds only on a mismatch. The Idle branch is identical in
+// both modes: the room went idle and the call is left.
+func (h *Handlers) advancePlaybackMode(ctx context.Context, chatID int64, endedID string, fromSkip bool, rebind bool) (room.AdvanceOutcome, model.NowPlaying, error) {
 	out, err := h.rooms.Advance(ctx, chatID, endedID, fromSkip)
 	if err != nil {
 		return out, model.NowPlaying{}, mapRoomErr(err)
@@ -432,22 +509,28 @@ func (h *Handlers) advancePlayback(ctx context.Context, chatID int64, endedID st
 		// A loop replay fires TrackStarted only — never
 		// TrackAdvanced (§4.5).
 		h.events.TrackStarted(chatID, *out.Track)
-		if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
-			snap, _ := h.rooms.Snapshot(chatID)
-			return out, snap, err
+		if rebind {
+			if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
+				snap, _ := h.rooms.Snapshot(chatID)
+				return out, snap, err
+			}
 		}
 	case room.AdvanceNext:
 		h.events.TrackAdvanced(chatID, *out.Track, out.PreviousTrackID)
 		h.events.TrackStarted(chatID, *out.Track)
-		if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
-			snap, _ := h.rooms.Snapshot(chatID)
-			return out, snap, err
+		if rebind {
+			if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
+				snap, _ := h.rooms.Snapshot(chatID)
+				return out, snap, err
+			}
 		}
 	case room.AdvanceAutoplay:
 		h.events.TrackStarted(chatID, *out.Track)
-		if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
-			snap, _ := h.rooms.Snapshot(chatID)
-			return out, snap, err
+		if rebind {
+			if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
+				snap, _ := h.rooms.Snapshot(chatID)
+				return out, snap, err
+			}
 		}
 	case room.AdvanceIdle:
 		if out.EndedTrack != nil {
@@ -466,11 +549,12 @@ func (h *Handlers) advancePlayback(ctx context.Context, chatID int64, endedID st
 		}
 	}
 	snap, _ := h.rooms.Snapshot(chatID)
-	// Lookahead: a track just started, so N+1 (the new queue top)
-	// is prefetched in the background; an idle room drops any
+	// Lookahead: a track just started, so the next one is
+	// prefetched in the background (the loop replay when Loop >
+	// 0, else N+1 — see maybePrefetch); an idle room drops any
 	// pending prefetch.
 	switch out.Kind {
-	case room.AdvanceNext, room.AdvanceAutoplay:
+	case room.AdvanceNext, room.AdvanceAutoplay, room.AdvanceReplayed:
 		h.maybePrefetch(chatID, snap)
 	case room.AdvanceIdle:
 		h.prefetchCancel(chatID)
@@ -517,4 +601,58 @@ func (h *Handlers) advanceFromFeedEnd(chatID int64, endedID string, feedErr erro
 	// transition (or NoOp, when the user already skipped or
 	// stopped) is the outcome.
 	_, _, _ = h.advancePlayback(ctx, chatID, endedID, false)
+}
+
+// onTransition is the DSP gapless-promotion callback
+// (Manager.OnTransition). It NEVER blocks the pump goroutine: it
+// captures the transitioned track id synchronously and dispatches
+// the advance to a worker goroutine, exactly like onFeedEnd.
+func (h *Handlers) onTransition(chatID int64, trackID string) {
+	go h.advanceFromTransition(chatID, trackID)
+}
+
+// advanceFromTransition advances the room after the DSP promoted
+// its next slot — WITHOUT rebinding, because the audio is already
+// flowing. The room must advance to the track the DSP is playing;
+// when it does not (the queue was mutated between the LoadNext and
+// the promotion, so Advance popped a different track — or the
+// room went idle), the transition is repaired with a normal
+// rebind (or the idle path, which leaves the call). The feeding
+// record is updated to the track now playing so the next feed-end
+// matches it.
+func (h *Handlers) advanceFromTransition(chatID int64, trackID string) {
+	h.chatLock(chatID).Lock()
+	defer h.chatLock(chatID).Unlock()
+	endedID, ok := h.getFeeding(chatID)
+	if !ok {
+		return // no feed was playing; spurious transition
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, _, _ := h.advancePlaybackMode(ctx, chatID, endedID, false, false)
+	switch out.Kind {
+	case room.AdvanceNoOp:
+		// The user already skipped or stopped; the skip's bind
+		// already replaced the feed. Nothing to do.
+		return
+	case room.AdvanceIdle:
+		// advancePlaybackMode's Idle branch already left the
+		// call (the promoted audio is stopped with it).
+		return
+	}
+	if out.Track == nil {
+		return
+	}
+	if out.Track.ID != trackID {
+		// The room advanced to a different track than the DSP
+		// is playing: rebind to the room's track (a gap, but
+		// correct — the alternative is playing the wrong track
+		// under the right name).
+		log.Printf("handlers: transition chat %d advanced to %s but DSP plays %s; rebinding", chatID, out.Track.ID, trackID)
+		if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
+			log.Printf("handlers: transition rebind chat %d failed: %v", chatID, err)
+		}
+		return
+	}
+	h.setFeeding(chatID, out.Track.ID)
 }

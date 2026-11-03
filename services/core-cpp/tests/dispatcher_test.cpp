@@ -2968,26 +2968,43 @@ int main() {
               "/download plain query: still falls through to YouTube");
     }
 
-    // cbDl FX honours applied:false (D16).
+    // cbDl FX honours applied:false (D16, Phase 5: recorded for
+    // the next track — no live stream to apply to).
     {
         Rig rig;
         rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
         rig.ipc.fx_response =
-            R"({"output_path":"/tmp/in.ogg","applied":false,"effect":"slow-reverb","pending_dsp":true})";
+            R"({"output_path":"/tmp/in.ogg","applied":false,"effect":"slow-reverb","live_applied":false,"detail":"recorded for the next track; no live stream to apply to"})";
         rig.d.handleCallback(makeCq("pl:dl:fx:run1:slow"));
         CHECK(rig.tg.audios.empty(),
               "cbDl FX applied:false: no audio sent for a "
               "recorded-only effect");
         CHECK(rig.tg.toasts.size() >= 2 &&
                   contains(rig.tg.toasts.back().text, "recorded") &&
-                  contains(rig.tg.toasts.back().text, "Phase 5"),
-              "cbDl FX applied:false: honest recorded/Phase 5 toast");
+                  contains(rig.tg.toasts.back().text, "next track"),
+              "cbDl FX applied:false: honest recorded/next-track toast");
+    }
+    // cbDl FX honours live_applied:true (Phase 5): the effect is
+    // on the live stream, so the unprocessed input file must NOT
+    // be sent as if it were processed audio.
+    {
+        Rig rig;
+        rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
+        rig.ipc.fx_response =
+            R"({"output_path":"/tmp/in.ogg","applied":true,"effect":"nightcore","live_applied":true,"detail":"applied live to the voice chat"})";
+        rig.d.handleCallback(makeCq("pl:dl:fx:run1:nightcore"));
+        CHECK(rig.tg.audios.empty(),
+              "cbDl FX live_applied:true: no audio sent (the file "
+              "is unprocessed; the effect is on the live stream)");
+        CHECK(rig.tg.toasts.size() >= 2 &&
+                  contains(rig.tg.toasts.back().text, "live"),
+              "cbDl FX live_applied:true: honest live toast");
     }
     {
         Rig rig;
         rig.store.set("dlrun:run1", "/tmp/in.ogg\n-1001");
         rig.ipc.fx_response =
-            R"({"output_path":"/tmp/in.ogg","applied":true,"effect":"original","pending_dsp":false})";
+            R"({"output_path":"/tmp/in.ogg","applied":true,"effect":"original","live_applied":false})";
         rig.d.handleCallback(makeCq("pl:dl:fx:run1:orig"));
         CHECK(rig.tg.audios.size() == 1 &&
                   rig.tg.audios[0].audio == "/tmp/in.ogg",

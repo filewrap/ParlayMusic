@@ -1,0 +1,467 @@
+diff --git a/ntgcalls/src/opus_encoder_config_c.cpp b/ntgcalls/src/opus_encoder_config_c.cpp
+new file mode 100644
+index 0000000..c579581
+--- /dev/null
++++ b/ntgcalls/src/opus_encoder_config_c.cpp
+@@ -0,0 +1,78 @@
++// Parlay patch (OD-1): C API for the locked Opus encoder configuration.
++// Hand-written (not NTL-generated); see targets/c/ntgcalls_opus.h.
++
++#include "ntgcalls.h"
++#include "ntgcalls_opus.h"
++
++#include <wrtc/interfaces/media/opus_encoder_factory.hpp>
++
++namespace {
++
++wrtc::interfaces::media::OpusEncoderSettings ToCpp(
++    const ntg_opus_encoder_config& c) {
++    wrtc::interfaces::media::OpusEncoderSettings s;
++    s.bitrate_bps = c.bitrate_bps;
++    s.complexity = c.complexity;
++    s.vbr_enabled = c.vbr_enabled;
++    s.fec_enabled = c.fec_enabled;
++    s.dtx_enabled = c.dtx_enabled;
++    s.frame_size_ms = c.frame_size_ms;
++    s.max_playback_rate_hz = c.max_playback_rate_hz;
++    return s;
++}
++
++ntg_opus_encoder_config FromCpp(
++    const wrtc::interfaces::media::OpusEncoderSettings& s) {
++    ntg_opus_encoder_config c{};
++    c.bitrate_bps = s.bitrate_bps;
++    c.complexity = s.complexity;
++    c.vbr_enabled = s.vbr_enabled;
++    c.fec_enabled = s.fec_enabled;
++    c.dtx_enabled = s.dtx_enabled;
++    c.frame_size_ms = s.frame_size_ms;
++    c.max_playback_rate_hz = s.max_playback_rate_hz;
++    return c;
++}
++
++bool ValidFrameSize(int32_t ms) {
++    return ms == 10 || ms == 20 || ms == 40 || ms == 60;
++}
++
++} // namespace
++
++extern "C" {
++
++NTG_C_EXPORT ntg_result ntg_opus_set_config(const ntg_opus_encoder_config* config) {
++    if (config == nullptr) {
++        return NTG_ERR_NULL_POINTER;
++    }
++    if (config->bitrate_bps < 6000 || config->bitrate_bps > 510000 ||
++        config->complexity < 0 || config->complexity > 10 ||
++        !ValidFrameSize(config->frame_size_ms) ||
++        config->max_playback_rate_hz < 8000 ||
++        config->max_playback_rate_hz > 48000) {
++        return NTG_ERR_INVALID_PARAMS;
++    }
++    wrtc::interfaces::media::OpusEncoderFactory::SetSettings(ToCpp(*config));
++    return NTG_OK;
++}
++
++NTG_C_EXPORT ntg_result ntg_opus_get_config(ntg_opus_encoder_config* out) {
++    if (out == nullptr) {
++        return NTG_ERR_NULL_POINTER;
++    }
++    *out = FromCpp(wrtc::interfaces::media::OpusEncoderFactory::GetSettings());
++    return NTG_OK;
++}
++
++NTG_C_EXPORT ntg_result ntg_opus_set_bitrate(int32_t bitrate_bps) {
++    if (bitrate_bps < 6000 || bitrate_bps > 510000) {
++        return NTG_ERR_INVALID_PARAMS;
++    }
++    auto settings = wrtc::interfaces::media::OpusEncoderFactory::GetSettings();
++    settings.bitrate_bps = bitrate_bps;
++    wrtc::interfaces::media::OpusEncoderFactory::SetSettings(settings);
++    return NTG_OK;
++}
++
++} // extern "C"
+diff --git a/targets/c/build.cmake b/targets/c/build.cmake
+index bc44f12..5b9727b 100644
+--- a/targets/c/build.cmake
++++ b/targets/c/build.cmake
+@@ -26,6 +26,10 @@ else ()
+ endif ()
+ set(ARCHIVE_DIR "${CMAKE_SOURCE_DIR}/${ARCHIVE_TYPE_NAME}-output")
+ file(COPY "${TARGET_CODE_DIR}/ntgcalls.h" DESTINATION "${ARCHIVE_DIR}/include")
++# Parlay patch (OD-1): hand-written C API for the Opus encoder config.
++# NOTE: do not add an "@generated" marker to ntgcalls_opus.h -- the codegen
++# step purges @generated files under targets/ at configure time.
++file(COPY "${TARGET_CODE_DIR}/ntgcalls_opus.h" DESTINATION "${ARCHIVE_DIR}/include")
+ file(COPY "${ROOT_DIR}/LICENSE" "${ROOT_DIR}/THIRD_PARTY_NOTICES.md" DESTINATION "${ARCHIVE_DIR}")
+ 
+ if (NOT STATIC_BUILD)
+diff --git a/targets/c/ntgcalls_opus.h b/targets/c/ntgcalls_opus.h
+new file mode 100644
+index 0000000..e3f75e5
+--- /dev/null
++++ b/targets/c/ntgcalls_opus.h
+@@ -0,0 +1,66 @@
++// Parlay patch (OD-1): C API for the locked Opus encoder configuration.
++//
++// Hand-written sidecar to the generated ntgcalls.h -- intentionally NOT
++// part of the NTL schema (schema changes would regenerate every binding).
++// Include after ntgcalls.h; links against the same libntgcalls.so.
++//
++// Effective encoder settings (defaults are the locked values):
++//   bitrate_bps         320000 (ladder 320000 -> 256000 -> 192000; lock the
++//                              verified ceiling in parlay.toml opus_bitrate_kbps)
++//   complexity          10     (OPUS_SET_COMPLEXITY(10))
++//   vbr_enabled         true   (OPUS_SET_VBR(1))
++//   fec_enabled         false  (OPUS_SET_INBAND_FEC(0))
++//   dtx_enabled         false
++//   frame_size_ms       60     (ptime=60, unchanged from stock behaviour)
++//   max_playback_rate_hz 48000 (fullband)
++//
++// Application is OPUS_APPLICATION_AUDIO, fixed (the lock has no VoIP mode).
++// Signal is OPUS_AUTO, not OPUS_SIGNAL_MUSIC: WebRTC M152 exposes no
++// OPUS_SET_SIGNAL path (AudioEncoderOpusConfig has no signal field and
++// WebRtcOpus_EncoderCreate never calls it). With APPLICATION_AUDIO, libopus
++// caps the voice estimate and at 192-320 kbps stereo selects CELT_ONLY /
++// fullband identically to SIGNAL_MUSIC; see phase5/worker-a-ntgcalls.md.
++//
++// Scope: settings are process-global and apply to Opus encoders created
++// AFTER the call. Set them once at startup (or before joining a call);
++// changing them does not reconfigure a running encoder.
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "ntgcalls.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct ntg_opus_encoder_config {
++    int32_t bitrate_bps;
++    int32_t complexity;
++    bool vbr_enabled;
++    bool fec_enabled;
++    bool dtx_enabled;
++    int32_t frame_size_ms;
++    int32_t max_playback_rate_hz;
++} ntg_opus_encoder_config;
++
++// Replace the global Opus encoder settings. Values are clamped to the
++// ranges WebRTC accepts (bitrate 6000-510000, complexity 0-10,
++// frame_size_ms one of 10/20/40/60, max_playback_rate_hz 8000-48000).
++// Returns NTG_ERR_NULL_POINTER if config is NULL.
++NTG_C_EXPORT ntg_result ntg_opus_set_config(const ntg_opus_encoder_config* config);
++
++// Read back the current global Opus encoder settings (the locked defaults
++// until ntg_opus_set_config / ntg_opus_set_bitrate is called).
++// Returns NTG_ERR_NULL_POINTER if out is NULL.
++NTG_C_EXPORT ntg_result ntg_opus_get_config(ntg_opus_encoder_config* out);
++
++// Convenience for the bitrate ladder: set only bitrate_bps, keeping every
++// other setting. Returns NTG_ERR_INVALID_PARAMS if the bitrate is outside
++// 6000-510000.
++NTG_C_EXPORT ntg_result ntg_opus_set_bitrate(int32_t bitrate_bps);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/wrtc/include/wrtc/interfaces/media/opus_encoder_factory.hpp b/wrtc/include/wrtc/interfaces/media/opus_encoder_factory.hpp
+new file mode 100644
+index 0000000..e287330
+--- /dev/null
++++ b/wrtc/include/wrtc/interfaces/media/opus_encoder_factory.hpp
+@@ -0,0 +1,105 @@
++// Parlay patch (OD-1): Opus encoder configuration for music playback.
++//
++// Stock libntgcalls.so 3.0.5 exposes no Opus encoder configuration: the
++// encoder is created by WebRTC's builtin AudioEncoderFactory from SDP
++// parameters only (see AudioEncoderOpusImpl::SdpToConfig, WebRTC M152),
++// which fixes application to kVoip for mono / kAudio for stereo, complexity
++// to the WebRTC default (9), and leaves the signal at OPUS_AUTO. The locked
++// Parlay requirement (FINAL-ARCHITECTURE.md §1.4/§3.3) needs explicit
++// control, so this factory wraps the builtin factory and constructs
++// AudioEncoderOpusImpl directly with a full AudioEncoderOpusConfig.
++//
++// What this delivers, per locked §1.4:
++//   - OPUS_APPLICATION_AUDIO: config.application = kAudio, always (the
++//     lock has no VoIP mode); applied by WebRtcOpus_EncoderCreate as
++//     opus_encoder_create(..., OPUS_APPLICATION_AUDIO, ...).
++//   - OPUS_SET_COMPLEXITY(10): config.complexity = 10 and
++//     config.low_rate_complexity = 10, so GetNewComplexity() keeps 10 at
++//     any bitrate; applied by RecreateEncoderInstance via
++//     WebRtcOpus_SetComplexity.
++//   - OPUS_SET_VBR(1): config.cbr_enabled = false -> DisableCbr ->
++//     OPUS_SET_VBR(1).
++//   - OPUS_SET_INBAND_FEC(0): config.fec_enabled = false -> DisableFec ->
++//     OPUS_SET_INBAND_FEC(0).
++//   - Bitrate ladder 320000 -> 256000 -> 192000 bps: config.bitrate_bps,
++//     settable at runtime (applies to encoders created after the call).
++//
++// Known deviation -- OPUS_SIGNAL_MUSIC: WebRTC M152's AudioEncoderOpusConfig
++// has no signal field and WebRtcOpus_EncoderCreate never calls
++// OPUS_SET_SIGNAL, so there is no WebRTC API path to set the signal
++// explicitly; the encoder runs with libopus's default signal OPUS_AUTO.
++// With OPUS_APPLICATION_AUDIO, libopus caps the voice estimate
++// (voice_est <= 115, 48 with no tonality analysis) and at the locked
++// 192-320 kbps stereo rates the mode decision lands on CELT_ONLY/fullband
++// either way (music mode threshold 10 kbps stereo vs voice 44 kbps), so
++// the audible difference vs OPUS_SIGNAL_MUSIC at these rates is nil.
++// A literal OPUS_SET_SIGNAL(MUSIC) would require reimplementing the Opus
++// encoder as a custom AudioEncoder subclass calling libopus directly;
++// that is out of scope for this patch -- see phase5/worker-a-ntgcalls.md.
++
++#pragma once
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include <api/audio_codecs/audio_encoder_factory.h>
++#include <api/audio_codecs/audio_format.h>
++#include <api/environment/environment.h>
++#include <api/scoped_refptr.h>
++
++namespace wrtc::interfaces::media {
++
++// Global Opus encoder settings. Applied to every Opus encoder created
++// after SetSettings() is called; encoders already running are unaffected
++// (use RtpParameters max_bitrate_bps for live bitrate changes, or
++// re-create the call). All fields are validated/clamped on set.
++struct OpusEncoderSettings {
++    // Target bitrate in bits per second. Locked ladder: 320000 -> 256000
++    // -> 192000 (lock the verified ceiling in parlay.toml opus_bitrate_kbps).
++    int32_t bitrate_bps = 320000;
++    // Opus complexity 0-10. Locked at 10 (maximum quality).
++    int32_t complexity = 10;
++    // True = OPUS_SET_VBR(1); false = CBR.
++    bool vbr_enabled = true;
++    // True = OPUS_SET_INBAND_FEC(1); false = OPUS_SET_INBAND_FEC(0).
++    bool fec_enabled = false;
++    // Opus DTX. Locked off: music must not gate.
++    bool dtx_enabled = false;
++    // Packet frame size in ms; one of 10/20/40/60. Keeps the existing
++    // 60 ms packets (ptime=60) from OutgoingAudioChannel.
++    int32_t frame_size_ms = 60;
++    // Maximum playback rate in Hz; 48000 = fullband.
++    int32_t max_playback_rate_hz = 48000;
++};
++
++// AudioEncoderFactory that creates Opus encoders with the Parlay locked
++// configuration and delegates every other codec to the builtin factory.
++// Signaling/negotiation behaviour is unchanged: GetSupportedEncoders() and
++// QueryAudioEncoder() delegate verbatim, so the advertised codec list is
++// exactly what the builtin factory advertises.
++// NOTE: deliberately not `final`: webrtc::make_ref_counted wraps the class
++// in RefCountedObject<T>, which derives from T.
++class OpusEncoderFactory : public webrtc::AudioEncoderFactory {
++public:
++    explicit OpusEncoderFactory(
++        webrtc::scoped_refptr<webrtc::AudioEncoderFactory> fallback);
++
++    std::vector<webrtc::AudioCodecSpec> GetSupportedEncoders() override;
++    std::optional<webrtc::AudioCodecInfo> QueryAudioEncoder(
++        const webrtc::SdpAudioFormat& format) override;
++    std::unique_ptr<webrtc::AudioEncoder> Create(
++        const webrtc::Environment& env,
++        const webrtc::SdpAudioFormat& format,
++        Options options) override;
++
++    // Global settings (thread-safe). Defaults are the locked values above.
++    static OpusEncoderSettings GetSettings();
++    static void SetSettings(const OpusEncoderSettings& settings);
++
++private:
++    webrtc::scoped_refptr<webrtc::AudioEncoderFactory> fallback_;
++};
++
++} // namespace wrtc::interfaces::media
+diff --git a/wrtc/src/interfaces/media/channels/outgoing_audio_channel.cpp b/wrtc/src/interfaces/media/channels/outgoing_audio_channel.cpp
+index 1fa599d..8ba7d73 100644
+--- a/wrtc/src/interfaces/media/channels/outgoing_audio_channel.cpp
++++ b/wrtc/src/interfaces/media/channels/outgoing_audio_channel.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <wrtc/interfaces/media/channels/outgoing_audio_channel.hpp>
+ 
++#include <wrtc/interfaces/media/opus_encoder_factory.hpp>
+ #include <wrtc/interfaces/native_connection.hpp>
+ 
+ namespace wrtc::interfaces::media::channels {
+@@ -37,11 +38,20 @@ namespace wrtc::interfaces::media::channels {
+             channel_->SetRtpTransport(rtp_transport);
+         });
+         std::vector<webrtc::Codec> codecs;
++        // Parlay patch (OD-1): advertise the locked Opus configuration in
++        // the negotiated SDP so the params match the encoder the factory
++        // actually builds (application AUDIO is implied by stereo;
++        // bitrate/FEC/frame-size come from the global settings).
++        const OpusEncoderSettings opus_settings = OpusEncoderFactory::GetSettings();
+         for (const auto& [id, name, clockrate, channels, feedbackTypes, parameters] : media_content.payload_types) {
+             if (name == "opus") {
+                 webrtc::Codec codec = webrtc::CreateAudioCodec(id, name, clockrate, channels);
+-                codec.SetParam(webrtc::kCodecParamUseInbandFec, 1);
+-                codec.SetParam(webrtc::kCodecParamPTime, 60);
++                codec.SetParam(webrtc::kCodecParamUseInbandFec, opus_settings.fec_enabled ? 1 : 0);
++                codec.SetParam(webrtc::kCodecParamPTime, opus_settings.frame_size_ms);
++                codec.SetParam(webrtc::kCodecParamMaxAverageBitrate, opus_settings.bitrate_bps);
++                if (channels == 2) {
++                    codec.SetParam(webrtc::kCodecParamStereo, 1);
++                }
+                 for (const auto& [type, subtype] : feedbackTypes) {
+                     codec.AddFeedbackParam(webrtc::FeedbackParam(type, subtype));
+                 }
+diff --git a/wrtc/src/interfaces/media/opus_encoder_factory.cpp b/wrtc/src/interfaces/media/opus_encoder_factory.cpp
+new file mode 100644
+index 0000000..01fb5af
+--- /dev/null
++++ b/wrtc/src/interfaces/media/opus_encoder_factory.cpp
+@@ -0,0 +1,111 @@
++// Parlay patch (OD-1): Opus encoder configuration for music playback.
++// See the header for the design and the OPUS_SIGNAL_MUSIC deviation note.
++
++#include <wrtc/interfaces/media/opus_encoder_factory.hpp>
++
++#include <algorithm>
++#include <mutex>
++
++#include <absl/strings/match.h>
++#include <api/audio_codecs/opus/audio_encoder_opus_config.h>
++#include <modules/audio_coding/codecs/opus/audio_encoder_opus.h>
++#include <rtc_base/checks.h>
++
++namespace wrtc::interfaces::media {
++
++namespace {
++
++std::mutex g_settings_mutex;
++OpusEncoderSettings g_settings;
++
++OpusEncoderSettings ClampSettings(const OpusEncoderSettings& in) {
++    OpusEncoderSettings out = in;
++    out.bitrate_bps = std::clamp<int32_t>(
++        out.bitrate_bps,
++        webrtc::AudioEncoderOpusConfig::kMinBitrateBps,
++        webrtc::AudioEncoderOpusConfig::kMaxBitrateBps);
++    out.complexity = std::clamp<int32_t>(out.complexity, 0, 10);
++    // Only frame sizes WebRTC's Opus encoder supports (see
++    // AudioEncoderOpusConfig::IsOk / kOpusSupportedFrameLengths).
++    if (out.frame_size_ms != 10 && out.frame_size_ms != 20 &&
++        out.frame_size_ms != 40 && out.frame_size_ms != 60) {
++        out.frame_size_ms = 60;
++    }
++    if (out.max_playback_rate_hz < 8000 ||
++        out.max_playback_rate_hz > 48000) {
++        out.max_playback_rate_hz = 48000;
++    }
++    return out;
++}
++
++} // namespace
++
++OpusEncoderFactory::OpusEncoderFactory(
++    webrtc::scoped_refptr<webrtc::AudioEncoderFactory> fallback)
++    : fallback_(std::move(fallback)) {}
++
++std::vector<webrtc::AudioCodecSpec> OpusEncoderFactory::GetSupportedEncoders() {
++    return fallback_->GetSupportedEncoders();
++}
++
++std::optional<webrtc::AudioCodecInfo> OpusEncoderFactory::QueryAudioEncoder(
++    const webrtc::SdpAudioFormat& format) {
++    return fallback_->QueryAudioEncoder(format);
++}
++
++std::unique_ptr<webrtc::AudioEncoder> OpusEncoderFactory::Create(
++    const webrtc::Environment& env,
++    const webrtc::SdpAudioFormat& format,
++    Options options) {
++    // Only Opus goes through the locked config; everything else is the
++    // builtin factory's job. SdpToConfig rejects non-48kHz / non-stereo
++    // formats, so mirror that gate here (num_channels 1-2; the negotiated
++    // Telegram group-call format is opus/48000/2).
++    if (!absl::EqualsIgnoreCase(format.name, "opus") ||
++        format.clockrate_hz != 48000 ||
++        (format.num_channels != 1 && format.num_channels != 2)) {
++        return fallback_->Create(env, format, options);
++    }
++
++    const OpusEncoderSettings settings = GetSettings();
++
++    webrtc::AudioEncoderOpusConfig config;
++    config.frame_size_ms = settings.frame_size_ms;
++    config.sample_rate_hz = format.clockrate_hz;
++    config.num_channels = format.num_channels;
++    // Locked: music, always. (SdpToConfig would derive kVoip for mono;
++    // the lock has no VoIP mode.)
++    config.application =
++        webrtc::AudioEncoderOpusConfig::ApplicationMode::kAudio;
++    config.bitrate_bps = settings.bitrate_bps;
++    config.fec_enabled = settings.fec_enabled;
++    // VBR on means CBR off.
++    config.cbr_enabled = !settings.vbr_enabled;
++    config.max_playback_rate_hz = settings.max_playback_rate_hz;
++    config.complexity = settings.complexity;
++    // Keep complexity at the locked value even if the bitrate later drops
++    // below the WebRTC low-rate threshold (GetNewComplexity switches to
++    // low_rate_complexity under ~12.5 kbps).
++    config.low_rate_complexity = settings.complexity;
++    config.dtx_enabled = settings.dtx_enabled;
++    config.supported_frame_lengths_ms = {20, 40, 60};
++    RTC_DCHECK(config.IsOk());
++
++    // Public constructor (M152): builds the encoder with the config above;
++    // RecreateEncoderInstance applies OPUS_SET_APPLICATION(AUDIO),
++    // OPUS_SET_BITRATE, OPUS_SET_COMPLEXITY, OPUS_SET_VBR, OPUS_SET_INBAND_FEC.
++    return std::make_unique<webrtc::AudioEncoderOpusImpl>(
++        env, std::move(config), options.payload_type);
++}
++
++OpusEncoderSettings OpusEncoderFactory::GetSettings() {
++    const std::lock_guard lock(g_settings_mutex);
++    return g_settings;
++}
++
++void OpusEncoderFactory::SetSettings(const OpusEncoderSettings& settings) {
++    const std::lock_guard lock(g_settings_mutex);
++    g_settings = ClampSettings(settings);
++}
++
++} // namespace wrtc::interfaces::media
+diff --git a/wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp b/wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp
+index a2de90c..ca6fdde 100644
+--- a/wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp
++++ b/wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp
+@@ -8,11 +8,13 @@
+ #include <rtc_base/ssl_adapter.h>
+ #include <api/audio/builtin_audio_processing_builder.h>
+ #include <api/create_peerconnection_factory.h>
++#include <api/make_ref_counted.h>
+ #include <api/rtc_event_log/rtc_event_log_factory.h>
+ #include <api/audio_codecs/builtin_audio_encoder_factory.h>
+ #include <api/audio_codecs/builtin_audio_decoder_factory.h>
+ #include <pc/media_factory.h>
+ #include <wrtc/interfaces/media/audio_device_module.hpp>
++#include <wrtc/interfaces/media/opus_encoder_factory.hpp>
+ #include <wrtc/utils/java_context.hpp>
+ 
+ extern "C" {
+@@ -56,7 +58,13 @@ namespace wrtc::interfaces::peer_connection {
+                 audio_device_module_ = webrtc::make_ref_counted<media::AudioDeviceModule>();
+             return audio_device_module_;
+         });
+-        dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
++        // Parlay patch (OD-1): Opus encoders are created with the locked
++        // music configuration (application AUDIO, complexity 10, VBR,
++        // FEC off, configurable bitrate) instead of WebRTC's SDP-derived
++        // defaults. Non-Opus codecs delegate to the builtin factory.
++        dependencies.audio_encoder_factory =
++            webrtc::make_ref_counted<media::OpusEncoderFactory>(
++                webrtc::CreateBuiltinAudioEncoderFactory());
+         dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
+ #ifdef IS_ANDROID
+         dependencies.video_encoder_factory = android::create_video_encoder_factory(static_cast<JNIEnv*>(jni_env_));

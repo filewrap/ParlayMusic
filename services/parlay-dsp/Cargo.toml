@@ -1,0 +1,30 @@
+[package]
+name = "parlay-dsp"
+version = "0.1.0"
+edition = "2021"
+description = "In-process Rust C-ABI DSP engine for Parlay (Phase 5): symphonia decode, rubato resample to 48 kHz, f32 FX chain, gapless dual-slot playback"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "parlay_dsp"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Decode: symphonia 0.5. Default features cover FLAC / Vorbis / WAV / PCM /
+# Ogg / MKV / ADPCM. The extras below are required by the locked spec:
+#   aac   — AAC-LC in ADTS and inside MP4/M4A
+#   alac  — Apple Lossless inside MP4/M4A
+#   mp3   — MP1/MP2/MP3 (LAME gapless delay/padding honoured)
+#   isomp4 — MP4/M4A container
+# Opus is NOT in symphonia 0.5: it is decoded by hand-rolled libopus FFI
+# (src/opus_ffi.rs + src/ogg_opus.rs) against the system libopus.so.0, so
+# no extra crate is needed for it.
+symphonia = { version = "0.5", features = ["aac", "alac", "mp3", "isomp4"] }
+# Resample: rubato 0.16, SincFixedOut (fixed 960-frame output, dynamic ratio
+# for the speed effect, built-in ratio ramping). Pulls realfft/rustfft.
+rubato = "0.16"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

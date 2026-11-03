@@ -17,13 +17,14 @@
 // that reads d.Room before that sees rooms with no picker
 // (autoplay drains go idle, never wrong).
 //
-// Frame path (interim, Phase 5 replacement target): audio reaches
-// ntgcalls through voice.Manager.Play's ffmpeg-decode-to-PCM path
-// (internal/voice/feeder.go — one persistent ffmpeg process per
-// room, 10 ms s16le frames over the external source). Phase 5
-// replaces it with parlay-dsp frames (f32 -> FX chain -> one
-// dither to s16le -> SendExternalFrame). No other frame path is
-// invented here.
+// Frame path (Phase 5): audio reaches ntgcalls through the
+// parlay-dsp engine (internal/dsp) — the DSP decodes the stream,
+// applies the room's FX/speed/bass/volume, and the voice feed
+// pushes 10 ms s16le frames over the external source. No ffmpeg
+// subprocess exists anywhere in the path. The engine is linked
+// only with -tags parlaydsp (Worker B's library); without the tag
+// the build logs the honest-unavailable state and Play fails with
+// dsp.ErrUnavailable instead of playing.
 package main
 
 import (
@@ -38,6 +39,7 @@ import (
 	"parlay/backend-go/internal/app"
 	"parlay/backend-go/internal/config"
 	"parlay/backend-go/internal/download"
+	"parlay/backend-go/internal/dsp"
 	"parlay/backend-go/internal/fx"
 	"parlay/backend-go/internal/gui"
 	"parlay/backend-go/internal/handlers"
@@ -136,10 +138,41 @@ func run() error {
 	defer client.Close()
 	log.Printf("backend-go: ntgcalls %s", voice.Version())
 
+	// Opus encoder: apply the locked bitrate from [quality]
+	// (voice_profile → kbps) BEFORE the first join. The
+	// settings are process-global and only affect Opus encoders
+	// created after the call (see internal/voice/opus.go), so
+	// this must run before the UDS server listens and any join
+	// can happen. A failure here is fatal: the encoder would
+	// otherwise run at the library default 320k instead of the
+	// configured profile, silently. The readback proves the
+	// setting stuck.
+	if err := voice.SetOpusBitrate(int32(cfg.Quality.OpusBitrateKbps() * 1000)); err != nil {
+		return fmt.Errorf("opus bitrate: %w", err)
+	}
+	if oc, err := voice.OpusConfig(); err != nil {
+		return fmt.Errorf("opus config readback: %w", err)
+	} else {
+		log.Printf("backend-go: opus encoder bitrate=%d complexity=%d vbr=%v fec=%v dtx=%v frame=%dms maxplay=%d (profile %s)",
+			oc.BitrateBps, oc.Complexity, oc.VBREnabled, oc.FECEnabled, oc.DTXEnabled, oc.FrameSizeMs, oc.MaxPlaybackRateHz, cfg.Quality.VoiceProfile)
+	}
+
 	server := uds.NewServer(cfg.SocketPath())
 	voiceMgr := voice.NewManager(client, func(ctx context.Context, chatID int64, localSDP string) (string, int64, error) {
 		return server.RequestJoin(ctx, chatID, localSDP)
 	})
+	// DSP engine: the real parlay-dsp library with -tags
+	// parlaydsp, the honest-unavailable engine otherwise (see
+	// internal/dsp). Startup continues either way — the voice
+	// path fails honestly at Play time when unlinked — but the
+	// state is logged loudly so an unlinked production build is
+	// never mistaken for a working one.
+	voiceMgr.SetDSP(dsp.New())
+	if dsp.Linked() {
+		log.Printf("backend-go: parlay-dsp linked")
+	} else {
+		log.Printf("backend-go: WARNING parlay-dsp NOT linked (build with -tags parlaydsp once services/parlay-dsp lands); audio will fail with dsp.ErrUnavailable")
+	}
 
 	// The single shared room Manager and lyrics Fetcher. The
 	// Fetcher is non-critical: if it cannot be built from the

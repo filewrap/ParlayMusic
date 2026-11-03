@@ -245,13 +245,12 @@ func (h *Handlers) vcStop(ctx context.Context, req uds.Request) (any, error) {
 // vcSeek moves the position clock (clamped to [0, duration] when
 // known; negative is bad_request; idle is not_found). A seek to 0
 // (replay) rebinds the feed from the start when a call exists.
-// A seek to a non-zero position moves the room clock only: the
-// interim ffmpeg feed has no seek-to-offset, so the audio
-// continues from its current decode point while the room clock —
-// the source of truth for now_playing/progress — reports the
-// requested position. True audio-position seek needs a
-// voice.Manager seek (ffmpeg -ss rebind), which lives outside
-// this package; see the Wave 2 report.
+// A seek to a non-zero position moves the room clock only: the DSP
+// feed has no seek-to-offset, so the audio continues from its
+// current decode point while the room clock — the source of truth
+// for now_playing/progress — reports the requested position. True
+// audio-position seek needs a voice.Manager seek (DSP stream
+// re-open at an offset), which lives outside this package.
 func (h *Handlers) vcSeek(ctx context.Context, req uds.Request) (any, error) {
 	var p struct {
 		ChatID      int64  `json:"chat_id"`

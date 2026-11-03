@@ -961,3 +961,112 @@ func TestMixVideoID(t *testing.T) {
 		}
 	}
 }
+
+// waitRoom polls until cond holds on the room snapshot, or fails.
+func waitRoom(t *testing.T, h *Handlers, chatID int64, cond func(model.NowPlaying) bool, what string) model.NowPlaying {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap, ok := h.rooms.Snapshot(chatID); ok && cond(snap) {
+			return snap
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("room did not become %s within 5s", what)
+	return model.NowPlaying{}
+}
+
+// TestTransitionAdvancesWithoutRebind proves the gapless path: the
+// DSP promotes the next slot (track B) and the room advances to B
+// WITHOUT rebinding — no voice call is needed, no bind is
+// attempted, the feeding record simply moves to B. The room state
+// and the DSP stay in agreement with zero gap.
+func TestTransitionAdvancesWithoutRebind(t *testing.T) {
+	e := newTestEnv(t)
+	Register(e.srv, e.deps)
+	chatID := testChatID
+	if _, err := e.h.rooms.Play(chatID, trackA, 7); err != nil {
+		t.Fatalf("rooms.Play A: %v", err)
+	}
+	if _, err := e.h.rooms.Play(chatID, trackB, 7); err != nil {
+		t.Fatalf("rooms.Play B (queue): %v", err)
+	}
+	e.h.setFeeding(chatID, trackA.ID)
+	// The DSP promotes B's slot. There is no voice call in this
+	// test env (join always fails), so any rebind attempt would
+	// surface — the point is that none happens.
+	e.h.onTransition(chatID, trackB.ID)
+	snap := waitRoom(t, e.h, chatID, func(s model.NowPlaying) bool {
+		return s.Track != nil && s.Track.ID == trackB.ID
+	}, "track B")
+	if snap.Track == nil || snap.Track.ID != trackB.ID {
+		t.Fatalf("current after transition = %+v, want track B", snap.Track)
+	}
+	if feeding, ok := e.h.getFeeding(chatID); !ok || feeding != trackB.ID {
+		t.Fatalf("feeding after transition = %q ok=%v, want track B", feeding, ok)
+	}
+	if _, ok := e.deps.Voice.Get(chatID); ok {
+		t.Fatal("a voice call appeared during a no-rebind transition")
+	}
+}
+
+// TestTransitionLoopReplay proves loop goes through the DSP's
+// gapless path: the replayed track IS the transitioned track, so
+// the room replays it without rebinding and the loop counter is
+// consumed exactly once.
+func TestTransitionLoopReplay(t *testing.T) {
+	e := newTestEnv(t)
+	Register(e.srv, e.deps)
+	chatID := testChatID
+	if _, err := e.h.rooms.Play(chatID, trackA, 7); err != nil {
+		t.Fatalf("rooms.Play A: %v", err)
+	}
+	if _, err := e.h.rooms.SetLoop(chatID, 1); err != nil {
+		t.Fatalf("rooms.SetLoop: %v", err)
+	}
+	e.h.setFeeding(chatID, trackA.ID)
+	e.h.onTransition(chatID, trackA.ID)
+	snap := waitRoom(t, e.h, chatID, func(s model.NowPlaying) bool {
+		return s.Loop == 0 && s.Track != nil && s.Track.ID == trackA.ID
+	}, "loop consumed, still track A")
+	if snap.Loop != 0 {
+		t.Fatalf("loop after transition = %d, want 0 (one replay consumed)", snap.Loop)
+	}
+	if feeding, ok := e.h.getFeeding(chatID); !ok || feeding != trackA.ID {
+		t.Fatalf("feeding after loop transition = %q ok=%v, want track A", feeding, ok)
+	}
+}
+
+// TestTransitionMismatchRebinds proves the repair path: the DSP
+// plays track C, but the room's queue top is B (the queue was
+// mutated between LoadNext and the promotion), so the room
+// advances to B and rebinds to it instead of playing the wrong
+// track under the right name. With no voice call in this env the
+// rebind is best-effort (the room stands, the feeding record is
+// cleared); with a live call it would Play B.
+func TestTransitionMismatchRebinds(t *testing.T) {
+	e := newTestEnv(t)
+	Register(e.srv, e.deps)
+	chatID := testChatID
+	trackC := model.Track{ID: "yt:ccc333ccc33", Title: "Song C", Artist: "Artist C", Source: "youtube", DurationSec: 200, StreamURL: "https://example.invalid/c.opus"}
+	if _, err := e.h.rooms.Play(chatID, trackA, 7); err != nil {
+		t.Fatalf("rooms.Play A: %v", err)
+	}
+	if _, err := e.h.rooms.Play(chatID, trackB, 7); err != nil {
+		t.Fatalf("rooms.Play B (queue): %v", err)
+	}
+	e.h.setFeeding(chatID, trackA.ID)
+	// The DSP promoted C, but the room advances to B.
+	e.h.onTransition(chatID, trackC.ID)
+	snap := waitRoom(t, e.h, chatID, func(s model.NowPlaying) bool {
+		return s.Track != nil && s.Track.ID == trackB.ID
+	}, "track B (queue top, not the transitioned C)")
+	if snap.Track == nil || snap.Track.ID != trackB.ID {
+		t.Fatalf("current after mismatch transition = %+v, want track B", snap.Track)
+	}
+	// The rebind was attempted: with no call record the bind is
+	// skipped and the feeding record cleared (best effort).
+	if feeding, ok := e.h.getFeeding(chatID); ok {
+		t.Fatalf("feeding after mismatch rebind = %q, want cleared (no call to bind to)", feeding)
+	}
+}

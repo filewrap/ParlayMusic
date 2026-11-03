@@ -5,7 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
+	"strings"
 	"sync"
+
+	"parlay/backend-go/internal/dsp"
 )
 
 // JoinFunc completes the voice join handshake for one chat. It
@@ -73,16 +78,29 @@ type Call struct {
 	FeedEnded bool
 	FeedErr   error
 
-	feed *ffmpegFeed
+	feed *dspFeed
 }
 
+// ErrNoFeed is returned by ApplyFX and LoadNext when the chat has
+// no live feed: there is no DSP stream to push parameters or a
+// next slot into. Callers that record FX for the next track
+// (fx.apply with nothing playing) treat this as "recorded, not
+// live" rather than as a failure.
+var ErrNoFeed = errors.New("voice: no live feed in this chat")
+
 // Manager owns one ntgcalls Client and the per-chat call records.
-// It performs the join handshake through its JoinFunc and drives the
-// interim ffmpeg frame feed for playback. It never calls TDLib and
+// It performs the join handshake through its JoinFunc and drives
+// the DSP frame feed for playback. It never calls TDLib and
 // never touches the UDS socket.
 type Manager struct {
 	client *Client
 	join   JoinFunc
+
+	// dspEngine is the parlay-dsp engine the feeds decode with,
+	// installed by SetDSP (main.go, from dsp.New()). A nil engine
+	// means Play/PlayStream fail honestly with dsp.ErrUnavailable
+	// instead of playing.
+	dspEngine dsp.Engine
 
 	mu    sync.Mutex
 	calls map[int64]*Call
@@ -91,6 +109,7 @@ type Manager struct {
 	streamEndHandlers        []StreamEndFunc
 	connectionChangeHandlers []ConnectionChangeFunc
 	feedEndHandlers          []func(chatID int64, err error)
+	transitionHandlers       []func(chatID int64, trackID string)
 }
 
 // NewManager builds a Manager around client. join may be nil only
@@ -127,13 +146,47 @@ func (m *Manager) OnConnectionChange(fn ConnectionChangeFunc) {
 	m.connectionChangeHandlers = append(m.connectionChangeHandlers, fn)
 }
 
-// OnFeedEnd registers a handler invoked when a chat's ffmpeg feed
+// SetDSP installs the parlay-dsp engine the Manager's feeds
+// decode with. It is called once at startup (main.go, from
+// dsp.New()); calling it while feeds are running is a wiring bug
+// and the new engine applies only to feeds started after the call.
+func (m *Manager) SetDSP(e dsp.Engine) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dspEngine = e
+}
+
+// OnFeedEnd registers a handler invoked when a chat's DSP feed
 // ends: err is nil on a clean end of stream (track finished), or the
-// exact feed error when ffmpeg died or the frame pump failed.
+// exact feed error when the DSP died or the frame pump failed.
 func (m *Manager) OnFeedEnd(fn func(chatID int64, err error)) {
 	m.handlersMu.Lock()
 	defer m.handlersMu.Unlock()
 	m.feedEndHandlers = append(m.feedEndHandlers, fn)
+}
+
+// OnTransition registers a handler invoked when a chat's DSP feed
+// promotes its next slot: the track with id trackID is now
+// playing, gaplessly, with no rebind. The handler must never
+// block the feed pump: handlers dispatch to a worker goroutine
+// (see handlers.onTransition). The feed keeps playing the promoted
+// slot while the handler runs.
+func (m *Manager) OnTransition(fn func(chatID int64, trackID string)) {
+	m.handlersMu.Lock()
+	defer m.handlersMu.Unlock()
+	m.transitionHandlers = append(m.transitionHandlers, fn)
+}
+
+// onTransition forwards a DSP slot promotion to the registered
+// handlers. It never blocks: it only copies the handler list and
+// calls each one, and every handler dispatches asynchronously.
+func (m *Manager) onTransition(chatID int64, trackID string) {
+	m.handlersMu.RLock()
+	handlers := append([]func(chatID int64, trackID string){}, m.transitionHandlers...)
+	m.handlersMu.RUnlock()
+	for _, fn := range handlers {
+		fn(chatID, trackID)
+	}
 }
 
 func (m *Manager) dispatchStreamEnd(chatID int64, streamType StreamType, device StreamDevice) {
@@ -260,64 +313,86 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 
 // Play starts playback of the resolved stream source (URL or local
 // file path) in chatID's live call. It binds the external audio source
-// and starts the room's persistent ffmpeg decode feed; on a track
-// change the previous feed is stopped and a new one started — the
-// feed is restarted only on track change, never per call or per
-// frame. Play requires a connected call; it does not join.
-func (m *Manager) Play(ctx context.Context, chatID int64, source string) error {
-	m.mu.Lock()
-	call, ok := m.calls[chatID]
-	if !ok || call.State != StateConnected {
-		state := "no call"
-		if ok {
-			state = call.State.String()
-		}
-		m.mu.Unlock()
-		return fmt.Errorf("voice: play chat %d: no connected call (state %s); call Join first", chatID, state)
+// and starts the room's persistent DSP feed; on a track change the
+// previous feed is stopped and a new one started — the feed is
+// restarted only on track change, never per call or per frame. Play
+// requires a connected call; it does not join. opts carries the
+// room's DSP parameters (speed, bass, volume, FX preset) and is
+// applied to the stream from its first frame.
+//
+// The source is opened in Go — http(s) URLs with an HTTP GET, local
+// paths with os.Open — and the body is handed to the DSP as its
+// byte source. There is no ffmpeg anywhere in this path. Note the
+// one behaviour the old ffmpeg feed had that Go does not: ffmpeg
+// reconnected a dropped HTTP stream; a mid-stream read failure
+// now ends the track (the feed error advances the room), it does
+// not silently reconnect.
+func (m *Manager) Play(ctx context.Context, chatID int64, source string, opts dsp.Options) error {
+	if strings.TrimSpace(source) == "" {
+		return fmt.Errorf("voice: play chat %d: empty audio source", chatID)
 	}
-	oldFeed := call.feed
-	call.feed = nil
-	call.FeedEnded = false
-	call.FeedErr = nil
-	m.mu.Unlock()
-
-	// Stop the previous track's feed outside the manager lock: the
-	// feed's pump goroutine must never block on this lock.
-	if oldFeed != nil {
-		oldFeed.Stop()
-	}
-	if err := m.client.SetExternalAudioSource(chatID); err != nil {
-		return fmt.Errorf("voice: play chat %d: set external audio source: %w", chatID, err)
-	}
-	feed, err := startFFmpegFeed(ctx, m.client, chatID, source, func(feedErr error) {
-		m.onFeedEnd(chatID, feedErr)
-	})
+	r, err := openSource(ctx, source)
 	if err != nil {
 		return fmt.Errorf("voice: play chat %d: %w", chatID, err)
 	}
-	m.mu.Lock()
-	// The call may have been stopped while the feed was starting.
-	if current, ok := m.calls[chatID]; ok && current == call && current.State == StateConnected {
-		call.feed = feed
-	} else {
-		m.mu.Unlock()
-		feed.Stop()
-		return fmt.Errorf("voice: play chat %d: call ended while the feed was starting", chatID)
+	if err := m.startStream(ctx, chatID, r, opts); err != nil {
+		_ = r.Close()
+		return err
 	}
-	m.mu.Unlock()
 	return nil
+}
+
+// openSource opens source for DSP decoding: an http(s) URL is
+// fetched (the body streams; a non-2xx status is an error), any
+// other path is opened as a local file.
+func openSource(ctx context.Context, source string) (io.ReadCloser, error) {
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+		if err != nil {
+			return nil, fmt.Errorf("open stream URL: %w", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("open stream URL: %w", err)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("open stream URL: HTTP %d", resp.StatusCode)
+		}
+		return resp.Body, nil
+	}
+	f, err := os.Open(source)
+	if err != nil {
+		return nil, fmt.Errorf("open audio file: %w", err)
+	}
+	return f, nil
 }
 
 // PlayStream starts playback of a pre-buffered stream (the
 // Phase 4 prefetch handle) in chatID's live call. It is the same
-// interim ffmpeg-decode-to-PCM path as Play, but the decode input
-// is the prefetch reader — the opening seconds are already in
-// memory, so the first frames need no fresh HTTP open — instead of
-// a URL or file path. Like Play it requires a connected call, binds
-// the external audio source, and (re)starts the room's persistent
-// feed on track change. Phase 5 replaces the ffmpeg decode with
-// parlay-dsp frames from this same handle type.
-func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser) error {
+// DSP path as Play, but the decode input is the prefetch reader —
+// the opening seconds are already in memory, so the first frames
+// need no fresh HTTP open — instead of a URL or file path. Like
+// Play it requires a connected call, binds the external audio
+// source, and (re)starts the room's persistent feed on track
+// change. opts carries the room's DSP parameters and is applied
+// from the first frame.
+func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser, opts dsp.Options) error {
+	if r == nil {
+		return fmt.Errorf("voice: play stream chat %d: nil stream reader", chatID)
+	}
+	return m.startStream(ctx, chatID, r, opts)
+}
+
+// startStream is the shared Play/PlayStream construction: bind the
+// external audio source, open the DSP stream for r with opts, and
+// start the feed pump. The caller owns r on error (startStream
+// closes it when the DSP stream fails to open); on success the
+// DSP stream owns it.
+func (m *Manager) startStream(ctx context.Context, chatID int64, r io.ReadCloser, opts dsp.Options) error {
+	if err := opts.Validate(); err != nil {
+		return fmt.Errorf("voice: play stream chat %d: %w", chatID, err)
+	}
 	m.mu.Lock()
 	call, ok := m.calls[chatID]
 	if !ok || call.State != StateConnected {
@@ -328,6 +403,7 @@ func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser)
 		m.mu.Unlock()
 		return fmt.Errorf("voice: play stream chat %d: no connected call (state %s); call Join first", chatID, state)
 	}
+	engine := m.dspEngine
 	oldFeed := call.feed
 	call.feed = nil
 	call.FeedEnded = false
@@ -339,13 +415,23 @@ func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser)
 	if oldFeed != nil {
 		oldFeed.Stop()
 	}
+	if engine == nil {
+		return fmt.Errorf("voice: play stream chat %d: %w", chatID, dsp.ErrUnavailable)
+	}
 	if err := m.client.SetExternalAudioSource(chatID); err != nil {
 		return fmt.Errorf("voice: play stream chat %d: set external audio source: %w", chatID, err)
 	}
-	feed, err := startFFmpegFeedFromReader(ctx, m.client, chatID, r, func(feedErr error) {
+	stream, err := engine.OpenStream(ctx, r, opts)
+	if err != nil {
+		return fmt.Errorf("voice: play stream chat %d: open DSP stream: %w", chatID, err)
+	}
+	feed, err := startDSPFeed(ctx, m.client, chatID, stream, func(feedErr error) {
 		m.onFeedEnd(chatID, feedErr)
+	}, func(trackID string) {
+		m.onTransition(chatID, trackID)
 	})
 	if err != nil {
+		_ = stream.Close()
 		return fmt.Errorf("voice: play stream chat %d: %w", chatID, err)
 	}
 	m.mu.Lock()
@@ -358,6 +444,52 @@ func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser)
 		return fmt.Errorf("voice: play stream chat %d: call ended while the feed was starting", chatID)
 	}
 	m.mu.Unlock()
+	return nil
+}
+
+// ApplyFX applies a live zero-restart parameter change to the
+// running DSP stream in chatID. A nil error is the DSP's
+// confirmation that the effect is active. ErrNoFeed when the chat
+// has no live feed (fx.apply records the preset for the next
+// track instead).
+func (m *Manager) ApplyFX(chatID int64, opts dsp.Options) error {
+	m.mu.Lock()
+	call, ok := m.calls[chatID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("voice: apply fx chat %d: %w", chatID, ErrNoFeed)
+	}
+	feed := call.feed
+	m.mu.Unlock()
+	if feed == nil {
+		return fmt.Errorf("voice: apply fx chat %d: %w", chatID, ErrNoFeed)
+	}
+	if err := feed.ApplyOptions(opts); err != nil {
+		return fmt.Errorf("voice: apply fx chat %d: %w", chatID, err)
+	}
+	return nil
+}
+
+// LoadNext loads the next slot of the running DSP stream in
+// chatID: the track that will start gaplessly when the active slot
+// ends. r is the next track's byte source (a PrefbufferedStream
+// reader), opts its DSP parameters, trackID the id the transition
+// fires with. ErrNoFeed when the chat has no live feed.
+func (m *Manager) LoadNext(chatID int64, r io.ReadCloser, opts dsp.Options, trackID string) error {
+	m.mu.Lock()
+	call, ok := m.calls[chatID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("voice: load next chat %d: %w", chatID, ErrNoFeed)
+	}
+	feed := call.feed
+	m.mu.Unlock()
+	if feed == nil {
+		return fmt.Errorf("voice: load next chat %d: %w", chatID, ErrNoFeed)
+	}
+	if err := feed.LoadNext(r, opts, trackID); err != nil {
+		return fmt.Errorf("voice: load next chat %d: %w", chatID, err)
+	}
 	return nil
 }
 

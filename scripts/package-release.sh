@@ -7,13 +7,18 @@
 #          (SHA256SUMS also lives inside the tarball, at its root.)
 #
 # Staged: bin/parlay-core, bin/parlay-backend, lib/libtdjson.so.1.8.69,
-# lib/libntgcalls.so, scripts/yt_dlp_worker.py (the yt-dlp daemon the
+# lib/libntgcalls.so (PATCHED Phase 5 build — see
+# patches/ntgcalls-opus-encoder/README.md; size-pinned below),
+# lib/libparlay_dsp.so (Phase 5 Rust DSP engine, rebuilt from
+# services/parlay-dsp sources in step 2b — never ship a stale .so:
+# a stale artifact fails exactly at EOS, after all audio played),
+# scripts/yt_dlp_worker.py (the yt-dlp daemon the
 # backend spawns at boot; its venv is created by install.sh, never
 # bundled), launchers, parlay.toml.example, .env.example, README,
 # INSTALL.md, VERSION.
 #
 # Re-runnable: the staging dir is wiped at the start of every run.
-# Never bundles: .env, tokens, session files, refs/ (except the one
+# Never bundles: .env, tokens, session files, refs/ (except the
 # prebuilt libntgcalls.so copied to lib/), build dirs, venvs,
 # __pycache__, .git, slskd (install.sh fetches it from upstream),
 # audio-fx-rust (Phase 5 port source, not a shipped service).
@@ -84,20 +89,41 @@ need_exec services/core-cpp/build/parlay-core
 cp services/core-cpp/build/parlay-core "$STAGE/bin/parlay-core"
 
 # --- 2. backend-go (unified Go backend) ----------------------------------
+# Phase 5: the backend MUST be built with -tags parlaydsp, or the
+# shipped binary logs "parlay-dsp NOT linked" and every Play fails
+# with dsp.ErrUnavailable. The DSP library is rebuilt from current
+# sources first (step 2b) so the Go link can never pick up a stale
+# .so (a stale .so fails exactly at EOS — see phase5/PHASE5.md).
 echo "==> backend-go"
-(cd services/backend-go && CGO_ENABLED=1 "$GO_BIN" build -trimpath -o "$STAGE/bin/parlay-backend" ./cmd/backend)
+DSP_SO="services/parlay-dsp/target/release/libparlay_dsp.so"
+CARGO_BIN="${PARLAY_CARGO_BIN:-$ROOT/.cargo/bin/cargo}"
+# Cargo lives at ~/.cargo/bin in the sandbox, which is $HOME/.cargo
+# — but the repo root is not necessarily $HOME, so try both.
+[ -x "$CARGO_BIN" ] || CARGO_BIN="$HOME/.cargo/bin/cargo"
+[ -x "$CARGO_BIN" ] || CARGO_BIN="$(command -v cargo || true)"
+[ -n "$CARGO_BIN" ] || { echo "ERROR: no cargo toolchain (tried $ROOT/.cargo/bin/cargo, \$HOME/.cargo/bin/cargo and PATH)" >&2; exit 1; }
+(cd services/parlay-dsp && "$CARGO_BIN" build --release)
+need_file "$DSP_SO"
+(cd services/backend-go && CGO_ENABLED=1 "$GO_BIN" build -tags parlaydsp -trimpath -o "$STAGE/bin/parlay-backend" ./cmd/backend)
 need_exec "$STAGE/bin/parlay-backend"
 
 # --- 3. Native voice libs (copy only — NEVER rebuild here) ------------------
 echo "==> native libs (copy only)"
 TDJSON_SRC="phase4/tdlib-src/build/libtdjson.so.1.8.69"
 NTG_SRC="refs/ntgcalls/shared-output/lib/libntgcalls.so"
-need_file "$TDJSON_SRC"; need_file "$NTG_SRC"
+DSP_SRC="$DSP_SO"
+need_file "$TDJSON_SRC"; need_file "$NTG_SRC"; need_file "$DSP_SRC"
 # Guard against accidental rebuilds / wrong files: sizes are pinned.
 [ "$(stat -c%s "$TDJSON_SRC")" = "50166944" ] || fail "$TDJSON_SRC has an unexpected size (expected 50166944 B)"
-[ "$(stat -c%s "$NTG_SRC")" = "98121040" ] || fail "$NTG_SRC has an unexpected size (expected 98121040 B)"
+# NTG size is the PATCHED Phase 5 build (98,123,704 B). The stock
+# 3.0.5 .so is 98,121,040 B — if this pin trips on the stock size,
+# the patch was never applied; rebuild with
+# scripts/rebuild-ntgcalls.sh. If a legitimate rebuild changes the
+# size, update this pin (and patches/ntgcalls-opus-encoder/README.md).
+[ "$(stat -c%s "$NTG_SRC")" = "98123704" ] || fail "$NTG_SRC has an unexpected size (expected 98123704 B)"
 cp "$TDJSON_SRC" "$STAGE/lib/libtdjson.so.1.8.69"
 cp "$NTG_SRC" "$STAGE/lib/libntgcalls.so"
+cp "$DSP_SRC" "$STAGE/lib/libparlay_dsp.so"
 
 # --- 4. yt-dlp worker (sources only — the venv is created by install.sh) --
 echo "==> yt-dlp worker"
@@ -153,7 +179,14 @@ fi
 #     or one of the documented literal defaults).
 if ! awk -F= '/^[A-Z_]+=/ {
        v=$2; sub(/ *#.*/, "", v); gsub(/ /, "", v)
-       if (v != "" && v !~ /^(https?:\/\/.*|mongodb:\/\/.*|redis:\/\/.*|[0-9]+|low-ram|data|\.\/downloads|MP3_320|gemini-2\.0-flash|ParlayBot|python3)$/) {
+       # Allowed placeholder shapes: URLs, integers AND decimals
+       # (rate limits are 1.0), the documented literal defaults
+       # (voice profiles, resampler qualities, comma-separated
+       # source ladders). A real secret (token/hash) matches none
+       # of these shapes. (Phase 5 fix: the sweep rejected the
+       # pre-Phase 4 .env.example literals, so packaging failed at
+       # step 7 before any tarball existed.)
+       if (v != "" && v !~ /^(https?:\/\/.*|mongodb:\/\/.*|redis:\/\/.*|[0-9]+(\.[0-9]+)?|low-ram|data|\.\/downloads|MP3_320|gemini-2\.0-flash|ParlayBot|python3|standard_192k|high_256k|ultra_320k|sinc_256|sinc_128|fast|[a-z]+(,[a-z]+)*)$/) {
          print "  suspicious value: " $0; bad=1
        }
      } END { exit bad }' "$STAGE/.env.example"; then

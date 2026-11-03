@@ -25,8 +25,17 @@ COPY services/backend-go/go.mod services/backend-go/go.sum ./services/backend-go
 RUN cd services/backend-go && go mod download
 COPY services/backend-go ./services/backend-go
 COPY refs/ntgcalls/shared-output ./refs/ntgcalls/shared-output
+# Phase 5: the DSP engine. The cgo binding (#include "parlay_dsp.h"
+# + -L services/parlay-dsp/target/release) needs the header AND the
+# prebuilt .so — same prebuilt-artifact pattern as libntgcalls.so
+# above (rebuild with `cargo build --release` in services/parlay-dsp;
+# a stale .so fails exactly at EOS). Only the header + .so are
+# copied, not the whole 130 MB target/ dir. The RUN guard fails
+# loudly if the .so is absent (fresh clone).
+COPY services/parlay-dsp/parlay_dsp.h ./services/parlay-dsp/
+COPY services/parlay-dsp/target/release/libparlay_dsp.so ./services/parlay-dsp/target/release/
 RUN cd services/backend-go \
-    && CGO_ENABLED=1 go build -trimpath -o /out/parlay-backend ./cmd/backend
+    && CGO_ENABLED=1 go build -tags parlaydsp -trimpath -o /out/parlay-backend ./cmd/backend
 
 FROM debian:bookworm-slim
 ARG http_proxy
@@ -36,11 +45,15 @@ ARG HTTPS_PROXY
 ARG no_proxy
 ARG NO_PROXY
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv ffmpeg ca-certificates \
+    python3 python3-venv ffmpeg libopus0 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/parlay-backend /usr/local/bin/parlay-backend
 COPY --from=build /src/refs/ntgcalls/shared-output/lib/libntgcalls.so /app/lib/libntgcalls.so
+# Phase 5: the DSP engine. libopus0 above is explicit (not just
+# transitive via ffmpeg): libparlay_dsp.so links libopus.so.0
+# directly (hand-rolled FFI — symphonia 0.5 has no Opus codec).
+COPY --from=build /src/services/parlay-dsp/target/release/libparlay_dsp.so /app/lib/libparlay_dsp.so
 COPY scripts/yt_dlp_worker.py /app/scripts/yt_dlp_worker.py
 RUN python3 -m venv /app/scripts/yt-dlp-venv \
     && /app/scripts/yt-dlp-venv/bin/pip install -q yt-dlp

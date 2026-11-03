@@ -27,7 +27,9 @@ covers the **repo-checkout install** on a plain Linux VPS.
 Install the tools on Debian/Ubuntu:
 
 ```bash
-sudo apt update && sudo apt install -y curl tar python3 python3-venv python3-pip ffmpeg cmake g++
+sudo apt update && sudo apt install -y curl tar python3 python3-venv python3-pip ffmpeg libopus0 cmake g++
+# libopus0 is explicit (Phase 5): libparlay_dsp.so links libopus.so.0
+# directly; ffmpeg normally pulls it in, but a static ffmpeg would not.
 # go 1.23+ (https://go.dev/dl/ — no distro package is new enough on 22.04):
 curl -LO https://go.dev/dl/go1.23.0.linux-amd64.tar.gz
 sudo tar -C /usr/local -xzf go1.23.0.linux-amd64.tar.gz

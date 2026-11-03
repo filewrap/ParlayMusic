@@ -368,6 +368,15 @@ func (c *Client) SendExternalFrame(chatID int64, data []byte) error {
 	return checkResult(C.ntg_send_external_frame(c.handle, C.int64_t(chatID), C.NTG_STREAM_DEVICE_MICROPHONE, dataC, C.size_t(len(data)), C.ntg_frame_data{}))
 }
 
+// SendFrame pushes one raw PCM audio frame to chatID's
+// microphone (external) source. It is the FrameSink
+// implementation: the DSP feed pump calls this, never
+// SendExternalFrame directly, so the sink stays one delimited
+// seam (see feed.go).
+func (c *Client) SendFrame(chatID int64, data []byte) error {
+	return c.SendExternalFrame(chatID, data)
+}
+
 // Pause pauses playback in chatID. The returned bool reports whether
 // any track's state actually changed, not the resulting paused state:
 // ntgcalls returns the "changed" flag from its update_pause, which

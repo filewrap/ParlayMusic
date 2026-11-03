@@ -244,3 +244,39 @@ func TestPrefetchResolveFailure(t *testing.T) {
 		t.Fatal("Take handed over a failed prefetch")
 	}
 }
+
+// TestPeekDoesNotConsume proves Peek returns the pending prefetch
+// without removing it: the loadNextWhenReady waiter Peeks, waits
+// on Ready, and then claims the handle through Take — and a Peek
+// for another track, or after Take, finds nothing.
+func TestPeekDoesNotConsume(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("fake audio bytes"))
+	}))
+	t.Cleanup(srv.Close)
+	resolve := func(_ context.Context, track model.Track) (model.Track, error) {
+		track.StreamURL = srv.URL
+		return track, nil
+	}
+	p := New(resolve, 4096, 5*time.Second)
+	p.Prefetch(1, model.Track{ID: "peek1", Source: "youtube"})
+	if _, ok := p.Peek(1, "other"); ok {
+		t.Error("Peek returned a prefetch for another track")
+	}
+	s, ok := p.Peek(1, "peek1")
+	if !ok || s == nil {
+		t.Fatal("Peek did not return the pending prefetch")
+	}
+	// Peek twice: still there (no consumption).
+	if _, ok := p.Peek(1, "peek1"); !ok {
+		t.Error("second Peek found nothing; Peek consumed the handle")
+	}
+	// Take removes it; a later Peek finds nothing.
+	<-s.Ready()
+	if _, ok := p.Take(1, "peek1"); !ok {
+		t.Fatal("Take after Peek failed")
+	}
+	if _, ok := p.Peek(1, "peek1"); ok {
+		t.Error("Peek returned a prefetch after Take")
+	}
+}

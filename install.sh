@@ -99,6 +99,11 @@ command -v python3 >/dev/null 2>&1 || MISSING_PKGS+=(python3)
 python3 -c "import venv" 2>/dev/null || MISSING_PKGS+=(python3-venv)
 command -v pip3    >/dev/null 2>&1 || MISSING_PKGS+=(python3-pip)
 command -v ffmpeg  >/dev/null 2>&1 || MISSING_PKGS+=(ffmpeg)
+# Phase 5: libparlay_dsp.so links libopus.so.0 directly (hand-rolled
+# FFI — symphonia 0.5 has no Opus codec). ffmpeg normally pulls
+# libopus0 in as a dependency, but check explicitly: a static ffmpeg
+# build would leave the DSP unloadable at runtime.
+ldconfig -p 2>/dev/null | grep -q "libopus\.so\.0" || MISSING_PKGS+=(libopus0)
 command -v unzip   >/dev/null 2>&1 || MISSING_PKGS+=(unzip)
 command -v openssl >/dev/null 2>&1 || MISSING_PKGS+=(openssl)
 

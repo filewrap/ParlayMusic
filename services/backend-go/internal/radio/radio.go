@@ -23,9 +23,11 @@ import (
 	"time"
 
 	"parlay/backend-go/internal/app"
+	"parlay/backend-go/internal/dsp"
 	"parlay/backend-go/internal/gui"
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
+	"parlay/backend-go/internal/room"
 	"parlay/backend-go/internal/store"
 	"parlay/backend-go/internal/uds"
 	"parlay/backend-go/internal/voice"
@@ -38,6 +40,7 @@ const fallbackRotationSecs = 180
 // Service owns the radio.* handlers.
 type Service struct {
 	store    *store.Store
+	rooms    *room.Manager
 	voice    *voice.Manager
 	registry *resolver.Registry
 
@@ -69,7 +72,7 @@ func Register(s *uds.Server, d *app.Deps) {
 		panic("radio: Register called with nil deps")
 	}
 	svc := &Service{
-		store: d.Store, voice: d.Voice, registry: d.Registry,
+		store: d.Store, rooms: d.Room, voice: d.Voice, registry: d.Registry,
 		probe: resolver.ProbeStream, handoffs: map[int64]map[string]any{},
 	}
 	s.Register("radio.list", svc.handleList)
@@ -173,11 +176,15 @@ func (s *Service) voiceHandoff(ctx context.Context, chatID int64, streamURL stri
 	if s.voice == nil {
 		return map[string]any{"joined": false, "error": "voice manager not configured"}
 	}
+	opts := dsp.DefaultOptions()
+	if s.rooms != nil {
+		opts = s.rooms.DSPOptions(chatID)
+	}
 	groupCallID, err := s.voice.Join(ctx, chatID)
 	if err != nil {
 		return map[string]any{"joined": false, "error": err.Error()}
 	}
-	if err := s.voice.Play(ctx, chatID, streamURL); err != nil {
+	if err := s.voice.Play(ctx, chatID, streamURL, opts); err != nil {
 		return map[string]any{"joined": true, "group_call_id": groupCallID, "error": err.Error()}
 	}
 	return map[string]any{"joined": true, "group_call_id": groupCallID}

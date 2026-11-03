@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"parlay/backend-go/internal/dsp"
+	"parlay/backend-go/internal/dsp/fake"
+	"parlay/backend-go/internal/model"
+	"parlay/backend-go/internal/prefetch"
 )
 
 // libPath resolves the real libntgcalls.so under test (the same
@@ -31,10 +38,13 @@ func libPath(t *testing.T) string {
 	return filepath.Join(root, "refs", "ntgcalls", "shared-output", "lib", "libntgcalls.so")
 }
 
-// requiredSymbols is every ntg_ symbol this package binds. The cgo
-// link already fails if a referenced symbol is absent; this test
-// re-verifies the whole set explicitly so a missing symbol is
-// reported by name instead of as a linker error.
+// requiredSymbols is every ntg_ symbol this package binds, plus the
+// OD-1 Opus encoder config API (ntgcalls_opus.h) whose Go binding lands
+// with the Phase 5 DSP/voice work -- the symbols must already be exported
+// by the patched libntgcalls.so. The cgo link already fails if a
+// referenced symbol is absent; this test re-verifies the whole set
+// explicitly so a missing symbol is reported by name instead of as a
+// linker error.
 var requiredSymbols = []string{
 	"ntg_instance_create",
 	"ntg_instance_destroy",
@@ -51,6 +61,9 @@ var requiredSymbols = []string{
 	"ntg_on_connection_change_callback",
 	"ntg_get_version",
 	"ntg_last_error",
+	"ntg_opus_set_config",
+	"ntg_opus_get_config",
+	"ntg_opus_set_bitrate",
 	"ntg_string_free",
 	"ntg_get_state",
 	"ntg_time",
@@ -319,6 +332,29 @@ func makeTone(t *testing.T, seconds int) string {
 	return path
 }
 
+// openFakeStream opens a fake DSP stream for the WAV file at
+// path with opts. The fake is the test double for parlay-dsp
+// (internal/dsp/fake): a pure-Go WAV decoder with a real (crude)
+// effect chain. It returns the concrete *fake.Stream so tests can
+// assert the parameters the DSP confirmed (LastParams) as well as
+// the dsp.Stream the feed consumes.
+func openFakeStream(t *testing.T, path string, opts dsp.Options) (*fake.Stream, dsp.Stream) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read tone: %v", err)
+	}
+	stream, err := fake.Engine{}.OpenStream(context.Background(), io.NopCloser(bytes.NewReader(data)), opts)
+	if err != nil {
+		t.Fatalf("fake OpenStream: %v", err)
+	}
+	fs, ok := stream.(*fake.Stream)
+	if !ok {
+		t.Fatalf("fake OpenStream returned %T, want *fake.Stream", stream)
+	}
+	return fs, stream
+}
+
 func TestFeedEndToEnd(t *testing.T) {
 	c := newTestClient(t)
 	chatID := int64(-1001234567898)
@@ -330,12 +366,13 @@ func TestFeedEndToEnd(t *testing.T) {
 		t.Fatalf("SetExternalAudioSource failed: %v", err)
 	}
 	tone := makeTone(t, 2)
+	_, stream := openFakeStream(t, tone, dsp.DefaultOptions())
 	ended := make(chan error, 1)
-	feed, err := startFFmpegFeed(context.Background(), c, chatID, tone, func(feedErr error) {
+	feed, err := startDSPFeed(context.Background(), c, chatID, stream, func(feedErr error) {
 		ended <- feedErr
-	})
+	}, nil)
 	if err != nil {
-		t.Fatalf("startFFmpegFeed failed: %v", err)
+		t.Fatalf("startDSPFeed failed: %v", err)
 	}
 	t.Cleanup(feed.Stop)
 	select {
@@ -355,13 +392,43 @@ func TestFeedEndToEnd(t *testing.T) {
 	}
 }
 
-// TestFeedFromReaderEndToEnd proves the Phase 4 prefetch feed
-// path: ffmpeg decodes from a stdin reader (the PrebufferedStream
-// reader) instead of a URL/file, pushes the same 10 ms frames to
-// ntgcalls, and ends cleanly at EOF. The reader here is a tone
-// file's bytes — the same bytes the prefetch reader yields (buffered
-// prefix first, then the live body).
-func TestFeedFromReaderEndToEnd(t *testing.T) {
+// TestFeedFromPrefetchReaderEndToEnd proves the Phase 4 → Phase 5
+// seam: a real PrefbufferedStream (Prefetcher against a local HTTP
+// server serving the tone) hands its Reader to the DSP feed, which
+// decodes it and pushes the same 10 ms frames to ntgcalls, ending
+// cleanly at EOF. The reader yields the buffered prefix first,
+// then the live body — exactly what the prefetch hands over.
+func TestFeedFromPrefetchReaderEndToEnd(t *testing.T) {
+	tone := makeTone(t, 2)
+	data, err := os.ReadFile(tone)
+	if err != nil {
+		t.Fatalf("read tone: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(srv.Close)
+
+	track := model.Track{ID: "yt:prefetch-tone", Title: "Tone", Source: "youtube", StreamURL: srv.URL}
+	p := prefetch.New(func(ctx context.Context, tr model.Track) (model.Track, error) {
+		return track, nil
+	}, prefetch.PrefixBytesForLeadTime(2), 10*time.Second)
+	p.Prefetch(-1001234567897, track)
+	pending, ok := p.Peek(-1001234567897, track.ID)
+	if !ok {
+		t.Fatal("prefetch not pending")
+	}
+	select {
+	case <-pending.Ready():
+	case <-time.After(10 * time.Second):
+		t.Fatal("prefetch never became ready")
+	}
+	stream, ok := p.Take(-1001234567897, track.ID)
+	if !ok {
+		t.Fatalf("prefetch Take failed: %v", pending.Err())
+	}
+
 	c := newTestClient(t)
 	chatID := int64(-1001234567897)
 	if _, err := c.CreateCall(chatID); err != nil {
@@ -371,17 +438,16 @@ func TestFeedFromReaderEndToEnd(t *testing.T) {
 	if err := c.SetExternalAudioSource(chatID); err != nil {
 		t.Fatalf("SetExternalAudioSource failed: %v", err)
 	}
-	tone := makeTone(t, 2)
-	data, err := os.ReadFile(tone)
+	dspStream2, err := fake.Engine{}.OpenStream(context.Background(), stream.Reader(), dsp.DefaultOptions())
 	if err != nil {
-		t.Fatalf("read tone: %v", err)
+		t.Fatalf("fake OpenStream over prefetch reader: %v", err)
 	}
 	ended := make(chan error, 1)
-	feed, err := startFFmpegFeedFromReader(context.Background(), c, chatID, io.NopCloser(bytes.NewReader(data)), func(feedErr error) {
+	feed, err := startDSPFeed(context.Background(), c, chatID, dspStream2, func(feedErr error) {
 		ended <- feedErr
-	})
+	}, nil)
 	if err != nil {
-		t.Fatalf("startFFmpegFeedFromReader failed: %v", err)
+		t.Fatalf("startDSPFeed failed: %v", err)
 	}
 	t.Cleanup(feed.Stop)
 	select {
@@ -393,45 +459,35 @@ func TestFeedFromReaderEndToEnd(t *testing.T) {
 		t.Fatalf("feed did not reach end of stream within 15s (frames sent: %d)", feed.FramesSent())
 	}
 	sent := feed.FramesSent()
-	// 2 s of audio is 200 ten-millisecond frames; allow a small
-	// shortfall for the trailing partial frame and scheduling.
-	t.Logf("stdin feed sent %d frames for a 2s tone (expect ~200)", sent)
+	t.Logf("prefetch-reader feed sent %d frames for a 2s tone (expect ~200)", sent)
 	if sent < 180 || sent > 220 {
 		t.Errorf("frames sent = %d, want ~200 for 2s of audio", sent)
 	}
 }
 
 func TestFeedRejectsBadSource(t *testing.T) {
+	// A non-WAV input fails at OpenStream: the DSP reports the
+	// exact decode failure instead of feeding garbage to WebRTC.
+	_, err := fake.Engine{}.OpenStream(context.Background(), io.NopCloser(strings.NewReader("this is not audio")), dsp.DefaultOptions())
+	if err == nil {
+		t.Fatal("fake OpenStream accepted garbage input")
+	} else {
+		t.Logf("fake OpenStream exact error: %v", err)
+	}
+
+	// A missing local file fails synchronously at open time.
 	c := newTestClient(t)
-	chatID := int64(-1001234567899)
-	if _, err := c.CreateCall(chatID); err != nil {
-		t.Fatalf("CreateCall failed: %v", err)
+	m := NewManager(c, nil)
+	t.Cleanup(m.Close)
+	if err := m.Play(context.Background(), -1001234567899, "/nonexistent/no-such-file.flac", dsp.DefaultOptions()); err == nil {
+		t.Fatal("Play on a missing file succeeded")
+	} else {
+		t.Logf("Play on a missing file exact error: %v", err)
 	}
-	t.Cleanup(func() { _ = c.Stop(chatID) })
-	if err := c.SetExternalAudioSource(chatID); err != nil {
-		t.Fatalf("SetExternalAudioSource failed: %v", err)
-	}
-	ended := make(chan error, 1)
-	feed, err := startFFmpegFeed(context.Background(), c, chatID, "/nonexistent/no-such-file.flac", func(feedErr error) {
-		ended <- feedErr
-	})
-	if err != nil {
-		// A synchronous start failure is also an honest failure.
-		t.Logf("startFFmpegFeed on a missing file failed synchronously: %v", err)
-		return
-	}
-	t.Cleanup(feed.Stop)
-	select {
-	case feedErr := <-ended:
-		if feedErr == nil {
-			t.Fatal("feed on a missing file ended cleanly; expected an error")
-		}
-		t.Logf("feed on a missing file exact error: %v", feedErr)
-		if feed.FramesSent() != 0 {
-			t.Errorf("feed sent %d frames from a missing file", feed.FramesSent())
-		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("feed on a missing file never terminated")
+
+	// A nil reader is rejected before any DSP work.
+	if err := m.PlayStream(context.Background(), -1001234567899, nil, dsp.DefaultOptions()); err == nil {
+		t.Fatal("PlayStream with nil reader succeeded")
 	}
 }
 
@@ -446,9 +502,10 @@ func TestFeedPauseResume(t *testing.T) {
 		t.Fatalf("SetExternalAudioSource failed: %v", err)
 	}
 	tone := makeTone(t, 10)
-	feed, err := startFFmpegFeed(context.Background(), c, chatID, tone, nil)
+	_, stream := openFakeStream(t, tone, dsp.DefaultOptions())
+	feed, err := startDSPFeed(context.Background(), c, chatID, stream, nil, nil)
 	if err != nil {
-		t.Fatalf("startFFmpegFeed failed: %v", err)
+		t.Fatalf("startDSPFeed failed: %v", err)
 	}
 	t.Cleanup(feed.Stop)
 	// Let a few frames flow, then pause: the frame count must stop
@@ -478,13 +535,176 @@ func TestFeedPauseResume(t *testing.T) {
 	}
 }
 
+// TestFeedSpeedReachesDSP proves vc.play's speed reaches the DSP:
+// a 2 s tone at speed 2.0 yields ~100 frames (not ~200), and the
+// stream confirms the speed it was given.
+func TestFeedSpeedReachesDSP(t *testing.T) {
+	c := newTestClient(t)
+	chatID := int64(-1001234567901)
+	if _, err := c.CreateCall(chatID); err != nil {
+		t.Fatalf("CreateCall failed: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Stop(chatID) })
+	if err := c.SetExternalAudioSource(chatID); err != nil {
+		t.Fatalf("SetExternalAudioSource failed: %v", err)
+	}
+	tone := makeTone(t, 2)
+	opts := dsp.Options{Speed: 2.0, Volume: 100}
+	fakeStream, stream := openFakeStream(t, tone, opts)
+	ended := make(chan error, 1)
+	feed, err := startDSPFeed(context.Background(), c, chatID, stream, func(feedErr error) {
+		ended <- feedErr
+	}, nil)
+	if err != nil {
+		t.Fatalf("startDSPFeed failed: %v", err)
+	}
+	t.Cleanup(feed.Stop)
+	select {
+	case feedErr := <-ended:
+		if feedErr != nil {
+			t.Fatalf("feed ended with an error: %v", feedErr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("feed did not reach end of stream within 15s (frames sent: %d)", feed.FramesSent())
+	}
+	sent := feed.FramesSent()
+	t.Logf("feed sent %d frames for a 2s tone at speed 2.0 (expect ~100)", sent)
+	if sent < 90 || sent > 110 {
+		t.Errorf("frames sent = %d, want ~100 for 2s of audio at speed 2.0", sent)
+	}
+	if got := fakeStream.LastParams().Speed; got != 2.0 {
+		t.Errorf("DSP confirmed speed = %v, want 2.0", got)
+	}
+}
+
+// TestFeedTransitionGapless proves the DSP dual-slot path: track B
+// is loaded as the next slot while track A plays; the feed
+// promotes it without restarting, fires onTransition exactly once
+// with B's id, and ends cleanly only after B finishes. Total
+// frames are ~400 (2 s + 2 s) with no gap frame dropped at the
+// boundary.
+func TestFeedTransitionGapless(t *testing.T) {
+	c := newTestClient(t)
+	chatID := int64(-1001234567902)
+	if _, err := c.CreateCall(chatID); err != nil {
+		t.Fatalf("CreateCall failed: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Stop(chatID) })
+	if err := c.SetExternalAudioSource(chatID); err != nil {
+		t.Fatalf("SetExternalAudioSource failed: %v", err)
+	}
+	toneA := makeTone(t, 2)
+	toneB := makeTone(t, 2)
+	_, streamA := openFakeStream(t, toneA, dsp.DefaultOptions())
+	dataB, err := os.ReadFile(toneB)
+	if err != nil {
+		t.Fatalf("read tone B: %v", err)
+	}
+	ended := make(chan error, 1)
+	transitions := make(chan string, 2)
+	feed, err := startDSPFeed(context.Background(), c, chatID, streamA, func(feedErr error) {
+		ended <- feedErr
+	}, func(trackID string) {
+		transitions <- trackID
+	})
+	if err != nil {
+		t.Fatalf("startDSPFeed failed: %v", err)
+	}
+	t.Cleanup(feed.Stop)
+	// Load the next slot while A is still playing.
+	if err := feed.LoadNext(io.NopCloser(bytes.NewReader(dataB)), dsp.DefaultOptions(), "track-b"); err != nil {
+		t.Fatalf("LoadNext failed: %v", err)
+	}
+	// A second LoadNext before the transition must fail: at most
+	// one next slot may be pending.
+	if err := feed.LoadNext(io.NopCloser(bytes.NewReader(dataB)), dsp.DefaultOptions(), "track-b-again"); err == nil {
+		t.Fatal("second LoadNext before the transition succeeded")
+	}
+	select {
+	case got := <-transitions:
+		if got != "track-b" {
+			t.Fatalf("transition fired with track %q, want track-b", got)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("transition never fired (frames sent: %d)", feed.FramesSent())
+	}
+	select {
+	case <-transitions:
+		t.Fatal("transition fired more than once")
+	case feedErr := <-ended:
+		if feedErr != nil {
+			t.Fatalf("feed ended with an error: %v", feedErr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("feed did not end after the transition (frames sent: %d)", feed.FramesSent())
+	}
+	sent := feed.FramesSent()
+	t.Logf("gapless feed sent %d frames for 2s + 2s (expect ~400)", sent)
+	if sent < 380 || sent > 420 {
+		t.Errorf("frames sent = %d, want ~400 for 2s + 2s gapless", sent)
+	}
+}
+
+// TestFeedApplyOptions proves fx.apply's live push: ApplyOptions
+// on a running feed returns nil (the DSP's confirmation) and the
+// stream records the new parameters from the next frame on.
+func TestFeedApplyOptions(t *testing.T) {
+	c := newTestClient(t)
+	chatID := int64(-1001234567903)
+	if _, err := c.CreateCall(chatID); err != nil {
+		t.Fatalf("CreateCall failed: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Stop(chatID) })
+	if err := c.SetExternalAudioSource(chatID); err != nil {
+		t.Fatalf("SetExternalAudioSource failed: %v", err)
+	}
+	tone := makeTone(t, 10)
+	fakeStream, stream := openFakeStream(t, tone, dsp.DefaultOptions())
+	feed, err := startDSPFeed(context.Background(), c, chatID, stream, nil, nil)
+	if err != nil {
+		t.Fatalf("startDSPFeed failed: %v", err)
+	}
+	t.Cleanup(feed.Stop)
+	deadline := time.Now().Add(10 * time.Second)
+	for feed.FramesSent() < 20 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if feed.FramesSent() < 20 {
+		t.Fatalf("feed sent only %d frames before ApplyOptions", feed.FramesSent())
+	}
+	opts := dsp.Options{Speed: 1.0, Bass: 80, Volume: 100, Effect: "bass-boost"}
+	if err := feed.ApplyOptions(opts); err != nil {
+		t.Fatalf("ApplyOptions failed: %v", err)
+	}
+	got := fakeStream.LastParams()
+	if got.Effect != "bass-boost" || got.Bass != 80 {
+		t.Errorf("DSP confirmed params = %+v, want effect bass-boost bass 80", got)
+	}
+	if err := feed.ApplyOptions(dsp.Options{Speed: 99}); err == nil {
+		t.Error("ApplyOptions accepted an out-of-range speed")
+	}
+}
+
 func TestManagerPlayRequiresConnectedCall(t *testing.T) {
 	c := newTestClient(t)
 	m := NewManager(c, nil)
 	t.Cleanup(m.Close)
-	err := m.Play(context.Background(), -1001234567901, "/tmp/does-not-matter.wav")
-	if err == nil {
+	// An existing file reaches the call-state gate (a missing
+	// file fails earlier, at open time — see
+	// TestFeedRejectsBadSource).
+	tone := makeTone(t, 1)
+	if err := m.Play(context.Background(), -1001234567901, tone, dsp.DefaultOptions()); err == nil {
 		t.Fatal("Play with no connected call succeeded")
+	} else {
+		t.Logf("Play without a call exact error: %v", err)
 	}
-	t.Logf("Play without a call exact error: %v", err)
+	if err := m.PlayStream(context.Background(), -1001234567901, io.NopCloser(strings.NewReader("x")), dsp.DefaultOptions()); err == nil {
+		t.Fatal("PlayStream with no connected call succeeded")
+	}
+	if err := m.ApplyFX(-1001234567901, dsp.DefaultOptions()); !errors.Is(err, ErrNoFeed) {
+		t.Errorf("ApplyFX with no feed: err = %v, want ErrNoFeed", err)
+	}
+	if err := m.LoadNext(-1001234567901, io.NopCloser(strings.NewReader("x")), dsp.DefaultOptions(), "track-x"); !errors.Is(err, ErrNoFeed) {
+		t.Errorf("LoadNext with no feed: err = %v, want ErrNoFeed", err)
+	}
 }

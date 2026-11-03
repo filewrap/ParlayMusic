@@ -672,3 +672,36 @@ func TestSetFX(t *testing.T) {
 		t.Fatalf("FX after original = %q", effect)
 	}
 }
+
+// TestDSPOptions proves the DSP seam reads the room's playback
+// parameters as one set: speed, bass, volume, FX preset +
+// parameters. A chat with no room gets the neutral defaults.
+// The params map is a copy: mutating it must not touch the room.
+func TestDSPOptions(t *testing.T) {
+	m := newTestManager(t)
+	got := m.DSPOptions(-100)
+	if got.Speed != 1.0 || got.Bass != 0 || got.Volume != 100 || got.Effect != "" {
+		t.Fatalf("DSPOptions with no room = %+v, want neutral defaults", got)
+	}
+	mustPlay(t, m, -100, mkTrack("yt:a", 300))
+	if _, err := m.SetSpeed(-100, 1.5); err != nil {
+		t.Fatalf("SetSpeed: %v", err)
+	}
+	if _, err := m.SetBass(-100, 40); err != nil {
+		t.Fatalf("SetBass: %v", err)
+	}
+	if _, err := m.SetVolume(-100, 80); err != nil {
+		t.Fatalf("SetVolume: %v", err)
+	}
+	if _, err := m.SetFX(-100, "nightcore", map[string]float64{"rate": 1.25}); err != nil {
+		t.Fatalf("SetFX: %v", err)
+	}
+	got = m.DSPOptions(-100)
+	if got.Speed != 1.5 || got.Bass != 40 || got.Volume != 80 || got.Effect != "nightcore" || got.EffectParams["rate"] != 1.25 {
+		t.Fatalf("DSPOptions = %+v, want speed 1.5 bass 40 volume 80 nightcore rate 1.25", got)
+	}
+	got.EffectParams["rate"] = 9
+	if _, params, _ := m.FX(-100); params["rate"] != 1.25 {
+		t.Fatal("DSPOptions aliased the room's FX params map")
+	}
+}

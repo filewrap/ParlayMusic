@@ -44,6 +44,7 @@ import (
 	"sync"
 	"time"
 
+	"parlay/backend-go/internal/dsp"
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/store"
 )
@@ -333,6 +334,37 @@ func (m *Manager) FX(chatID int64) (string, map[string]float64, bool) {
 		params[k] = v
 	}
 	return rs.st.FXPreset, params, true
+}
+
+// DSPOptions returns the DSP parameters for a chat — speed, bass,
+// volume, FX preset + parameters — as one dsp.Options, read from
+// the room in a single lock hold so the set can never straddle a
+// room mutation (a speed change landing between the FX read and
+// the speed read would start the track under a torn set). A chat
+// with no room gets the neutral defaults. This is the seam the
+// voice path uses at bind time: handlers build the options once
+// per bind and hand them to Manager.Play/PlayStream, which pass
+// them to the DSP from the first frame.
+func (m *Manager) DSPOptions(chatID int64) dsp.Options {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	opts := dsp.DefaultOptions()
+	rs, ok := m.rooms[chatID]
+	if !ok {
+		return opts
+	}
+	opts.Speed = rs.st.Speed
+	opts.Bass = rs.st.Bass
+	opts.Volume = rs.st.Volume
+	opts.Effect = rs.st.FXPreset
+	if len(rs.st.FXParams) > 0 {
+		params := make(map[string]float64, len(rs.st.FXParams))
+		for k, v := range rs.st.FXParams {
+			params[k] = v
+		}
+		opts.EffectParams = params
+	}
+	return opts
 }
 
 // HasRoom reports whether the chat has a room at all.
