@@ -1034,6 +1034,7 @@ inline const char* kToastUnknownAction = "Unknown action.";
 inline const char* kToastNothingPlaying = "Nothing playing right now.";
 inline const char* kToastExpired = "This button has expired.";
 inline const char* kToastNotAllowed = "You aren't allowed";
+inline const char* kToastVoteRecorded = "Vote recorded.";
 inline const char* kToastFeatureUnavailable =
     "This feature is not available yet.";
 // Toggle toasts (player row + settings panel): plain text, no HTML —

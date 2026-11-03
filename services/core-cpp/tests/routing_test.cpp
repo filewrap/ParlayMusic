@@ -11,10 +11,13 @@
 //     (the Bot API limit), including the 64-byte boundary itself.
 //  2. Every emitted callback routes to a handler that ANSWERS the
 //     callback query (toast recorded) — zero unhandled callbacks.
-//     Two deliberate exceptions, both recorded in the table:
-//     (a) pl:vote:* never answers (cbVote edits the card only; gap G2)
-//         — the test asserts the documented card edit instead, and
-//         asserts an unseeded vote is silently ignored.
+//     One deliberate exception, recorded in the table:
+//     (a) pl:vote:* — gap G2, FIXED 2026-11-03: cbVote answers
+//         every tap (confirmation toast "Vote recorded." on a
+//         counted vote, honest alert on unknown/foreign votes) and
+//         still edits the card; the test asserts the toast (and the
+//         card edit), and asserts an unseeded vote is answered
+//         with "Unknown action." instead of being ignored.
 //     (b) pl:restart:bot:<chat_id> exits the process by design
 //         (supervisor restart) — it is length- and table-checked
 //         only, NEVER dispatched.
@@ -22,8 +25,10 @@
 //     domain, non-pl: data, empty data, >64 bytes, unknown verb)
 //     with the "Unknown action." alert — never silence, never a crash.
 //  4. Every persistent reply-keyboard button is routed: in a DM it
-//     returns the start card; in a group it produces the table's
-//     documented outcome (no reply — gap G1).
+//     returns the start card; in a group it runs the claimed action
+//     (gap G1, FIXED 2026-11-03) — Music returns the start card,
+//     Global Search asks for a query, Settings opens the settings
+//     panel, About returns the about card.
 //  5. Table coverage: every callback template, every keyboard button
 //     label, and every command name / alias / channel command
 //     re-derived from dispatcher.cpp appears in
@@ -611,7 +616,8 @@ int main(int argc, char** argv) {
     }
 
     // --- D. Dispatch every template concrete through the real router
-    // and assert the query is answered (or, for votes, the card edit).
+    // and assert the query is answered (and, for votes, the card
+    // edit too — gap G2 fixed: votes answer with a toast now).
     {
         // Fresh store: earlier sections must not leak pending-state
         // keys (dlset_tpl_pending / sharefb) into this rig.
@@ -632,12 +638,13 @@ int main(int argc, char** argv) {
             if (is_vote)
                 rig.store.set("vote:track1", "-1001234567890");
             rig.d.handleCallback(makeCq(t.concrete));
+            CHECK(rig.tg.toasts.size() > toasts_before,
+                  "callback answered: " + t.concrete);
             if (is_vote) {
                 CHECK(rig.tg.edits.size() > edits_before,
-                      "vote answered by card edit: " + t.concrete);
-            } else {
-                CHECK(rig.tg.toasts.size() > toasts_before,
-                      "callback answered: " + t.concrete);
+                      "vote answered by card edit too: " + t.concrete);
+                CHECK(rig.tg.toasts.back().text == "Vote recorded.",
+                      "counted vote confirmed: " + t.concrete);
             }
         }
         // Every harvested callback is answered too (same set, but
@@ -660,23 +667,37 @@ int main(int argc, char** argv) {
                 rig.store.set("vote:" + tid, "-1001234567890");
             }
             rig.d.handleCallback(makeCq(cb));
+            CHECK(rig.tg.toasts.size() > toasts_before,
+                  "harvested callback answered: " + cb);
             if (is_vote) {
                 CHECK(rig.tg.edits.size() > edits_before,
-                      "harvested vote answered by card edit: " + cb);
-            } else {
-                CHECK(rig.tg.toasts.size() > toasts_before,
-                      "harvested callback answered: " + cb);
+                      "harvested vote answered by card edit too: " + cb);
+                CHECK(rig.tg.toasts.back().text == "Vote recorded.",
+                      "harvested counted vote confirmed: " + cb);
             }
         }
-        // Unseeded vote: silently ignored (gap G2, documented).
+        // Unseeded vote: answered with "Unknown action." (gap G2
+        // fixed) — never silently ignored.
         {
             size_t toasts_before = rig.tg.toasts.size();
             size_t edits_before = rig.tg.edits.size();
             rig.d.handleCallback(
                 makeCq("pl:vote:approve:nothing-open"));
-            CHECK(rig.tg.toasts.size() == toasts_before &&
+            CHECK(rig.tg.toasts.size() > toasts_before &&
+                      rig.tg.toasts.back().text == "Unknown action." &&
                       rig.tg.edits.size() == edits_before,
-                  "unseeded vote silently ignored (gap G2)");
+                  "unseeded vote answered with Unknown action.");
+        }
+        // Foreign-chat vote: answered with "You aren't allowed".
+        {
+            rig.store.set("vote:track1", "-1009999999999");
+            size_t toasts_before = rig.tg.toasts.size();
+            size_t edits_before = rig.tg.edits.size();
+            rig.d.handleCallback(makeCq("pl:vote:approve:track1"));
+            CHECK(rig.tg.toasts.size() > toasts_before &&
+                      rig.tg.toasts.back().text == "You aren't allowed" &&
+                      rig.tg.edits.size() == edits_before,
+                  "foreign-chat vote answered with You aren't allowed");
         }
     }
 
@@ -748,13 +769,27 @@ int main(int argc, char** argv) {
             CHECK(rig.tg.replies.size() > replies_before &&
                       contains(rig.tg.replies.back(), "Parlay"),
                   "keyboard button routed in DM: " + label);
-            // Group: the documented outcome is no reply (gap G1).
+            // Group: the claimed action runs (gap G1 fixed) — the
+            // reply lands in the group chat, never dropped.
             size_t replies_before_g = rig.tg.replies.size();
             rig.d.handleMessage(
                 makeMsg(-1001234567890, "supergroup", label));
-            CHECK(rig.tg.replies.size() == replies_before_g,
-                  "keyboard button silently dropped in group (gap G1): " +
+            CHECK(rig.tg.replies.size() > replies_before_g,
+                  "keyboard button answered in group (gap G1 fixed): " +
                       label);
+            const std::string& g = rig.tg.replies.back();
+            if (label == "Music")
+                CHECK(contains(g, "Parlay"),
+                      "Music in group returns the start card");
+            else if (label == "Global Search")
+                CHECK(contains(g, "What do you want to search for?"),
+                      "Global Search in group asks for a query");
+            else if (label == "Settings")
+                CHECK(contains(g, "Chat Settings"),
+                      "Settings in group opens the settings panel");
+            else if (label == "About")
+                CHECK(contains(g, "Parlay is an open source bot"),
+                      "About in group returns the about card");
         }
         // /keyboard off removes the keyboard.
         {

@@ -136,8 +136,8 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A72 | Authorized-users list card | ⨯ <name> | `pl:auth:del:<chat_id>:<user_id>` | `handleCallback` → `cbAuth` | none (local auth store) | toast `Authorization revoked.` + edit to rebuilt auth list (`authlistText` + `authlistKeyboard()`); non-admin tap → alert `Only admins can do these actions.` | Live |
 | A73 | Search results card | 1 … 10 (number buttons) | `pl:search:<n>:<user_id>:<token>` | `handleCallback` → `cbSearch` → `playSearchPick` | `vc.play` (via `/play` on the picked track) | toast `Success`; the search message is deleted and the now-playing card is sent as a new message; wrong user → alert `You aren't allowed`; expired session → alert `This button has expired.` + edit to `Search expired, please search again`; token mismatch → alert `This button has expired.` + edit to expired text | Live |
 | A74 | Search results card | Previous page / Next page | `pl:search:page:<user_id>:<page>:<hash>` | `handleCallback` → `cbSearch` | none (cached search session, no new IPC) | silent ack + edit to the requested results page (`searchResultsText` + `searchResultsKeyboard` + `searchPageKeyboard`); out of range → alert `No more results.`; wrong user → alert `You aren't allowed`; expired session or hash mismatch → alert `This button has expired.` | Live |
-| A75 | Voting queue card (queue-rust service, daslui §23 — no in-core builder) | Approve | `pl:vote:approve:<track_id>` | `handleCallback` → `cbVote` | `queue.vote` approve | edit to `voteAcceptedText` card (`{voter} has added to queue:`), keyboard removed; backend failure → edit to `Failed to queue track: {error}` card; **no toast is sent — the callback query is left unanswered (see §G, gap G2)**; unknown or foreign-chat vote → silently ignored, no answer at all | Gap |
-| A76 | Voting queue card (queue-rust service, daslui §23 — no in-core builder) | Decline | `pl:vote:decline:<track_id>` | `handleCallback` → `cbVote` | none | edit to `voteDeclinedText` card (`{voter} declined.`), keyboard removed; **no toast is sent — the callback query is left unanswered (see §G, gap G2)**; unknown or foreign-chat vote → silently ignored, no answer at all | Gap |
+| A75 | Voting queue card (queue-rust service, daslui §23 — no in-core builder) | Approve | `pl:vote:approve:<track_id>` | `handleCallback` → `cbVote` | `queue.vote` approve | edit to `voteAcceptedText` card (`{voter} has added to queue:`), keyboard removed, then toast `Vote recorded.`; backend failure → edit to `Failed to queue track: {error}` card + alert with the same text; unknown vote (none open / malformed) → alert `Unknown action.`; foreign-chat vote → alert `You aren't allowed` | Live |
+| A76 | Voting queue card (queue-rust service, daslui §23 — no in-core builder) | Decline | `pl:vote:decline:<track_id>` | `handleCallback` → `cbVote` | none | edit to `voteDeclinedText` card (`{voter} declined.`), keyboard removed, then toast `Vote recorded.`; unknown vote (none open / malformed) → alert `Unknown action.`; foreign-chat vote → alert `You aren't allowed` | Live |
 | A77 | Share help card | My Link | `pl:share:mylink` | `handleCallback` → `cbShare` | none (local share-link store) | silent ack + edit to the stored share link text (keyboard removed); no link stored → alert `You haven't shared anything yet — use /share first.` | Live |
 | A78 | n/a — no button emits it (the share send prompt's Cancel button is `pl:close`, row A19) | n/a | `pl:share:cancel` | `handleCallback` → `cbShare` | none | message deleted + silent ack (empty toast) | No button |
 | A79 | Received shared-audio card | Feedback | `pl:share:feedback:<sender>:<msg>:<file_unique>` | `handleCallback` → `cbShare` | none | silent ack + edit to `Send Feedback Text` prompt (keyboard removed); the user's next DM text is forwarded to the sender as feedback; blocked user → alert `You can't send Feedback\nYou are blocked` | Live |
@@ -168,10 +168,10 @@ therefore `handleMessage`'s plain-text path, not `handleCallback`.
 
 | # | Surface | Button / input | Emits | Router / handler | Backend action | Rendered update | Status |
 |---|---|---|---|---|---|---|---|
-| B1 | Persistent reply keyboard (any chat) | Music | plain text `Music` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: no reply — the text is silently dropped (see §G, gap G1) | Gap |
-| B2 | Persistent reply keyboard (any chat) | Global Search | plain text `Global Search` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: no reply — the text is silently dropped (see §G, gap G1) | Gap |
-| B3 | Persistent reply keyboard (any chat) | Settings | plain text `Settings` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: no reply — the text is silently dropped (see §G, gap G1) | Gap |
-| B4 | Persistent reply keyboard (any chat) | About | plain text `About` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: no reply — the text is silently dropped (see §G, gap G1) | Gap |
+| B1 | Persistent reply keyboard (any chat) | Music | plain text `Music` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: new message with the start card (`kStartPm` + `startPmKeyboard()`) — the music hub | Live |
+| B2 | Persistent reply keyboard (any chat) | Global Search | plain text `Global Search` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: new message with the search prompt (`What do you want to search for?`) — reply with a query to search | Live |
+| B3 | Persistent reply keyboard (any chat) | Settings | plain text `Settings` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: new message with the settings panel (`kSettingsText` + `settingsKeyboard()`); non-admin → admin denial (`kDenyAdmin`) | Live |
+| B4 | Persistent reply keyboard (any chat) | About | plain text `About` | `handleMessage` plain-text path | none | DM: new message with the start card (`kStartPm` + `startPmKeyboard()`); group: new message with the about card (`kAbout`, channel + repo) | Live |
 
 ### §B.2 URL buttons and switch-inline buttons (no `callback_data`)
 
@@ -302,7 +302,7 @@ from the core's local store / state only.
 | C98 | DM only | Pending share feedback | plain text (any non-command text while `sharefb:<user>` is set) | `handleMessage` plain-text path (DM pending-state flow) | none | new message: `Feedback is sent` to the user; the feedback text is forwarded to the original sender as a reply to the shared audio; undeliverable sender → `Could not send the feedback: <error>` | Live |
 | C99 | DM only | Pending share target | plain text `cancel` (while `sharetarget:<user>` is set) | `handleMessage` plain-text path (DM pending-state flow) | none | new message: `Sharing cancelled.`; any other text → `Your request was not handled` + the available-commands list (`kUnhandledText`) | Live |
 | C100 | DM only | Unhandled text | plain text (any non-command text, no pending state) | `handleMessage` plain-text path | none | new message: start card (`kStartPm` + `startPmKeyboard()`) | Live |
-| C101 | Group chat | Unhandled text | plain text (any non-command text, no pending state, not a digit, not `delete:`) | `handleMessage` plain-text path | none | no reply — the text is silently dropped (see §G, gap G1) | Gap |
+| C101 | Group chat | Unhandled text | plain text (any non-command text, no pending state, not a digit, not `delete:`, not one of the four reply-keyboard labels in rows B1–B4) | `handleMessage` plain-text path | none | no reply — the text is silently dropped (intended: the bot does not answer arbitrary group chatter) | Live |
 
 ## §D. Inline mode + deep links
 
@@ -398,8 +398,8 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
 
 | # | Gap | Rows | What happens today | What a fix looks like |
 |---|---|---|---|---|
-| G1 | Reply-keyboard buttons unrouted in groups | B1–B4, C101 | Tapping Music / Global Search / Settings / About in a group sends plain text that `handleMessage` silently drops (no reply, no toast). In a DM the same tap returns the start card. `UI_INVENTORY.md` claims Music opens the music list/search, Global Search opens `/search`, Settings opens §9, About opens the about text — none of that is wired. | Add plain-text routing in `handleMessage` for the four labels (group: run the claimed action; DM: keep the start card or run the claimed action). Not a Phase 2 change — the routing table records the gap and the test pins the current behaviour so the fix is visible when it lands. |
-| G2 | Vote callbacks never answer the callback query | A75–A76 | `cbVote` edits the card but never calls `answerCallbackQuery` — a valid approve/decline tap leaves the spinner until Telegram times it out. Unknown or foreign-chat votes are silently ignored with no answer at all (deliberate per the handler comment, still a §7.5 deviation). | Answer every `pl:vote:*` tap (empty ack on success, `You aren't allowed` on a foreign chat, `Unknown action.` on an unknown vote) after the card edit. |
+| G1 | Reply-keyboard buttons unrouted in groups | B1–B4, C101 | FIXED 2026-11-03: `handleMessage` routes the four labels in groups — Music returns the start card, Global Search asks for a query, Settings opens the settings panel, About returns the about card; other plain text is still silently dropped (row C101). | Done — see rows B1–B4 and `routing_test.cpp` §F. |
+| G2 | Vote callbacks never answer the callback query | A75–A76 | FIXED 2026-11-03: `cbVote` answers every tap — toast `Vote recorded.` on a counted vote (after the card edit), alert `Unknown action.` on an unknown/malformed vote, alert `You aren't allowed` on a foreign-chat vote, alert with the failure text on a backend failure. | Done — see rows A75–A76 and `routing_test.cpp` §D. |
 | G3 | `/menu` panel: other users' taps are silently ignored | C41, A21–A34 (panel path) | By design (remix §2.3): only the user who ran `/menu` may press; everyone else gets an empty ack and no toast. The query IS answered, so this is a deliberate silent-ignore, recorded here for completeness. | No fix proposed — deliberate rule; recorded so it is not mistaken for a missing answer. |
 
 ## §H. Verification
@@ -414,17 +414,20 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
      and asserts each is ≤64 bytes.
   2. It dispatches every collected callback through a real
      `Dispatcher` (fake Telegram sender + fake IPC backend, owner
-     user) and asserts the callback query was answered (toast recorded)
-     — except `pl:vote:*`, which it asserts produces the documented
-     card edit instead (gap G2), and `pl:restart:bot`, which it does
-     NOT dispatch (it exits the process by design) and asserts only
-     for length + table presence.
+     user) and asserts the callback query was answered (toast
+     recorded) — `pl:vote:*` included (gap G2 fixed: counted votes
+     answer `Vote recorded.` and still edit the card); and
+     `pl:restart:bot`, which it does NOT dispatch (it exits the
+     process by design) and asserts only for length + table
+     presence.
   3. It dispatches unknown callbacks (`pl:bogus:…`, non-`pl:` data,
      empty data, 65-byte data) and asserts each is answered with the
      `Unknown action.` alert — the default branch.
   4. It enumerates `persistentKeyboard()` and asserts every button
-     label is routed in a DM (start card reply) and produces the
-     table's documented outcome in a group (no reply — gap G1).
+     label is routed in a DM (start card reply) and runs its claimed
+     action in a group (gap G1 fixed: Music → start card, Global
+     Search → search prompt, Settings → settings panel, About →
+     about card).
   5. It reads this file (path passed by CMake) and asserts every
      collected callback's fixed prefix, every keyboard button label,
      and every command name / alias / channel command re-derived from
@@ -433,8 +436,8 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
      this table fails the test.
   6. It asserts zero unrouted buttons and zero unhandled callbacks in
      the sense above: every button and callback in code is accounted
-     for in this table with a verified outcome. Gaps G1–G2 are
-     accounted for with their real (deficient) outcomes, not hidden.
+     for in this table with a verified outcome. Gaps G1–G2 are fixed
+     and verified; G3 remains a deliberate recorded rule, not a gap.
 - **Blank-row check:** a script check (not eyeballing) parses every
   table row in this file and asserts no cell is empty after trimming.
   The check is this one-liner, run from `~/workspace/parlay` (it treats

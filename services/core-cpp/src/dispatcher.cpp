@@ -749,6 +749,44 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
     if (msg.chat.type == "group" || msg.chat.type == "supergroup")
         noteLastChat(msg.from.id, msg.chat.id);
 
+    // Reply-keyboard button taps in a group/supergroup (§14, §B.1;
+    // gap G1): the persistent keyboard sends its label as plain
+    // text. In a DM the same tap returns the start card; in a group
+    // the tap now runs the claimed action instead of being silently
+    // dropped. Music returns the start card (the music hub, same
+    // card the DM path sends for it), Global Search opens the search
+    // prompt, Settings opens the group settings panel (admin-gated
+    // inside onSettings, with an honest denial for non-admins),
+    // About returns the about card. Any other plain text still
+    // falls through to the silent drop below, exactly as before.
+    // (DM non-command text already returned above, so anything
+    // reaching here is a group/supergroup message.)
+    if (!text0.empty() && text0.front() != '/') {
+        std::string label = trim(text0);
+        if (label == "Music" || label == "Global Search" ||
+            label == "Settings" || label == "About") {
+            CommandContext ctx;
+            ctx.message = msg;
+            if (label == "Music") {
+                ctx.command = "start";
+                replyKb(ctx, ui_texts::kStartPm,
+                        ui_texts::startPmKeyboard(
+                            bot_username_, cfg_.updates_url,
+                            cfg_.support_url, cfg_.source_url));
+            } else if (label == "Global Search") {
+                ctx.command = "search";
+                onSearch(ctx);
+            } else if (label == "Settings") {
+                ctx.command = "settings";
+                onSettings(ctx);
+            } else {
+                ctx.command = "about";
+                onAbout(ctx);
+            }
+            return;
+        }
+    }
+
     // Parse "/cmd@bot args" (NoxBeats parse_command): @bot must be us.
     std::string text = msg.text;
     if (text.empty() || text.front() != '/') return;
@@ -7361,28 +7399,46 @@ void Dispatcher::cbSearch(const TgCallbackQuery& cq,
 void Dispatcher::cbVote(const TgCallbackQuery& cq,
                         const std::vector<std::string>& parts) {
     // pl:vote:<approve|decline>:<track_id> (daslui §23). Only
-    // callbacks from the voting chat are handled; unknown or
-    // foreign-chat votes are silently ignored (no answer at all).
+    // callbacks from the voting chat are handled. Every path
+    // answers the callback query (§7.5: never leave a callback
+    // un-answered): a counted vote gets a confirmation toast after
+    // the card edit, an unknown vote gets the "Unknown action."
+    // alert, a foreign-chat vote gets the "You aren't allowed"
+    // alert, and a backend failure gets an alert with the failure.
     // The track id is rejoined from parts[3:] — ids are opaque and
     // a ':' inside one must not truncate it.
-    if (parts.size() < 4) return;
+    if (parts.size() < 4) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
     const std::string& verdict = parts[2];
     std::string track_id = parts[3];
     for (size_t i = 4; i < parts.size(); ++i) track_id += ":" + parts[i];
-    if (verdict != "approve" && verdict != "decline") return;
+    if (verdict != "approve" && verdict != "decline") {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
     auto chat = store_.get("vote:" + track_id);
-    if (!chat) return;  // no vote open for this track
+    if (!chat) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;  // no vote open for this track
+    }
     int64_t vote_chat = 0;
     try {
         vote_chat = std::stoll(*chat);
     } catch (...) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
         return;
     }
-    if (vote_chat != cq.chat_id) return;
+    if (vote_chat != cq.chat_id) {
+        answerCb(cq, ui_texts::kToastNotAllowed, true);
+        return;
+    }
     if (verdict == "decline") {
         editCbCard(cq, ui_texts::voteDeclinedText(displayName(cq.from), ""),
                    InlineKeyboard{});
         store_.del("vote:" + track_id);
+        answerCb(cq, ui_texts::kToastVoteRecorded);
         return;
     }
     CommandContext ctx;
@@ -7400,12 +7456,14 @@ void Dispatcher::cbVote(const TgCallbackQuery& cq,
     if (!r.ok) {
         editCbCard(cq, ui_texts::voteQueueFailText(r.error_message),
                    InlineKeyboard{});
+        answerCb(cq, ui_texts::voteQueueFailText(r.error_message), true);
         return;
     }
     editCbCard(cq,
                ui_texts::voteAcceptedText(displayName(cq.from), ""),
                InlineKeyboard{});
     store_.del("vote:" + track_id);
+    answerCb(cq, ui_texts::kToastVoteRecorded);
 }
 
 void Dispatcher::cbShare(const TgCallbackQuery& cq,
