@@ -11,6 +11,24 @@ Go, Rust, C++, JavaScript / TypeScript — in one Telegram music bot.**
 - **Audio FX** — Slow+Reverb, Nightcore, Bass Boost, 8D
 - **Spotify intelligence** — profanity / AI-lyrics filter, auto-skip disliked tracks
 
+## Install in one minute (VPS, no Docker)
+
+```bash
+curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.2.0/parlay-v0.2.0-linux-x86_64.tar.gz
+tar xzf parlay-v0.2.0-linux-x86_64.tar.gz
+cd parlay-v0.2.0-linux-x86_64 && ./install.sh
+cp .env.example .env   # fill in BOT_TOKEN, API_ID, API_HASH, OWNER_ID, PARLAY_TOKEN
+./start.sh
+```
+
+```bash
+./stop.sh     # stop everything
+./status.sh   # check every service answers /healthz
+```
+
+Full guide (prereqs, ports, systemd, updates, troubleshooting):
+[INSTALL.md](INSTALL.md). Docker route: Quick start below.
+
 ## Architecture (one line each)
 
 | Piece | Language | From | Does |

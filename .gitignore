@@ -29,3 +29,4 @@ phase5/
 *.node
 phase6/
 phase6-mongo-data/
+release/
