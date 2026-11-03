@@ -1,21 +1,40 @@
-// tdlib_client.cpp — TDLib 1.8.69 JSON client via dlopen.
-// See tdlib_client.hpp. No network is touched until authorize() is
-// called with real credentials; merely creating the client and calling
+// tdlib_client.cpp — TDLib 1.8.69 JSON client, BUILD-TIME linked.
+//
+// See tdlib_client.hpp. No runtime loading: the td_json_client_* entry points are
+// called directly (prototypes below, verified against
+// phase4/tdlib-src/td/telegram/td_json_client.h) and resolved by the
+// linker against phase4/tdlib-src/build/libtdjson.so.1.8.69. A missing
+// .so fails the link; a missing .so at runtime fails process start.
+// No network is touched until authorize() is called with real
+// credentials; merely creating the client and calling
 // getOption/setLogVerbosityLevel works fully offline.
 #include "tdlib_client.hpp"
-
-#include <dlfcn.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <sys/stat.h>
 #include <vector>
-
-#include "config.hpp"
 
 namespace parlay {
 namespace {
+
+// Linked TDLib entry points (td_json_client.h). The CMake build verifies
+// all 14 td_ exports exist in the .so; these six are the ones this
+// module calls. td_set_log_verbosity_level is the global log control.
+extern "C" {
+void* td_json_client_create();
+void td_json_client_send(void* client, const char* request);
+const char* td_json_client_receive(void* client, double timeout);
+const char* td_json_client_execute(void* client, const char* request);
+void td_json_client_destroy(void* client);
+void td_set_log_verbosity_level(int verbosity_level);
+}
+
+#ifndef PARLAY_TDJSON_SONAME
+#define PARLAY_TDJSON_SONAME "libtdjson.so.1.8.69"
+#endif
 
 std::string envStr(const char* name, const std::string& fallback = "") {
     const char* v = std::getenv(name);
@@ -32,13 +51,6 @@ int64_t envInt(const char* name, int64_t fallback = 0) {
     }
 }
 
-// Default libtdjson.so: the repo phase4 build output (verified
-// 2026-11-02: libtdjson.so.1.8.69, 50,166,944 B, all deps resolvable
-// per ldd). Dev fallback only — the release layout (lib/ next to the
-// binary) is tried first in the constructor.
-const char* kDefaultLib =
-    "/home/hatch/workspace/parlay/phase4/tdlib-src/build/libtdjson.so";
-
 std::string nowStamp() {
     using namespace std::chrono;
     auto ms = duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
@@ -48,14 +60,33 @@ std::string nowStamp() {
 
 }  // namespace
 
+// --- Params ---------------------------------------------------------------
+
 TdLibClient::Params TdLibClient::Params::fromEnv() {
+    return fromEnvFor(SessionKind::Assistant);
+}
+
+TdLibClient::Params TdLibClient::Params::botFromEnv() {
+    return fromEnvFor(SessionKind::Bot);
+}
+
+TdLibClient::Params TdLibClient::Params::fromEnvFor(SessionKind kind) {
     Params p;
+    p.is_bot = (kind == SessionKind::Bot);
     p.api_id = envInt("TD_API_ID", envInt("API_ID"));
     p.api_hash = envStr("TD_API_HASH", envStr("API_HASH"));
-    // Same default as Config::fromEnv: <PARLAY_DATA_DIR>/tdlib.
-    p.session_dir = envStr(
-        "TD_SESSION_DIR",
-        envStr("PARLAY_DATA_DIR", "data") + "/tdlib");
+    std::string data_dir = envStr("PARLAY_DATA_DIR", "data");
+    if (p.is_bot) {
+        // Bot session dir: data/tdlib-bot (TD_BOT_SESSION_DIR overrides).
+        p.session_dir = envStr("TD_BOT_SESSION_DIR", data_dir + "/tdlib-bot");
+        p.bot_token = envStr("BOT_TOKEN");
+    } else {
+        // Assistant session dir: data/tdlib (TD_SESSION_DIR overrides).
+        // Same default as Config::fromEnv, so a host needs nothing but
+        // the session dir itself for the path.
+        p.session_dir =
+            envStr("TD_SESSION_DIR", data_dir + "/tdlib");
+    }
     p.phone = envStr("TD_PHONE");
     p.code = envStr("TD_CODE");
     p.password = envStr("TD_PASSWORD");
@@ -68,61 +99,19 @@ TdLibClient::Params TdLibClient::Params::fromEnv() {
     return p;
 }
 
-TdLibClient::TdLibClient(const std::string& explicit_lib) {
-    std::vector<std::string> candidates;
-    if (!explicit_lib.empty()) candidates.push_back(explicit_lib);
-    std::string env_lib = envStr("TDJSON_LIB");
-    if (!env_lib.empty()) candidates.push_back(env_lib);
-    // Release layout first: lib/ next to the binary, and lib/ next
-    // to bin/ (parlay-vX.Y.Z/{bin/parlay-core, lib/libtdjson.so*}).
-    // A proper host needs nothing but the session dir + the built
-    // .so in lib/ — no TDJSON_LIB, no repo paths.
-    std::string exe = exeDir();
-    if (!exe.empty()) {
-        candidates.push_back(exe + "/lib/libtdjson.so");
-        candidates.push_back(exe + "/lib/libtdjson.so.1.8.69");
-        candidates.push_back(exe + "/../lib/libtdjson.so");
-        candidates.push_back(exe + "/../lib/libtdjson.so.1.8.69");
-    }
-    candidates.push_back(kDefaultLib);
-    candidates.push_back("libtdjson.so");
-    for (const auto& path : candidates) {
-        handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (handle_) {
-            lib_path_ = path;
-            break;
-        }
-    }
-    if (!handle_) {
-        last_error_ = std::string("libtdjson.so not found (dlopen: ") +
-                      dlerror() + ")";
-        return;
-    }
-    auto sym = [&](const char* name) { return dlsym(handle_, name); };
-    fn_create_ = reinterpret_cast<fn_create>(sym("td_json_client_create"));
-    fn_send_ = reinterpret_cast<fn_send>(sym("td_json_client_send"));
-    fn_receive_ =
-        reinterpret_cast<fn_receive>(sym("td_json_client_receive"));
-    fn_execute_ =
-        reinterpret_cast<fn_execute>(sym("td_json_client_execute"));
-    fn_destroy_ =
-        reinterpret_cast<fn_destroy>(sym("td_json_client_destroy"));
-    // Optional: td_set_log_verbosity_level (global, in libtdjson).
-    fn_set_log_verbosity_ = reinterpret_cast<fn_set_log_verbosity>(
-        sym("td_set_log_verbosity_level"));
-    if (!fn_create_ || !fn_send_ || !fn_receive_ || !fn_execute_ ||
-        !fn_destroy_) {
-        last_error_ = "libtdjson.so at " + lib_path_ +
-                      " lacks the td_json_client_* symbols";
-        dlclose(handle_);
-        handle_ = nullptr;
-        return;
-    }
-    client_ = fn_create_();
+// --- construction ---------------------------------------------------------
+
+TdLibClient::TdLibClient(const std::string&)
+    : TdLibClient(SessionKind::Assistant) {}
+
+TdLibClient::TdLibClient(SessionKind kind) : kind_(kind) {
+    // Build-time link: the client is created directly. There is no
+    // fallback when the library is absent — the binary cannot link
+    // without it, by design (Phase 2 exit benchmark).
+    lib_path_ = PARLAY_TDJSON_SONAME;
+    client_ = td_json_client_create();
     if (!client_) {
         last_error_ = "td_json_client_create() returned null";
-        dlclose(handle_);
-        handle_ = nullptr;
     }
 }
 
@@ -134,39 +123,33 @@ TdLibClient::~TdLibClient() {
             close(2.0);
         } catch (...) {
         }
-        if (client_ && fn_destroy_) fn_destroy_(client_);
+        if (client_) td_json_client_destroy(client_);
         client_ = nullptr;
     }
-    if (handle_) dlclose(handle_);
 }
 
+// --- raw pipe -------------------------------------------------------------
+
 void TdLibClient::setLogVerbosity(int level) {
-    if (fn_set_log_verbosity_) {
-        fn_set_log_verbosity_(level);
-        return;
-    }
-    // Fallback: the synchronous setLogVerbosityLevel request.
-    Json req = Json::objectOf({
-        {"@type", Json("setLogVerbosityLevel")},
-        {"new_verbosity_level", Json(static_cast<int64_t>(level))},
-    });
-    execute(req.dump());
+    td_set_log_verbosity_level(level);
 }
 
 void TdLibClient::send(const std::string& json) {
+    last_sent_request_ = json;
     if (!client_) return;
-    fn_send_(client_, json.c_str());
+    td_json_client_send(client_, json.c_str());
 }
 
 std::string TdLibClient::receive(double timeout_sec) {
     if (!client_) return "";
-    const char* r = fn_receive_(client_, timeout_sec);
+    const char* r = td_json_client_receive(client_, timeout_sec);
     return r ? std::string(r) : std::string();
 }
 
 std::string TdLibClient::execute(const std::string& json) {
-    if (!fn_execute_) return "";
-    const char* r = fn_execute_(client_, json.c_str());
+    // td_json_client_execute ignores the client argument (NULL is
+    // allowed); pass the client when there is one.
+    const char* r = td_json_client_execute(client_, json.c_str());
     return r ? std::string(r) : std::string();
 }
 
@@ -204,8 +187,25 @@ std::string TdLibClient::pump(double timeout_sec, bool* was_update) {
     if (type && type->asString().rfind("update", 0) == 0) {
         if (was_update) *was_update = true;
         last_update_ = parsed;
+        pending_updates_.push(parsed);
     }
     return raw;
+}
+
+bool TdLibClient::pollUpdate(Json& out, double timeout_sec) {
+    if (!pending_updates_.empty()) {
+        out = pending_updates_.front();
+        pending_updates_.pop();
+        return true;
+    }
+    bool was_update = false;
+    pump(timeout_sec, &was_update);
+    if (!pending_updates_.empty()) {
+        out = pending_updates_.front();
+        pending_updates_.pop();
+        return true;
+    }
+    return false;
 }
 
 Json TdLibClient::call(const Json& req_in, double timeout_sec) {
@@ -240,9 +240,52 @@ Json TdLibClient::call(const Json& req_in, double timeout_sec) {
     return Json();  // timeout: null
 }
 
+// --- auth -----------------------------------------------------------------
+
+bool TdLibClient::ensureSessionDir0700(const std::string& session_dir,
+                                       std::string& error_out) {
+    std::error_code ec;
+    std::filesystem::create_directories(session_dir, ec);
+    if (ec) {
+        error_out = "cannot create session directory " + session_dir +
+                    ": " + ec.message();
+        return false;
+    }
+    // Mode 0700 on the session dir (and the files subdir when TDLib
+    // has already created it): the database holds the account's auth
+    // keys and must not be readable by other local users.
+    std::filesystem::permissions(
+        session_dir,
+        std::filesystem::perms::owner_read |
+            std::filesystem::perms::owner_write |
+            std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        error_out = "cannot set mode 0700 on session directory " +
+                    session_dir + ": " + ec.message();
+        return false;
+    }
+    std::string files_dir = session_dir + "/files";
+    if (std::filesystem::is_directory(files_dir, ec)) {
+        std::error_code ec2;
+        std::filesystem::permissions(
+            files_dir,
+            std::filesystem::perms::owner_read |
+                std::filesystem::perms::owner_write |
+                std::filesystem::perms::owner_exec,
+            std::filesystem::perm_options::replace, ec2);
+        // Best effort: a files dir that cannot be tightened does not
+        // block auth — the database dir itself is already 0700.
+    }
+    return true;
+}
+
 bool TdLibClient::handleAuthState(const std::string& state,
                                   std::string& error_out) {
-    Params p = Params::fromEnv();
+    // Re-read env on every call: tests drive states by changing env
+    // after construction, and a long-running process picks up creds
+    // set between restarts the same way.
+    Params p = Params::fromEnvFor(kind_);
     if (state == "authorizationStateWaitTdlibParameters") {
         if (!p.configured()) {
             error_out =
@@ -250,8 +293,10 @@ bool TdLibClient::handleAuthState(const std::string& state,
                 "TD_SESSION_DIR must all be set for setTdlibParameters)";
             return false;
         }
-        std::error_code ec;
-        std::filesystem::create_directories(p.session_dir, ec);
+        if (!ensureSessionDir0700(p.session_dir, error_out)) {
+            error_out = "not authorized: " + error_out;
+            return false;
+        }
         Json params = Json::objectOf({
             {"@type", Json("setTdlibParameters")},
             {"use_test_dc", Json(false)},
@@ -273,6 +318,24 @@ bool TdLibClient::handleAuthState(const std::string& state,
         return true;
     }
     if (state == "authorizationStateWaitPhoneNumber") {
+        if (p.is_bot) {
+            // anonx-cpp src/telegram/tdlib_client.cpp:296-302: a bot
+            // session answers WaitPhoneNumber with
+            // checkAuthenticationBotToken, not a phone number.
+            if (p.bot_token.empty()) {
+                error_out =
+                    "not authorized: no credentials (BOT_TOKEN not set; "
+                    "authorizationStateWaitPhoneNumber on a bot session "
+                    "needs checkAuthenticationBotToken)";
+                return false;
+            }
+            Json req = Json::objectOf({
+                {"@type", Json("checkAuthenticationBotToken")},
+                {"token", Json(p.bot_token)},
+            });
+            send(req);
+            return true;
+        }
         if (!p.phone.empty()) {
             Json settings = Json::objectOf({
                 {"@type", Json("phoneNumberAuthenticationSettings")},
@@ -406,7 +469,7 @@ bool TdLibClient::handleAuthState(const std::string& state,
     error_out = "not authorized: unsupported authorization state " + state +
                 " (authorizationStateWaitPremiumPurchase is an in-store "
                 "purchase and cannot be driven headless; log in once "
-                "with a full client and reuse TD_SESSION_DIR)";
+                "with a full client and reuse the session directory)";
     return false;
 }
 
@@ -430,7 +493,8 @@ bool TdLibClient::authorize(double timeout_sec) {
         std::string raw = pump(1.0, &was_update);
         if (!raw.empty() && !was_update) {
             // A direct response (e.g. to getAuthorizationState, or an
-            // error answering one of our auth requests).
+            // error answering one of our auth requests — including
+            // checkAuthenticationBotToken rejecting a bad token).
             Json parsed;
             try {
                 parsed = Json::parse(raw);
@@ -479,6 +543,27 @@ bool TdLibClient::authorize(double timeout_sec) {
     return false;
 }
 
+bool TdLibClient::getMe(int64_t& id_out, std::string& username_out) {
+    Json resp = call(Json::objectOf({{"@type", Json("getMe")}}), 30.0);
+    if (resp.isNull()) {
+        last_error_ = "getMe timed out";
+        return false;
+    }
+    if (isError(resp)) {
+        last_error_ = "getMe failed: " + errorMessage(resp);
+        return false;
+    }
+    const Json* id = resp.find("id");
+    if (!id) {
+        last_error_ = "getMe failed: no id in TDLib user object";
+        return false;
+    }
+    id_out = id->asInt();
+    const Json* username = resp.find("username");
+    username_out = username ? username->asString() : std::string();
+    return true;
+}
+
 void TdLibClient::close(double timeout_sec) {
     if (!client_) return;
     Json req = Json::objectOf({{"@type", Json("close")}});
@@ -504,8 +589,247 @@ void TdLibClient::close(double timeout_sec) {
     // Destroy regardless: TDLib frees resources once closed; if the
     // close handshake did not finish, destroy still tears the client
     // down (the docs require destroy after close, best effort here).
-    if (fn_destroy_) fn_destroy_(client_);
+    td_json_client_destroy(client_);
     client_ = nullptr;
+}
+
+// --- bot-session sends ----------------------------------------------------
+
+bool TdLibClient::isError(const Json& resp) {
+    const Json* type = resp.find("@type");
+    return type && type->asString() == "error";
+}
+
+std::string TdLibClient::errorMessage(const Json& resp) {
+    const Json* code = resp.find("code");
+    const Json* msg = resp.find("message");
+    std::string out;
+    if (code) out += std::to_string(code->asInt());
+    if (msg && !msg->asString().empty()) {
+        if (!out.empty()) out += ": ";
+        out += msg->asString();
+    }
+    return out;
+}
+
+Json TdLibClient::formattedText(const std::string& text,
+                                const std::string& parse_mode,
+                                std::string& error_out) {
+    if (parse_mode.empty()) {
+        return Json::objectOf({
+            {"@type", Json("formattedText")},
+            {"text", Json(text)},
+        });
+    }
+    Json mode;
+    if (parse_mode == "HTML") {
+        mode = Json::objectOf({{"@type", Json("textParseModeHTML")}});
+    } else if (parse_mode == "Markdown") {
+        mode = Json::objectOf({
+            {"@type", Json("textParseModeMarkdown")},
+            {"version", Json(static_cast<int64_t>(2))},
+        });
+    } else {
+        error_out = "unknown parse_mode \"" + parse_mode +
+                    "\" (expected \"\", \"HTML\" or \"Markdown\")";
+        return Json();
+    }
+    Json req = Json::objectOf({
+        {"@type", Json("parseTextEntities")},
+        {"text", Json(text)},
+        {"parse_mode", mode},
+    });
+    // parseTextEntities is a local computation: 10 s is ample, and a
+    // timeout is reported as a parse failure (nothing is sent).
+    Json resp = call(req, 10.0);
+    if (resp.isNull()) {
+        error_out = "parseTextEntities timed out";
+        return Json();
+    }
+    if (isError(resp)) {
+        error_out = "parseTextEntities failed: " + errorMessage(resp);
+        return Json();
+    }
+    return resp;  // parseTextEntities returns the formattedText object
+}
+
+Json TdLibClient::inputMessageText(const std::string& text,
+                                   const std::string& parse_mode,
+                                   std::string& error_out) {
+    Json ft = formattedText(text, parse_mode, error_out);
+    if (ft.isNull()) return Json();
+    return Json::objectOf({
+        {"@type", Json("inputMessageText")},
+        {"text", ft},
+        {"disable_web_page_preview", Json(true)},
+        {"clear_draft", Json(true)},
+    });
+}
+
+namespace {
+// A synthetic TDLib-shaped error object for failures that happen
+// before anything is sent (e.g. a parse failure): callers treat it
+// exactly like a TDLib "error" response.
+Json localError(int64_t code, const std::string& message) {
+    return Json::objectOf({
+        {"@type", Json("error")},
+        {"code", Json(code)},
+        {"message", Json(message)},
+    });
+}
+}  // namespace
+
+Json TdLibClient::sendMessage(int64_t chat_id, const std::string& text,
+                              int64_t reply_to_message_id,
+                              const std::string& parse_mode) {
+    std::string err;
+    Json content = inputMessageText(text, parse_mode, err);
+    if (content.isNull()) return localError(400, err);
+    Json req = Json::objectOf({
+        {"@type", Json("sendMessage")},
+        {"chat_id", Json(chat_id)},
+        {"input_message_content", content},
+    });
+    if (reply_to_message_id != 0) {
+        req.set("reply_to", Json::objectOf({
+            {"@type", Json("inputMessageReplyToMessage")},
+            {"message_id", Json(reply_to_message_id)},
+        }));
+    }
+    return call(req, 30.0);
+}
+
+int64_t TdLibClient::sendMessageId(int64_t chat_id, const std::string& text,
+                                   int64_t reply_to_message_id,
+                                   const std::string& parse_mode,
+                                   std::string* error_out) {
+    Json resp = sendMessage(chat_id, text, reply_to_message_id, parse_mode);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "sendMessage timed out";
+        return -1;
+    }
+    if (isError(resp)) {
+        if (error_out) *error_out = errorMessage(resp);
+        return -1;
+    }
+    const Json* id = resp.find("id");
+    if (!id) {
+        if (error_out) *error_out = "sendMessage: no id in response";
+        return -1;
+    }
+    return id->asInt();
+}
+
+Json TdLibClient::editMessage(int64_t chat_id, int64_t message_id,
+                              const std::string& text,
+                              const std::string& parse_mode) {
+    std::string err;
+    Json content = inputMessageText(text, parse_mode, err);
+    if (content.isNull()) return localError(400, err);
+    Json req = Json::objectOf({
+        {"@type", Json("editMessageText")},
+        {"chat_id", Json(chat_id)},
+        {"message_id", Json(message_id)},
+        {"input_message_content", content},
+    });
+    return call(req, 30.0);
+}
+
+Json TdLibClient::answerCallbackQuery(const std::string& callback_query_id,
+                                      const std::string& text,
+                                      bool show_alert,
+                                      int cache_time_sec) {
+    Json req = Json::objectOf({
+        {"@type", Json("answerCallbackQuery")},
+        {"callback_query_id", Json(callback_query_id)},
+        {"text", Json(text)},
+        {"show_alert", Json(show_alert)},
+        {"url", Json("")},
+        {"cache_time", Json(static_cast<int64_t>(cache_time_sec))},
+    });
+    return call(req, 30.0);
+}
+
+Json TdLibClient::sendPhoto(int64_t chat_id, const std::string& photo,
+                            const std::string& caption,
+                            const std::string& parse_mode) {
+    std::string err;
+    Json ft = formattedText(caption, parse_mode, err);
+    if (ft.isNull()) return localError(400, err);
+    Json file;
+    std::error_code ec;
+    if (!photo.empty() && photo[0] == '/' &&
+        std::filesystem::exists(photo, ec)) {
+        file = Json::objectOf({
+            {"@type", Json("inputFileLocal")},
+            {"path", Json(photo)},
+        });
+    } else {
+        // A TDLib file_id. A remote HTTP(S) URL is NOT valid here —
+        // TDLib answers with its exact error, which the caller sees.
+        file = Json::objectOf({
+            {"@type", Json("inputFileRemote")},
+            {"id", Json(photo)},
+        });
+    }
+    Json content = Json::objectOf({
+        {"@type", Json("inputMessagePhoto")},
+        {"photo", file},
+        {"caption", ft},
+    });
+    Json req = Json::objectOf({
+        {"@type", Json("sendMessage")},
+        {"chat_id", Json(chat_id)},
+        {"input_message_content", content},
+    });
+    return call(req, 30.0);
+}
+
+int64_t TdLibClient::sendPhotoId(int64_t chat_id, const std::string& photo,
+                                 const std::string& caption,
+                                 const std::string& parse_mode,
+                                 std::string* error_out) {
+    Json resp = sendPhoto(chat_id, photo, caption, parse_mode);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "sendPhoto timed out";
+        return -1;
+    }
+    if (isError(resp)) {
+        if (error_out) *error_out = errorMessage(resp);
+        return -1;
+    }
+    const Json* id = resp.find("id");
+    if (!id) {
+        if (error_out) *error_out = "sendPhoto: no id in response";
+        return -1;
+    }
+    return id->asInt();
+}
+
+// --- dual session ---------------------------------------------------------
+
+TdLibDualSession::TdLibDualSession()
+    : bot_(SessionKind::Bot), assistant_(SessionKind::Assistant) {}
+
+bool TdLibDualSession::pollUpdate(Json& out, SessionKind& from,
+                                  double timeout_sec) {
+    // Split the budget so neither session can starve the other: each
+    // half returns immediately when it already has a queued update.
+    double half = timeout_sec / 2.0;
+    if (bot_.pollUpdate(out, half)) {
+        from = SessionKind::Bot;
+        return true;
+    }
+    if (assistant_.pollUpdate(out, half)) {
+        from = SessionKind::Assistant;
+        return true;
+    }
+    return false;
+}
+
+void TdLibDualSession::close(double timeout_sec) {
+    bot_.close(timeout_sec);
+    assistant_.close(timeout_sec);
 }
 
 }  // namespace parlay

@@ -1,33 +1,37 @@
-// dispatcher_test.cpp — Dispatcher: /play from replied-to media, /mute,
-// /join (Phase 5, Worker B); /autoplay-skip, /broadcast errors.txt
-// (Phase 6, Worker B); /speed + /bass core-voice filter path,
-// engine honest replies, /speedtest helpers (Phase 6, Worker C);
-// /play through an engine attaches core audio, skip/pause/resume/
-// seek/stop keep the core stream in step, watcher follow pass
-// (Phase 7, Worker A1b).
+// dispatcher_test.cpp — Dispatcher: /play from replied-to media (honest
+// gap, Phase 2), /mute, /join (backend vc.* calls, Phase 2);
+// /autoplay-skip, /broadcast errors.txt (Phase 6, Worker B);
+// /speed + /bass honest saved-not-applied replies (Phase 2, backend
+// DSP is Phase 5); /play through the backend (no core audio attach,
+// Phase 2); /speedtest helpers (Phase 6, Worker C); backend-driven
+// events + duplex join handshake + token-bucket limiter (Phase 2).
 // (Phase 1 telemetry, §J) Every /play emits one t_dispatch_to_ipc
-// line: dispatch_to_post_us + post_to_response_us == total, engine /
-// fell_back / ok, or ipc=none on the replied-file + usage-error
-// paths (no engine IPC exists there).
+// line: dispatch_to_post_us + post_to_response_us == total,
+// transport=uds / ok, or ipc=none on the replied-file + usage-error
+// paths (no backend IPC exists there).
 //
-// - TelegramApi::parseMessage: reply with audio / document / video_note
-//   file_id is captured; a reply with no media captures nothing.
-// - onPlay: reply with audio/document file_id downloads (fake) and plays
-//   through the core voice backend (source "file"); no media + no query
-//   answers the honest usage error; download/backend failures are
-//   reported honestly, never faked.
-// - onMute: core-owned session -> real voice_.mute()/unmute(); engine
-//   session -> honest refusal (no vc.mute in the engines); nothing
+// - onPlay: reply with audio/document file_id downloads (fake) and
+//   answers the honest gap (local-file playback is a Phase 3 backend
+//   action); no media + no query answers the honest usage error;
+//   download failures are reported honestly, never faked.
+// - onMute: playing session -> vc.mute through the backend; nothing
 //   playing -> "Nothing is playing."
-// - onJoin: admin-gated; backend join or the honest reason.
+// - onJoin: admin-gated; backend vc.join or the honest reason.
 //
 // Build: g++ -std=c++20 -I src tests/dispatcher_test.cpp
-//   src/dispatcher.cpp src/telegram_api.cpp src/ipc.cpp
-//   src/engine_router.cpp src/store.cpp src/scram.cpp src/json.cpp
-//   src/config.cpp src/http.cpp src/voice_call.cpp src/tdlib_client.cpp
-//   -o /tmp/dispatcher_test -ldl && /tmp/dispatcher_test
-// Exit 0 = all checks pass. No network: Telegram/IPC/voice are faked,
+//   src/dispatcher.cpp src/ipc.cpp src/store.cpp src/scram.cpp src/json.cpp
+//   src/config.cpp src/toml.cpp src/rate_limiter.cpp src/tdlib_client.cpp
+//   <path>/libtdjson.so.1.8.69 -Wl,-rpath,<dir>
+//   -o /tmp/dispatcher_test && /tmp/dispatcher_test
+// Exit 0 = all checks pass. No network: Telegram/IPC/TDLib are faked,
 // the Store uses its JSON file backend in a temp dir.
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -35,16 +39,16 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "config.hpp"
 #include "dispatcher.hpp"
-#include "engine_router.hpp"
 #include "ipc.hpp"
 #include "json.hpp"
 #include "store.hpp"
-#include "telegram_api.hpp"
-#include "voice_call.hpp"
+#include "tdlib_client.hpp"
+#include "ui_texts.hpp"
 
 static int failures = 0;
 #define CHECK(cond, msg)                                                    \
@@ -65,97 +69,152 @@ bool contains(const std::string& hay, const std::string& needle) {
 
 // --- fakes -------------------------------------------------------------------
 
-class FakeTelegramApi : public parlay::TelegramApi {
+class FakeTelegramSender : public parlay::TelegramSender {
 public:
-    explicit FakeTelegramApi(const parlay::Config& cfg)
-        : parlay::TelegramApi(cfg) {}
+    // Replies (message text, one entry per send) and one serialised
+    // keyboard per sendMessageHtml/sendPhoto/sendMessageReplyKb call,
+    // so tests can assert a button is present by its callback_data.
     std::vector<std::string> replies;
+    std::vector<std::string> markups;
+    std::vector<std::string> photos;
     std::vector<int64_t> admins = {111};
     bool download_ok = true;
     std::string download_saved =
         "/tmp/parlay-dispatcher-test/replied/BQACAgAAA.ogg";
-    // Broadcast fan-out scripting (Phase 6, B11): forward/copy fail
-    // for the chats in forward_fail; sendDocument records the
-    // attachment (or fails when doc_ok is false).
     std::set<int64_t> forward_fail;
     bool doc_ok = true;
     struct DocCall {
         int64_t chat;
-        std::string filename;
-        std::string content;
-        std::string caption;
+        std::string filename, content, caption;
     };
     std::vector<DocCall> docs;
-    // Phase 9 interactive layer: every new virtual records its call
-    // instead of hitting the network. sendMessageHtml / sendPhoto push
-    // the text (or caption) into replies so the existing replies[0]
-    // assertions keep working; markups are recorded in parallel.
-    std::vector<std::string> markups;  // reply_markup JSON per reply
-    std::vector<std::string> photos;   // photo URL/file_id per sendPhoto
     struct EditCall {
-        int64_t chat;
-        int64_t msg;
-        std::string text;
-        std::string kind;  // text | caption | markup
+        int64_t chat, msg;
+        std::string text, kind;  // kind: text | caption | markup
     };
     std::vector<EditCall> edits;
     struct ToastCall {
-        std::string id;
-        std::string text;
+        std::string id, text;
         bool alert;
     };
     std::vector<ToastCall> toasts;
     std::vector<std::pair<int64_t, int64_t>> deleted;
     struct AudioCall {
         int64_t chat;
-        std::string audio;  // file_id/URL (sendAudio) or path (sendAudioFile/sendFile)
-        std::string caption;
-        std::string kind;  // audio | audiofile | file
+        std::string audio, caption, kind;  // audiofile | file | audio
     };
     std::vector<AudioCall> audios;
+    struct InlineCall {
+        std::string id, results_json;
+        int cache_time;
+        std::string switch_pm_text, switch_pm_parameter;
+    };
+    std::vector<InlineCall> inlines;
+    std::string member_status_for_other = "member";
     int64_t next_id = 1000;
+
+    static std::string serialiseKb(const parlay::InlineKeyboard& kb) {
+        std::string out;
+        for (const auto& row : kb) {
+            out += "[";
+            for (const auto& b : row) {
+                out += b.text + "=";
+                if (!b.callback_data.empty()) out += b.callback_data;
+                else if (!b.url.empty()) out += b.url;
+                else if (b.has_switch) out += b.switch_inline_query;
+                out += "|";
+            }
+            out += "]";
+        }
+        return out;
+    }
+
+    bool sendMessage(int64_t chat_id, const std::string& text,
+                     std::string& error_out) override {
+        (void)chat_id;
+        (void)error_out;
+        replies.push_back(text);
+        return true;
+    }
+    int64_t sendMessageId(int64_t chat_id, const std::string& text,
+                          int64_t reply_to = 0,
+                          std::string* error_out = nullptr) override {
+        (void)chat_id;
+        (void)reply_to;
+        (void)error_out;
+        replies.push_back(text);
+        return static_cast<int64_t>(replies.size());
+    }
     int64_t sendMessageHtml(int64_t chat_id, const std::string& text,
-                            const parlay::Json& reply_markup, int64_t reply_to = 0,
+                            const parlay::InlineKeyboard& kb,
+                            int64_t reply_to = 0,
                             std::string* error_out = nullptr) override {
         (void)chat_id;
         (void)reply_to;
         (void)error_out;
         replies.push_back(text);
-        markups.push_back(reply_markup.dump());
+        markups.push_back(serialiseKb(kb));
+        return static_cast<int64_t>(replies.size());
+    }
+    int64_t sendMessageReplyKb(int64_t chat_id, const std::string& text,
+                               const parlay::ReplyKeyboard& kb,
+                               int64_t reply_to = 0,
+                               std::string* error_out = nullptr) override {
+        (void)chat_id;
+        (void)reply_to;
+        (void)error_out;
+        replies.push_back(text);
+        std::string flat;
+        for (const auto& row : kb.rows)
+            for (const auto& label : row) flat += label + "|";
+        markups.push_back(flat);
+        return static_cast<int64_t>(replies.size());
+    }
+    int64_t sendMessageRemoveKb(int64_t chat_id, const std::string& text,
+                                int64_t reply_to = 0,
+                                std::string* error_out = nullptr) override {
+        (void)chat_id;
+        (void)reply_to;
+        (void)error_out;
+        replies.push_back(text);
+        markups.push_back("");
         return static_cast<int64_t>(replies.size());
     }
     int64_t sendPhoto(int64_t chat_id, const std::string& photo,
-                      const std::string& caption, const parlay::Json& reply_markup,
+                      const std::string& caption,
+                      const parlay::InlineKeyboard& kb,
                       std::string* error_out = nullptr) override {
         (void)chat_id;
         (void)error_out;
         photos.push_back(photo);
         replies.push_back(caption);
-        markups.push_back(reply_markup.dump());
+        markups.push_back(serialiseKb(kb));
         return static_cast<int64_t>(replies.size());
     }
     bool editMessageText(int64_t chat_id, int64_t message_id,
-                         const std::string& text, const parlay::Json& reply_markup,
+                         const std::string& text,
+                         const parlay::InlineKeyboard& kb,
                          std::string* error_out = nullptr) override {
-        (void)reply_markup;
+        (void)kb;
         (void)error_out;
         edits.push_back({chat_id, message_id, text, "text"});
         return true;
     }
     bool editMessageCaption(int64_t chat_id, int64_t message_id,
                             const std::string& caption,
-                            const parlay::Json& reply_markup,
+                            const parlay::InlineKeyboard& kb,
                             std::string* error_out = nullptr) override {
-        (void)reply_markup;
+        (void)kb;
         (void)error_out;
         edits.push_back({chat_id, message_id, caption, "caption"});
         return true;
     }
     bool editMessageReplyMarkup(int64_t chat_id, int64_t message_id,
-                                const parlay::Json& reply_markup,
+                                const parlay::InlineKeyboard& kb,
                                 std::string* error_out = nullptr) override {
         (void)error_out;
-        edits.push_back({chat_id, message_id, reply_markup.dump(), "markup"});
+        edits.push_back(
+            {chat_id, message_id, serialiseKb(kb), "markup"});
         return true;
     }
     bool answerCallbackQuery(const std::string& callback_query_id,
@@ -167,16 +226,6 @@ public:
         toasts.push_back({callback_query_id, text, show_alert});
         return true;
     }
-    // Inline answers (Phase 9 gaps, §13): the results JSON + cache
-    // time + switch_pm button are recorded for the assertions.
-    struct InlineCall {
-        std::string id;
-        std::string results_json;
-        int cache_time;
-        std::string switch_pm_text;
-        std::string switch_pm_parameter;
-    };
-    std::vector<InlineCall> inlines;
     bool answerInlineQuery(const std::string& inline_query_id,
                            const parlay::Json& results, int cache_time_sec,
                            const std::string& switch_pm_text,
@@ -189,6 +238,10 @@ public:
     }
     bool deleteMessage(int64_t chat_id, int64_t message_id) override {
         deleted.emplace_back(chat_id, message_id);
+        return true;
+    }
+    bool leaveChat(int64_t chat_id) override {
+        (void)chat_id;
         return true;
     }
     int64_t sendAudioFile(int64_t chat_id, const std::string& file_path,
@@ -206,9 +259,10 @@ public:
         return ++next_id;
     }
     int64_t sendAudio(int64_t chat_id, const std::string& audio,
-                      const std::string& caption, const parlay::Json& reply_markup,
+                      const std::string& caption,
+                      const parlay::InlineKeyboard& kb,
                       std::string* error_out = nullptr) override {
-        (void)reply_markup;
+        (void)kb;
         (void)error_out;
         audios.push_back({chat_id, audio, caption, "audio"});
         return ++next_id;
@@ -239,26 +293,21 @@ public:
         docs.push_back({chat_id, filename, content, caption});
         return 99;
     }
-    int64_t sendMessageId(int64_t chat_id, const std::string& text,
-                          int64_t reply_to,
-                          std::string* error_out) override {
-        (void)chat_id;
-        (void)reply_to;
-        (void)error_out;
-        replies.push_back(text);
-        return static_cast<int64_t>(replies.size());
-    }
     std::vector<int64_t> getChatAdministrators(int64_t chat_id) override {
         (void)chat_id;
         return admins;
     }
-    // Scripted member status for non-admin users (Phase 9 §K): the
-    // default "member" stands in for any non-admin state; tests set
-    // it to "kicked"/"restricted" to exercise the assistant checks.
-    std::string member_status_for_other = "member";
-    std::string getChatMemberStatus(int64_t chat_id, int64_t user_id) override {
+    std::string getChatMemberStatus(int64_t chat_id,
+                                    int64_t user_id) override {
         (void)chat_id;
         return user_id == 111 ? "administrator" : member_status_for_other;
+    }
+    int64_t getChatId(const std::string& username_or_id) override {
+        try {
+            return std::stoll(username_or_id);
+        } catch (...) {
+            return 0;
+        }
     }
     bool downloadFile(const std::string& file_id,
                       const std::string& dest_dir,
@@ -274,7 +323,6 @@ public:
         return true;
     }
 };
-
 class FakeIpc : public parlay::IpcClient {
 public:
     explicit FakeIpc(const parlay::Config& cfg) : parlay::IpcClient(cfg) {}
@@ -306,6 +354,11 @@ public:
     mutable std::string download_response;
     mutable std::string radio_status_response;
     mutable std::string last_post_body;
+    // Scripted vc.join / vc.mute answers (Phase 2): join_ok=false
+    // fails the join with join_error; mute_error fails a mute.
+    mutable bool join_ok = true;
+    mutable std::string join_error = "backend join failed";
+    mutable std::string mute_error;
     // Scripted playback state (Phase 6, B11 speed/bass engine path):
     // when true, GET now-playing returns a playing track and POST
     // seek succeeds; when false (default) the engines know nothing.
@@ -398,6 +451,30 @@ public:
             r.data = parlay::Json::parse(resume_response);
             return r;
         }
+        if (action == "join") {
+            if (!join_ok) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = join_error;
+                return r;
+            }
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
+        if (action == "mute") {
+            if (!mute_error.empty()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = mute_error;
+                return r;
+            }
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
         if (action == "autoplay-skip") {
             if (!autoplay_skip_error.empty()) {
                 r.http_status = 400;
@@ -461,91 +538,68 @@ public:
     }
 };
 
-class FakeVoice : public parlay::VoiceCall {
+// Fake assistant session: a real TdLibClient object (creates a real
+// td_json client, as tdlib_test does) with scripted call() answers for
+// the duplex join handshake (Phase 2): getChat -> the video chat's
+// group_call_id, createVideoChat -> a fresh call, joinVideoChat -> the
+// remote SDP (or a scripted error).
+class FakeAssistant : public parlay::TdLibClient {
 public:
+    FakeAssistant() : parlay::TdLibClient(parlay::SessionKind::Assistant) {}
     bool avail = true;
-    bool play_ok = true, join_ok = true, mute_ok = true, unmute_ok = true;
-    bool pause_ok = true, resume_ok = true;
-    std::string fail_reason = "fake voice failure";
-    struct PlayCall {
-        int64_t chat;
-        std::string url;
-        std::string title;
-        bool video;
-        int seek_sec = 0;
-        double speed = 1.0;
-        int bass = 0;
-    };
-    std::vector<PlayCall> plays;
-    std::vector<int64_t> joins, mutes, unmutes, stops, pauses, resumes;
-    // Scripted position for time() (Phase 6, B11): -1 = unknown.
-    int64_t time_value = -1;
-    bool play(int64_t chat_id, const std::string& stream_url,
-              const std::string& title, bool video, int seek_sec, double speed,
-              int bass) override {
-        plays.push_back({chat_id, stream_url, title, video, seek_sec, speed,
-                         bass});
-        if (!play_ok) {
-            last_error_ = fail_reason;
-            return false;
-        }
-        return true;
-    }
-    bool join(int64_t chat_id) override {
-        joins.push_back(chat_id);
-        if (!join_ok) {
-            last_error_ = fail_reason;
-            return false;
-        }
-        return true;
-    }
-    bool stop(int64_t chat_id) override {
-        stops.push_back(chat_id);
-        return true;
-    }
-    bool pause(int64_t chat_id) override {
-        pauses.push_back(chat_id);
-        if (!pause_ok) {
-            last_error_ = fail_reason;
-            return false;
-        }
-        return true;
-    }
-    bool resume(int64_t chat_id) override {
-        resumes.push_back(chat_id);
-        if (!resume_ok) {
-            last_error_ = fail_reason;
-            return false;
-        }
-        return true;
-    }
-    bool mute(int64_t chat_id) override {
-        mutes.push_back(chat_id);
-        if (!mute_ok) {
-            last_error_ = fail_reason;
-            return false;
-        }
-        return true;
-    }
-    bool unmute(int64_t chat_id) override {
-        unmutes.push_back(chat_id);
-        if (!unmute_ok) {
-            last_error_ = fail_reason;
-            return false;
-        }
-        return true;
-    }
-    int64_t time(int64_t chat_id) override {
-        (void)chat_id;
-        return time_value;
-    }
+    bool authed = true;
+    std::string fail = "assistant unavailable";
+    bool has_video_chat = true;
+    int32_t group_call_id = 12345;
+    int32_t created_call_id = 777;
+    std::string join_error;  // non-empty -> joinVideoChat fails
+    std::string remote_sdp = "v=0\r\nfake-remote-sdp";
+    mutable std::vector<std::string> calls;  // @type of each call()
     bool available() const override { return avail; }
-    std::string describe() const override { return "fake-voice"; }
-    const char* name() const override { return "fake"; }
-    std::string lastError() const override { return last_error_; }
-
-private:
-    std::string last_error_;
+    bool authorized() const override { return authed; }
+    std::string lastError() const override { return fail; }
+    parlay::Json call(const parlay::Json& req,
+                      double timeout_sec = 30.0) override {
+        (void)timeout_sec;
+        const parlay::Json* t = req.find("@type");
+        std::string type = t ? t->asString() : "";
+        calls.push_back(type);
+        if (type == "getChat") {
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("chat")},
+                {"video_chat",
+                 parlay::Json::objectOf(
+                     {{"group_call_id",
+                       parlay::Json(static_cast<int64_t>(
+                           has_video_chat ? group_call_id : 0))}})},
+            });
+        }
+        if (type == "createVideoChat") {
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("groupCall")},
+                {"id", parlay::Json(static_cast<int64_t>(created_call_id))},
+            });
+        }
+        if (type == "joinVideoChat") {
+            if (!join_error.empty()) {
+                return parlay::Json::objectOf({
+                    {"@type", parlay::Json("error")},
+                    {"code", parlay::Json(static_cast<int64_t>(400))},
+                    {"message", parlay::Json(join_error)},
+                });
+            }
+            return parlay::Json::objectOf({
+                {"@type", parlay::Json("text")},
+                {"text", parlay::Json(remote_sdp)},
+            });
+        }
+        return parlay::Json::objectOf({
+            {"@type", parlay::Json("error")},
+            {"code", parlay::Json(static_cast<int64_t>(400))},
+            {"message",
+             parlay::Json("fake assistant: unexpected call " + type)},
+        });
+    }
 };
 
 // --- helpers -----------------------------------------------------------------
@@ -606,10 +660,10 @@ parlay::TgMessage makeMsg(int64_t chat, int64_t from,
 struct Rig {
     parlay::Config cfg;
     parlay::Store store;
-    FakeTelegramApi tg;
+    FakeTelegramSender tg;
     FakeIpc ipc;
-    parlay::EngineRouter router;
-    FakeVoice voice;
+    FakeAssistant assistant;
+    parlay::RateLimiter limiter;
     parlay::Dispatcher d;
     Rig()
         : cfg([] {
@@ -619,64 +673,22 @@ struct Rig {
               return c;
           }()),
           store(cfg),
-          tg(cfg),
           ipc(cfg),
-          router(cfg, &store),
-          d(cfg, tg, ipc, router, store, voice, "parlaybot") {}
+          limiter(cfg.rate_limit),
+          d(cfg, tg, ipc, store, assistant, limiter, "parlaybot") {}
 };
 
 }  // namespace
 
 int main() {
 
-    // --- A. parseMessage: reply media ------------------------------------
-    {
-        parlay::Json j = parlay::Json::parse(
-            R"({"message_id":10,"from":{"id":111},"chat":{"id":-1001,"type":"supergroup"},"text":"/play","reply_to_message":{"message_id":5,"from":{"id":222},"audio":{"file_id":"AUDIO123","title":"Song","performer":"Artist"}}})");
-        parlay::TgMessage m = parlay::TelegramApi::parseMessage(j);
-        CHECK(m.has_reply_to, "parse: reply detected");
-        CHECK(m.has_reply_media, "parse: reply audio detected");
-        CHECK(m.reply_media_file_id == "AUDIO123",
-              "parse: reply audio file_id");
-        CHECK(m.reply_media_kind == "audio", "parse: reply audio kind");
-        CHECK(m.reply_media_title == "Artist - Song",
-              "parse: reply audio title (performer - title)");
-    }
-    {
-        parlay::Json j = parlay::Json::parse(
-            R"({"message_id":10,"from":{"id":111},"chat":{"id":-1001,"type":"supergroup"},"text":"/play","reply_to_message":{"message_id":5,"from":{"id":222},"document":{"file_id":"DOC456","file_name":"track.mp3"}}})");
-        parlay::TgMessage m = parlay::TelegramApi::parseMessage(j);
-        CHECK(m.has_reply_media && m.reply_media_file_id == "DOC456",
-              "parse: reply document file_id");
-        CHECK(m.reply_media_kind == "document",
-              "parse: reply document kind");
-        CHECK(m.reply_media_title == "track.mp3",
-              "parse: reply document title (file_name)");
-    }
-    {
-        parlay::Json j = parlay::Json::parse(
-            R"({"message_id":10,"from":{"id":111},"chat":{"id":-1001,"type":"supergroup"},"text":"/play","reply_to_message":{"message_id":5,"from":{"id":222},"video_note":{"file_id":"VN789"}}})");
-        parlay::TgMessage m = parlay::TelegramApi::parseMessage(j);
-        CHECK(m.has_reply_media && m.reply_media_file_id == "VN789" &&
-                  m.reply_media_kind == "video_note",
-              "parse: reply video_note file_id + kind");
-    }
-    {
-        parlay::Json j = parlay::Json::parse(
-            R"({"message_id":10,"from":{"id":111},"chat":{"id":-1001,"type":"supergroup"},"text":"/play","reply_to_message":{"message_id":5,"from":{"id":222},"text":"hello"}})");
-        parlay::TgMessage m = parlay::TelegramApi::parseMessage(j);
-        CHECK(m.has_reply_to && !m.has_reply_media,
-              "parse: reply with no media captures nothing");
-    }
-    {
-        parlay::Json j = parlay::Json::parse(
-            R"({"message_id":10,"from":{"id":111},"chat":{"id":-1001,"type":"supergroup"},"text":"/play"})");
-        parlay::TgMessage m = parlay::TelegramApi::parseMessage(j);
-        CHECK(!m.has_reply_to && !m.has_reply_media,
-              "parse: no reply captures nothing");
-    }
-
-    // --- B. onPlay: replied media -----------------------------------------
+    // --- A. parseMessage: deleted with telegram_api.cpp
+    // (Phase 2). Updates now arrive as TDLib JSON via main.cpp.
+    // --- B. onPlay: replied media (Phase 2 honest gap) ------------------
+    // The file is downloaded via the TDLib bot session, but local-file
+    // playback needs a backend action that does not exist yet (Phase
+    // 3): the download is real, the reply says plainly that nothing
+    // plays, and no IPC call is issued. Never a fake "Now playing".
     {
         Rig rig;
         parlay::TgMessage m = makeMsg(-1001, 111, "/play");
@@ -687,214 +699,185 @@ int main() {
         m.reply_media_kind = "audio";
         m.reply_media_title = "Artist - Song";
         rig.d.handleMessage(m);
-        CHECK(rig.voice.plays.size() == 1,
-              "play reply audio: voice backend play called once");
-        CHECK(!rig.voice.plays.empty() &&
-                  rig.voice.plays[0].url == rig.tg.download_saved,
-              "play reply audio: plays the downloaded file path");
-        CHECK(!rig.voice.plays.empty() &&
-                  rig.voice.plays[0].title == "Artist - Song",
-              "play reply audio: track title from reply");
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Now playing") &&
-                  contains(rig.tg.replies[0], "Artist - Song"),
-              "play reply audio: Now playing reply");
+                  contains(rig.tg.replies[0], "Downloaded") &&
+                  contains(rig.tg.replies[0], "Artist - Song") &&
+                  contains(rig.tg.replies[0], "not available yet") &&
+                  contains(rig.tg.replies[0], "Nothing is playing"),
+              "play reply audio: downloaded, honest gap reply, no fake "
+              "Now playing");
         CHECK(rig.ipc.posts.empty(),
-              "play reply audio: no vc.play IPC call (core voice path)");
+              "play reply audio: no vc.play IPC call (no backend "
+              "action yet)");
     }
     {
         Rig rig;
         parlay::TgMessage m = makeMsg(-1002, 111, "/play");
         m.has_reply_to = true;
-        m.reply_to_message_id = 5;
+        m.reply_to_message_id = 6;
         m.has_reply_media = true;
-        m.reply_media_file_id = "DOC456";
+        m.reply_media_file_id = "DOC123";
         m.reply_media_kind = "document";
         m.reply_media_title = "track.mp3";
         rig.d.handleMessage(m);
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].title == "track.mp3",
-              "play reply document: voice backend play with file title");
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Now playing"),
-              "play reply document: Now playing reply");
+                  contains(rig.tg.replies[0], "Downloaded") &&
+                  contains(rig.tg.replies[0], "track.mp3") &&
+                  contains(rig.tg.replies[0], "not available yet"),
+              "play reply document: downloaded, honest gap reply");
+        CHECK(rig.ipc.posts.empty(),
+              "play reply document: no vc.play IPC call");
     }
     {
         Rig rig;
-        parlay::TgMessage m = makeMsg(-1003, 111, "/play");
-        rig.d.handleMessage(m);
-        // Phase 9: the usage error is the ported kNoSongQuery card.
+        rig.d.handleMessage(makeMsg(-1003, 111, "/play"));
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Whoops! Nothing to play") &&
                   contains(rig.tg.replies[0], "/play [song name or link]"),
-              "play no media + no query: honest usage error");
-        CHECK(rig.voice.plays.empty() && rig.ipc.posts.empty(),
-              "play no media + no query: nothing played, no IPC");
+              "play no media + no query: usage error, no IPC");
+        CHECK(rig.ipc.posts.empty(),
+              "play no media + no query: no engine call issued");
     }
     {
         Rig rig;
         rig.tg.download_ok = false;
         parlay::TgMessage m = makeMsg(-1004, 111, "/play");
         m.has_reply_to = true;
-        m.reply_to_message_id = 5;
+        m.reply_to_message_id = 7;
         m.has_reply_media = true;
         m.reply_media_file_id = "AUDIO123";
         m.reply_media_kind = "audio";
-        m.reply_media_title = "Song";
+        m.reply_media_title = "Artist - Song";
         rig.d.handleMessage(m);
-        CHECK(rig.voice.plays.empty(),
-              "play reply audio, download fails: no voice play");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Could not fetch"),
-              "play reply audio, download fails: honest error");
+              "play reply audio, download fails: honest error, no fake "
+              "play");
+        CHECK(rig.ipc.posts.empty(),
+              "play reply audio, download fails: no engine call");
     }
-    {
-        Rig rig;
-        rig.voice.play_ok = false;
-        rig.voice.fail_reason = "fake voice failure";
-        parlay::TgMessage m = makeMsg(-1005, 111, "/play");
-        m.has_reply_to = true;
-        m.reply_to_message_id = 5;
-        m.has_reply_media = true;
-        m.reply_media_file_id = "AUDIO123";
-        m.reply_media_kind = "audio";
-        m.reply_media_title = "Song";
-        rig.d.handleMessage(m);
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Could not play") &&
-                  contains(rig.tg.replies[0], "fake voice failure"),
-              "play reply audio, backend fails: honest error, no fake success");
-    }
-
     // --- C. onMute ----------------------------------------------------------
+    // Mute goes to the backend (vc.mute) after the nothing-playing
+    // check; the already-muted short-circuit is the stored flag.
     {
         Rig rig;
-        rig.store.hset("chat:-1011", "voice_owner", "core");
+        rig.store.set("call:-1011", "1");
         rig.store.hset("chat:-1011", "muted", "0");
         rig.d.handleMessage(makeMsg(-1011, 111, "/mute"));
-        CHECK(rig.voice.mutes.size() == 1,
-              "mute core session: backend mute() called");
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|mute") != std::string::npos,
+              "mute session: vc.mute issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "\U0001F507 | <b>Muted.</b>",
-              "mute core session: Muted reply");
-        auto v = rig.store.hget("chat:-1011", "muted");
-        CHECK(v && *v == "1", "mute core session: flag stored");
+                  rig.tg.replies[0] == "<b>Muted.</b>",
+              "mute session: exact reply is the emoji-free string");
+        auto f = rig.store.hgetall("chat:-1011");
+        CHECK(f["muted"] == "1", "mute session: muted flag stored");
     }
     {
         Rig rig;
-        rig.store.hset("chat:-1012", "voice_owner", "core");
+        rig.store.set("call:-1012", "1");
         rig.store.hset("chat:-1012", "muted", "1");
         rig.d.handleMessage(makeMsg(-1012, 111, "/mute"));
-        CHECK(rig.voice.mutes.empty(),
-              "mute when already muted: no backend call");
+        CHECK(rig.ipc.posts.empty(),
+              "mute already muted: no vc.mute issued");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "\u274C | <b>Already muted.</b>",
-              "mute when already muted: Already muted reply");
+                  rig.tg.replies[0] == "<b>Already muted.</b>",
+              "mute already muted: exact reply is the emoji-free "
+              "string");
     }
     {
         Rig rig;
-        rig.store.hset("chat:-1013", "voice_owner", "core");
+        rig.store.set("call:-1013", "1");
         rig.store.hset("chat:-1013", "muted", "1");
         rig.d.handleMessage(makeMsg(-1013, 111, "/unmute"));
-        CHECK(rig.voice.unmutes.size() == 1,
-              "unmute core session: backend unmute() called");
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|mute") != std::string::npos,
+              "unmute session: vc.mute issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "\U0001F50A | <b>Unmuted.</b>",
-              "unmute core session: Unmuted reply");
+                  rig.tg.replies[0] == "<b>Unmuted.</b>",
+              "unmute session: exact reply is the emoji-free string");
+        auto f = rig.store.hgetall("chat:-1013");
+        CHECK(f["muted"] == "0", "unmute session: muted flag cleared");
     }
     {
         Rig rig;
-        rig.store.hset("chat:-1014", "voice_owner", "go");
-        rig.store.set("call:-1014", "1");
         rig.d.handleMessage(makeMsg(-1014, 111, "/mute"));
-        CHECK(rig.voice.mutes.empty(),
-              "mute engine session: backend NOT called");
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "cannot mute"),
-              "mute engine session: honest refusal, no fake mute");
-    }
-    {
-        Rig rig;
-        rig.d.handleMessage(makeMsg(-1015, 111, "/mute"));
-        CHECK(rig.voice.mutes.empty(),
-              "mute nothing playing: no backend call");
+        CHECK(rig.ipc.posts.empty(),
+              "mute nothing playing: no vc.mute issued");
         CHECK(rig.tg.replies.size() == 1 &&
                   rig.tg.replies[0] == "Nothing is playing.",
               "mute nothing playing: honest reply");
     }
     {
+        // Playing track (no call flag): the now-playing leg of the
+        // nothing-playing check lets the mute through.
         Rig rig;
-        rig.store.hset("chat:-1016", "voice_owner", "core");
+        rig.ipc.np_ok = true;
+        rig.store.hset("chat:-1015", "muted", "0");
+        rig.d.handleMessage(makeMsg(-1015, 111, "/mute"));
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|mute") != std::string::npos,
+              "mute playing track: vc.mute issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "<b>Muted.</b>",
+              "mute playing track: Muted reply");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1016", "1");
         rig.store.hset("chat:-1016", "muted", "0");
-        rig.voice.mute_ok = false;
-        rig.voice.fail_reason = "ntgcalls mute failed";
+        rig.ipc.mute_error = "ntgcalls mute failed";
         rig.d.handleMessage(makeMsg(-1016, 111, "/mute"));
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Could not mute") &&
                   contains(rig.tg.replies[0], "ntgcalls mute failed"),
-              "mute backend fails: honest error, no fake success");
-        auto v = rig.store.hget("chat:-1016", "muted");
-        CHECK(v && *v == "0", "mute backend fails: flag untouched");
+              "mute backend fails: exact backend error reported");
+        auto f = rig.store.hgetall("chat:-1016");
+        CHECK(f["muted"] == "0",
+              "mute backend fails: muted flag stays 0");
     }
-
     // --- D. onJoin ----------------------------------------------------------
+    // The backend owns the call: /join issues vc.join, and the backend
+    // drives the duplex JoinRequest handshake from there. An already
+    // active call short-circuits before any IPC.
     {
         Rig rig;
         rig.d.handleMessage(makeMsg(-1021, 111, "/join"));
-        CHECK(rig.voice.joins.size() == 1,
-              "join: backend join() called");
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|join") != std::string::npos,
+              "join: vc.join issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "\u2705 | <b>Joined the voice chat.</b>",
-              "join: Joined reply");
-        auto v = rig.store.hget("chat:-1021", "voice_owner");
-        CHECK(v && *v == "core", "join: voice_owner recorded as core");
+                  rig.tg.replies[0] == "<b>Joined the voice chat.</b>",
+              "join: exact reply is the emoji-free string");
         auto c = rig.store.get("call:-1021");
         CHECK(c && *c == "1", "join: call marked active");
     }
     {
         Rig rig;
-        rig.voice.avail = false;
+        rig.ipc.join_ok = false;
+        rig.ipc.join_error = "tdlib not authorized";
         rig.d.handleMessage(makeMsg(-1022, 111, "/join"));
-        CHECK(rig.voice.joins.empty(),
-              "join backend unavailable: no join call");
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Cannot join the voice chat"),
-              "join backend unavailable: honest reason");
-    }
-    {
-        Rig rig;
-        rig.voice.join_ok = false;
-        rig.voice.fail_reason = "tdlib not authorized";
-        rig.d.handleMessage(makeMsg(-1023, 111, "/join"));
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Could not join") &&
+                  contains(rig.tg.replies[0],
+                           "Could not join the voice chat") &&
                   contains(rig.tg.replies[0], "tdlib not authorized"),
-              "join backend fails: honest error");
+              "join backend unavailable: exact backend error reported");
+        auto c = rig.store.get("call:-1022");
+        CHECK(!c || *c != "1",
+              "join backend unavailable: call stays inactive");
     }
     {
         Rig rig;
-        rig.store.hset("chat:-1024", "voice_owner", "core");
-        rig.store.set("call:-1024", "1");
-        rig.d.handleMessage(makeMsg(-1024, 111, "/join"));
-        CHECK(rig.voice.joins.empty(),
-              "join when already in call: no second join");
+        rig.store.set("call:-1023", "1");
+        rig.d.handleMessage(makeMsg(-1023, 111, "/join"));
+        CHECK(rig.ipc.posts.empty(),
+              "join already in call: no vc.join issued");
         CHECK(rig.tg.replies.size() == 1 &&
                   rig.tg.replies[0] ==
-                      "\u274C | <b>Already in the voice chat.</b>",
-              "join when already in call: Already reply");
+                      "<b>Already in the voice chat.</b>",
+              "join already in call: exact reply is the emoji-free "
+              "string");
     }
-    {
-        Rig rig;
-        rig.store.hset("chat:-1025", "voice_owner", "go");
-        rig.store.set("call:-1025", "1");
-        rig.d.handleMessage(makeMsg(-1025, 111, "/join"));
-        CHECK(rig.voice.joins.empty(),
-              "join when engine session active: no backend join");
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Already in the voice chat"),
-              "join when engine session active: Already reply");
-    }
-
     // --- E. onAutoplaySkip (Phase 6) --------------------------------------
     {
         Rig rig;
@@ -1012,122 +995,74 @@ int main() {
               "broadcast without reply: usage error, no fan-out");
     }
 
-    // --- G. /speed + /bass: core voice applies, engines honestly don't --
-    // (Phase 6, B11). Core-owned session = voice_owner "core" + call
-    // active + a recorded core_source; the filter is re-attached
-    // through voice_.play with the stored speed/bass at the current
-    // position (voice_.time). Engine sessions keep the seek-restart
-    // but the reply says the value was only saved.
-    {
-        Rig rig;
-        rig.store.set("call:-1041", "1");
-        rig.store.hset("chat:-1041", "voice_owner", "core");
-        rig.store.hset("chat:-1041", "core_source", "/tmp/song.ogg");
-        rig.store.hset("chat:-1041", "core_title", "Song");
-        rig.store.hset("chat:-1041", "core_video", "0");
-        rig.voice.time_value = 42;
-        rig.d.handleMessage(makeMsg(-1041, 111, "/speed 1.5"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url == "/tmp/song.ogg" &&
-                  rig.voice.plays[0].speed == 1.5 &&
-                  rig.voice.plays[0].seek_sec == 42 &&
-                  rig.voice.plays[0].bass == 0,
-              "speed core session: voice re-attached at 42s with 1.5x");
-        CHECK(rig.ipc.posts.empty(),
-              "speed core session: no engine seek call");
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Speed set to 1.5x") &&
-                  contains(rig.tg.replies[0], "core voice re-attached") &&
-                  contains(rig.tg.replies[0], "0:42"),
-              "speed core session: applied reply names the position");
-    }
-    {
-        Rig rig;
-        rig.store.set("call:-1042", "1");
-        rig.store.hset("chat:-1042", "voice_owner", "core");
-        rig.store.hset("chat:-1042", "core_source", "/tmp/song.ogg");
-        rig.store.hset("chat:-1042", "core_title", "Song");
-        rig.store.hset("chat:-1042", "speed", "1.25");
-        rig.voice.time_value = 90;
-        rig.d.handleMessage(makeMsg(-1042, 111, "/bass 40"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].bass == 40 &&
-                  rig.voice.plays[0].speed == 1.25 &&
-                  rig.voice.plays[0].seek_sec == 90,
-              "bass core session: voice re-attached with bass 40 + stored speed 1.25x");
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Bass set to 40"),
-              "bass core session: applied reply");
-    }
-    {
-        Rig rig;
-        rig.store.set("call:-1043", "1");
-        rig.store.hset("chat:-1043", "voice_owner", "core");
-        rig.voice.time_value = 10;
-        rig.d.handleMessage(makeMsg(-1043, 111, "/speed 1.5"));
-        CHECK(rig.voice.plays.empty(),
-              "speed core session, no source: no re-attach attempted");
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "no source was recorded"),
-              "speed core session, no source: honest reply, no fake success");
-    }
-    {
-        Rig rig;
-        rig.store.hset("chat:-1044", "voice_owner", "core");
-        rig.store.hset("chat:-1044", "core_source", "/tmp/song.ogg");
-        rig.d.handleMessage(makeMsg(-1044, 111, "/bass 30"));
-        CHECK(rig.voice.plays.empty() &&
-                  rig.tg.replies.size() == 1 &&
-                  rig.tg.replies[0] == "Nothing is playing.",
-              "bass core session, call inactive: nothing playing");
-    }
+    // --- G. /speed + /bass: backend DSP is Phase 5 ---------------------
+    // The value is stored and the stream restarts at the current
+    // position; the reply says plainly the filter did not apply.
     {
         Rig rig;
         rig.ipc.np_ok = true;
         rig.d.handleMessage(makeMsg(-1045, 111, "/speed 1.5"));
         CHECK(!rig.ipc.posts.empty() &&
                   rig.ipc.posts[0].find("|seek") != std::string::npos,
-              "speed engine session: seek-restart issued to the engine");
+              "speed playing: seek-restart issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "1.5x saved") &&
                   contains(rig.tg.replies[0],
-                           "cannot apply audio filters"),
-              "speed engine session: honest saved-not-applied reply");
-        CHECK(rig.voice.plays.empty(),
-              "speed engine session: core voice untouched");
+                           "cannot apply audio filters") &&
+                  contains(rig.tg.replies[0], "Phase 5"),
+              "speed playing: honest saved-not-applied reply");
     }
     {
         Rig rig;
-        rig.store.hset("chat:-1046", "speed", "1.5");
-        rig.store.hset("chat:-1046", "bass", "40");
-        parlay::TgMessage m = makeMsg(-1046, 111, "/play");
-        m.has_reply_to = true;
-        m.reply_to_message_id = 5;
-        m.has_reply_media = true;
-        m.reply_media_file_id = "AUDIO123";
-        m.reply_media_kind = "audio";
-        m.reply_media_title = "Artist - Song";
-        rig.d.handleMessage(m);
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].speed == 1.5 &&
-                  rig.voice.plays[0].bass == 40,
-              "play replied file: stored speed/bass passed to core voice");
-        auto fields = rig.store.hgetall("chat:-1046");
-        CHECK(fields["core_source"] == rig.tg.download_saved &&
-                  fields["core_title"] == "Artist - Song" &&
-                  fields["voice_owner"] == "core",
-              "play replied file: core source recorded for later /speed+/bass");
+        rig.ipc.np_ok = true;
+        rig.d.handleMessage(makeMsg(-1046, 111, "/bass 40"));
+        CHECK(!rig.ipc.posts.empty() &&
+                  rig.ipc.posts[0].find("|seek") != std::string::npos,
+              "bass playing: seek-restart issued to the backend");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "40 saved") &&
+                  contains(rig.tg.replies[0],
+                           "cannot apply audio filters") &&
+                  contains(rig.tg.replies[0], "Phase 5"),
+              "bass playing: honest saved-not-applied reply");
     }
-
-    // --- I. /play through an engine attaches core audio (Phase 7, A1b) --
-    // The stub engine answers vc.play with a resolved track carrying
-    // stream_url (top-level + track-level, A8). The dispatcher must
-    // hand that URL to the core voice backend — the engine's own
-    // "play" never reaches a call — and record the session as
-    // core-owned. A failed attach stops the engine again and reports
-    // the exact error instead of a "Now playing" lie. Skip /
-    // autoplay-skip / pause / resume / seek / stop / the watcher
-    // follow pass keep the core stream in step the same way.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1047, 111, "/speed 1.5"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Nothing is playing.",
+              "speed nothing playing: honest reply, no seek");
+        CHECK(rig.ipc.posts.empty(),
+              "speed nothing playing: no IPC issued");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1048, 111, "/bass 40"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Nothing is playing.",
+              "bass nothing playing: honest reply, no seek");
+        CHECK(rig.ipc.posts.empty(),
+              "bass nothing playing: no IPC issued");
+    }
+    {
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.d.handleMessage(makeMsg(-1049, 111, "/speed 4.5"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "0.5x to 4.0x"),
+              "speed out of range: range error, no seek");
+        CHECK(rig.ipc.posts.empty(),
+              "speed out of range: no IPC issued");
+    }
+    // --- I. /play through the backend (Phase 2) -------------------------
+    // The backend owns the call and the audio: vc.play is the play.
+    // A successful play renders the Now playing card; a backend
+    // failure reports the exact error, never a "Now playing" lie.
+    // The core never sees the stream URL and keeps no core-stream
+    // session fields (voice_owner / core_source / core_follow are
+    // gone). Skip / pause / resume / seek / stop go to vc.* the same
+    // way; the call-active flag is set by a successful play and
+    // cleared by /stop and the TrackEnded/QueueEmpty events.
     const std::string play_np =
         R"({"now_playing":{"track":{"id":"t1","title":"Test Song","artist":"Test Artist","duration_sec":200,"stream_url":"https://example.invalid/audio.webm"},"stream_url":"https://example.invalid/audio.webm","position_sec":0,"paused":false}})";
     const std::string skip_np =
@@ -1137,394 +1072,211 @@ int main() {
             if (p.find("|" + action) != std::string::npos) return true;
         return false;
     };
+    auto last_post_body = [](const Rig& rig) {
+        return rig.ipc.last_post_body;
+    };
     {
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.d.handleMessage(makeMsg(-1051, 111, "/play Test Song"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/audio.webm" &&
-                  rig.voice.plays[0].title == "Test Song" &&
-                  !rig.voice.plays[0].video &&
-                  rig.voice.plays[0].seek_sec == 0 &&
-                  rig.voice.plays[0].speed == 1.0 &&
-                  rig.voice.plays[0].bass == 0,
-              "play query: core voice plays the engine-resolved stream_url");
         CHECK(has_post(rig, "play"),
-              "play query: vc.play issued to the engine first");
+              "play query: vc.play issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Now playing") &&
                   contains(rig.tg.replies[0], "Test Song"),
               "play query: Now playing reply");
-        auto fields = rig.store.hgetall("chat:-1051");
-        CHECK(fields["voice_owner"] == "core" &&
-                  fields["core_source"] ==
-                      "https://example.invalid/audio.webm" &&
-                  fields["core_title"] == "Test Song" &&
-                  fields["core_track_id"] == "t1" &&
-                  fields["core_follow"] == "1",
-              "play query: session recorded as core-owned with source + track id");
         auto c = rig.store.get("call:-1051");
         CHECK(c && *c == "1", "play query: call marked active");
     }
     {
+        // Stored speed/bass are kept, not sent to a core voice path:
+        // the backend owns the audio now (DSP is Phase 5).
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.store.hset("chat:-1052", "speed", "1.5");
         rig.store.hset("chat:-1052", "bass", "40");
         rig.d.handleMessage(makeMsg(-1052, 111, "/play Test Song"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].speed == 1.5 &&
-                  rig.voice.plays[0].bass == 40,
-              "play query: stored speed/bass passed to core voice");
+        CHECK(has_post(rig, "play"),
+              "play query: vc.play issued with stored speed/bass");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Now playing"),
+              "play query: Now playing reply with stored speed/bass");
+        auto f = rig.store.hgetall("chat:-1052");
+        CHECK(f["speed"] == "1.5" && f["bass"] == "40",
+              "play query: stored speed/bass survive the play");
     }
     {
+        // Engine refuses vc.play (stub 404): the exact error, never
+        // a "Now playing" over a silent call.
         Rig rig;
-        rig.ipc.play_response = play_np;
-        rig.voice.play_ok = false;
-        rig.voice.fail_reason = "tdlib not authorized";
         rig.d.handleMessage(makeMsg(-1053, 111, "/play Test Song"));
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0],
-                           "Could not play in the voice chat") &&
-                  contains(rig.tg.replies[0], "tdlib not authorized") &&
-                  !contains(rig.tg.replies[0], "Now playing"),
-              "play query, attach fails: honest error, no fake Now playing");
-        CHECK(has_post(rig, "stop"),
-              "play query, attach fails: engine playback stopped again");
+                  contains(rig.tg.replies[0], "Service error") &&
+                  contains(rig.tg.replies[0], "not_found"),
+              "play backend 404: exact error reported, no Now playing");
         auto c = rig.store.get("call:-1053");
         CHECK(!c || *c != "1",
-              "play query, attach fails: call not marked active");
-        auto v = rig.store.hget("chat:-1053", "voice_owner");
-        CHECK(!v || v->empty(),
-              "play query, attach fails: no voice owner recorded");
+              "play backend 404: call stays inactive");
     }
     {
+        // No stream_url in the response: the core needs no URL any
+        // more (the backend owns the audio), so the play succeeds.
         Rig rig;
         rig.ipc.play_response =
-            R"({"now_playing":{"track":{"id":"t9","title":"No URL Song","duration_sec":200},"position_sec":0,"paused":false}})";
+            R"({"now_playing":{"track":{"id":"t3","title":"No URL Song","duration_sec":120},"position_sec":0,"paused":false}})";
         rig.d.handleMessage(makeMsg(-1054, 111, "/play No URL Song"));
-        CHECK(rig.voice.plays.empty(),
-              "play query, no stream_url: core voice never called");
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0],
-                           "Could not play in the voice chat") &&
-                  contains(rig.tg.replies[0], "no stream_url"),
-              "play query, no stream_url: honest error naming the missing URL");
-        CHECK(has_post(rig, "stop"),
-              "play query, no stream_url: engine playback stopped again");
+                  contains(rig.tg.replies[0], "Now playing") &&
+                  contains(rig.tg.replies[0], "No URL Song"),
+              "play no stream_url: play succeeds without a URL");
     }
     {
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.d.handleMessage(makeMsg(-1055, 111, "/vplay Test Song"));
-        CHECK(rig.voice.plays.size() == 1 && rig.voice.plays[0].video,
-              "vplay: core voice plays with video");
-        auto v = rig.store.hget("chat:-1055", "core_video");
-        CHECK(v && *v == "1", "vplay: video flag recorded");
+        CHECK(has_post(rig, "play") &&
+                  contains(last_post_body(rig), "\"video\":true"),
+              "vplay: vc.play issued with video=true");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Now playing"),
+              "vplay: Now playing reply");
     }
     {
         Rig rig;
         rig.ipc.play_response = play_np;
-        rig.d.handleMessage(makeMsg(-1068, 111, "/playforce Test Song"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/audio.webm",
-              "playforce: replacement track attached to core voice");
-        CHECK(has_post(rig, "stop"),
-              "playforce: old engine playback stopped first");
+        rig.d.handleMessage(makeMsg(-1056, 111, "/playforce Test Song"));
+        CHECK(has_post(rig, "stop") && has_post(rig, "play"),
+              "playforce: vc.stop then vc.play issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Now playing"),
+              "playforce: Now playing reply");
     }
     {
         Rig rig;
         rig.ipc.skip_response = skip_np;
-        rig.store.set("call:-1056", "1");
-        rig.store.hset("chat:-1056", "voice_owner", "core");
-        rig.store.hset("chat:-1056", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1056", "core_title", "Test Song");
-        rig.store.hset("chat:-1056", "core_video", "0");
-        rig.store.hset("chat:-1056", "core_track_id", "t1");
-        rig.store.hset("chat:-1056", "core_follow", "1");
-        rig.d.handleMessage(makeMsg(-1056, 111, "/skip"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/next.webm" &&
-                  rig.voice.plays[0].title == "Next Song",
-              "skip: new track's stream_url re-attached to core voice");
-        auto fields = rig.store.hgetall("chat:-1056");
-        CHECK(fields["core_source"] ==
-                      "https://example.invalid/next.webm" &&
-                  fields["core_track_id"] == "t2",
-              "skip: recorded source + track id updated to the new track");
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.store.set("call:-1057", "1");
+        rig.d.handleMessage(makeMsg(-1057, 111, "/skip"));
+        CHECK(has_post(rig, "skip"),
+              "skip: vc.skip issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Skipped") &&
                   contains(rig.tg.replies[0], "Next Song"),
-              "skip: new track reported");
+              "skip: Skipped reply with the next track");
     }
     {
         Rig rig;
         rig.ipc.skip_response =
-            R"({"now_playing":{"track":null,"queue":[],"position_sec":0,"paused":false}})";
-        rig.store.set("call:-1057", "1");
-        rig.store.hset("chat:-1057", "voice_owner", "core");
-        rig.store.hset("chat:-1057", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1057", "core_title", "Test Song");
-        rig.store.hset("chat:-1057", "core_follow", "1");
-        rig.d.handleMessage(makeMsg(-1057, 111, "/skip"));
-        CHECK(!rig.voice.stops.empty() && rig.voice.stops[0] == -1057,
-              "skip to empty queue: core voice stopped");
-        auto c = rig.store.get("call:-1057");
-        CHECK(!c || *c != "1", "skip to empty queue: call inactive");
-        auto v = rig.store.hget("chat:-1057", "core_source");
-        CHECK(!v || v->empty(),
-              "skip to empty queue: core source cleared");
+            R"({"now_playing":{"track":null},"queue":[]})";
+        rig.store.set("call:-1058", "1");
+        rig.d.handleMessage(makeMsg(-1058, 111, "/skip"));
+        CHECK(has_post(rig, "skip"),
+              "skip to empty: vc.skip issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "queue is now empty"),
-              "skip to empty queue: honest reply");
+              "skip to empty: queue-empty reply");
+        auto c = rig.store.get("call:-1058");
+        CHECK(!c || *c != "1",
+              "skip to empty: call marked inactive");
     }
     {
         Rig rig;
-        rig.ipc.autoplay_skip_response =
-            R"({"now_playing":{"track":{"id":"m1","title":"Mix Pick","artist":"Mix Artist","duration_sec":200,"stream_url":"https://example.invalid/mix.webm"},"position_sec":0,"paused":false}})";
-        rig.store.set("call:-1069", "1");
-        rig.store.hset("chat:-1069", "voice_owner", "core");
-        rig.store.hset("chat:-1069", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1069", "core_title", "Test Song");
-        rig.store.hset("chat:-1069", "core_track_id", "t1");
-        rig.store.hset("chat:-1069", "core_follow", "1");
-        rig.d.handleMessage(makeMsg(-1069, 111, "/autoplay-skip"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/mix.webm",
-              "autoplay-skip: picked track's stream_url re-attached");
+        rig.ipc.autoplay_skip_response = skip_np;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.store.set("call:-1059", "1");
+        rig.d.handleMessage(makeMsg(-1059, 111, "/autoplay-skip"));
+        CHECK(has_post(rig, "autoplay-skip"),
+              "autoplay-skip: vc.autoplay-skip issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Autoplay skipped") &&
+                  contains(rig.tg.replies[0], "Next Song"),
+              "autoplay-skip: card renders the next track");
     }
     {
         Rig rig;
         rig.ipc.pause_response =
             R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
-        rig.store.set("call:-1058", "1");
-        rig.store.hset("chat:-1058", "voice_owner", "core");
-        rig.store.hset("chat:-1058", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1058", "core_title", "Test Song");
-        rig.d.handleMessage(makeMsg(-1058, 111, "/pause"));
-        CHECK(rig.voice.pauses.size() == 1 && rig.voice.pauses[0] == -1058,
-              "pause core session: backend pause() called");
+        rig.store.set("call:-1060", "1");
+        rig.d.handleMessage(makeMsg(-1060, 111, "/pause"));
+        CHECK(has_post(rig, "pause"),
+              "pause: vc.pause issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Paused"),
-              "pause core session: Paused reply");
+              "pause: Paused reply");
     }
     {
-        // Fresh Rig: the dispatcher rate-limits to 1 cmd/s per chat,
-        // so a second command in the same Rig right after /pause is
-        // silently dropped. The store is shared, so the seeded
-        // core-streaming session survives.
+        // A fresh Rig per command: the token bucket would allow the
+        // burst, but the store is shared, so the seeded call survives.
         Rig rig;
         rig.ipc.resume_response =
             R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":false}})";
-        rig.store.set("call:-1058", "1");
-        rig.store.hset("chat:-1058", "voice_owner", "core");
-        rig.store.hset("chat:-1058", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1058", "core_title", "Test Song");
-        rig.d.handleMessage(makeMsg(-1058, 111, "/resume"));
-        CHECK(rig.voice.resumes.size() == 1 &&
-                  rig.voice.resumes[0] == -1058,
-              "resume core session: backend resume() called");
+        rig.store.set("call:-1061", "1");
+        rig.d.handleMessage(makeMsg(-1061, 111, "/resume"));
+        CHECK(has_post(rig, "resume"),
+              "resume: vc.resume issued to the backend");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Test Song"),
+              "resume: Now playing card rendered for the resumed track");
     }
     {
+        // Backend refuses the pause (stub 404): the exact error.
         Rig rig;
-        rig.ipc.pause_response =
-            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
-        rig.store.set("call:-1059", "1");
-        rig.store.hset("chat:-1059", "voice_owner", "core");
-        rig.store.hset("chat:-1059", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1059", "core_title", "Test Song");
-        rig.voice.pause_ok = false;
-        rig.voice.fail_reason = "ntgcalls pause failed";
-        rig.d.handleMessage(makeMsg(-1059, 111, "/pause"));
+        rig.store.set("call:-1062", "1");
+        rig.d.handleMessage(makeMsg(-1062, 111, "/pause"));
         CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "Paused") &&
-                  contains(rig.tg.replies[0], "could not pause") &&
-                  contains(rig.tg.replies[0], "ntgcalls pause failed"),
-              "pause core backend fails: honest note, no silent claim");
+                  contains(rig.tg.replies[0], "Service error") &&
+                  contains(rig.tg.replies[0], "not_found"),
+              "pause backend 404: exact error reported");
     }
     {
         Rig rig;
         rig.ipc.np_ok = true;
-        rig.store.set("call:-1060", "1");
-        rig.store.hset("chat:-1060", "voice_owner", "core");
-        rig.store.hset("chat:-1060", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1060", "core_title", "Test Song");
-        rig.store.hset("chat:-1060", "core_video", "0");
-        rig.d.handleMessage(makeMsg(-1060, 111, "/seek 10"));
+        rig.store.set("call:-1063", "1");
+        rig.d.handleMessage(makeMsg(-1063, 111, "/seek 10"));
         CHECK(has_post(rig, "seek"),
-              "seek core session: engine seek issued");
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/audio.webm" &&
-                  rig.voice.plays[0].seek_sec == 40,
-              "seek core session: core voice re-attached at 40s");
+              "seek: vc.seek issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Seeked forward to 0:40"),
-              "seek core session: seek reply");
+              "seek: Seeked reply with the new position");
     }
     {
         Rig rig;
-        rig.store.set("call:-1061", "1");
-        rig.store.hset("chat:-1061", "voice_owner", "core");
-        rig.store.hset("chat:-1061", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1061", "core_title", "Test Song");
-        rig.store.hset("chat:-1061", "core_track_id", "t1");
-        rig.store.hset("chat:-1061", "core_follow", "1");
-        rig.d.handleMessage(makeMsg(-1061, 111, "/stop"));
-        CHECK(!rig.voice.stops.empty(),
-              "stop core session: backend stop() called");
-        auto fields = rig.store.hgetall("chat:-1061");
-        CHECK(fields["voice_owner"].empty() &&
-                  fields["core_source"].empty() &&
-                  fields["core_track_id"].empty(),
-              "stop core session: core-stream fields cleared");
+        rig.store.set("call:-1064", "1");
+        rig.store.hset("chat:-1064", "loop", "1");
+        rig.store.hset("chat:-1064", "speed", "1.5");
+        rig.store.hset("chat:-1064", "bass", "40");
+        rig.store.hset("chat:-1064", "muted", "1");
+        rig.d.handleMessage(makeMsg(-1064, 111, "/stop"));
+        CHECK(has_post(rig, "stop"),
+              "stop: vc.stop issued to the backend");
+        auto c = rig.store.get("call:-1064");
+        CHECK(!c || *c != "1", "stop: call marked inactive");
+        auto f = rig.store.hgetall("chat:-1064");
+        CHECK(f["loop"] == "0" && f["speed"] == "1.0" &&
+                  f["bass"] == "0" && f["muted"] == "0",
+              "stop: loop/speed/bass/muted reset");
     }
     {
         Rig rig;
         rig.ipc.play_response = play_np;
         rig.store.set("playlist:111",
-                      R"([{"title":"Test Song","artist":"Test Artist"},{"title":"Second Song","artist":"Other"}])");
-        rig.d.handleMessage(makeMsg(-1067, 111, "/playplaylist"));
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/audio.webm",
-              "playplaylist: first track attached to core voice");
+                      R"([{"title":"Song A"},{"title":"Song B"}])");
+        rig.d.handleMessage(makeMsg(-1065, 111, "/playplaylist"));
         CHECK(has_post(rig, "queue"),
-              "playplaylist: remaining tracks queued");
+              "playplaylist: vc.queue issued to the backend");
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Playing your playlist"),
               "playplaylist: playlist reply");
-    }
-    // --- J. watchCoreFollow: engine-internal auto-advance -------------
-    // The follow pass runs over store keys("call:"), which the Rig
-    // instances share — wipe the dir first (broadcast-test pattern)
-    // so stale sessions from earlier blocks cannot interfere.
-    {
-        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
-        Rig rig;
-        rig.ipc.np_ok = true;
-        rig.ipc.np_track_id = "t2";
-        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
-        rig.ipc.np_position = 5;
-        rig.store.set("call:-1062", "1");
-        rig.store.hset("chat:-1062", "voice_owner", "core");
-        rig.store.hset("chat:-1062", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1062", "core_title", "Test Song");
-        rig.store.hset("chat:-1062", "core_track_id", "t1");
-        rig.store.hset("chat:-1062", "core_pos", "150");
-        rig.store.hset("chat:-1062", "core_follow", "1");
-        rig.d.watchCoreFollow();
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/next.webm" &&
-                  rig.voice.plays[0].seek_sec == 5,
-              "follow: engine advance to t2 re-attached at 5s");
-        auto v = rig.store.hget("chat:-1062", "core_track_id");
-        CHECK(v && *v == "t2",
-              "follow: recorded track id updated to t2");
-    }
-    {
-        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
-        Rig rig;
-        rig.ipc.np_ok = true;
-        rig.ipc.np_track_id = "t1";
-        rig.ipc.np_stream_url = "https://example.invalid/audio.webm";
-        rig.ipc.np_position = 35;
-        rig.store.set("call:-1063", "1");
-        rig.store.hset("chat:-1063", "voice_owner", "core");
-        rig.store.hset("chat:-1063", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1063", "core_title", "Test Song");
-        rig.store.hset("chat:-1063", "core_track_id", "t1");
-        rig.store.hset("chat:-1063", "core_pos", "30");
-        rig.store.hset("chat:-1063", "core_follow", "1");
-        rig.d.watchCoreFollow();
-        CHECK(rig.voice.plays.empty(),
-              "follow: same track, position forward — no re-attach");
-        auto v = rig.store.hget("chat:-1063", "core_pos");
-        CHECK(v && *v == "35",
-              "follow: position scratch updated to 35");
-    }
-    {
-        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
-        Rig rig;
-        rig.ipc.np_ok = true;
-        rig.ipc.np_track_id = "t1";
-        rig.ipc.np_stream_url = "https://example.invalid/audio.webm";
-        rig.ipc.np_position = 8;
-        rig.store.set("call:-1064", "1");
-        rig.store.hset("chat:-1064", "voice_owner", "core");
-        rig.store.hset("chat:-1064", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1064", "core_title", "Test Song");
-        rig.store.hset("chat:-1064", "core_track_id", "t1");
-        rig.store.hset("chat:-1064", "core_pos", "150");
-        rig.store.hset("chat:-1064", "core_follow", "1");
-        rig.d.watchCoreFollow();
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].seek_sec == 8,
-              "follow: same id, position jumped back — loop copy re-attached at 8s");
-    }
-    {
-        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
-        Rig rig;
-        rig.ipc.np_ok = true;
-        rig.ipc.np_track_id = "t2";
-        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
-        rig.ipc.np_position = 5;
-        rig.voice.play_ok = false;
-        rig.voice.fail_reason = "tdlib not authorized";
-        rig.store.set("call:-1065", "1");
-        rig.store.hset("chat:-1065", "voice_owner", "core");
-        rig.store.hset("chat:-1065", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1065", "core_title", "Test Song");
-        rig.store.hset("chat:-1065", "core_track_id", "t1");
-        rig.store.hset("chat:-1065", "core_pos", "150");
-        rig.store.hset("chat:-1065", "core_follow", "1");
-        rig.d.watchCoreFollow();
-        CHECK(rig.voice.plays.size() == 1 &&
-                  rig.voice.plays[0].url ==
-                      "https://example.invalid/next.webm",
-              "follow failure: re-attach was attempted with the new URL");
-        CHECK(!rig.voice.stops.empty(),
-              "follow failure: core voice stopped");
         auto c = rig.store.get("call:-1065");
-        CHECK(!c || *c != "1", "follow failure: call not active");
-        CHECK(has_post(rig, "stop"),
-              "follow failure: engine playback stopped");
+        CHECK(c && *c == "1", "playplaylist: call marked active");
     }
-    {
-        std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
-        Rig rig;
-        rig.ipc.np_ok = true;
-        rig.ipc.np_track_id = "t2";
-        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
-        rig.ipc.np_position = 5;
-        rig.store.set("call:-1066", "1");
-        rig.store.hset("chat:-1066", "voice_owner", "core");
-        rig.store.hset("chat:-1066", "core_source", "/tmp/song.ogg");
-        rig.store.hset("chat:-1066", "core_title", "Song");
-        rig.store.hset("chat:-1066", "core_track_id", "");
-        rig.store.hset("chat:-1066", "core_follow", "0");
-        rig.d.watchCoreFollow();
-        CHECK(rig.voice.plays.empty(),
-              "follow: replied-file session (core_follow 0) never re-attached");
-    }
-
+    // --- J. watchCoreFollow: deleted with the 5-second watcher
+    // (Phase 2). Track transitions are backend-driven events now;
+    // see section N.
     // --- H. /speedtest pure helpers (Phase 6, B11) ------------------------
     {
         CHECK(parlay::Dispatcher::speedMbps(25000000, 10.0) == 20.0,
@@ -1800,8 +1552,9 @@ int main() {
     }
     {
         // /admincache reloads once, then cools down for 10 minutes.
-        // One Rig per call: the dispatcher rate-limits to 1 cmd/s per
-        // chat, and the cooldown map is static (survives a fresh Rig).
+        // One Rig per call: the token bucket would allow the
+        // burst, but the cooldown map is static (survives a fresh
+        // Rig).
         Rig rig;
         rig.d.handleMessage(makeMsg(-1001, 111, "/admincache"));
         CHECK(rig.tg.replies.size() == 1 &&
@@ -1853,7 +1606,7 @@ int main() {
     }
     {
         // /channelplay: usage, disable, invalid ids, inaccessible.
-        // One Rig per call (1 cmd/s per chat rate limit).
+        // One Rig per call (fresh Rig keeps the token buckets full).
         Rig rig;
         rig.d.handleMessage(makeMsg(-1001, 111, "/channelplay"));
         CHECK(rig.tg.replies.size() == 1 &&
@@ -1898,8 +1651,9 @@ int main() {
     }
     {
         // /setrtmp is DM-only; bare / invalid / save / off in a DM.
-        // One Rig per call (1 cmd/s per chat); the RTMP target lives
-        // in the file store and survives a fresh Rig.
+        // One Rig per call (fresh Rig keeps the token buckets
+        // full); the RTMP target lives in the file store and survives
+        // a fresh Rig.
         Rig rig;
         rig.d.handleMessage(makeDm(111, 111, "/setrtmp"));
         CHECK(rig.tg.replies.size() == 1 &&
@@ -1924,7 +1678,7 @@ int main() {
     }
     {
         // /stream / /streamstop / /streamstatus with no target/stream.
-        // One Rig per call (1 cmd/s per chat rate limit).
+        // One Rig per call (fresh Rig keeps the token buckets full).
         Rig rig;
         rig.d.handleMessage(makeMsg(-1001, 111, "/stream"));
         CHECK(rig.tg.replies.size() == 1 &&
@@ -1982,7 +1736,7 @@ int main() {
     }
     {
         // delete: trigger validates the path before confirming.
-        // One Rig per call (1 cmd/s per chat rate limit).
+        // One Rig per call (fresh Rig keeps the token buckets full).
         Rig rig;
         rig.d.handleMessage(makeMsg(-1001, 111, "delete:Song.mp3"));
         CHECK(rig.tg.replies.size() == 1 &&
@@ -2014,21 +1768,14 @@ int main() {
     }
     {
         // pl:player:skip success toasts the pressing user by name.
-        // The skip re-checks now-playing after the engine call, so the
-        // fake needs a playing track + a core session to re-attach.
+        // The skip re-checks now-playing after the backend call, so
+        // the fake needs a playing track.
         Rig rig;
         rig.ipc.skip_response = skip_np;
         rig.ipc.np_ok = true;
         rig.ipc.np_track_id = "t2";
         rig.ipc.np_stream_url = "https://example.invalid/next.webm";
         rig.store.set("call:-1001", "1");
-        rig.store.hset("chat:-1001", "voice_owner", "core");
-        rig.store.hset("chat:-1001", "core_source",
-                       "https://example.invalid/audio.webm");
-        rig.store.hset("chat:-1001", "core_title", "Test Song");
-        rig.store.hset("chat:-1001", "core_video", "0");
-        rig.store.hset("chat:-1001", "core_track_id", "t1");
-        rig.store.hset("chat:-1001", "core_follow", "1");
         rig.d.handleCallback(makeCq("pl:player:skip:-1001"));
         CHECK(!rig.tg.toasts.empty() &&
                   contains(rig.tg.toasts[0].text, "Skipped by"),
@@ -2498,11 +2245,10 @@ int main() {
         CHECK(!line.empty(), "telemetry /play: t_dispatch_to_ipc emitted");
         CHECK(contains(line, "action=play") &&
                   contains(line, "chat_id=-1070") &&
-                  contains(line, "engine=go") &&
-                  contains(line, "fell_back=0") &&
+                  contains(line, "transport=uds") &&
                   contains(line, "ok=1"),
-              "telemetry /play: line names the action, chat, engine, "
-              "no fallback, ok=1");
+              "telemetry /play: line names the action, chat, UDS "
+              "transport, ok=1");
         int64_t total = fieldInt(line, "t_dispatch_to_ipc_us");
         int64_t d2p = fieldInt(line, "dispatch_to_post_us");
         int64_t p2r = fieldInt(line, "post_to_response_us");
@@ -2545,9 +2291,10 @@ int main() {
         }
         std::string line = telemetryLine(out, "t_dispatch_to_ipc");
         CHECK(!line.empty() && contains(line, "ipc=none") &&
-                  contains(line, "ok=1"),
+                  contains(line, "ok=0") &&
+                  contains(line, "error=replied_file_failed"),
               "telemetry /play replied file: line emitted with "
-              "ipc=none, ok=1");
+              "ipc=none, ok=0, error=replied_file_failed");
     }
     {
         // /play with no query and no media: usage error, still timed.
@@ -2564,6 +2311,270 @@ int main() {
                   contains(line, "error=no_query"),
               "telemetry /play no query: line emitted with ipc=none, "
               "ok=0, error=no_query");
+    }
+
+    // --- M. token-bucket limiter (Phase 2) ------------------------------
+    // Per-chat + per-user buckets from the config (chat burst 5,
+    // user burst 3, both 1.0/s): the tighter user bucket denies the
+    // 4th command, the denial carries the limiter's reason string,
+    // other users and other chats are unaffected, and the refill lets
+    // the same user through again after ~1.2s.
+    {
+        Rig rig;
+        for (int i = 0; i < 3; ++i)
+            rig.d.handleMessage(makeMsg(-1080, 111, "/id"));
+        CHECK(rig.tg.replies.size() == 3 &&
+                  contains(rig.tg.replies[2], "-1080"),
+              "limiter: 3 commands inside the user burst all pass");
+        rig.d.handleMessage(makeMsg(-1080, 111, "/id"));
+        CHECK(rig.tg.replies.size() == 4 &&
+                  contains(rig.tg.replies[3],
+                           "rate limit exceeded for user 111") &&
+                  contains(rig.tg.replies[3], "retry after"),
+              "limiter: 4th command denied with the limiter's reason "
+              "string");
+        rig.d.handleMessage(makeMsg(-1080, 333, "/id"));
+        CHECK(rig.tg.replies.size() == 5 &&
+                  contains(rig.tg.replies[4], "-1080"),
+              "limiter: a different user in the same chat is allowed");
+        rig.d.handleMessage(makeMsg(-1081, 111, "/id"));
+        CHECK(rig.tg.replies.size() == 6 &&
+                  contains(rig.tg.replies[5],
+                           "rate limit exceeded for user 111"),
+              "limiter: the same user in another chat is still "
+              "denied (per-user bucket)");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+        rig.d.handleMessage(makeMsg(-1080, 111, "/id"));
+        CHECK(rig.tg.replies.size() == 7 &&
+                  contains(rig.tg.replies[6], "-1080"),
+              "limiter: the user passes again after the refill");
+    }
+
+    // --- N. backend-driven events (Phase 2) -----------------------------
+    // Track transitions arrive over UDS (setEventHandler); the
+    // dispatcher edits the recorded card in place or sends a fresh
+    // card, and ends the call record on TrackEnded/QueueEmpty.
+    {
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.ipc.np_position = 5;
+        rig.store.set("call:-1091", "1");
+        rig.store.set("card:-1091", "text|55");
+        rig.d.onBackendEvent(
+            "TrackStarted",
+            parlay::Json::objectOf(
+                {{"chat_id", parlay::Json(static_cast<int64_t>(-1091))}}));
+        rig.d.processPendingWork();
+        CHECK(rig.tg.edits.size() == 1 && rig.tg.edits[0].chat == -1091 &&
+                  rig.tg.edits[0].msg == 55 &&
+                  contains(rig.tg.edits[0].text, "T"),
+              "event TrackStarted: recorded card edited in place");
+        CHECK(rig.tg.replies.empty(),
+              "event TrackStarted: no fresh card when one is recorded");
+    }
+    {
+        // No recorded card: a fresh card is sent instead of an edit.
+        Rig rig;
+        rig.ipc.np_ok = true;
+        rig.ipc.np_track_id = "t2";
+        rig.ipc.np_stream_url = "https://example.invalid/next.webm";
+        rig.store.set("call:-1092", "1");
+        rig.d.onBackendEvent(
+            "TrackStarted",
+            parlay::Json::objectOf(
+                {{"chat_id", parlay::Json(static_cast<int64_t>(-1092))}}));
+        rig.d.processPendingWork();
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Now Playing"),
+              "event TrackStarted no card: fresh card sent");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1093", "1");
+        rig.store.set("card:-1093", "text|56");
+        rig.d.onBackendEvent(
+            "TrackEnded",
+            parlay::Json::objectOf(
+                {{"chat_id", parlay::Json(static_cast<int64_t>(-1093))}}));
+        rig.d.processPendingWork();
+        CHECK(rig.tg.edits.size() == 1 &&
+                  rig.tg.edits[0].text == parlay::ui_texts::kNowIdle,
+              "event TrackEnded: recorded card goes idle");
+        auto c = rig.store.get("call:-1093");
+        CHECK(!c || *c != "1",
+              "event TrackEnded: call marked inactive");
+    }
+    {
+        Rig rig;
+        rig.d.onBackendEvent(
+            "VoiceError",
+            parlay::Json::objectOf(
+                {{"chat_id", parlay::Json(static_cast<int64_t>(-1094))},
+                 {"code", parlay::Json("join_failed")},
+                 {"message",
+                  parlay::Json("ntgcalls connect failed")}}));
+        rig.d.processPendingWork();
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Voice error") &&
+                  contains(rig.tg.replies[0], "join_failed") &&
+                  contains(rig.tg.replies[0], "ntgcalls connect failed"),
+              "event VoiceError: error text delivered to the chat");
+    }
+    {
+        // Unknown / no-UI events (DownloadReady) change nothing.
+        Rig rig;
+        rig.d.onBackendEvent(
+            "DownloadReady",
+            parlay::Json::objectOf(
+                {{"chat_id", parlay::Json(static_cast<int64_t>(-1095))},
+                 {"track_id", parlay::Json("t9")}}));
+        rig.d.processPendingWork();
+        CHECK(rig.tg.edits.empty() && rig.tg.replies.empty(),
+              "event DownloadReady: no UI action");
+    }
+
+    // --- O. duplex join handshake (Phase 2) -----------------------------
+    // The backend sends JoinRequest(chat_id, local_sdp) over UDS; the
+    // core runs TDLib joinVideoChat(local_sdp) on the SHARED assistant
+    // session and answers JoinResponse(remote_sdp, group_call_id).
+    // onJoinRequest runs on the IpcClient worker thread and blocks
+    // until the main thread drains the pending work, so the tests
+    // drive it on a worker thread + processPendingWork() here.
+    {
+        Rig rig;
+        parlay::Json req = parlay::Json::objectOf(
+            {{"chat_id", parlay::Json(static_cast<int64_t>(-1080))},
+             {"local_sdp", parlay::Json("v=0\r\nfake-local-sdp")}});
+        parlay::Json resp;
+        std::atomic<bool> done{false};
+        std::thread worker([&] {
+            resp = rig.d.onJoinRequest(req);
+            done.store(true);
+        });
+        for (int i = 0; i < 200 && !done.load(); ++i) {
+            rig.d.processPendingWork();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done.load(), "join handshake: answered without hanging");
+        if (done.load()) worker.join(); else worker.detach();
+        const parlay::Json* ok = resp.find("ok");
+        CHECK(ok && ok->asBool(), "join handshake: ok=true");
+        const parlay::Json* data = resp.find("data");
+        CHECK(data && data->find("remote_sdp") &&
+                  data->find("remote_sdp")->asString() ==
+                      "v=0\r\nfake-remote-sdp",
+              "join handshake: remote_sdp returned");
+        CHECK(data && data->find("group_call_id") &&
+                  data->find("group_call_id")->asInt() == 12345,
+              "join handshake: group_call_id returned");
+        CHECK(rig.assistant.calls.size() == 2 &&
+                  rig.assistant.calls[0] == "getChat" &&
+                  rig.assistant.calls[1] == "joinVideoChat",
+              "join handshake: getChat then joinVideoChat on the "
+              "shared assistant session");
+        auto c = rig.store.get("call:-1080");
+        CHECK(c && *c == "1", "join handshake: call marked active");
+    }
+    {
+        // No video chat exists yet: createVideoChat runs first.
+        Rig rig;
+        rig.assistant.has_video_chat = false;
+        parlay::Json req = parlay::Json::objectOf(
+            {{"chat_id", parlay::Json(static_cast<int64_t>(-1081))},
+             {"local_sdp", parlay::Json("v=0\r\nfake-local-sdp")}});
+        parlay::Json resp;
+        std::atomic<bool> done{false};
+        std::thread worker([&] {
+            resp = rig.d.onJoinRequest(req);
+            done.store(true);
+        });
+        for (int i = 0; i < 200 && !done.load(); ++i) {
+            rig.d.processPendingWork();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done.load(),
+              "join handshake no video chat: answered without hanging");
+        if (done.load()) worker.join(); else worker.detach();
+        const parlay::Json* data = resp.find("data");
+        CHECK(data && data->find("group_call_id") &&
+                  data->find("group_call_id")->asInt() == 777,
+              "join handshake no video chat: created call id returned");
+        CHECK(rig.assistant.calls.size() == 3 &&
+                  rig.assistant.calls[0] == "getChat" &&
+                  rig.assistant.calls[1] == "createVideoChat" &&
+                  rig.assistant.calls[2] == "joinVideoChat",
+              "join handshake no video chat: getChat, createVideoChat, "
+              "joinVideoChat in order");
+    }
+    {
+        // joinVideoChat refused: ok=false with the exact TDLib error.
+        Rig rig;
+        rig.assistant.join_error = "GROUPCALL_FORBIDDEN";
+        parlay::Json req = parlay::Json::objectOf(
+            {{"chat_id", parlay::Json(static_cast<int64_t>(-1082))},
+             {"local_sdp", parlay::Json("v=0\r\nfake-local-sdp")}});
+        parlay::Json resp;
+        std::atomic<bool> done{false};
+        std::thread worker([&] {
+            resp = rig.d.onJoinRequest(req);
+            done.store(true);
+        });
+        for (int i = 0; i < 200 && !done.load(); ++i) {
+            rig.d.processPendingWork();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done.load(),
+              "join handshake failure: answered without hanging");
+        if (done.load()) worker.join(); else worker.detach();
+        const parlay::Json* ok = resp.find("ok");
+        const parlay::Json* err = resp.find("error");
+        CHECK(ok && !ok->asBool() && err &&
+                  err->find("message") &&
+                  contains(err->find("message")->asString(),
+                           "GROUPCALL_FORBIDDEN"),
+              "join handshake failure: ok=false with the exact error");
+    }
+    {
+        // Assistant session down: the handshake refuses without
+        // attempting any TDLib call.
+        Rig rig;
+        rig.assistant.avail = false;
+        parlay::Json req = parlay::Json::objectOf(
+            {{"chat_id", parlay::Json(static_cast<int64_t>(-1083))},
+             {"local_sdp", parlay::Json("v=0\r\nfake-local-sdp")}});
+        parlay::Json resp;
+        std::atomic<bool> done{false};
+        std::thread worker([&] {
+            resp = rig.d.onJoinRequest(req);
+            done.store(true);
+        });
+        for (int i = 0; i < 200 && !done.load(); ++i) {
+            rig.d.processPendingWork();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done.load(),
+              "join handshake no assistant: answered without hanging");
+        if (done.load()) worker.join(); else worker.detach();
+        const parlay::Json* ok = resp.find("ok");
+        CHECK(ok && !ok->asBool(),
+              "join handshake no assistant: ok=false");
+        CHECK(rig.assistant.calls.empty(),
+              "join handshake no assistant: no TDLib call attempted");
+    }
+    {
+        // Bad request (no local_sdp): answered immediately, no thread,
+        // no TDLib call.
+        Rig rig;
+        parlay::Json bad = parlay::Json::objectOf(
+            {{"chat_id", parlay::Json(static_cast<int64_t>(-1084))}});
+        parlay::Json resp = rig.d.onJoinRequest(bad);
+        const parlay::Json* ok = resp.find("ok");
+        CHECK(ok && !ok->asBool(),
+              "join handshake bad request: ok=false immediately");
+        CHECK(rig.assistant.calls.empty(),
+              "join handshake bad request: no TDLib call attempted");
     }
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");

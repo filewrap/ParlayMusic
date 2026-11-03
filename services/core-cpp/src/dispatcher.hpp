@@ -5,17 +5,41 @@
 // (Bad/cmd/*.cpp, Bad/cmd/common.cpp): a route table with Scope + Perm,
 // the alias map, the c-command map, the owner/sudo/auth/admin-mode model,
 // clean mode / cmddelete, maintenance + blacklist gates, and the
-// background loops (track watcher for loop/autoplay, clean-mode sweeper).
-// Every handler validates permissions, emits real IPC calls (vc-*,
-// downloaders, netease-go, radio-js, share-rust) or a real store action,
-// and formats the result. No handler replies with a stub.
+// background clean-mode sweeper.
+//
+// Phase 2 (FINAL-ARCHITECTURE.md §9): the transport is the persistent
+// UDS IpcClient — one unified backend, no engine fallback router, no
+// /healthz pre-probes. All engine calls go through vcCall/vcGet, which
+// post straight to the one backend. The core never touches ntgcalls or
+// audio: voice ops (play/pause/resume/skip/seek/stop/mute/speed/bass)
+// are backend actions, and voice joins arrive as duplex JoinRequests
+// over UDS (onJoinRequest) that the core answers by running TDLib
+// joinVideoChat on the shared assistant session (TdLibDualSession —
+// never a second client on data/tdlib, which TDLib locks). Track
+// transitions are backend-driven events (onBackendEvent), not a
+// 5-second watcher. Sends go through the TelegramSender interface,
+// implemented over the TDLib bot session (TdLibTelegramSender) — no
+// Bot API HTTP traffic remains anywhere in the dispatcher. Rate
+// limiting is the token-bucket RateLimiter (per-chat + per-user,
+// from parlay.toml); denials are answered honestly, never silently
+// dropped.
+//
+// Threading: the dispatcher runs on the main thread (handleMessage /
+// handleCallback / handleInlineQuery are called from main's TDLib pump
+// loop). The IpcClient's reader/worker threads must never call TDLib
+// directly (TdLibClient::call/pollUpdate share unguarded state with
+// main's pump): onBackendEvent and onJoinRequest only enqueue work,
+// and the sweeper's deletes go through the same queue; main drains
+// everything with processPendingWork() once per loop iteration.
 #pragma once
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -24,14 +48,261 @@
 #include <vector>
 
 #include "config.hpp"
-#include "engine_router.hpp"
 #include "ipc.hpp"
+#include "rate_limiter.hpp"
 #include "store.hpp"
-#include "telegram_api.hpp"
+#include "tdlib_client.hpp"
+#include "tg_types.hpp"
 #include "ui_texts.hpp"
-#include "voice_call.hpp"
 
 namespace parlay {
+
+// --- Telegram transport -----------------------------------------------------
+// The dispatcher's only Telegram surface. The production implementation
+// (TdLibTelegramSender, below) drives the TDLib bot session; tests
+// substitute a recording fake. Method-for-method this mirrors the old
+// TelegramApi surface the dispatcher used, minus the Bot API-only
+// parts (getUpdates long-poll, getFilePath, exportChatInviteLink —
+// gone with the Bot API client). Keyboards arrive as typed values,
+// not Bot API reply_markup JSON: the sender builds the TDLib
+// replyMarkup objects itself.
+//
+// Conventions (match the old client, so handlers need no rework):
+//   * send* returning int64_t: the new message id, -1 + error_out on
+//     failure. An empty InlineKeyboard means "no markup".
+//   * editMessageText/editMessageCaption with an empty keyboard pass
+//     null markup (TDLib: "pass null if none").
+//   * editMessageReplyMarkup with an empty keyboard removes the
+//     keyboard entirely.
+//   * downloadFile resolves a TDLib remote file id (getRemoteFile +
+//     synchronous downloadFile) and returns the local path in
+//     saved_path_out. No 20 MB Bot API cap: TDLib downloads any size.
+class TelegramSender {
+public:
+    virtual ~TelegramSender() = default;
+
+    // Plain-text send. False + error_out on failure.
+    virtual bool sendMessage(int64_t chat_id, const std::string& text,
+                             std::string& error_out) = 0;
+    // Plain-text send returning the new message id (-1 on failure).
+    // Needed for clean-mode deletion scheduling (NoxBeats reply()).
+    virtual int64_t sendMessageId(int64_t chat_id, const std::string& text,
+                                  int64_t reply_to = 0,
+                                  std::string* error_out = nullptr) = 0;
+    // HTML send (parse_mode=HTML, web preview off) with an optional
+    // inline keyboard. All Phase 9 UI text goes through this; user-
+    // derived text inside must already be HTML-escaped
+    // (ui_texts::htmlEscape).
+    virtual int64_t sendMessageHtml(int64_t chat_id, const std::string& text,
+                                    const InlineKeyboard& kb,
+                                    int64_t reply_to = 0,
+                                    std::string* error_out = nullptr) = 0;
+    // HTML send with a persistent reply keyboard.
+    virtual int64_t sendMessageReplyKb(int64_t chat_id,
+                                       const std::string& text,
+                                       const ReplyKeyboard& kb,
+                                       int64_t reply_to = 0,
+                                       std::string* error_out = nullptr) = 0;
+    // HTML send removing any reply keyboard.
+    virtual int64_t sendMessageRemoveKb(int64_t chat_id,
+                                        const std::string& text,
+                                        int64_t reply_to = 0,
+                                        std::string* error_out = nullptr) = 0;
+    // Photo send (caption is HTML). `photo` is a TDLib remote file id
+    // (inputFileRemote) or a local file path (inputFileLocal). A remote
+    // HTTP(S) URL is NOT valid: the sender fails it honestly and the
+    // caller falls back to a text card (sendNowPlayingCard).
+    virtual int64_t sendPhoto(int64_t chat_id, const std::string& photo,
+                              const std::string& caption,
+                              const InlineKeyboard& kb,
+                              std::string* error_out = nullptr) = 0;
+    // Edit a message's text (HTML) and/or its inline keyboard.
+    virtual bool editMessageText(int64_t chat_id, int64_t message_id,
+                                 const std::string& text,
+                                 const InlineKeyboard& kb,
+                                 std::string* error_out = nullptr) = 0;
+    // Edit a photo message's caption (HTML) and/or its keyboard.
+    virtual bool editMessageCaption(int64_t chat_id, int64_t message_id,
+                                    const std::string& caption,
+                                    const InlineKeyboard& kb,
+                                    std::string* error_out = nullptr) = 0;
+    // Replace only the inline keyboard of a message (empty = drop it).
+    virtual bool editMessageReplyMarkup(int64_t chat_id, int64_t message_id,
+                                        const InlineKeyboard& kb,
+                                        std::string* error_out = nullptr) = 0;
+    // answerCallbackQuery: the toast/alert after a button tap. text
+    // empty = silent ack. show_alert=true pops the alert dialog.
+    virtual bool answerCallbackQuery(const std::string& callback_query_id,
+                                     const std::string& text, bool show_alert,
+                                     int cache_time_sec = 0,
+                                     std::string* error_out = nullptr) = 0;
+    // answerInlineQuery: `results` are the Bot API-shaped
+    // InlineQueryResult objects the dispatcher builds (inlineTrackResult
+    // / inlineArticleResult); the sender translates them to TDLib
+    // inputInlineQueryResult values (audio_url is a native TDLib field,
+    // so URL audio results survive the translation).
+    virtual bool answerInlineQuery(const std::string& inline_query_id,
+                                   const Json& results, int cache_time_sec,
+                                   const std::string& switch_pm_text,
+                                   const std::string& switch_pm_parameter,
+                                   std::string* error_out = nullptr) = 0;
+
+    // getFile/download: download a Telegram file by remote file id
+    // into the TDLib files dir (synchronous downloadFile); saved_path_out
+    // receives the local path. False + error on any failure.
+    virtual bool downloadFile(const std::string& file_id,
+                              const std::string& dest_dir,
+                              std::string& saved_path_out,
+                              std::string& error_out) = 0;
+    // getChatMember(chat_id, user_id) -> status string ("creator",
+    // "administrator", "member", "restricted", "left", "kicked") or "".
+    virtual std::string getChatMemberStatus(int64_t chat_id,
+                                            int64_t user_id) = 0;
+    // getChatAdministrators -> ids of creator + administrators.
+    virtual std::vector<int64_t> getChatAdministrators(int64_t chat_id) = 0;
+    // getChat(id or @username) -> chat id, or 0.
+    virtual int64_t getChatId(const std::string& username_or_id) = 0;
+
+    // deleteMessage / leaveChat / forwardMessage / copyMessage — used by
+    // clean mode, cmddelete, /broadcast and bot-removed handling.
+    virtual bool deleteMessage(int64_t chat_id, int64_t message_id) = 0;
+    virtual bool leaveChat(int64_t chat_id) = 0;
+    virtual bool forwardMessage(int64_t to_chat, int64_t from_chat,
+                                int64_t message_id) = 0;
+    virtual bool copyMessage(int64_t to_chat, int64_t from_chat,
+                             int64_t message_id) = 0;
+    // sendDocument(chat_id, filename, content, caption): the /broadcast
+    // failure list goes out as an errors.txt attachment.
+    virtual int64_t sendDocument(int64_t chat_id,
+                                 const std::string& filename,
+                                 const std::string& content,
+                                 const std::string& caption,
+                                 std::string* error_out = nullptr) = 0;
+    // Send an audio file from disk. Used for FX results (§8).
+    virtual int64_t sendAudioFile(int64_t chat_id,
+                                  const std::string& file_path,
+                                  const std::string& caption,
+                                  std::string* error_out = nullptr) = 0;
+    // Send a file from disk as a document. Used for Spotify playlist
+    // ZIPs and .lrc lyric files (§8, §6).
+    virtual int64_t sendFile(int64_t chat_id, const std::string& file_path,
+                             const std::string& caption,
+                             std::string* error_out = nullptr) = 0;
+    // Send audio by remote file_id with an optional caption and inline
+    // keyboard. Used for the §22 share flow.
+    virtual int64_t sendAudio(int64_t chat_id, const std::string& audio,
+                              const std::string& caption,
+                              const InlineKeyboard& kb,
+                              std::string* error_out = nullptr) = 0;
+    // Invite-link-era helper kept for the share flow: resolve a user id
+    // to a display name (best effort).
+    virtual std::string getUserMention(int64_t user_id) = 0;
+};
+
+// TelegramSender over the TDLib bot session (TdLibClient::call).
+// All calls run on the thread that invokes the sender — the dispatcher
+// guarantees that is the main thread (see the file header note).
+class TdLibTelegramSender : public TelegramSender {
+public:
+    // data_dir is used for the sendDocument temp file only.
+    TdLibTelegramSender(TdLibClient& bot, std::string data_dir);
+    bool sendMessage(int64_t chat_id, const std::string& text,
+                     std::string& error_out) override;
+    int64_t sendMessageId(int64_t chat_id, const std::string& text,
+                          int64_t reply_to = 0,
+                          std::string* error_out = nullptr) override;
+    int64_t sendMessageHtml(int64_t chat_id, const std::string& text,
+                            const InlineKeyboard& kb, int64_t reply_to = 0,
+                            std::string* error_out = nullptr) override;
+    int64_t sendMessageReplyKb(int64_t chat_id, const std::string& text,
+                               const ReplyKeyboard& kb, int64_t reply_to = 0,
+                               std::string* error_out = nullptr) override;
+    int64_t sendMessageRemoveKb(int64_t chat_id, const std::string& text,
+                                int64_t reply_to = 0,
+                                std::string* error_out = nullptr) override;
+    int64_t sendPhoto(int64_t chat_id, const std::string& photo,
+                      const std::string& caption, const InlineKeyboard& kb,
+                      std::string* error_out = nullptr) override;
+    bool editMessageText(int64_t chat_id, int64_t message_id,
+                         const std::string& text, const InlineKeyboard& kb,
+                         std::string* error_out = nullptr) override;
+    bool editMessageCaption(int64_t chat_id, int64_t message_id,
+                            const std::string& caption,
+                            const InlineKeyboard& kb,
+                            std::string* error_out = nullptr) override;
+    bool editMessageReplyMarkup(int64_t chat_id, int64_t message_id,
+                                const InlineKeyboard& kb,
+                                std::string* error_out = nullptr) override;
+    bool answerCallbackQuery(const std::string& callback_query_id,
+                             const std::string& text, bool show_alert,
+                             int cache_time_sec = 0,
+                             std::string* error_out = nullptr) override;
+    bool answerInlineQuery(const std::string& inline_query_id,
+                           const Json& results, int cache_time_sec,
+                           const std::string& switch_pm_text,
+                           const std::string& switch_pm_parameter,
+                           std::string* error_out = nullptr) override;
+    bool downloadFile(const std::string& file_id,
+                      const std::string& dest_dir,
+                      std::string& saved_path_out,
+                      std::string& error_out) override;
+    std::string getChatMemberStatus(int64_t chat_id,
+                                    int64_t user_id) override;
+    std::vector<int64_t> getChatAdministrators(int64_t chat_id) override;
+    int64_t getChatId(const std::string& username_or_id) override;
+    bool deleteMessage(int64_t chat_id, int64_t message_id) override;
+    bool leaveChat(int64_t chat_id) override;
+    bool forwardMessage(int64_t to_chat, int64_t from_chat,
+                        int64_t message_id) override;
+    bool copyMessage(int64_t to_chat, int64_t from_chat,
+                     int64_t message_id) override;
+    int64_t sendDocument(int64_t chat_id, const std::string& filename,
+                         const std::string& content,
+                         const std::string& caption,
+                         std::string* error_out = nullptr) override;
+    int64_t sendAudioFile(int64_t chat_id, const std::string& file_path,
+                          const std::string& caption,
+                          std::string* error_out = nullptr) override;
+    int64_t sendFile(int64_t chat_id, const std::string& file_path,
+                     const std::string& caption,
+                     std::string* error_out = nullptr) override;
+    int64_t sendAudio(int64_t chat_id, const std::string& audio,
+                      const std::string& caption, const InlineKeyboard& kb,
+                      std::string* error_out = nullptr) override;
+    std::string getUserMention(int64_t user_id) override;
+
+private:
+    // parseTextEntities (HTML) or a plain formattedText when
+    // parse_mode is empty. Json() (null) + error_out on parse failure.
+    // TdLibClient has the same helpers but they are private, so the
+    // sender builds the formattedText itself via bot_.call().
+    Json formattedText(const std::string& text, const std::string& parse_mode,
+                       std::string& error_out);
+    // inputMessageText content object for `text` (Json() on failure).
+    Json inputMessageText(const std::string& text,
+                          const std::string& parse_mode,
+                          std::string& error_out);
+    // TDLib replyMarkup JSON for an inline keyboard (Json(nullptr)
+    // when empty = "pass null if none").
+    static Json inlineMarkup(const InlineKeyboard& kb);
+    static Json replyMarkup(const ReplyKeyboard& kb);
+    // One Bot API-shaped InlineQueryResult -> its TDLib
+    // inputInlineQueryResult (audio keeps audio_url; article keeps its
+    // message_text).
+    static Json inlineResult(const Json& r, TdLibClient& bot);
+    // sendMessage with a prebuilt content object + markup. Returns the
+    // new message id, -1 + error_out on failure.
+    int64_t sendWithContent(int64_t chat_id, const Json& content,
+                            const Json& reply_markup, int64_t reply_to,
+                            std::string* error_out);
+    // Send a local file as audio (audio=true) or document (false).
+    int64_t sendLocalFile(int64_t chat_id, const std::string& file_path,
+                          const std::string& caption, bool audio,
+                          std::string* error_out);
+
+    TdLibClient& bot_;
+    std::string data_dir_;
+};
 
 struct CommandContext {
     TgMessage message;
@@ -47,8 +318,8 @@ struct CommandContext {
 
 class Dispatcher {
 public:
-    Dispatcher(const Config& cfg, TelegramApi& tg, IpcClient& ipc,
-               EngineRouter& router, Store& store, VoiceCall& voice,
+    Dispatcher(const Config& cfg, TelegramSender& tg, IpcClient& ipc,
+               Store& store, TdLibClient& assistant, RateLimiter& limiter,
                const std::string& bot_username);
 
     // Handle one incoming message. Non-commands and denied commands are
@@ -82,7 +353,29 @@ public:
     // it). Returns true when a pending target consumed the message.
     bool forwardShareMedia(const TgMessage& msg);
 
-    // Background loops: clean-mode sweeper + loop/autoplay watcher.
+    // --- Backend-driven duplex hooks (Phase 2) ---------------------------
+    // Backend event (TrackStarted / TrackAdvanced / TrackEnded /
+    // QueueEmpty / DownloadReady / VoiceError). Called on the IpcClient
+    // reader thread: it only enqueues the event (fast, non-blocking).
+    // Main drains it with processPendingWork().
+    void onBackendEvent(const std::string& event, const Json& data);
+    // Backend JoinRequest (duplex handshake, contracts/uds-protocol.md
+    // §6): {chat_id, local_sdp}. Called on an IpcClient worker thread:
+    // it enqueues the request and blocks on the future — main drains it
+    // with processPendingWork(), runs the TDLib joinVideoChat on the
+    // shared assistant session, and the returned Json becomes the
+    // JoinResponse data {remote_sdp, group_call_id} (or an error object
+    // when the join fails).
+    Json onJoinRequest(const Json& request);
+    // Drain everything queued by onBackendEvent / onJoinRequest / the
+    // background sweeper. MAIN THREAD ONLY (it calls TDLib). Main calls
+    // this once per loop iteration; tests call it directly after
+    // enqueueing.
+    void processPendingWork();
+
+    // Background loop: clean-mode sweeper only (the 5-second
+    // loop/autoplay watcher and the core-follow pass are deleted —
+    // track transitions are backend-driven events now).
     void startBackground();
     void stopBackground();
     void setBotId(int64_t id) { bot_id_ = id; }
@@ -91,33 +384,20 @@ public:
     // HTTP API seam (core_api.hpp VcStateProvider): live engine state
     // for one chat, for GET /api/now-playing and GET /api/queue.
     // apiNowPlaying returns the whole now-playing object; false when
-    // the engines report no state (or none is reachable).
+    // the backend reports no state (or none is reachable).
     bool apiNowPlaying(int64_t chat_id, Json& np_out, std::string& error);
-    // The engine's queue list (POST /v1/queue action=list).
+    // The backend's queue list (POST /v1/queue action=list).
     bool apiQueueList(int64_t chat_id, Json& queue_out, std::string& error);
-    // vc.join (POST /v1/join): join the chat's voice call on the
-    // core's TDLib backend. True only after a real join (or when the
-    // chat is already in a call); false + error when the backend
-    // cannot join. Called by the vc-ts / vc-rust engines, which hold
-    // no MTProto client of their own.
+    // vc.join (POST /v1/join): join the chat's voice call through the
+    // unified backend. True only after a real join (or when the chat is
+    // already in a call); false + error when the backend cannot join.
+    // Called by the HTTP API; the Telegram /join command is onJoin.
     bool joinVoice(int64_t chat_id, std::string& error);
     // vc.mute (POST /v1/mute): mute (mute=true) or unmute the chat's
-    // voice call on the core's TDLib backend. Same mute as /mute,
+    // voice call through the unified backend. Same mute as /mute,
     // minus the Telegram permission check and reply. False + error
-    // on a session the core does not hold (a stale/pre-fix
-    // engine-owned session — since Phase 7 A1b, engine plays are
-    // core-attached, so /mute reaches them through the backend), when
-    // nothing is playing, or when the backend mute/unmute fails. True
-    // only after a real backend mute/unmute.
+    // when nothing is playing or the backend mute/unmute fails.
     bool muteVoice(int64_t chat_id, bool mute, std::string& error);
-
-    // One core-stream follow pass (background-loop step, public so
-    // tests can drive it synchronously): when a vc engine advances
-    // its own state machine to a new track, re-attach the new
-    // track's audio to the core voice backend. See the .cpp for the
-    // full note. No reply channel — failures are logged to stderr
-    // and the session is stopped cleanly.
-    void watchCoreFollow();
 
     // Pure /speedtest helpers (no I/O; unit-tested in
     // dispatcher_test.cpp): Mbps from a byte count + elapsed seconds,
@@ -158,7 +438,11 @@ private:
     bool canManageVc(const CommandContext& ctx);
     // /play gate: play_mode admin-only (or force) needs admin/auth/sudo.
     bool playAllowed(const CommandContext& ctx, bool force);
-    bool rateLimited(int64_t chat_id);
+    // Token-bucket gate (RateLimiter, per-chat + per-user). True when
+    // the command may run; false when the limiter denied it — the
+    // denial is answered HERE with the limiter's honest reason string
+    // (no silent drops, ever), so the caller just stops.
+    bool checkRateLimit(const CommandContext& ctx);
     bool maintenanceOn() const;
 
     // --- chat settings (NoxBeats DB per-chat fields, stored in Store) ---
@@ -168,66 +452,9 @@ private:
                       const std::string& value);
     int chatIntField(int64_t chat_id, const std::string& field, int def = 0);
     // Stored playback speed (0.5-2.0) for the chat, 1.0 when unset or
-    // unparseable. Used by /speed reporting and by the core voice
-    // backend, which is the only playback path that applies it.
+    // unparseable. Used by /speed reporting; the backend owns live
+    // playback, so the value is stored for the backend's FX path.
     double chatSpeedField(int64_t chat_id);
-    // Core-voice filter path for /speed and /bass: when the chat's
-    // audio is on the core voice backend (voice_owner == "core"), the
-    // stored speed/bass ARE applied — the source is re-attached at the
-    // current position with the new filter values (buildFfmpegCmd
-    // atempo/bass). Since Phase 7 A1b that covers engine sessions too:
-    // attachEngineAudio records engine-resolved tracks as core-owned,
-    // so /speed + /bass apply to them as well. Returns true when it
-    // handled the command (core session, including the nothing-playing
-    // / no-source honest replies); false when the session belongs to
-    // a vc engine that was never core-attached (stale / pre-fix
-    // state), and the caller falls through to the engine seek-restart,
-    // which moves the position but cannot apply the filter.
-    bool applyCoreFilter(const CommandContext& ctx, double speed, int bass,
-                         const std::string& done_msg);
-    // Core-stream attach (Phase 7, A1b): the core streams
-    // engine-resolved audio through its own ntgcalls session — the
-    // only session that can actually be in the call. The engine's
-    // "play" is state only (its ntgcalls instance never joins: no
-    // MTProto client in-process), so after a vc.play succeeds the
-    // dispatcher attaches the resolved track here, or the call stays
-    // silent behind a "Now playing" lie.
-    //
-    // The playable source for an engine-resolved track: the top-level
-    // now_playing.stream_url (A8) first, then track.stream_url. A
-    // caller-known URL (the /radio stream URL) may be passed as a
-    // fallback. Empty when the engine gave the core nothing to play:
-    // no local file path is usable here — the engines deliberately
-    // strip file_path from IPC (engine-local; vc-rust's leak check),
-    // and a path on an engine host is not a path on the core host
-    // under compose.
-    static std::string engineTrackSource(const Json& np,
-                                         const std::string& fallback = "");
-    // Attach an engine-resolved track to the core voice backend:
-    // voice_.play(chat, source, title, video, seek, speed, bass) with
-    // the chat's stored speed/bass. On success records voice_owner =
-    // "core" + core_source/core_title/core_video/core_track_id/
-    // core_pos + core_follow=1 + call active, and returns true. On
-    // failure returns false + error (no source, or the backend
-    // refused); the caller stops the engine playback and reports the
-    // error honestly — nothing is marked playing.
-    bool attachEngineAudio(int64_t chat, const Json& np, bool video,
-                           int seek_sec, const std::string& fallback_source,
-                           std::string& error);
-    // Re-attach the recorded core source at a new position (seek /
-    // jump / replay follow-up): voice_.play with the stored source,
-    // title, video flag and the chat's stored speed/bass. False +
-    // error when nothing is recorded or the backend refuses.
-    bool reattachCoreAudio(int64_t chat, int seek_sec, std::string& error);
-    // Clear every core-stream field for a chat (stop / call end /
-    // attach failure): voice_owner, core_source, core_title,
-    // core_video, core_track_id, core_pos, core_follow.
-    void clearCoreStream(int64_t chat);
-    // True when the core voice backend is the one streaming this chat:
-    // voice_owner "core" + call active + a recorded core_source.
-    // Covers replied-file sessions and engine sessions attached via
-    // attachEngineAudio alike.
-    bool coreStreaming(int64_t chat);
     bool isAuthUser(int64_t chat_id, int64_t user_id) const;
     // Effective voice-chat target: linked channel when via_channel.
     int64_t vcTarget(const CommandContext& ctx) const;
@@ -238,6 +465,36 @@ private:
         return ctx.message.chat.type == "group" ||
                ctx.message.chat.type == "supergroup";
     }
+
+    // --- duplex join (assistant session, shared — never a second
+    // client on data/tdlib) -------------------------------------------------
+    // getChat -> video_chat.group_call_id (0 = none, -1 + error on
+    // failure); createVideoChat when none exists; joinVideoChat(local
+    // SDP) -> remote transport payload. Ported from the deleted
+    // TdLibVoiceCall (voice_call.cpp) minus the ntgcalls half: the
+    // backend owns the call and the audio, the core only signals.
+    int32_t groupCallId(int64_t chat_id, std::string& error);
+    int32_t createVideoChat(int64_t chat_id, const std::string& title,
+                            std::string& error);
+    std::string joinVideoChat(int32_t group_call_id,
+                              const std::string& local_sdp, bool video,
+                              std::string& error);
+    // Full join for one JoinRequest: resolve/create the video chat,
+    // joinVideoChat, fill response_out {remote_sdp, group_call_id}.
+    // False + error when any step fails (no fake success).
+    bool doJoinVideoChat(int64_t chat_id, const std::string& local_sdp,
+                         Json& response_out, std::string& error);
+    // Main-thread handling of one dequeued backend event.
+    void onTrackEvent(const std::string& event, const Json& data);
+    // Re-render the recorded now-playing card for a chat in place
+    // (event path): edit the recorded card when one exists, else send
+    // a fresh card. No-op when the backend reports no track.
+    void editNowPlayingCard(int64_t chat_id, const Json& np);
+    // Render the now-playing card text + keyboard for a chat and edit
+    // the given card message with it (shared by refreshCard and the
+    // event path).
+    void refreshCardText(int64_t chat_id, int64_t message_id, bool is_photo,
+                         const Json& np);
 
     // --- replies / IPC helpers ---
     // Replies and returns the new message id (-1 on failure); schedules
@@ -250,10 +507,10 @@ private:
     // HTML reply with an inline keyboard.
     int64_t replyKb(const CommandContext& ctx, const std::string& text,
                     const InlineKeyboard& kb);
-    // HTML reply with a persistent reply keyboard (or the remove-
-    // keyboard markup). Pass removeKeyboardJson() to clear one.
+    // HTML reply with a persistent reply keyboard (or remove the
+    // keyboard when remove_kb is true).
     int64_t replyReplyKb(const CommandContext& ctx, const std::string& text,
-                         const Json& reply_markup);
+                         const ReplyKeyboard& kb, bool remove_kb = false);
     // Photo reply (thumbnail rule §0.3): the card as the caption, HTML,
     // optional inline keyboard. Returns the message id, -1 on failure.
     int64_t replyPhoto(const CommandContext& ctx, const std::string& photo,
@@ -302,10 +559,9 @@ private:
     }
     // Send the now-playing card for a chat: photo with caption when the
     // track has a thumbnail and thumbnails are on for the chat, text
-    // fallback otherwise (§0.3). state_line is prepended when non-empty
-    // ("▶ Now playing", "⏭ Skipped — now playing", ...). The sent
-    // message id + kind are recorded for /player re-send and for
-    // callback edits. Returns the message id, -1 on failure.
+    // fallback otherwise (§0.3). state_line is prepended when non-empty.
+    // The sent message id + kind are recorded for /player re-send and
+    // for callback edits. Returns the message id, -1 on failure.
     int64_t sendNowPlayingCard(int64_t chat_id, const Json& np,
                                const std::string& state_line = "");
     // Record / read the last now-playing card message for a chat:
@@ -434,11 +690,11 @@ private:
     void cbDlset(const TgCallbackQuery& cq,
                  const std::vector<std::string>& parts);
     void cbSpotify(const TgCallbackQuery& cq,
-                   const std::vector<std::string>& parts);
+                  const std::vector<std::string>& parts);
     // Run one player action for a chat (shared by /commands and
     // callbacks): pause/resume/replay/skip/stop/mute/unmute/seek±15/
     // autoplay/shuffle/refresh/voldec/volinc. Returns false + error
-    // when nothing is playing or the engine refuses; the caller
+    // when nothing is playing or the backend refuses; the caller
     // answers the toast. On success the card is re-rendered in place
     // when edit_msg is set (callback path).
     bool playerAction(int64_t chat_id, const std::string& verb,
@@ -448,15 +704,18 @@ private:
     // message (after a player action). No-op when there is no card.
     void refreshCard(const TgCallbackQuery& cq, int64_t chat_id);
     // Re-render the /menu control panel in place on the callback's
-    // message (remix §2.3): now/next lines + the emoji panel
+    // message (remix §2.3): now/next lines + the panel
     // keyboard. No-op when there is no current track.
     void refreshPanel(const TgCallbackQuery& cq, int64_t chat_id);
 
-    // Shared IPC helpers.
+    // Shared IPC helpers: one POST / one GET to the single unified
+    // backend over the persistent UDS socket (no fallback, no
+    // pre-probes). vcCall posts the dotted contract action with a
+    // 30 s budget; vcGet translates "/v1/<action>?chat_id=..." with
+    // a 10 s budget.
     IpcResult vcCall(const CommandContext& ctx, const std::string& action,
-                     const Json& body, Engine& used, bool& fell_back);
-    IpcResult vcGet(const CommandContext& ctx, const std::string& action,
-                    Engine& used, bool& fell_back);
+                     const Json& body);
+    IpcResult vcGet(const CommandContext& ctx, const std::string& action);
     // Current track for the chat's session (vc.now_playing), if any.
     bool nowPlaying(int64_t chat_id, Json& np_out, Json& track_out);
     // Mark/unmark the chat as having an active call (for /ac).
@@ -465,7 +724,6 @@ private:
 
     // Formatting for contract types (contracts/ipc.json: Track, NowPlaying).
     static std::string fmtTrack(const Json& track);
-    static std::string fmtNowPlaying(const Json& np, const std::string& verb);
     static std::string fmtQueue(const Json& data);
     static std::string fmtSeconds(int64_t sec);
     static std::vector<std::string> splitArgs(const std::string& args);
@@ -476,7 +734,6 @@ private:
     // --- background work ---
     void backgroundLoop();
     void sweepClean();
-    void watchLoopAutoplay();
 
     // Handlers: playback / queue.
     void onStart(const CommandContext& ctx);
@@ -502,8 +759,11 @@ private:
     void onMute(const CommandContext& ctx);
     void onJoin(const CommandContext& ctx);
     // Play a replied-to (or captioned) Telegram file: download via
-    // getFile, then play through the core's in-process voice backend.
-    // Returns true only after the voice backend accepted the file.
+    // TDLib, then hand it to the backend. The backend owns playback;
+    // until it exposes a local-file play action (Phase 3) the file is
+    // downloaded for real and the user is told honestly that local-file
+    // playback is not wired up yet — never a fake "Now playing".
+    // Always returns false in Phase 2 (nothing plays yet).
     bool playRepliedFile(const CommandContext& ctx,
                          const std::string& file_id,
                          const std::string& title, const std::string& kind);
@@ -585,11 +845,11 @@ private:
     void onStreamStatus(const CommandContext& ctx);
 
     const Config& cfg_;
-    TelegramApi& tg_;
+    TelegramSender& tg_;
     IpcClient& ipc_;
-    EngineRouter& router_;
     Store& store_;
-    VoiceCall& voice_;
+    TdLibClient& assistant_;
+    RateLimiter& limiter_;
     std::string bot_username_;
     int64_t bot_id_ = 0;
     std::chrono::steady_clock::time_point boot_time_ =
@@ -598,7 +858,6 @@ private:
     std::vector<Route> routes_;
     std::map<std::string, std::string> aliases_;
     std::map<std::string, std::pair<std::string, bool>> channel_cmds_;
-    std::map<int64_t, std::chrono::steady_clock::time_point> last_cmd_;
 
     // Clean-mode deletion queue: (chat, message, delete_at).
     struct PendingDelete {
@@ -628,6 +887,20 @@ private:
     // Recent command log for /logs (last 100 lines, in-memory).
     std::mutex log_mu_;
     std::vector<std::string> recent_log_;
+
+    // Main-thread work queue (see the file header note): outbound
+    // Telegram work queued from the background sweeper and backend
+    // events, drained by processPendingWork() on the main thread.
+    std::mutex work_mu_;
+    std::vector<std::function<void()>> pending_work_;
+    // Pending duplex JoinRequests, drained by processPendingWork().
+    struct PendingJoin {
+        int64_t chat_id = 0;
+        std::string local_sdp;
+        std::shared_ptr<std::promise<Json>> done;
+    };
+    std::mutex joins_mu_;
+    std::vector<PendingJoin> pending_joins_;
 
     std::atomic<bool> bg_stop_{false};
     std::thread bg_thread_;

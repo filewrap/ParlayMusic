@@ -1,15 +1,59 @@
-// config.hpp — configuration from environment names only.
-// No secret VALUES are ever stored here or anywhere in the repo; every
-// credential is read at process start from the environment (see .env.example
-// at the Parlay root / docker-compose.yml for the full list).
+// config.hpp — unified Parlay configuration (FINAL-ARCHITECTURE.md
+// §1.4, §8.2 "config.cpp / config.hpp REWRITE", OD-6: TOML).
+//
+// Sources, in precedence order (later wins):
+//   1. Built-in defaults (the values below — they match today's
+//      behaviour wherever a value exists today).
+//   2. parlay.toml — searched as: $PARLAY_CONFIG, then ./parlay.toml,
+//      <exeDir>/parlay.toml, <exeDir>/../parlay.toml. A missing file
+//      is NOT an error: the core runs on defaults and records that
+//      honestly in config_source / config_file_found.
+//   3. Environment overrides (PARLAY_* names; the legacy
+//      DURATION_LIMIT / QUEUE_LIMIT are still honoured after the
+//      PARLAY_* ones, and are documented as deprecated).
+//
+// Secrets are NEVER in the TOML file: credentials (BOT_TOKEN,
+// API_ID/API_HASH, PARLAY_TOKEN, TDLib login values) come only from
+// the environment, exactly as before. No secret VALUES are stored
+// here or anywhere in the repo.
+//
+// Errors are exact, never silent: a malformed TOML file, an unknown
+// key inside a core-owned table, a wrong-typed value, an out-of-range
+// value, or a malformed env override throws ConfigError naming the
+// key, the offending value, and the reason. The old code silently
+// fell back to defaults on a bad env int; that behaviour is gone for
+// the unified keys.
+//
+// Protocol/physical constants stay constants (§6-R6) and are NOT in
+// config: loop 0-10, volume 0-200, 960-sample frames, 48 kHz.
+// Operational values live here: rate limits, per-action timeouts,
+// duration/queue caps, cache TTLs, prefetch lead, Opus profile.
+//
+// Compatibility: Config::fromEnv() is kept (env-only, no file) so
+// main.cpp and the existing tests keep working unchanged; Wave 2
+// switches startup to Config::load(). duration_limit_min /
+// queue_limit are kept as mirrors of limits.max_duration_minutes /
+// max_queue_size so dispatcher.cpp (which reads them) needs no edit
+// in this wave.
 #pragma once
 
 #include <cstdint>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace parlay {
+
+// Thrown by Config::load/loadFromFile/loadFromText/fromEnv on any
+// configuration problem. what() is "config: <key>: <reason> (got
+// <value>)" or "config: <file>: <reason>" — exact enough to fix the
+// file from the message alone.
+class ConfigError : public std::runtime_error {
+public:
+    explicit ConfigError(const std::string& message)
+        : std::runtime_error(message) {}
+};
 
 // Directory holding the running executable (release layout: bin/
 // next to lib/), "" when it cannot be determined. The voice backends
@@ -17,7 +61,84 @@ namespace parlay {
 // install needs no explicit lib paths.
 std::string exeDir();
 
+// --- Unified schema (§1.4) -------------------------------------------
+
+// One token bucket: `capacity` tokens may be spent in a burst, then
+// the bucket refills at `refill_rate_per_sec` tokens/second.
+struct BucketConfig {
+    int capacity = 5;                 // burst size (tokens), >= 1
+    double refill_rate_per_sec = 1.0;  // sustained rate, > 0
+};
+
+// Sustained per-chat 1.0/s is today's 1 cmd/sec behaviour
+// (dispatcher.cpp:911); capacity 5 is the new burst allowance.
+// Per-user is stricter in burst (3) at the same sustained 1.0/s.
+struct RateLimitConfig {
+    BucketConfig chat{5, 1.0};
+    BucketConfig user{3, 1.0};
+};
+
+// Per-action budgets in milliseconds. resolve_ms / join_ms /
+// ipc_cmd_ms map today's IPC timeouts: 30 s (ipc post), 30 s (TDLib
+// call) and 10 s (vcGet). download_ms 300 s is today's file-download
+// budget. healthz_ms 5 s is today's /healthz probe budget.
+struct TimeoutConfig {
+    int resolve_ms = 30000;
+    int join_ms = 30000;
+    int ipc_cmd_ms = 10000;
+    int download_ms = 300000;
+    int healthz_ms = 5000;
+};
+
+struct QualityConfig {
+    // ultra_320k = 320 kbps, high_256k = 256 kbps,
+    // standard_192k = 192 kbps. Default standard_192k: today's
+    // ceiling is 128 kbps (ffmpeg -b:a 128k), so 192k is the lowest
+    // new profile; ultra_320k becomes the default only after the
+    // Phase 6 live VPS bitrate test (OD-1) locks the verified ceiling.
+    std::string voice_profile = "standard_192k";
+    // Resolution order, Tier 1 lossless first (§1.3): Navidrome,
+    // Soulseek, Deezer, NetEase, then Tier 2 JioSaavn, then Tier 3
+    // YouTube, Spotify, TikTok, radio.
+    std::vector<std::string> source_ladder = {
+        "navidrome", "soulseek", "deezer", "netease", "jiosaavn",
+        "youtube", "spotify", "tiktok", "radio"};
+    // sinc_256 (mastering-grade) | sinc_128 | fast.
+    std::string resampler_quality = "sinc_256";
+
+    // Opus target bitrate implied by voice_profile (§1.4
+    // opus_bitrate_kbps): 320 / 256 / 192.
+    int opusBitrateKbps() const;
+};
+
+struct LimitConfig {
+    int max_duration_minutes = 60;   // today's DURATION_LIMIT
+    int max_queue_size = 20;         // today's QUEUE_LIMIT
+    int prefetch_lead_time_sec = 30;  // resolve N+1 this far ahead
+    int url_cache_ttl_sec = 120;     // CDN URLs live ~2 min (Phase 1)
+};
+
+// Known source names for quality.source_ladder validation.
+inline const std::vector<std::string>& knownSources() {
+    static const std::vector<std::string> kSources = {
+        "navidrome", "soulseek", "deezer", "netease", "jiosaavn",
+        "youtube", "spotify", "tiktok", "radio"};
+    return kSources;
+}
+
 struct Config {
+    // Unified schema (defaults above; file + env overrides apply).
+    RateLimitConfig rate_limit;
+    TimeoutConfig timeouts;
+    QualityConfig quality;
+    LimitConfig limits;
+
+    // Where the effective config came from, for the startup log:
+    // the parlay.toml path that was loaded, or
+    // "(defaults: no parlay.toml found; see parlay.toml.example)".
+    std::string config_source;
+    bool config_file_found = false;
+
     // Telegram Bot API (required to run).
     std::string bot_token;    // BOT_TOKEN
     int64_t api_id = 0;       // API_ID (MTProto, reserved for the voice path)
@@ -32,6 +153,9 @@ struct Config {
     std::string parlay_token;  // PARLAY_TOKEN
 
     // IPC service base URLs (defaults match docker-compose.yml).
+    // NOTE: the 11 HTTP services are deleted by the locked
+    // architecture (Phase 3); these URLs are kept until Wave 2
+    // removes the HTTP IPC client, and are NOT in parlay.toml.
     std::string vc_go_url = "http://vc-go:8001";       // VC_GO_URL
     std::string vc_ts_url = "http://vc-ts:8002";       // VC_TS_URL
     std::string vc_rust_url = "http://vc-rust:8003";   // VC_RUST_URL
@@ -87,9 +211,12 @@ struct Config {
     std::string log_file;                    // PARLAY_LOG_FILE (optional stdout/stderr tee)
     std::string telegram_api_base = "https://api.telegram.org";  // TELEGRAM_API_BASE
 
-    // Playback limits (NoxBeats config.cpp defaults).
-    int duration_limit_min = 60;             // DURATION_LIMIT (minutes)
-    int queue_limit = 20;                    // QUEUE_LIMIT
+    // Playback limits — mirrors of limits.max_duration_minutes /
+    // limits.max_queue_size, kept so dispatcher.cpp needs no edit in
+    // this wave. Always kept in sync by the load paths; do not set
+    // them directly.
+    int duration_limit_min = 60;
+    int queue_limit = 20;
     std::string support_chat;                // SUPPORT_CHAT
 
     // Phase 9 UI links/images (UI_INVENTORY.md §2/§16: URLs come from
@@ -106,7 +233,34 @@ struct Config {
 
     std::string long_poll_timeout_sec = "30";
 
+    // Built-in defaults (no file, no env).
+    static Config defaults();
+
+    // Full load: defaults <- parlay.toml <- env overrides.
+    // Throws ConfigError on a malformed file or override. A missing
+    // file is NOT an error (defaults apply, honestly recorded).
+    // An explicit $PARLAY_CONFIG that cannot be read IS an error.
+    static Config load();
+
+    // Load one file (must exist and parse). Throws ConfigError.
+    static Config loadFromFile(const std::string& path);
+    // Load from TOML text (tests; `source_name` labels errors).
+    static Config loadFromText(const std::string& text,
+                               const std::string& source_name);
+
+    // Env-only load (no file): kept for main.cpp and existing tests.
+    // Applies the same env overrides and validation as load().
     static Config fromEnv();
+
+    // Config-file search: $PARLAY_CONFIG if set ("" when unset),
+    // else the first existing candidate among ./parlay.toml,
+    // <exeDir>/parlay.toml, <exeDir>/../parlay.toml; "" when none
+    // exists.
+    static std::string defaultConfigPath();
+
+    // Throws ConfigError unless every unified value is in range.
+    void validate() const;
+
     // Names of the variables that must be set for the bot to start.
     std::vector<std::string> missingRequired() const;
     // One-line, secret-free summary for the startup log.

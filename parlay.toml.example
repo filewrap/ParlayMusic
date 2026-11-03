@@ -1,0 +1,84 @@
+# parlay.toml — Parlay unified configuration (FINAL-ARCHITECTURE.md §1.4,
+# OD-6: TOML, not YAML).
+#
+# Copy to `parlay.toml` next to the install root (or point $PARLAY_CONFIG
+# at it). The core reads it from: $PARLAY_CONFIG, then ./parlay.toml,
+# <exeDir>/parlay.toml, <exeDir>/../parlay.toml.
+#
+# Precedence: built-in defaults < this file < environment overrides
+# (PARLAY_* — see the comments; a set override always wins over the
+# file). A missing file is NOT an error: the core runs on defaults and
+# says so in the startup log.
+#
+# Secrets are NEVER in this file. BOT_TOKEN, API_ID, API_HASH,
+# PARLAY_TOKEN, and the TDLib login values come only from the
+# environment (see .env.example). Anything malformed here — a typo'd
+# key, a wrong type, an out-of-range value — is a startup error with
+# the exact key and reason, never a silent default.
+#
+# Protocol/physical constants are NOT configurable (§6-R6): loop 0-10,
+# volume 0-200, 960-sample frames, 48 kHz stay constants in code.
+
+# --- Rate limits: per-chat AND per-user token buckets -------------------
+# capacity = burst size (tokens); refill_rate_per_sec = sustained rate.
+# Today's behaviour was 1 cmd/sec per chat with a silent drop
+# (dispatcher.cpp:911); the bucket keeps that sustained 1.0/s while
+# allowing a short burst, and a denial now carries an honest reason +
+# retry-after instead of dropping the command silently.
+# Env: PARLAY_RATE_LIMIT_CHAT_CAPACITY, PARLAY_RATE_LIMIT_CHAT_REFILL_PER_SEC,
+#      PARLAY_RATE_LIMIT_USER_CAPACITY, PARLAY_RATE_LIMIT_USER_REFILL_PER_SEC
+[rate_limit.chat]
+capacity = 5
+refill_rate_per_sec = 1.0
+
+[rate_limit.user]
+capacity = 3
+refill_rate_per_sec = 1.0
+
+# --- Timeouts: per-action budgets, milliseconds -------------------------
+# resolve_ms: track/stream resolution budget (today: IPC post, 30 s).
+# join_ms: voice-chat join budget (today: TDLib call, 30 s).
+# ipc_cmd_ms: generic IPC command budget (today: vcGet, 10 s).
+# download_ms: file download budget (today: Telegram file fetch, 300 s).
+# healthz_ms: backend health-probe budget (today: 5 s).
+# Env: PARLAY_TIMEOUT_RESOLVE_MS, PARLAY_TIMEOUT_JOIN_MS,
+#      PARLAY_TIMEOUT_IPC_CMD_MS, PARLAY_TIMEOUT_DOWNLOAD_MS,
+#      PARLAY_TIMEOUT_HEALTHZ_MS
+[timeouts]
+resolve_ms = 30000
+join_ms = 30000
+ipc_cmd_ms = 10000
+download_ms = 300000
+healthz_ms = 5000
+
+# --- Quality ------------------------------------------------------------
+# voice_profile: ultra_320k (320 kbps) | high_256k (256 kbps) |
+#   standard_192k (192 kbps). Default standard_192k: today's ceiling is
+#   128 kbps, so 192k is the lowest new profile; ultra_320k becomes the
+#   default only after the Phase 6 live VPS bitrate test (OD-1) locks
+#   the verified ceiling.
+# source_ladder: resolution order, Tier 1 lossless first, then Tier 2
+#   high-bitrate lossy, then Tier 3 adaptive/metadata. Known names:
+#   navidrome, soulseek, deezer, netease, jiosaavn, youtube, spotify,
+#   tiktok, radio.
+# resampler_quality: sinc_256 (mastering-grade) | sinc_128 | fast.
+# Env: PARLAY_VOICE_PROFILE, PARLAY_SOURCE_LADDER (comma-separated),
+#      PARLAY_RESAMPLER_QUALITY
+[quality]
+voice_profile = "standard_192k"
+source_ladder = ["navidrome", "soulseek", "deezer", "netease", "jiosaavn", "youtube", "spotify", "tiktok", "radio"]
+resampler_quality = "sinc_256"
+
+# --- Limits -------------------------------------------------------------
+# max_duration_minutes: longest playable track (today: 60).
+# max_queue_size: most queued tracks per chat (today: 20).
+# prefetch_lead_time_sec: resolve track N+1 this far before track N ends.
+# url_cache_ttl_sec: resolved URL cache TTL; CDN URLs live ~2 min (Phase 1).
+# Env: PARLAY_MAX_DURATION_MINUTES (legacy: DURATION_LIMIT),
+#      PARLAY_MAX_QUEUE_SIZE (legacy: QUEUE_LIMIT),
+#      PARLAY_PREFETCH_LEAD_TIME_SEC, PARLAY_URL_CACHE_TTL_SEC
+[limits]
+max_duration_minutes = 60
+max_queue_size = 20
+prefetch_lead_time_sec = 30
+url_cache_ttl_sec = 120

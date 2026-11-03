@@ -3,8 +3,8 @@
 // pure function of its inputs.
 //
 // Build: g++ -std=c++20 -I src tests/ui_test.cpp src/scram.cpp
-//   src/telegram_api.cpp src/json.cpp src/http.cpp src/config.cpp
-//   -o /tmp/ui_test -ldl && /tmp/ui_test
+//   src/json.cpp src/config.cpp src/toml.cpp
+//   -o /tmp/ui_test && /tmp/ui_test
 // Exit 0 = all checks pass.
 #include <cstdio>
 #include <iostream>
@@ -167,10 +167,10 @@ int main() {
               "playerKeyboard: row 1 is the progress no-op button");
         CHECK(contains(kb[0][0].text, "1:30"),
               "playerKeyboard: progress label shows the position");
-        CHECK(kb[1].size() == 4 && kb[1][0].text == "II" &&
+        CHECK(kb[1].size() == 4 && kb[1][0].text == "Pause" &&
                   kb[1][0].callback_data == "pl:player:pause:-1001",
               "playerKeyboard: row 2 pause button when playing");
-        CHECK(kb[1][1].text == "⟳ ×2",
+        CHECK(kb[1][1].text == "Loop ×2",
               "playerKeyboard: loop button shows the remaining count");
         CHECK(kb[2].size() == 2 &&
                   kb[2][0].callback_data == "pl:player:seekback15:-1001" &&
@@ -186,10 +186,10 @@ int main() {
     {
         InlineKeyboard kb = playerKeyboard(-1001, true, false, 0, "", false, 0, 0);
         CHECK(kb.size() == 4, "playerKeyboard: 4 rows without progress");
-        CHECK(kb[0][0].text == "▷" &&
+        CHECK(kb[0][0].text == "Resume" &&
                   kb[0][0].callback_data == "pl:player:resume:-1001",
               "playerKeyboard: paused state shows the resume button");
-        CHECK(kb[3].size() == 1 && kb[3][0].text == "🗑 Close",
+        CHECK(kb[3].size() == 1 && kb[3][0].text == "Close",
               "playerKeyboard: no Add to Playlist without a token");
     }
 
@@ -208,11 +208,13 @@ int main() {
               "menuPanelKeyboard: refresh button");
     }
     {
-        std::string t = menuPanelText("▶️", "Song A", "https://x/a", "Song B",
+        std::string t = menuPanelText("Song A", "https://x/a", "Song B",
                                       "https://x/b");
         CHECK(contains(t, "Song A") && contains(t, "Song B"),
               "menuPanelText: both titles present");
-        std::string empty = menuPanelText("⏹", "", "", "", "");
+        CHECK(contains(t, "Now:") && contains(t, "Next:"),
+              "menuPanelText: Now/Next labels");
+        std::string empty = menuPanelText("", "", "", "");
         CHECK(contains(empty, "Nothing streaming now") &&
                   !contains(empty, "href=\"\""),
               "menuPanelText: empty URLs render plain bold, never empty href");
@@ -259,11 +261,11 @@ int main() {
               "settingsKeyboard: 12 rows + timer row + index row = 14");
         CHECK(kb[0][1].callback_data == "pl:set:adminmode",
               "settingsKeyboard: admin mode toggle");
-        CHECK(kb[0][1].text == "Auth Users 🎧",
+        CHECK(kb[0][1].text == "Auth Users",
               "settingsKeyboard: admin mode 0 shows Auth Users");
         CHECK(kb[10].size() == 6, "settingsKeyboard: timer row has 2-7");
-        CHECK(kb[10][3].text == "✓ 5",
-              "settingsKeyboard: current timer value is ticked");
+        CHECK(kb[10][3].text == "5 (current)",
+              "settingsKeyboard: current timer value is marked");
         CHECK(kb[12].size() == 2 &&
                   kb[12][0].callback_data == "pl:set:page" &&
                   kb[12][1].callback_data == "pl:set:musicdl",
@@ -306,7 +308,7 @@ int main() {
         CHECK(contains(card, "Bob"), "nowPlayingText: requester present");
         CHECK(contains(card, "https://x/test"),
               "nowPlayingText: title links to the track URL");
-        std::string state = stateCardText("⏸", "Paused", t, "Bob");
+        std::string state = stateCardText("Paused", t, "Bob");
         CHECK(contains(state, "Paused") && contains(state, "Test Song"),
               "stateCardText: state line + track");
         CHECK(contains(progressLabel(90, 200), "◉"),

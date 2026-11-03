@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "scram.hpp"
-#include "telegram_api.hpp"
+#include "tg_types.hpp"
 
 namespace parlay::ui_texts {
 
@@ -151,19 +151,6 @@ inline std::string queryHash(const std::string& q) {
     return out;
 }
 
-// House status-line prefixes (remix §2.1, §15): errors "❌ | <b>…</b>",
-// successes "✅ | <b>…</b>", info "{emoji} | <b>…</b>".
-inline std::string errLine(const std::string& text) {
-    return "❌ | <b>" + text + "</b>";
-}
-inline std::string okLine(const std::string& text) {
-    return "✅ | <b>" + text + "</b>";
-}
-inline std::string infoLine(const std::string& emoji,
-                            const std::string& text) {
-    return emoji + " | <b>" + text + "</b>";
-}
-
 // --- callback data (§1 namespace) ------------------------------------------
 // Format: pl:<domain>:<verb>[:<arg>…], colon-separated, lowercase,
 // 64-byte Bot API limit (callers keep payloads short; track ids go
@@ -240,7 +227,7 @@ inline const char* kCbSetMain = "pl:set:main";
 // PM start card (Yukki wins, §2). {user} = first name, HTML-escaped by
 // the caller. {bot} = bot username (no @).
 inline const char* kStartPm =
-    "<b>🎵 Parlay</b>\n"
+    "<h1>Parlay</h1>\n"
     "\n"
     "Hey {user} — I stream music in your Telegram voice &amp; video chats "
     "from YouTube, Spotify, SoundCloud, Apple Music, NetEase and more. "
@@ -259,25 +246,22 @@ inline const char* kStartGroup =
     "Spotify, SoundCloud, Apple Music, NetEase and more — with queue, loop, "
     "shuffle, seek and speed control.\n"
     "\n"
-    "<i>Try a command… if you think you can handle me 😉</i>";
+    "<i>Try a command… if you think you can handle me.</i>";
 
 inline const char* kBotAdded =
-    "🎵 Thanks for adding me! Use /play [song] to start playing music.";
-inline const char* kBotAddedMaintenance =
-    "⚠️ I'm currently under maintenance and will be back soon. Thanks for "
-    "your patience! ⏰";
+    "Thanks for adding me! Use /play [song] to start playing music.";
 inline const char* kDemoted =
-    "<b>⚠️ Permission Lost</b>\n"
+    "<h2>Permission Lost</h2>\n"
     "\n"
     "I've been <b>demoted from admin</b> and can't perform my tasks "
     "anymore. Without proper rights, I'm unable to function here, so I'll "
     "be <i>leaving the chat now</i>.\n"
     "\n"
-    "<b>Goodbye 👋</b>";
+    "<b>Goodbye</b>";
 inline const char* kOwnerJoined =
-    "👑 {user} — owner of Parlay — just entered the chat.";
+    "<b>{user}</b> — owner of Parlay — just entered the chat.";
 inline const char* kSudoJoined =
-    "🛡️ {user}, a sudo user of Parlay, just joined the chat.";
+    "<b>{user}</b>, a sudo user of Parlay, just joined the chat.";
 
 // Private-mode notice (navidrome §7.2, §2). Only when Parlay is in
 // private mode; otherwise the normal start card.
@@ -292,7 +276,7 @@ inline const char* kPrivateBotNotice =
 // About text (beetube §3.4, rewritten music-only, §14). {channel} is
 // the updates channel handle without @; the repo links are Parlay's own.
 inline const char* kAbout =
-    "ℹ <b>About</b>\n"
+    "<h2>About</h2>\n"
     "\n"
     "Parlay is an open source bot developed to give users access to "
     "unlimited free music downloads and streaming from within Telegram.\n"
@@ -303,7 +287,7 @@ inline const char* kAbout =
     "For bug reports create an <a href=\"https://github.com/filewrap/"
     "ParlayMusic/issues\">issue</a>\n"
     "\n"
-    "<code>If you find this bot useful, feel free to give us a ⭐</code>\n"
+    "<code>If you find this bot useful, feel free to give us a star</code>\n"
     "\n"
     "Want to contribute to the development of this project? PRs are "
     "welcomed.";
@@ -316,28 +300,28 @@ inline InlineKeyboard startPmKeyboard(const std::string& bot_username,
                                       const std::string& source_url) {
     InlineKeyboard kb;
     kb.push_back({InlineButton::link(
-        "⚡ Add Me to Your Group",
+        "Add Me to Your Group",
         "https://t.me/" + bot_username + "?startgroup&admin=invite_users")});
     kb.push_back(
-        {InlineButton::callback("❓ Help & Commands", kCbHelpMain)});
+        {InlineButton::callback("Help & Commands", kCbHelpMain)});
     std::vector<InlineButton> row;
-    if (!updates_url.empty()) row.push_back(InlineButton::link("📢 Updates", updates_url));
-    if (!support_url.empty()) row.push_back(InlineButton::link("💬 Support", support_url));
+    if (!updates_url.empty()) row.push_back(InlineButton::link("Updates", updates_url));
+    if (!support_url.empty()) row.push_back(InlineButton::link("Support", support_url));
     if (!row.empty()) kb.push_back(std::move(row));
     std::vector<InlineButton> row2;
-    row2.push_back(InlineButton::callback("🌐 Language", kCbLangSelect));
+    row2.push_back(InlineButton::callback("Language", kCbLangSelect));
     if (!source_url.empty())
-        row2.push_back(InlineButton::link("🔗 Source Code", source_url));
+        row2.push_back(InlineButton::link("Source Code", source_url));
     kb.push_back(std::move(row2));
     // Inline shortcuts (navidrome §7.2.2 + lemonic §6.1, §13).
-    kb.push_back({InlineButton::switchInline("🔎 Search", "", true),
-                  InlineButton::switchInline("📚 Library", "lib ", true),
-                  InlineButton::switchInline("🗑 Delete", "del ", true)});
-    kb.push_back({InlineButton::switchInline("▶️ Playing", "np", true),
-                  InlineButton::switchInline("📝 Lyrics", "l", true),
-                  InlineButton::switchInline("🔗 Share", "s", true)});
+    kb.push_back({InlineButton::switchInline("Search", "", true),
+                  InlineButton::switchInline("Library", "lib ", true),
+                  InlineButton::switchInline("Delete", "del ", true)});
+    kb.push_back({InlineButton::switchInline("Playing", "np", true),
+                  InlineButton::switchInline("Lyrics", "l", true),
+                  InlineButton::switchInline("Share", "s", true)});
     kb.push_back(
-        {InlineButton::switchInline("📤 Send playing to…", "np", false)});
+        {InlineButton::switchInline("Send playing to…", "np", false)});
     return kb;
 }
 
@@ -345,8 +329,8 @@ inline InlineKeyboard startGroupKeyboard(const std::string& updates_url,
                                          const std::string& support_url) {
     InlineKeyboard kb;
     std::vector<InlineButton> row;
-    if (!updates_url.empty()) row.push_back(InlineButton::link("📢 Updates", updates_url));
-    if (!support_url.empty()) row.push_back(InlineButton::link("💬 Support", support_url));
+    if (!updates_url.empty()) row.push_back(InlineButton::link("Updates", updates_url));
+    if (!support_url.empty()) row.push_back(InlineButton::link("Support", support_url));
     if (!row.empty()) kb.push_back(std::move(row));
     return kb;
 }
@@ -354,7 +338,7 @@ inline InlineKeyboard startGroupKeyboard(const std::string& updates_url,
 // --- §3 /help (menu + topics) ----------------------------------------------
 // Menu text (Yukki wins, §3). {support} = support URL.
 inline const char* kHelpMenu =
-    "<b>📚 Help Menu</b>\n"
+    "<h1>Help Menu</h1>\n"
     "\n"
     "Browse commands by category: <b>Public</b> for everyone, plus "
     "<b>Admin</b>, <b>Sudo</b> and <b>Owner</b> for higher access levels.\n"
@@ -382,13 +366,13 @@ inline InlineKeyboard helpMenuKeyboard() {
         {B::callback("Playlist", cbHelp("playlist")),
          B::callback("VC Logs", cbHelp("vclogs")),
          B::callback("Playback Buttons", cbHelp("inline"))},
-        {B::callback("⬅️ Back", kCbStart)},
+        {B::callback("Back", kCbStart)},
     };
 }
 
 // Back row on every topic page (§3).
 inline InlineKeyboard helpTopicKeyboard() {
-    return {{InlineButton::callback("⬅️ Back", kCbHelpMain)}};
+    return {{InlineButton::callback("Back", kCbHelpMain)}};
 }
 
 // Topic pages: Parvati/Yukki merged, small-caps converted to normal
@@ -396,229 +380,229 @@ inline InlineKeyboard helpTopicKeyboard() {
 // (Yukki): "Channel variants (e.g. /cpause, /cskip) act on the linked
 // channel's voice chat."
 inline const char* kHelpPlay =
-    "⊚ <b><u>Play &amp; Channel Play:</u></b>\n"
+    "<h2>Play &amp; Channel Play</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/play</b> : start audio streaming in chat.\n"
-    "➻ <b>/vplay</b> : start video streaming in chat.\n"
-    "➻ <b>/playforce</b> : instant play (overrides queue).</blockquote>\n"
+    "<blockquote>• <b>/play</b> : start audio streaming in chat.\n"
+    "• <b>/vplay</b> : start video streaming in chat.\n"
+    "• <b>/playforce</b> : instant play (overrides queue).</blockquote>\n"
     "\n"
-    "⊚ <b><u>Channel Play:</u></b>\n"
+    "<h2>Channel Play</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/cplay</b> : audio stream in linked channel.\n"
-    "➻ <b>/cvplay</b> : video stream in linked channel.\n"
-    "➻ <b>/cplayforce</b> : force stream in linked channel.\n"
-    "➻ <b>/channelplay [id]</b> : connect channel to this group.</blockquote>\n"
+    "<blockquote>• <b>/cplay</b> : audio stream in linked channel.\n"
+    "• <b>/cvplay</b> : video stream in linked channel.\n"
+    "• <b>/cplayforce</b> : force stream in linked channel.\n"
+    "• <b>/channelplay [id]</b> : connect channel to this group.</blockquote>\n"
     "\n"
     "Send a music link to download it. Add <b>re</b> after the link to "
-    "force re-download. Every download and upload import carries a ✖ "
+    "force re-download. Every download and upload import carries a "
     "Cancel button until it finishes.";
 
 inline const char* kHelpAdmins =
-    "⊚ <b><u>Admin Commands:</u></b>\n"
+    "<h2>Admin Commands</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Just add c as a prefix to the commands to control "
+    "<blockquote><b>Just add c as a prefix to the commands to control "
     "channel streaming.</b></blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>/pause</b> : halt the currently active stream.\n"
-    "➻ <b>/resume</b> : restart the paused playback.\n"
-    "➻ <b>/skip</b> : play the next track in the queue.\n"
-    "➻ <b>/askip</b> : play the next track in the autoplay queue.\n"
-    "➻ <b>/stop</b> : cease the stream and empty queue.\n"
-    "➻ <b>/mute</b> : mute playback in videochat.\n"
-    "➻ <b>/unmute</b> : unmute playback in videochat.\n"
-    "➻ <b>/queue</b> : view the list of upcoming tracks.\n"
-    "➻ <b>/jump</b> : jump to a given time in track.\n"
-    "➻ <b>/move</b> : move a queued track to another position.\n"
-    "➻ <b>/clear</b> : clear all songs from queue.\n"
-    "➻ <b>/remove</b> : remove a specific track from queue.\n"
-    "➻ <b>/loop [1-10]</b> : repeat the currently playing song.\n"
-    "➻ <b>/shuffle</b> : randomize the queued playlist.\n"
-    "➻ <b>/seek [secs]</b> : forward seek to a specific time.\n"
-    "➻ <b>/seekback [secs]</b> : reverse seek to a specific time.\n"
-    "➻ <b>/speed</b> : modify playback speed (0.50x - 4.00x).\n"
-    "➻ <b>/playmode</b> : control who can use /play cmd.\n"
-    "➻ <b>/cmddelete</b> : toggle automatic deletion of bot commands.\n"
-    "➻ <b>/join</b> : join the assistant to the voice chat.\n"
-    "➻ <b>/reload</b> : refresh the admin cache.</blockquote>\n"
+    "<blockquote>• <b>/pause</b> : halt the currently active stream.\n"
+    "• <b>/resume</b> : restart the paused playback.\n"
+    "• <b>/skip</b> : play the next track in the queue.\n"
+    "• <b>/askip</b> : play the next track in the autoplay queue.\n"
+    "• <b>/stop</b> : cease the stream and empty queue.\n"
+    "• <b>/mute</b> : mute playback in videochat.\n"
+    "• <b>/unmute</b> : unmute playback in videochat.\n"
+    "• <b>/queue</b> : view the list of upcoming tracks.\n"
+    "• <b>/jump</b> : jump to a given time in track.\n"
+    "• <b>/move</b> : move a queued track to another position.\n"
+    "• <b>/clear</b> : clear all songs from queue.\n"
+    "• <b>/remove</b> : remove a specific track from queue.\n"
+    "• <b>/loop [1-10]</b> : repeat the currently playing song.\n"
+    "• <b>/shuffle</b> : randomize the queued playlist.\n"
+    "• <b>/seek [secs]</b> : forward seek to a specific time.\n"
+    "• <b>/seekback [secs]</b> : reverse seek to a specific time.\n"
+    "• <b>/speed</b> : modify playback speed (0.50x - 4.00x).\n"
+    "• <b>/playmode</b> : control who can use /play cmd.\n"
+    "• <b>/cmddelete</b> : toggle automatic deletion of bot commands.\n"
+    "• <b>/join</b> : join the assistant to the voice chat.\n"
+    "• <b>/reload</b> : refresh the admin cache.</blockquote>\n"
     "\n"
     "Channel variants (e.g. /cpause, /cskip) act on the linked channel's "
     "voice chat.";
 
 inline const char* kHelpOwner =
-    "⊚ <b><u>Owner Commands:</u></b>\n"
+    "<h2>Owner Commands</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/addsudo</b> : add a new sudo user to bot.\n"
-    "➻ <b>/delsudo</b> : remove a user from sudo list.\n"
-    "➻ <b>/blockuser [username | id]</b> : stop user from using bot.\n"
-    "➻ <b>/unblockuser [username | id]</b> : allow the blocked user.\n"
-    "➻ <b>/blacklistchat [chat id]</b> : ban a chat from using bot.\n"
-    "➻ <b>/unblockchat [chat id]</b> : unban a blacklisted chat.\n"
-    "➻ <b>/blacklisted</b> : show all blacklisted groups &amp; users.\n"
-    "➻ <b>/broadcast</b> : send a message to all chats.\n"
-    "➻ <b>/maintenance</b> : [enable | disable] maintenance mode.\n"
-    "➻ <b>/restart</b> : restart the bot.\n"
-    "➻ <b>/sh</b> : run shell commands.</blockquote>";
+    "<blockquote>• <b>/addsudo</b> : add a new sudo user to bot.\n"
+    "• <b>/delsudo</b> : remove a user from sudo list.\n"
+    "• <b>/blockuser [username | id]</b> : stop user from using bot.\n"
+    "• <b>/unblockuser [username | id]</b> : allow the blocked user.\n"
+    "• <b>/blacklistchat [chat id]</b> : ban a chat from using bot.\n"
+    "• <b>/unblockchat [chat id]</b> : unban a blacklisted chat.\n"
+    "• <b>/blacklisted</b> : show all blacklisted groups &amp; users.\n"
+    "• <b>/broadcast</b> : send a message to all chats.\n"
+    "• <b>/maintenance</b> : [enable | disable] maintenance mode.\n"
+    "• <b>/restart</b> : restart the bot.\n"
+    "• <b>/sh</b> : run shell commands.</blockquote>";
 
 inline const char* kHelpSudoers =
-    "⊚ <b><u>System &amp; Sudo Management:</u></b>\n"
+    "<h2>System &amp; Sudo Management</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Manage logs, and administrative privileges of your "
+    "<blockquote><b>Manage logs, and administrative privileges of your "
     "bot.</b></blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>Bot logs &amp; maintenance</b> :\n"
-    "➻ <b>/logs</b> : get real-time logs of the bot.\n"
-    "➻ <b>/logger</b> : [enable | disable] bot activity logging.\n"
-    "➻ <b>/maintenance</b> : [enable | disable] maintenance mode.\n"
-    "➻ <b>/eval</b> : execute code snippets.\n"
-    "➻ <b>/sh</b> : run shell commands.</blockquote>\n"
+    "<blockquote>• <b>Bot logs &amp; maintenance</b> :\n"
+    "• <b>/logs</b> : get real-time logs of the bot.\n"
+    "• <b>/logger</b> : [enable | disable] bot activity logging.\n"
+    "• <b>/maintenance</b> : [enable | disable] maintenance mode.\n"
+    "• <b>/eval</b> : execute code snippets.\n"
+    "• <b>/sh</b> : run shell commands.</blockquote>\n"
     "\n"
-    "⊚ <b><u>Active Streams:</u></b>\n"
+    "<h2>Active Streams</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/activevoice</b> : view ongoing audio sessions.\n"
-    "➻ <b>/ac</b> : view all combined active streams.</blockquote>\n"
+    "<blockquote>• <b>/activevoice</b> : view ongoing audio sessions.\n"
+    "• <b>/ac</b> : view all combined active streams.</blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>Sudo list management</b> :\n"
-    "➻ <b>/addsudo</b> : add a new sudo user to bot.\n"
-    "➻ <b>/rmsudo</b> : remove a user from sudo list.\n"
-    "➻ <b>/sudolist</b> : check all authorized sudo users.\n"
+    "<blockquote>• <b>Sudo list management</b> :\n"
+    "• <b>/addsudo</b> : add a new sudo user to bot.\n"
+    "• <b>/rmsudo</b> : remove a user from sudo list.\n"
+    "• <b>/sudolist</b> : check all authorized sudo users.\n"
     "\n"
-    "❏ These commands are highly sensitive, use with care.</blockquote>";
+    "• These commands are highly sensitive, use with care.</blockquote>";
 
 inline const char* kHelpAuth =
-    "⊚ <b><u>Auth Users:</u></b>\n"
+    "<h2>Auth Users</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Auth users are granted admin privileges without "
+    "<blockquote><b>Auth users are granted admin privileges without "
     "requiring group admin status to manage streams.</b></blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>/auth [user]</b> : add user to authorized list.\n"
-    "➻ <b>/unauth [user]</b> : remove user from authorized list.\n"
-    "➻ <b>/authlist</b> : display all authorized members.</blockquote>";
+    "<blockquote>• <b>/auth [user]</b> : add user to authorized list.\n"
+    "• <b>/unauth [user]</b> : remove user from authorized list.\n"
+    "• <b>/authlist</b> : display all authorized members.</blockquote>";
 
 inline const char* kHelpBcast =
-    "⊚ <b><u>Broadcast Feature [only for sudoers]:</u></b>\n"
+    "<h2>Broadcast Feature [only for sudoers]</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/broadcast [message or reply]</b> : send to all "
+    "<blockquote>• <b>/broadcast [message or reply]</b> : send to all "
     "chats.\n"
     "\n"
-    "➻ <b>Modes</b> :\n"
+    "• <b>Modes</b> :\n"
     "<b>-pin</b> : pin the message\n"
     "<b>-pinloud</b> : pin + notify members\n"
     "<b>-user</b> : broadcast to started users\n"
     "<b>-assistant</b> : send via assistant\n"
     "<b>-nobot</b> : don't send from bot\n"
     "\n"
-    "⊚ Example : /broadcast -user -pin testing broadcast</blockquote>";
+    "<b>Example:</b> /broadcast -user -pin testing broadcast</blockquote>";
 
 inline const char* kHelpRestrict =
-    "⊚ <b><u>Blacklist &amp; Global Ban:</u></b>\n"
+    "<h2>Blacklist &amp; Global Ban</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Restrict specific chats or users from using the bot "
+    "<blockquote><b>Restrict specific chats or users from using the bot "
     "globally.</b></blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>Chat blacklist</b> :\n"
-    "➻ <b>/blacklistchat [chat id]</b> : ban a chat from using bot.\n"
-    "➻ <b>/unblockchat [chat id]</b> : unban a blacklisted chat.\n"
-    "➻ <b>/blacklisted</b> : show all blacklisted groups &amp; "
+    "<blockquote>• <b>Chat blacklist</b> :\n"
+    "• <b>/blacklistchat [chat id]</b> : ban a chat from using bot.\n"
+    "• <b>/unblockchat [chat id]</b> : unban a blacklisted chat.\n"
+    "• <b>/blacklisted</b> : show all blacklisted groups &amp; "
     "users.</blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>User block</b> :\n"
-    "➻ <b>/blockuser [username | id]</b> : stop user from using bot.\n"
-    "➻ <b>/unblockuser [username | id]</b> : allow the blocked user.\n"
-    "➻ <b>/blacklisted</b> : view the list of all blocked users.</blockquote>";
+    "<blockquote>• <b>User block</b> :\n"
+    "• <b>/blockuser [username | id]</b> : stop user from using bot.\n"
+    "• <b>/unblockuser [username | id]</b> : allow the blocked user.\n"
+    "• <b>/blacklisted</b> : view the list of all blocked users.</blockquote>";
 
 inline const char* kHelpThumb =
-    "⊚ <b><u>Thumbnail Settings:</u></b>\n"
+    "<h2>Thumbnail Settings</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/nothumb</b> : manage stream visual settings.\n"
+    "<blockquote>• <b>/nothumb</b> : manage stream visual settings.\n"
     "\n"
-    "💮 <b>Toggle album art display. Disabling it reduces data load and "
+    "<b>Toggle album art display. Disabling it reduces data load and "
     "maintains a minimalist chat look.</b>\n"
     "\n"
-    "➻ <b>Options</b> :\n"
+    "• <b>Options</b> :\n"
     "• <b>enable</b> : display artwork with stream info.\n"
     "• <b>disable</b> : send pure text-based updates.\n"
     "• <b>close</b> : dismiss the configuration.\n"
     "\n"
-    "❏ Settings are saved individually per chat.</blockquote>";
+    "• Settings are saved individually per chat.</blockquote>";
 
 inline const char* kHelpStart =
-    "⊚ <b><u>Basic Commands:</u></b>\n"
+    "<h2>Basic Commands</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/start</b> : initialize the music service.\n"
-    "➻ <b>/help</b> : access the command guidelines.\n"
-    "➻ <b>/ping</b> : measure system latency and ping.\n"
-    "➻ <b>/repo</b> : get the source code repo.\n"
-    "➻ <b>/position</b> : show current track's timestamp.\n"
-    "➻ <b>/reload</b> : refresh admin data cache.\n"
-    "➻ <b>/settings</b> : adjust configuration options.\n"
-    "➻ <b>/lang</b> : select your preferred language.\n"
-    "➻ <b>/bug</b> : report an issue or problem.\n"
-    "➻ <b>/json</b> : show message JSON structure.\n"
-    "➻ <b>/sudolist</b> : view the list of sudo admins.\n"
-    "➻ <b>/stats</b> : view comprehensive bot metrics.</blockquote>";
+    "<blockquote>• <b>/start</b> : initialize the music service.\n"
+    "• <b>/help</b> : access the command guidelines.\n"
+    "• <b>/ping</b> : measure system latency and ping.\n"
+    "• <b>/repo</b> : get the source code repo.\n"
+    "• <b>/position</b> : show current track's timestamp.\n"
+    "• <b>/reload</b> : refresh admin data cache.\n"
+    "• <b>/settings</b> : adjust configuration options.\n"
+    "• <b>/lang</b> : select your preferred language.\n"
+    "• <b>/bug</b> : report an issue or problem.\n"
+    "• <b>/json</b> : show message JSON structure.\n"
+    "• <b>/sudolist</b> : view the list of sudo admins.\n"
+    "• <b>/stats</b> : view comprehensive bot metrics.</blockquote>";
 
 inline const char* kHelpAutoplay =
-    "⊚ <b><u>Autoplay Control:</u></b>\n"
+    "<h2>Autoplay Control</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/autoplay</b> : toggle the autoplay settings panel.\n"
-    "➻ <b>/skip</b> : play the next track in the autoplay queue.</blockquote>\n"
+    "<blockquote>• <b>/autoplay</b> : toggle the autoplay settings panel.\n"
+    "• <b>/skip</b> : play the next track in the autoplay queue.</blockquote>\n"
     "\n"
-    "⊚ <b><u>What is Autoplay?</u></b>\n"
+    "<h2>What is Autoplay?</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Autoplay seamlessly adds related tracks to the queue "
+    "<blockquote><b>Autoplay seamlessly adds related tracks to the queue "
     "based on your current playlist for non-stop music.</b>\n"
     "\n"
-    "➻ <b>Panel options</b> :\n"
+    "• <b>Panel options</b> :\n"
     "• <b>enable</b> : activate smart recommendations.\n"
     "• <b>disable</b> : deactivate smart recommendations.\n"
     "• <b>close</b> : exit the control panel.\n"
     "\n"
-    "➻ <b>Note</b> : requires at least one active song to function.</blockquote>";
+    "• <b>Note</b> : requires at least one active song to function.</blockquote>";
 
 inline const char* kHelpPlaylist =
-    "⊚ <b><u>Playlist Commands:</u></b>\n"
+    "<h2>Playlist Commands</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Create, organize, and manage your personal "
+    "<blockquote><b>Create, organize, and manage your personal "
     "playlists.</b></blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>/createplaylist</b> : create a new playlist.\n"
-    "➻ <b>/deleteplaylist</b> : delete one of your playlists.\n"
-    "➻ <b>/addtoplaylist</b> : add a track to a playlist.\n"
-    "➻ <b>/removefromplaylist</b> : remove a track from a playlist.\n"
-    "➻ <b>/playlistinfo</b> : display information about a playlist.\n"
-    "➻ <b>/myplaylists</b> : list all of your playlists.</blockquote>\n"
+    "<blockquote>• <b>/createplaylist</b> : create a new playlist.\n"
+    "• <b>/deleteplaylist</b> : delete one of your playlists.\n"
+    "• <b>/addtoplaylist</b> : add a track to a playlist.\n"
+    "• <b>/removefromplaylist</b> : remove a track from a playlist.\n"
+    "• <b>/playlistinfo</b> : display information about a playlist.\n"
+    "• <b>/myplaylists</b> : list all of your playlists.</blockquote>\n"
     "\n"
     "Your personal playlist: <code>/addplaylist [song]</code> saves a song, "
     "<code>/playlist</code> lists it, <code>/playplaylist</code> plays it "
     "(add <code>-s</code> to shuffle, <code>-v</code> for video).";
 
 inline const char* kHelpVclogs =
-    "⊚ <b><u>VC Logger Module:</u></b>\n"
+    "<h2>VC Logger Module</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/vclogger [on|off]</b> : toggle join / leave alerts.\n"
-    "➻ <b>/vcstatus</b> : verify the current logger state.\n"
+    "<blockquote>• <b>/vclogger [on|off]</b> : toggle join / leave alerts.\n"
+    "• <b>/vcstatus</b> : verify the current logger state.\n"
     "\n"
     "• Tracks user IDs during VC activity.\n"
     "• Alerts are cleaned automatically after 5 sec.</blockquote>";
 
 inline const char* kHelpInline =
-    "⊚ <b><u>Bot Play Button Details:</u></b>\n"
+    "<h2>Bot Play Button Details</h2>\n"
     "\n"
-    "<blockquote>💮 <b>Manage your music playback directly through inline "
+    "<blockquote><b>Manage your music playback directly through inline "
     "buttons with ease.</b></blockquote>\n"
     "\n"
-    "<blockquote>➻ <b>Playback controls</b> :\n"
-    "➻ <b>▷</b> : resume the paused stream.\n"
-    "➻ <b>II</b> : pause the ongoing stream.\n"
-    "➻ <b>↻</b> : replay the current song from start.\n"
-    "➻ <b>‣‣I</b> : skip the current track and play next.\n"
-    "➻ <b>▢</b> : stop the playback and clear queue.\n"
+    "<blockquote>• <b>Playback controls</b> :\n"
+    "• <b>Resume</b> : resume the paused stream.\n"
+    "• <b>Pause</b> : pause the ongoing stream.\n"
+    "• <b>Replay</b> : replay the current song from start.\n"
+    "• <b>Skip</b> : skip the current track and play next.\n"
+    "• <b>Stop</b> : stop the playback and clear queue.\n"
     "\n"
-    "➻ <b>Seek and navigation</b> :\n"
-    "➻ <b>-15s</b> : seek backward by 15 seconds.\n"
-    "➻ <b>15s+</b> : seek forward by 15 seconds.\n"
+    "• <b>Seek and navigation</b> :\n"
+    "• <b>-15s</b> : seek backward by 15 seconds.\n"
+    "• <b>15s+</b> : seek forward by 15 seconds.\n"
     "\n"
-    "❏ All buttons only for group admins.</blockquote>\n"
+    "• All buttons only for group admins.</blockquote>\n"
     "\n"
     "Send a music link to download it. Add <b>re</b> after the link to "
     "force re-download. In inline mode, type <code>@{bot} </code> followed "
@@ -628,18 +612,18 @@ inline const char* kHelpInline =
 
 // Radio topic page (openradiobot §2.1, §3/§21; corrected English).
 inline const char* kHelpRadio =
-    "<b>📻 Radio Commands</b>\n"
+    "<h2>Radio Commands</h2>\n"
     "\n"
-    "<blockquote>➻ <b>/new</b> : create your radio.\n"
-    "➻ <b>/destroy</b> : destroy your radio.\n"
-    "➻ <b>/manage</b> : check your radio status.\n"
-    "➻ <b>/play [song|URL]</b> : play a song or stream.\n"
-    "➻ <b>/pause</b> / <b>/resume</b> : pause / resume playback.\n"
-    "➻ <b>/skip</b> : skip the current song.\n"
-    "➻ <b>/stop</b> : stop the player.\n"
-    "➻ <b>/queue</b> : view the radio queue.\n"
-    "➻ <b>/autoplay [on|off]</b> : toggle autoplay.\n"
-    "➻ <b>/loop [queue|single|none]</b> : set the loop type.</blockquote>";
+    "<blockquote>• <b>/new</b> : create your radio.\n"
+    "• <b>/destroy</b> : destroy your radio.\n"
+    "• <b>/manage</b> : check your radio status.\n"
+    "• <b>/play [song|URL]</b> : play a song or stream.\n"
+    "• <b>/pause</b> / <b>/resume</b> : pause / resume playback.\n"
+    "• <b>/skip</b> : skip the current song.\n"
+    "• <b>/stop</b> : stop the player.\n"
+    "• <b>/queue</b> : view the radio queue.\n"
+    "• <b>/autoplay [on|off]</b> : toggle autoplay.\n"
+    "• <b>/loop [queue|single|none]</b> : set the loop type.</blockquote>";
 
 inline const char* kSearchHelp =
     "You can search for tracks, albums and playlists.\n"
@@ -697,25 +681,24 @@ inline std::string helpTopicTitle(const std::string& topic) {
 }
 
 inline const char* kHelpGroup =
-    "🤖 Hi! For bot help and commands, please DM me directly — I'm more "
+    "Hi! For bot help and commands, please DM me directly — I'm more "
     "responsive in private chats!";
 inline const char* kHelpUnknownCmd =
-    "⚠️ <i>No help found for command <code>{cmd}</code></i>";
-inline const char* kHelpOpeningToast = "Opening help menu...";
+    "<i>No help found for command <code>{cmd}</code></i>";
 inline const char* kHelpBackToast = "Returning to main menu...";
 inline const char* kHelpUnknownCategory = "Unknown help category.";
 
 // Unknown command / unhandled text (rustify §7.1, §3). {list} is the
 // command list for the caller's access level.
 inline const char* kUnknownCommand =
-    "❓ Command <code>{command}</code> not found.\n"
+    "<b>Command <code>{command}</code> not found.</b>\n"
     "\n"
-    "📋 Commands available to you:\n"
+    "<b>Commands available to you:</b>\n"
     "{list}";
 inline const char* kUnhandledText =
-    "😔 Your request was not handled\n"
+    "<b>Your request was not handled</b>\n"
     "\n"
-    "📋 Commands available to you:\n"
+    "<b>Commands available to you:</b>\n"
     "{list}";
 
 // Per-command help (§3): intro + Usage + Restrictions + Use Case.
@@ -924,7 +907,7 @@ inline std::string trackLink(const CardTrack& t) {
 // Started-streaming card (Yukki wins for text, §4). Title truncated to
 // 25 chars in the card (Yukki ShortTitle).
 inline std::string nowPlayingText(const CardTrack& t) {
-    return fmt("<b>🎵 Now Playing:</b>\n"
+    return fmt("<h2>Now Playing</h2>\n"
                "\n"
                "<b>▫ Track:</b> {track}\n"
                "<b>▫ Duration:</b> {duration}\n"
@@ -936,18 +919,16 @@ inline std::string nowPlayingText(const CardTrack& t) {
 
 // State cards (TgMusicBot buildTrackMessage template, §4): the same
 // card with a state line + a "by {user}" trailer.
-inline std::string stateCardText(const std::string& emoji,
-                                 const std::string& state,
+inline std::string stateCardText(const std::string& state,
                                  const CardTrack& t,
                                  const std::string& by_user) {
-    return fmt("{emoji} <b>{state}</b>\n"
+    return fmt("<h2>{state}</h2>\n"
                "\n"
                "<b>▫ Track:</b> {track}\n"
                "<b>▫ Duration:</b> {duration}\n"
                "<b>▫ Requested by:</b> {by}\n"
                "{trailer}",
-               {{"emoji", emoji},
-                {"state", state},
+               {{"state", state},
                 {"track", trackLink(t)},
                 {"duration", t.duration},
                 {"by", t.requester},
@@ -961,7 +942,7 @@ inline const char* kStoppedCard =
 
 // Queued card (Yukki wins, §4).
 inline std::string queuedText(int index, const CardTrack& t) {
-    return fmt("<b>🎵 Added to Queue:</b> #{index}\n"
+    return fmt("<b>Added to Queue:</b> #{index}\n"
                "\n"
                "<b>▫ Track:</b> {track}\n"
                "<b>▫ Duration:</b> {duration}\n"
@@ -972,23 +953,12 @@ inline std::string queuedText(int index, const CardTrack& t) {
                 {"by", t.requester}});
 }
 
-inline std::string queuedManyText(int count, const std::string& user,
-                                  bool hit_limit) {
-    std::string out = fmt("➕ <b>Added {count} tracks</b> by {user}",
-                          {{"count", std::to_string(count)},
-                           {"user", user}});
-    if (hit_limit)
-        out += "\n⚠️ <i>Queue limit reached — some tracks were skipped.</i>";
-    out += "\n<i>Use /queue to view full list.</i>";
-    return out;
-}
-
 // Merged 5-row control keyboard (Tina seek row + Yukki pause toggle +
 // Parvati autoplay row, §4). Row 1 is the no-op progress button (only
 // when NOT queued — the caller omits it for queued cards). The pause
-// button shows ▷ when paused, II while playing. Row 5 is Close +
-// Add-to-Playlist (TgMusicBot). The loop state is shown on the pause
-// row's replay button label when looping ("⟳ ×n").
+// button reads Pause while playing, Resume while paused. Row 5 is Close +
+// Add-to-Playlist (TgMusicBot). The loop state is shown on the replay
+// button label when looping ("Loop ×n").
 inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
                                      bool autoplay_on, int loop_count,
                                      const std::string& token,
@@ -1002,27 +972,27 @@ inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
             cbPlayer("progress", chat_id))});
     }
     std::string replay = loop_count > 0
-                             ? "⟳ ×" + std::to_string(loop_count)
-                             : "⟳";
+                             ? "Loop ×" + std::to_string(loop_count)
+                             : "Replay";
     kb.push_back({
-        B::callback(paused ? "▷" : "II",
+        B::callback(paused ? "Resume" : "Pause",
                     cbPlayer(paused ? "resume" : "pause", chat_id)),
         B::callback(replay, cbPlayer("replay", chat_id)),
-        B::callback("‣‣I", cbPlayer("skip", chat_id)),
-        B::callback("▢", cbPlayer("stop", chat_id)),
+        B::callback("Skip", cbPlayer("skip", chat_id)),
+        B::callback("Stop", cbPlayer("stop", chat_id)),
     });
     kb.push_back({
         B::callback("-15s", cbPlayer("seekback15", chat_id)),
         B::callback("+15s", cbPlayer("seek15", chat_id)),
     });
     kb.push_back({B::callback(
-        std::string("♫ Autoplay: ") + (autoplay_on ? "Enabled" : "Disabled"),
+        std::string("Autoplay: ") + (autoplay_on ? "Enabled" : "Disabled"),
         cbPlayer("autoplay", chat_id))});
     std::vector<B> row5;
-    row5.push_back(B::callback("🗑 Close", kCbClose));
+    row5.push_back(B::callback("Close", kCbClose));
     if (!token.empty())
         row5.push_back(
-            B::callback("➕ Add to Playlist", cbPlayerToken("addlist", token)));
+            B::callback("Add to Playlist", cbPlayerToken("addlist", token)));
     kb.push_back(std::move(row5));
     return kb;
 }
@@ -1035,99 +1005,70 @@ inline InlineKeyboard queuedKeyboard(const std::string& token) {
 
 // Callback toasts + edited cards (Parvati wins, corrected English, §4).
 inline std::string toastPaused(int64_t pos_sec) {
-    return "⏸️ Track paused at " + mmss(pos_sec);
+    return "Track paused at " + mmss(pos_sec);
 }
-inline const char* kCardPaused =
-    "<b>⏸️ Track Paused</b>\n"
-    "\n"
-    "<b>▫ Track:</b> {track}\n"
-    "<b>▫ Position:</b> {position} / {duration}\n"
-    "<b>▫ Paused by:</b> {user}";
 inline std::string toastResumed(int64_t pos_sec) {
-    return "▶️ Resumed at " + mmss(pos_sec) + ".";
+    return "Resumed at " + mmss(pos_sec) + ".";
 }
-inline const char* kCardResumed =
-    "<b>▶️ Track Resumed</b>\n"
-    "\n"
-    "<b>▫ Track:</b> {track}\n"
-    "<b>▫ Position:</b> {position} / {duration}\n"
-    "<b>▫ Resumed by:</b> {user}";
-inline const char* kToastReplay = "🔁 Replaying current track...";
-inline const char* kToastReplayed = "🔁 Track replayed.";
-inline const char* kToastReplayedBy = "🔁 Track replayed by {user}.";
-inline const char* kToastSkipped = "⏭️ Track skipped.";
-inline const char* kToastSkippedBy = "⏭️ Skipped by {user}";
-inline const char* kToastStopped = "⏹️ Playback stopped.";
-inline const char* kToastMuted = "🔇 Muted.";
-inline const char* kToastUnmuted = "🔊 Unmuted.";
-inline const char* kCardMuted =
-    "<b>🔇 Track Muted</b>\n"
-    "\n"
-    "<b>▫ Track:</b> {track}\n"
-    "<b>▫ Muted by:</b> {user}";
-inline const char* kCardUnmuted =
-    "<b>🔊 Track Unmuted</b>\n"
-    "\n"
-    "<b>▫ Track:</b> {track}\n"
-    "<b>▫ Unmuted by:</b> {user}";
+inline const char* kToastReplayedBy = "Track replayed by {user}.";
+inline const char* kToastSkipped = "Track skipped.";
+inline const char* kToastSkippedBy = "Skipped by {user}";
+inline const char* kToastStopped = "Playback stopped.";
+inline const char* kToastMuted = "Muted.";
+inline const char* kToastUnmuted = "Unmuted.";
 inline std::string toastSeekFwd(int seconds) {
-    return "⏩ Sought forward " + std::to_string(seconds) + " seconds";
+    return "Sought forward " + std::to_string(seconds) + " seconds";
 }
 inline std::string toastSeekBack(int seconds) {
-    return "⏪ Sought back " + std::to_string(seconds) + " seconds";
+    return "Sought back " + std::to_string(seconds) + " seconds";
 }
 inline std::string toastSeekNearEnd(int seconds) {
-    return "⚠️ Cannot seek forward " + std::to_string(seconds) +
+    return "Cannot seek forward " + std::to_string(seconds) +
            " seconds — about to reach end.";
 }
-inline const char* kToastAlreadyPlaying = "ℹ️ Track is already playing.";
-inline const char* kToastResumeFailed = "❌ Failed to resume playback.";
-inline const char* kToastSeekFailed = "❌ Failed to seek.\nError: <code>{error}</code>";
-inline const char* kToastSkipEmpty = "⏹️ Playback stopped — queue empty.";
-inline const char* kToastNextDownloadFailed = "❌ Failed to download next track.";
-inline const char* kToastNextPlayFailed = "❌ Failed to play next track.";
-inline const char* kToastInvalidRequest = "⚠️ Invalid request.";
-inline const char* kToastUnknownAction = "⚠️ Unknown action.";
-inline const char* kToastNothingPlaying = "⚠️ Nothing playing right now.";
+inline const char* kToastResumeFailed = "Failed to resume playback.";
+inline const char* kToastSeekFailed = "Failed to seek.\nError: <code>{error}</code>";
+inline const char* kToastSkipEmpty = "Playback stopped — queue empty.";
+inline const char* kToastInvalidRequest = "Invalid request.";
+inline const char* kToastUnknownAction = "Unknown action.";
+inline const char* kToastNothingPlaying = "Nothing playing right now.";
 inline const char* kToastExpired = "This button has expired.";
 inline const char* kToastNotAllowed = "You aren't allowed";
 inline const char* kToastFeatureUnavailable =
-    "🚧 This feature is not available yet.";
+    "This feature is not available yet.";
 // Toggle toasts (player row + settings panel): plain text, no HTML —
 // answerCallbackQuery shows the text verbatim.
-inline const char* kToastAutoplayOn = "♫ Autoplay enabled.";
-inline const char* kToastAutoplayOff = "♫ Autoplay disabled.";
-inline const char* kToastLoopOn = "🔁 Loop enabled.";
-inline const char* kToastLoopOff = "🔁 Loop disabled.";
-inline const char* kToastThumbOn = "🖼 Thumbnails enabled.";
-inline const char* kToastThumbOff = "🖼 Thumbnails disabled.";
-inline const char* kToastShuffle = "🔀 Queue shuffled.";
-inline const char* kToastAddedToPlaylist = "➕ Added to your playlist.";
+inline const char* kToastAutoplayOn = "Autoplay enabled.";
+inline const char* kToastAutoplayOff = "Autoplay disabled.";
+inline const char* kToastThumbOn = "Thumbnails enabled.";
+inline const char* kToastThumbOff = "Thumbnails disabled.";
+inline const char* kToastShuffle = "Queue shuffled.";
+inline const char* kToastAddedToPlaylist = "Added to your playlist.";
 inline const char* kToastAlreadyInPlaylist = "Already in your playlist.";
 inline const char* kToastPlaylistFull = "Your playlist is full.";
 inline const char* kToastDisliked = "Disliked.";
 
 // Stop confirm (Yukki wins, §4).
 inline const char* kStopConfirmPaused =
-    "⏸️ <b>Playback is currently paused.</b>\n"
+    "<h2>Playback is currently paused.</h2>\n"
     "\n"
     "Do you want to resume playing or stop it completely?";
 inline const char* kStopConfirmMuted =
-    "🔇 <b>Playback is currently muted.</b>\n"
+    "<h2>Playback is currently muted.</h2>\n"
     "\n"
     "Do you want to unmute or stop it completely?";
 inline InlineKeyboard stopConfirmKeyboard(int64_t chat_id, bool paused) {
     using B = InlineButton;
     std::vector<B> row;
     if (paused)
-        row.push_back(B::callback("▶️ Resume",
+        row.push_back(B::callback("Resume",
                                   "pl:player:confirm:resume:" +
                                       std::to_string(chat_id)));
     else
-        row.push_back(B::callback("🔊 Unmute",
+        row.push_back(B::callback("Unmute",
                                   "pl:player:confirm:unmute:" +
                                       std::to_string(chat_id)));
-    row.push_back(B::callback("⏹️ Stop",
+    row.push_back(B::callback("Stop",
                               "pl:player:confirm:stop:" +
                                   std::to_string(chat_id)));
     return {std::move(row)};
@@ -1135,46 +1076,34 @@ inline InlineKeyboard stopConfirmKeyboard(int64_t chat_id, bool paused) {
 
 // Restart confirm (Yukki §3.3, §4).
 inline const char* kRestartConfirm =
-    "⚠️ A song is currently playing in this chat.\nChoose an action below.";
+    "A song is currently playing in this chat.\nChoose an action below.";
 inline InlineKeyboard restartConfirmKeyboard(int64_t chat_id) {
     using B = InlineButton;
     return {{B::callback("Restart the Bot", cbRestart("bot", chat_id)),
              B::callback("Replay the Song", cbRestart("replay", chat_id))}};
 }
-inline const char* kToastRestarting = "♻️ Restarting the bot...";
-inline const char* kToastReplayOk = "⏮️ Current song replayed successfully.";
+inline const char* kToastRestarting = "Restarting the bot...";
+inline const char* kToastReplayOk = "Current song replayed successfully.";
 
 // Text-command control replies (remix wins, §4). The three-way select:
 // true -> done, false -> not streaming, null -> not in call.
-inline const char* kCtlPaused = "⏸ | <b>Paused.</b>";
-inline const char* kCtlResumed = "▶️ | <b>Resumed.</b>";
-inline const char* kCtlSkipped = "⏩ | <b>Skipped.</b>";
-inline const char* kCtlStopped = "⏹ | <b>Stopped.</b>";
-inline const char* kCtlNotStreaming = "❌ | <b>Not streaming.</b>";
-inline const char* kCtlNotInCall = "❌ | <b>Not in call.</b>";
-inline const char* kCtlMuted = "🔇 | <b>Muted.</b>";
-inline const char* kCtlUnmuted = "🔊 | <b>Unmuted.</b>";
-inline const char* kCtlAlreadyMuted = "❌ | <b>Already muted.</b>";
-inline const char* kCtlJoined = "✅ | <b>Joined the voice chat.</b>";
+inline const char* kCtlPaused = "<b>Paused.</b>";
+inline const char* kCtlResumed = "<b>Resumed.</b>";
+inline const char* kCtlSkipped = "<b>Skipped.</b>";
+inline const char* kCtlNotStreaming = "<b>Not streaming.</b>";
+inline const char* kCtlMuted = "<b>Muted.</b>";
+inline const char* kCtlUnmuted = "<b>Unmuted.</b>";
+inline const char* kCtlAlreadyMuted = "<b>Already muted.</b>";
+inline const char* kCtlJoined = "<b>Joined the voice chat.</b>";
 inline const char* kCtlAlreadyJoined =
-    "❌ | <b>Already in the voice chat.</b>";
-inline const char* kCtlNotMuted = "❌ | <b>Not muted.</b>";
-inline const char* kCtlLoopOn = "🔁 | <b>Turned loop on.</b>";
-inline const char* kCtlLoopOff = "🔁 | <b>Turned loop off.</b>";
-inline std::string ctlVolume(int amount) {
-    return fmt("🔈 | <b>Volume set to {amount}.</b>",
-               {{"amount", std::to_string(amount)}});
-}
-inline const char* kCtlVolumeInvalid =
-    "❌ | <b>Pass a number between 0 and 200.</b>";
-inline const char* kCtlShuffling = "🔀 | <b>Shuffling...</b>";
-inline const char* kCtlShuffleFew =
-    "❌ | <b>Not enough items to shuffle.</b>";
+    "<b>Already in the voice chat.</b>";
+inline const char* kCtlNotMuted = "<b>Not muted.</b>";
+inline const char* kCtlLoopOn = "<b>Turned loop on.</b>";
+inline const char* kCtlLoopOff = "<b>Turned loop off.</b>";
 
 // Control panel /menu (remix §2.3, §4). Admin-only; only the user who
 // sent the replied-to command may press (others silently ignored).
-inline std::string menuPanelText(const std::string& now_emoji,
-                                 const std::string& now_title,
+inline std::string menuPanelText(const std::string& now_title,
                                  const std::string& now_url,
                                  const std::string& next_title,
                                  const std::string& next_url) {
@@ -1187,7 +1116,9 @@ inline std::string menuPanelText(const std::string& now_emoji,
         if (url.empty()) return "<b>" + title + "</b>";
         return "<b><a href=\"" + url + "\">" + title + "</a></b>";
     };
-    return now_emoji + " | " + linked(now, now_url) + "\n➡️ | " +
+    // The state is carried by the Now/Next labels; no emoji is emitted
+    // anywhere in the UI (§7.3).
+    return "<b>Now:</b> " + linked(now, now_url) + "\n<b>Next:</b> " +
            linked(next, next_url);
 }
 inline InlineKeyboard menuPanelKeyboard(int64_t chat_id) {
@@ -1196,11 +1127,11 @@ inline InlineKeyboard menuPanelKeyboard(int64_t chat_id) {
         return cbPlayer(v, chat_id);
     };
     return {
-        {B::callback("🔀", p("shuffle")), B::callback("⏩", p("skip")),
-         B::callback("⏸", p("pause")), B::callback("▶️", p("resume"))},
-        {B::callback("🔇", p("mute")), B::callback("🔈", p("unmute")),
-         B::callback("🔉", p("voldec")), B::callback("🔊", p("volinc"))},
-        {B::callback("🔄", p("refresh"))},
+        {B::callback("Shuffle", p("shuffle")), B::callback("Skip", p("skip")),
+         B::callback("Pause", p("pause")), B::callback("Resume", p("resume"))},
+        {B::callback("Mute", p("mute")), B::callback("Unmute", p("unmute")),
+         B::callback("Vol -", p("voldec")), B::callback("Vol +", p("volinc"))},
+        {B::callback("Refresh", p("refresh"))},
     };
 }
 inline const char* kToastPanelUpdated = "Updated.";
@@ -1213,58 +1144,48 @@ inline std::string nowText(const std::string& title,
                            const std::string& title_url,
                            const std::string& requester,
                            const std::string& requester_url) {
-    return fmt("🎵 | Currently streaming <b><a href=\"{titleUrl}\">{title}</a></b> "
+    return fmt("Currently streaming <b><a href=\"{titleUrl}\">{title}</a></b> "
                "by <b><a href=\"{requesterUrl}\">{requester}</a></b>...",
                {{"titleUrl", title_url},
                 {"title", title},
                 {"requesterUrl", requester_url},
                 {"requester", requester}});
 }
-inline const char* kNowIdle = "❌ | <b>Not streaming.</b>";
+inline const char* kNowIdle = "<b>Not streaming.</b>";
 
 // /position (Parvati/Yukki §3.6/§3.7, §4).
 inline const char* kPositionText =
-    "🎵 <b>{title}</b>\n"
-    "📍 <code>{position} / {duration}</code>\n"
-    "⚙️ Speed: <b>{speed}x</b>";
+    "<b>{title}</b>\n"
+    "<code>{position} / {duration}</code>\n"
+    "Speed: <b>{speed}x</b>";
 
 // Voice-chat events (Tina/Yukki §2.9/§3.9, §4).
 inline const char* kVcStarted =
-    "<b>♻️ Voice chat started!</b>\n"
+    "<h2>Voice chat started!</h2>\n"
     "\n"
     "<i>Use /play [song name] to play music.</i>";
-inline const char* kVcEnded =
-    "<b>⚠️ Video chat ended</b>\n"
-    "\n"
-    "<i>⏰ Duration: {duration}</i>";
-inline const char* kQueueFinished =
-    "🎵 <b>Queue Finished!</b>\n"
-    "\n"
-    "No more songs to play. Use /play to add more tracks! 🎶";
-inline const char* kNextDownloading = "📥 Downloading your next track...";
-inline const char* kAutoplayNext = "🔁 Autoplay: <b>{title}</b>";
 inline const char* kVcEndedStop =
-    "📴 The voice chat was ended, so playback has stopped.\n"
+    "The voice chat was ended, so playback has stopped.\n"
     "\n"
-    "💐 Start a new voice chat and use /play again.";
+    "Start a new voice chat and use /play again.";
 
 // --- §5 queue display ------------------------------------------------------
 // Yukki wins — the only rich queue in any ref (table + per-track delete
 // + show-more), Bot-API-HTML translation (§5). First page shows 15
-// up-next tracks; a [➕ Show {count} more] button reveals the rest.
+// up-next tracks; a [Show {count} more] button reveals the rest.
 inline const int kQueuePageSize = 15;
 
 inline std::string queueText(const CardTrack& now,
                              const std::vector<CardTrack>& up_next,
                              size_t total_up_next) {
-    std::string out = "<b>🎶 Current Queue</b>\n\n";
-    out += "<b>▶️ Now Playing</b>\n";
+    std::string out = "<h2>Current Queue</h2>\n\n";
+    out += "<b>Now Playing</b>\n";
     out += trackLink(now) + "\n";
-    out += "⏱️ " + now.duration + "  •  👤 " + now.requester + "\n";
-    out += "\n<b>⏭️ Up Next • " + std::to_string(total_up_next) +
+    out += now.duration + "  •  " + now.requester + "\n";
+    out += "\n<b>Up Next • " + std::to_string(total_up_next) +
            " tracks</b>\n";
     if (up_next.empty()) {
-        out += "📭 <i>No more songs in queue.</i>";
+        out += "<i>No more songs in queue.</i>";
         return out;
     }
     int i = 0;
@@ -1287,26 +1208,20 @@ inline InlineKeyboard queueKeyboard(int64_t chat_id,
                          cbQueueDel(chat_id, t.token))});
     }
     if (has_more) {
-        kb.push_back({B::callback("➕ Show " + std::to_string(remaining) +
+        kb.push_back({B::callback("Show " + std::to_string(remaining) +
                                       " more",
                                   cbQueueMore(chat_id))});
     }
     return kb;
 }
 
-inline const char* kQueueFetching = "Fetching queue...";
 inline const char* kQueueEmpty =
-    "⚠️ <b>No active playback.</b>\n"
+    "<b>No active playback.</b>\n"
     "\n"
     "<i>Nothing is queued right now.</i>";
 inline const char* kQueueAlreadyEmpty =
-    "⚠️ <b>The queue is already empty.</b>";
-inline std::string queueLimitText(int limit) {
-    return fmt("⚠️ Queue limit reached ({limit} tracks max). Use /clear to "
-               "clear queue.",
-               {{"limit", std::to_string(limit)}});
-}
-inline const char* kToastQueueRemoved = "🗑️ Removed from queue.";
+    "<b>The queue is already empty.</b>";
+inline const char* kToastQueueRemoved = "Removed from queue.";
 
 // Queue ops replies (NoxBeats wins, corrected English, §5).
 inline std::string queueClearedText(int count, const std::string& by) {
@@ -1345,12 +1260,6 @@ inline std::string queueShuffledText(int count, const std::string& by) {
     return fmt("Shuffled <b>{count}</b> queued tracks.\n\n» By {by}",
                {{"count", std::to_string(count)}, {"by", by}});
 }
-inline std::string queueFullText(int limit) {
-    return fmt("» The queue limit ({limit}) has been reached. Please wait for "
-               "the currently queued tracks to finish playing, then try "
-               "again.",
-               {{"limit", std::to_string(limit)}});
-}
 
 // /queue help block (openradiobot §2.3 queue ops, §5) — appended to the
 // /queue help topic.
@@ -1364,15 +1273,11 @@ inline const char* kQueueHelpOps =
     "  shuffle - Sort queue into random order";
 
 // --- §6 lyrics --------------------------------------------------------------
-inline const char* kLyricsNotStreaming = "❌ | <b>Not streaming.</b>";
-inline const char* kLyricsNotFound = "❌ | <b>Lyrics not found.</b>";
+inline const char* kLyricsNotStreaming = "<b>Not streaming.</b>";
+inline const char* kLyricsNotFound = "<b>Lyrics not found.</b>";
 inline const char* kLyricsCard = "<b>{title}</b> #lyrics\n\n{lyrics}";
-inline const char* kLyricsNeedQuery =
-    "Please enter a song keyword, song share link, or song ID";
-inline const char* kLyricsFetching = "Fetching lyrics…";
 inline const char* kLyricsFail =
     "Failed to get lyrics — the song may not exist or may be instrumental";
-inline const char* kLyricsNoProgram = "Radio programs don't support lyrics";
 inline const char* kLyricsNoResults = "No results found";
 
 // --- §7 search results ------------------------------------------------------
@@ -1400,10 +1305,10 @@ inline std::string searchResultLine(int n, const std::string& title,
     if (!duration.empty()) out += " (" + duration + ")";
     out += "\n<b>By :</b> " + artists;
     std::string dur = is_live ? "Live" : (duration.empty() ? "N/A" : duration);
-    out += "\n  ├ 🕓 " + dur;
-    out += "\n  ├ 👁 " + (views.empty() ? "N/A" : views);
-    out += "\n  ├ 📅 " + (upload_time.empty() ? "N/A" : upload_time);
-    out += "\n  └ 👤 " + (uploader.empty() ? "N/A" : uploader);
+    out += "\n  ├ <b>Duration:</b> " + dur;
+    out += "\n  ├ <b>Views:</b> " + (views.empty() ? "N/A" : views);
+    out += "\n  ├ <b>Uploaded:</b> " + (upload_time.empty() ? "N/A" : upload_time);
+    out += "\n  └ <b>Uploader:</b> " + (uploader.empty() ? "N/A" : uploader);
     return out;
 }
 
@@ -1434,144 +1339,53 @@ inline InlineKeyboard searchPageKeyboard(int64_t user_id, int page,
     std::vector<B> row;
     if (has_prev)
         row.push_back(B::callback(
-            "⬅️ Previous page",
+            "Previous page",
             cbSearchPage(user_id, page - 1, hash)));
     if (has_next)
         row.push_back(B::callback(
-            "Next page ➡️", cbSearchPage(user_id, page + 1, hash)));
+            "Next page", cbSearchPage(user_id, page + 1, hash)));
     if (row.empty()) return {};
     (void)total_pages;
     return {std::move(row)};
 }
 
-inline const char* kSearchActive = "❌ | <b>There is an active search.</b>";
 inline const char* kSearchNoQuery =
-    "❔ | <b>What do you want to search for?</b>";
-inline const char* kSearchNoResults = "❌ | <b>No results found.</b>";
-inline const char* kSearchCancelled = "✅ | <b>Search canceled.</b>";
-inline const char* kSearchNoActive = "❌ | <b>There is no search active.</b>";
+    "<b>What do you want to search for?</b>";
+inline const char* kSearchNoResults = "<b>No results found.</b>";
 inline const char* kSearchExpired = "Search expired, please search again";
-inline const char* kSearchOnlyStarter =
-    "Only the person who started the search can use it";
 inline std::string searchTooFrequentText(int seconds) {
     return "Too frequent, please try again in " + std::to_string(seconds) +
            " seconds";
 }
 inline const char* kSearchNoMore = "No more results.";
 inline const char* kSearchSuccessToast = "Success";
-inline const char* kSearching = "🔎 Searching for track...";
-inline const char* kChooseTrack = "Choose a track:";
-inline const char* kLinkAccepted =
-    "🔗 Link accepted! What exactly to download?";
-inline const char* kSearchLinkOutdated = "❌ Link is outdated.";
-inline const char* kSearchResultsOutdated = "❌ Results are outdated.";
-inline const char* kSearchNothingFound = "I've found nothing.";
 
 // /search help text (lemonic §6.2, typo corrected, §7).
 
-
 // /play search flow lifecycle (NoxBeats/Tina/Yukki/Arc/Parvati, §7).
-inline const char* kPlaySearching = "🔍🎶 Searching... ⚡✨";
-inline std::string playSearchingForText(const std::string& query) {
-    return fmt("🔍🎶 Searching for: <b>{query}</b>... ⚡✨",
-               {{"query", htmlEscape(query)}});
-}
-inline std::string playDownloadingText(const std::string& title) {
-    return fmt("📥 Downloading song \"{title}\"",
-               {{"title", htmlEscape(title)}});
-}
+
 inline const char* kNoSongQuery =
-    "<b>🎵 Whoops! Nothing to play.</b>\n"
+    "<b>Whoops! Nothing to play.</b>\n"
     "\n"
     "<i>Send <b>{cmd} [song name or link]</b>, or reply to a <b>media</b> "
     "message to start the music.</i>";
-inline const char* kPlayNotFound = "❌ No tracks found.";
-inline std::string playAlreadyQueuedText(const std::string& title) {
-    return fmt("✅ <b>Track already added!</b>\n\n<i>{title}</i> is already "
-               "playing or in the queue.",
-               {{"title", htmlEscape(title)}});
-}
-inline const char* kPlayAlreadyPlaying =
-    "⚠️ <b>A song is already playing.</b>\n"
-    "\n"
-    "Please wait for it to finish or use <code>/stop</code> to stop it "
-    "first.";
-inline std::string playFailedText(const std::string& error) {
-    return fmt("❌ Failed to play\nError: {error}",
-               {{"error", htmlEscape(error)}});
-}
-inline const char* kPlayUnable =
-    "❌ Unable to play — please restart the voice chat.";
 inline std::string playTooLongText(int minutes) {
     return fmt("Sorry, song exceeds max duration of {n} minutes.",
                {{"n", std::to_string(minutes)}});
 }
-inline std::string playAllTooLongText(int minutes) {
-    return fmt("❌ All found tracks were skipped due to duration limits "
-               "({n} min).",
-               {{"n", std::to_string(minutes)}});
-}
-inline const char* kDownloadTooLong =
-    "‼️ <b>Oops! Video too long to convert!</b> Order something 30 minutes "
-    "or less.";
-inline const char* kFoundLine = "🎵 {title}\n🔗 {link}";
-inline const char* kSpotifyLinkUnsupported =
-    "‼️ <b>Oops! The bot does not support Spotify links!</b>";
 
 // --- §8 download progress ---------------------------------------------------
 // Live progress message (Parvati fields + navidrome checklist, §8),
 // edited in place. {done}/{total} byte line is added when known.
-inline const char* kDlProgress =
-    "📥 Downloading your track...\n"
-    "\n"
-    "<b>Progress:</b> {pct}%\n"
-    "<b>Speed:</b> {speed}\n"
-    "<b>ETA:</b> {eta}\n"
-    "<b>Elapsed:</b> {elapsed}";
-inline const char* kDlProgressBytes =
-    "<b>Progress:</b> {done} / {total} [{pct:.1f}%]";
-inline const char* kDlCancelBtn = "🚦 Cancel Downloading";
+
+inline const char* kDlCancelBtn = "Cancel Downloading";
 inline const char* kDlUsage = "Usage: /download &lt;song title or link&gt;";
-inline const char* kDlCancelled = "✅ Download cancelled.";
-inline const char* kDlNoDownload = "ℹ️ No download to cancel.";
-inline std::string dlCancelledByText(const std::string& user) {
-    return fmt("⚠️ Download cancelled by {user}", {{"user", user}});
-}
-inline const char* kDlCancelling = "Hang on, cancelling the download now!";
 inline const char* kDlFetching = "Fetching song info...";
-inline const char* kDlCacheHit = "…\nCache hit, sending...";
-inline const char* kDlWaiting = "Waiting to download...";
-inline const char* kDlDownloading = "Downloading...";
-inline const char* kDlComplete = "Download complete, sending...";
-inline const char* kDlResolving = "Resolving link…";
-inline std::string dlResolveFailText(const std::string& error) {
-    std::string e = error;
-    if (e.size() > 120) e = e.substr(0, 120);
-    return fmt("❌ Failed to resolve link: {error}",
-               {{"error", htmlEscape(e)}});
-}
-inline std::string dlCouldNotResolveText(const std::string& bot) {
-    return fmt("❌ Could not resolve link. Search by name instead: @{bot} "
-               "artist title",
-               {{"bot", bot}});
-}
-inline const char* kDlQueued =
-    "Queued — will start after the current download finishes";
-inline const char* kDlFetchAlbum = "Fetching album info…";
-inline const char* kDlFetchTrack = "Fetching track info…";
 inline std::string dlFailedText(const std::string& error) {
-    return fmt("❌ Download failed: {error}",
+    return fmt("Download failed: {error}",
                {{"error", htmlEscape(error)}});
 }
-inline const char* kDlAlreadyQueued = "Already queued.";
-inline std::string dlCompleteProcessingText(int seconds) {
-    return fmt("Download completed. Processing file...\n\nTime elapsed: {s}s",
-               {{"s", std::to_string(seconds)}});
-}
-inline const char* kDlSuccess = "✅ Song downloaded successfully!";
-inline const char* kDlSizeLimit =
-    "» Failed to process the file. The maximum download limit is "
-    "<b>200 MB</b>.";
+inline const char* kDlSuccess = "Song downloaded successfully!";
 
 // Lossy-fallback prompt (navidrome §7.6.7, §8).
 inline const char* kLossyPrompt =
@@ -1581,22 +1395,15 @@ inline const char* kLossyPrompt =
 inline InlineKeyboard lossyKeyboard(const std::string& id,
                                     const std::string& summary) {
     using B = InlineButton;
-    return {{B::callback("✓ Accept " + summary, cbLossy("accept", id)),
-             B::callback("✗ Skip", cbLossy("skip", id)),
-             B::callback("✖ Cancel", cbDlCancel(id))}};
+    return {{B::callback("Accept " + summary, cbLossy("accept", id)),
+             B::callback("Skip", cbLossy("skip", id)),
+             B::callback("Cancel", cbDlCancel(id))}};
 }
-inline const char* kLossyExpired = "Prompt expired (5 min).";
 inline const char* kToastLossyExpired = "Prompt expired.";
 inline const char* kToastLossySkipped = "Skipped.";
 inline std::string lossySkippedText(const std::string& artist,
                                     const std::string& title) {
     return fmt("Skipped — FLAC not available for {artist} — {title}",
-               {{"artist", artist}, {"title", title}});
-}
-inline std::string lossyCancelledText(const std::string& artist,
-                                      const std::string& title) {
-    return fmt("✖ Cancelled — FLAC not available for {artist} — {title}, no "
-               "fallback taken",
                {{"artist", artist}, {"title", title}});
 }
 
@@ -1605,15 +1412,6 @@ inline const char* kToastDlNothingToCancel =
     "Nothing to cancel — already finished.";
 inline const char* kToastDlWrongChat =
     "Only the chat that requested this can cancel it.";
-inline const char* kToastDlCancelling = "Cancelling…";
-inline const char* kDlCancelSaved =
-    "✖ Cancelled — the track was already saved";
-inline const char* kDlCancelNothing = "✖ Cancelled — nothing was downloaded";
-inline std::string dlCancelAlbumText(int saved, int total) {
-    return fmt("✖ Cancelled — {saved}/{total} tracks were already saved",
-               {{"saved", std::to_string(saved)},
-                {"total", std::to_string(total)}});
-}
 
 // Spotify download option picker (Spotify-Loader §5.3, §8).
 inline const char* kDlSpotifyOptions = "Select Options Below!";
@@ -1626,24 +1424,21 @@ inline std::string dlSpotifySuccessText(int count, const std::string& kind) {
     return fmt("Successfully uploaded {x} from a Spotify {kind}",
                {{"x", std::to_string(count)}, {"kind", kind}});
 }
-inline const char* kDlWrongSpotifyUrl =
-    "Looks like you've sent the wrong Spotify URL.";
 
 // Audio-effect picker (tmb-rust §4.4, §8).
 inline const char* kDlFxPrompt =
-    "📌 Track: <b>{title}</b>\n\nChoose a processing option:";
+    "<b>Track:</b> {title}\n\nChoose a processing option:";
 inline InlineKeyboard dlFxKeyboard(const std::string& run_id) {
     using B = InlineButton;
     return {
-        {B::callback("🎵 Original", cbDlFx(run_id, "orig")),
-         B::callback("🌌 Slow + Reverb", cbDlFx(run_id, "slow"))},
-        {B::callback("⚡ Nightcore", cbDlFx(run_id, "nightcore")),
-         B::callback("🔊 Bass Boost", cbDlFx(run_id, "bass"))},
-        {B::callback("🌀 8D Audio", cbDlFx(run_id, "8d"))},
+        {B::callback("Original", cbDlFx(run_id, "orig")),
+         B::callback("Slow + Reverb", cbDlFx(run_id, "slow"))},
+        {B::callback("Nightcore", cbDlFx(run_id, "nightcore")),
+         B::callback("Bass Boost", cbDlFx(run_id, "bass"))},
+        {B::callback("8D Audio", cbDlFx(run_id, "8d"))},
     };
 }
-inline const char* kDlFxApplying = "📥 Downloading and applying effect...";
-inline const char* kDlFxError = "❌ Error downloading track.";
+inline const char* kDlFxApplying = "Downloading and applying effect...";
 
 // Download-delivery audio caption (Music163bot §6.3, §4/§8).
 inline const char* kAudioCaption =
@@ -1651,29 +1446,6 @@ inline const char* kAudioCaption =
     "Album: {album}\n"
     "#{ext} {sizeMB:.2f}MB {kbps:.2f}kbps\n"
     "via @{bot}";
-
-// Upload intake (navidrome §7.10, §8/§24).
-inline const char* kUploadReceived =
-    "📦 {name}: {n} audio file(s) received. Identifying release…";
-inline const char* kUploadIdentified =
-    "📦 {name}: release identified. Import queued until the current "
-    "download finishes…";
-inline const char* kUploadImporting =
-    "📦 Importing upload: {artist} — {title}…";
-inline const char* kUploadNoMatch =
-    "❓ {name}: couldn't match this to a release — {diagnosis}. Files are "
-    "kept in uploads staging; nothing was filed.";
-inline const char* kUploadImportFailed =
-    "❌ Upload import failed: {error}. Files kept in staging.";
-inline const char* kUploadRejected =
-    "❌ Upload rejected: {name}\nReason: {error}\nMoved to {_REJECTED}/ — "
-    "fix and re-drop.";
-
-// Resume after restart (navidrome §7.11, §8).
-inline const char* kDlResume = "🔁 Bot restarted — resuming this download…";
-inline const char* kDlGiveUp =
-    "A download kept dying across bot restarts — giving up on it. Re-send "
-    "the link to try again.";
 
 // --- §9 settings menus ------------------------------------------------------
 // Per-chat settings snapshot the panel renders from. The dispatcher
@@ -1694,7 +1466,7 @@ struct ChatSettings {
 };
 
 inline const char* kSettingsText =
-    "⚙️ <b>Chat Settings</b>\n"
+    "<h2>Chat Settings</h2>\n"
     "\n"
     "<b>Group:</b> {title}\n"
     "<b>Group ID:</b> <code>{id}</code>\n"
@@ -1712,11 +1484,11 @@ inline InlineKeyboard settingsKeyboard(const ChatSettings& s) {
     using B = InlineButton;
     auto on_off = [](bool v) { return v ? "Enabled" : "Disabled"; };
     std::string admin_mode = s.admin_mode == 1
-                                 ? "Admins 🔐"
-                                 : s.admin_mode == 2 ? "Everyone 🌍"
-                                                     : "Auth Users 🎧";
+                                 ? "Admins"
+                                 : s.admin_mode == 2 ? "Everyone"
+                                                     : "Auth Users";
     std::string play_mode =
-        s.play_mode == "admin" ? "Admins 🔐" : "Everyone 🌍";
+        s.play_mode == "admin" ? "Admins" : "Everyone";
     std::string delay = s.clean_delay_min == 0
                             ? "15m"
                             : std::to_string(s.clean_delay_min) + "m";
@@ -1724,33 +1496,34 @@ inline InlineKeyboard settingsKeyboard(const ChatSettings& s) {
                               std::to_string(s.auto_delete_min) +
                               " minutes";
     InlineKeyboard kb = {
-        {B::callback("🛡️ Admin Mode", cbSetInfo("adminmode")),
+        {B::callback("Admin Mode", cbSetInfo("adminmode")),
          B::callback(admin_mode, cbSet("adminmode"))},
-        {B::callback("🎵 Play Mode", cbSetInfo("playmode")),
+        {B::callback("Play Mode", cbSetInfo("playmode")),
          B::callback(play_mode, cbSet("playmode"))},
-        {B::callback("🗑️ Cmd Delete", cbSetInfo("cmddelete")),
+        {B::callback("Cmd Delete", cbSetInfo("cmddelete")),
          B::callback(on_off(s.cmd_delete), cbSet("cmddelete"))},
-        {B::callback("🧹 Clean Mode", cbSetInfo("cleanmode")),
+        {B::callback("Clean Mode", cbSetInfo("cleanmode")),
          B::callback(on_off(s.clean_delay_min > 0), cbSet("cleanmode"))},
-        {B::callback("⏱️ Clean Delay", cbSetInfo("cleanduration")),
+        {B::callback("Clean Delay", cbSetInfo("cleanduration")),
          B::callback(delay, cbSet("cleanduration"))},
-        {B::callback("🖼️ Thumbnails", cbSetInfo("nothumb")),
+        {B::callback("Thumbnails", cbSetInfo("nothumb")),
          B::callback(on_off(s.thumbnails), cbSet("nothumb"))},
-        {B::callback("📻 Autoplay", cbSetInfo("autoplay")),
+        {B::callback("Autoplay", cbSetInfo("autoplay")),
          B::callback(on_off(s.autoplay), cbSet("autoplay"))},
-        {B::callback("🌐 Language", cbSetInfo("lang")),
+        {B::callback("Language", cbSetInfo("lang")),
          B::callback(s.language, kCbLangSelect)},
         {B::callback(std::string("Auto-delete: ") + on_off(s.auto_delete),
                      cbSet("autodelete"))},
         {B::callback(timer_label, cbSetInfo("timer"))},
         {B::callback(std::string("Silent mode: ") + on_off(s.silent), cbSet("silent"))},
-        {B::callback("🗑 Close", kCbClose)},
+        {B::callback("Close", kCbClose)},
     };
-    // Timer buttons 2–7 min (TgMusicBot §5.7): current value prefixed ✓.
+    // Timer buttons 2–7 min (TgMusicBot §5.7): current value marked.
     std::vector<B> timers;
     for (int n = 2; n <= 7; ++n) {
         timers.push_back(B::callback(
-            (n == s.auto_delete_min ? "✓ " : "") + std::to_string(n),
+            (n == s.auto_delete_min ? std::to_string(n) + " (current)"
+                                  : std::to_string(n)),
             cbSetTimer(n)));
     }
     kb.insert(kb.begin() + 10, std::move(timers));
@@ -1804,66 +1577,15 @@ inline std::string settingInfoText(const std::string& key) {
     return "";
 }
 
-inline const char* kSettingsUpdated = "✅ Settings updated!";
+inline const char* kSettingsUpdated = "Settings updated!";
 inline const char* kSettingsGroupOnly =
     "These settings are available only in groups.";
-inline const char* kSettingsOutdated =
-    "This settings button is outdated. Open /settings again.";
-inline const char* kSettingsLoadFail =
-    "Unable to load settings. Please try again later.";
-inline const char* kSettingsSaveFail =
-    "Unable to save settings. Please try again.";
-inline const char* kSettingsNoDeletePerm =
-    "I don't have permission to delete messages in this chat.";
-inline const char* kSettingsNotStreaming = "Bot is not streaming.";
-
-// Dashboard toggle cards (Yukki §3.7, §9): command-form equivalent of
-// the panel rows.
-inline std::string dashboardCardText(const std::string& title,
-                                     const std::string& description,
-                                     bool enabled) {
-    return "<b>" + title + "</b>\n\n<i>" + description + "</i>\n\nℹ️ Status: <b>" +
-           (enabled ? "Enabled ✅" : "Disabled ❌") + "</b>";
-}
-inline InlineKeyboard dashboardKeyboard(const std::string& key,
-                                        bool enabled) {
-    using B = InlineButton;
-    return {{B::callback(enabled ? "Enabled ✅" : "Disabled ❌",
-                         cbSet(key)),
-             B::callback("Close", kCbClose)}};
-}
-inline std::string settingUpdatedText(bool enabled) {
-    return fmt("✅ Setting updated to {status}.",
-               {{"status", enabled ? "Enabled" : "Disabled"}});
-}
-inline const char* kSettingUpdateFail = "⚠️ Failed to update the setting.";
-
-inline const char* kDashAutoplayDesc =
-    "Once the queue ends, the bot automatically keeps playing recommended "
-    "songs similar to the last played track.";
-inline const char* kDashAutoleaveDesc =
-    "When enabled, the assistant automatically leaves inactive or "
-    "unnecessary chats every 10 minutes.";
-inline const char* kDashMaintenanceDesc =
-    "When enabled, all active rooms are stopped and only the owner/sudo "
-    "users can use the bot.";
-inline const char* kDashLoggerDesc =
-    "When enabled, bot activity is logged to the logger channel.";
-inline const char* kDashCmdDeleteDesc =
-    "When enabled, command messages are deleted after they run.";
-inline const char* kDashCleanModeDesc =
-    "When enabled, the bot's messages are auto-deleted after the clean "
-    "delay.";
-inline const char* kDashPlayModeDesc =
-    "When enabled, only admins and authorized users can use /play.";
-inline const char* kDashNothumbDesc =
-    "When enabled, album art is hidden from now-playing and queue cards.";
 
 // Autoplay card (Tina wins, §9).
 inline std::string autoplayCardText(bool enabled) {
     std::string out =
-        "📻 <b>Autoplay Mode Settings</b>\n\n• <b>Current Status:</b> ";
-    out += enabled ? "🟢 <b>Enabled (ON)</b>" : "🔴 <b>Disabled (OFF)</b>";
+        "<h2>Autoplay Mode Settings</h2>\n\n• <b>Current Status:</b> ";
+    out += enabled ? "<b>Enabled (ON)</b>" : "<b>Disabled (OFF)</b>";
     out += "\n\n<i>When the current queue finishes, the bot will <b>";
     out += enabled
                ? "automatically discover and stream related songs</b> "
@@ -1875,9 +1597,9 @@ inline std::string autoplayCardText(bool enabled) {
 }
 inline InlineKeyboard autoplayCardKeyboard(bool enabled) {
     using B = InlineButton;
-    return {{B::callback(enabled ? "🟢 Turn OFF" : "🔴 Turn ON",
+    return {{B::callback(enabled ? "Turn OFF" : "Turn ON",
                          cbSet("autoplay")),
-             B::callback("🗑 Close", kCbClose)}};
+             B::callback("Close", kCbClose)}};
 }
 inline std::string autoplayStatusText(bool on, const std::string& lang,
                                       const std::string& mood) {
@@ -1885,57 +1607,43 @@ inline std::string autoplayStatusText(bool on, const std::string& lang,
                "<b>Mood:</b> <code>{mood}</code>",
                {{"on", on ? "on" : "off"}, {"lang", lang}, {"mood", mood}});
 }
-inline const char* kAskipDisabled =
-    "⚠️ Autoplay is disabled. Use /autoplay to enable it.";
-inline const char* kAskipNone =
-    "⚠️ No autoplay recommendations found to skip to.";
-inline std::string askipSuccessText(const std::string& user,
-                                    const std::string& title) {
-    return fmt("⏭️ Autoplay skipped by {user}\n🔁 Playing: <b>{title}</b>",
-               {{"user", user}, {"title", title}});
-}
 
 // Language picker (merged, English-only today, §9).
-inline const char* kLangPicker = "🌐 <b>Select Bot Language:</b>";
+inline const char* kLangPicker = "<h2>Select Bot Language</h2>";
 inline InlineKeyboard langPickerKeyboard(const std::string& origin) {
     using B = InlineButton;
     std::string back = kCbStart;
     if (origin == "help") back = kCbHelpMain;
     if (origin == "settings") back = kCbSetMain;
     return {
-        {B::callback("✔️ English 🇺🇸", std::string(kCbLangEn) + ":" + origin)},
-        {B::callback("⬅️ Back", back)},
+        {B::callback("English", std::string(kCbLangEn) + ":" + origin)},
+        {B::callback("Back", back)},
     };
 }
 inline std::string langUpdatedText(const std::string& lang_name) {
-    return fmt("✅ Language successfully updated to {lang}.",
+    return fmt("Language successfully updated to {lang}.",
                {{"lang", lang_name}});
 }
-inline const char* kLangAlready = "ℹ️ You're already using this language.";
-inline const char* kLangFailed =
-    "❌ Failed to update language. Please try again later.";
+inline const char* kLangAlready = "You're already using this language.";
 
 // Command-form settings (§9).
 inline const char* kAdminModeInvalid =
-    "⚠️ Invalid mode. Use: <code>admin</code>, <code>adminauth</code>, or "
+    "Invalid mode. Use: <code>admin</code>, <code>adminauth</code>, or "
     "<code>everyone</code>.";
 inline std::string adminModeUpdatedText(const std::string& status) {
-    return fmt("✅ <b>Admin command mode</b> updated to: {status}",
+    return fmt("<b>Admin command mode</b> updated to: {status}",
                {{"status", status}});
 }
 inline const char* kPlayModeAdmin =
-    "🛡️ <b>Play mode</b> is now restricted to <b>Admins &amp; DJs</b> only. 🎧";
+    "<b>Play mode</b> is now restricted to <b>Admins &amp; DJs</b> only.";
 inline const char* kPlayModeEveryone =
-    "✅ <b>Play mode</b> is now <b>Open to Everyone</b>. Let the music flow! 🎶";
-inline const char* kPlayModeDenied =
-    "🚫 Play mode is enabled. Only admins and authorized users can play.";
+    "<b>Play mode</b> is now <b>Open to Everyone</b>. Let the music flow!";
 inline const char* kCleanModeStatus =
-    "🧹 <b>Clean mode</b>\n"
+    "<h2>Clean mode</h2>\n"
     "\n"
     "Auto-cleanup of command and service messages.\n"
     "Current state: {action}\n"
     "Delete after: {duration}m";
-inline const char* kCleanModeHint = "Use /settings to change auto-delete duration.";
 inline const char* kLoggerNeedId = "Please set LOGGER_ID in .env first.";
 inline const char* kLoggerUsage =
     "Usage: /logger [enable|disable|on|off]\nCurrent status: {status}";
@@ -1944,8 +1652,6 @@ inline const char* kLoggerDisabled = "Logger disabled";
 inline const char* kThumbStatus =
     "<b>Thumbnail:</b> {on}\n\n<code>/thumbnail on</code> • "
     "<code>/thumbnail off</code>";
-inline const char* kInvalidBool =
-    "⚠️ <b>Invalid value.</b>\nUse 'enable' or 'disable'.";
 
 // /download-settings (Spotify-Loader §5.4, §9) — per-user download prefs.
 inline const char* kDlSettingsIndex = "Select one of the settings below!";
@@ -1996,24 +1702,22 @@ inline const char* kDlSettingsTemplatePrompt =
     "Note: \"/\" is used for making new directories.";
 
 // beetube settings screens (§9): pagination + music download toggles.
-inline const char* kSettingsIndex =
-    "⚙ <b>Settings</b>\n"
-    "Use this section to apply personalized custom tweaks to Parlay";
+
 inline InlineKeyboard settingsIndexKeyboard() {
     using B = InlineButton;
-    return {{B::callback("⏩ Pagination", cbSet("page")),
-             B::callback("💀 Music Download", cbSet("musicdl"))}};
+    return {{B::callback("Pagination", cbSet("page")),
+             B::callback("Music Download", cbSet("musicdl"))}};
 }
 inline const char* kSettingsPageScreen =
-    "⏩ <b>Auto delete old messages</b>\n"
+    "<h2>Auto delete old messages</h2>\n"
     "By default previous messages are deleted during pagination to ease "
     "chat scrolling, use this section to change this behaviour.";
 inline const char* kSettingsMusicDlScreen =
-    "⬇ <b>Download music via chat</b>\n"
+    "<h2>Download music via chat</h2>\n"
     "Enabling this will allow you to download music directly from chat.\n"
     "<b>Note:</b> The actual size is compressed and you can't download a "
     "music file of more than <em>200MB</em> via chat.\n"
-    "✅ Supported formats\n"
+    "<b>Supported formats</b>\n"
     "- MP3\n"
     "- FLAC\n"
     "- WMA\n"
@@ -2024,21 +1728,21 @@ inline const char* kSettingsMusicDlScreen =
 inline InlineKeyboard settingsToggleKeyboard(const std::string& key,
                                              bool enabled) {
     using B = InlineButton;
-    return {{B::callback(enabled ? "✅ Enabled" : "❌ Disabled",
+    return {{B::callback(enabled ? "Enabled" : "Disabled",
                          cbSet(key + ":" + (enabled ? "0" : "1"))),
-             B::callback("🔙 Back", kCbSetMain)}};
+             B::callback("Back", kCbSetMain)}};
 }
 
 // --- §10 admin/sudo panels ---------------------------------------------------
 // Permission denials (Yukki §3.9 wins, §10).
 inline const char* kDenyAdmin =
-    "<b>🚫 Access Denied</b>\n"
-    "<i>🔒 This action is limited to <b>chat admins</b>.</i>\n"
+    "<h2>Access Denied</h2>\n"
+    "<i>This action is limited to <b>chat admins</b>.</i>\n"
     "\n"
     "You can still <code>/play</code> songs and enjoy the music.\n"
     "\n"
-    "<i>💡 Admin? Run <code>/reload</code> to refresh permissions.</i>";
-inline const char* kDenyAdminCb = "⚠️ Only admins can do these actions.";
+    "<i>Admin? Run <code>/reload</code> to refresh permissions.</i>";
+inline const char* kDenyAdminCb = "Only admins can do these actions.";
 inline const char* kEngineOnlyAdmin =
     "Only group admins (or the bot owner) can switch engines.";
 inline std::string engineCurrentText(const std::string& engine) {
@@ -2060,153 +1764,67 @@ inline std::string engineSetText(const std::string& engine,
                 {"f2", htmlEscape(fb2)}});
 }
 inline const char* kDenyAdminOrAuth =
-    "<b>🚫 Access Denied</b>\n"
-    "<i>🔒 This action is limited to <b>chat admins and authorized "
+    "<h2>Access Denied</h2>\n"
+    "<i>This action is limited to <b>chat admins and authorized "
     "users</b>.</i>\n"
     "\n"
     "You can still <code>/play</code> songs and enjoy the music.";
-inline const char* kDenySupergroup =
-    "⚠️ This command can only be used in groups.";
-inline const char* kDenyOwner = "⚠️ Only the bot owner can use this command.";
-inline const char* kDenySudo =
-    "⚠️ Only sudo users or the bot owner can use this command.";
-inline const char* kSupergroupGuide =
-    "⚠️ <b>This bot only works in supergroups.</b>\n"
-    "\n"
-    "Convert this group to a supergroup to use it.";
-inline const char* kPlayChatInvalid =
-    "This bot can only be used in <b>supergroups</b>… Leaving this chat...";
+inline const char* kDenyOwner = "Only the bot owner can use this command.";
 
 // Active streams (NoxBeats §1.7 + Tina/Yukki §2.7/§3.7, §10).
 inline const char* kActiveStreamsHeader = "<u><b>List of active streams:</b></u>";
-inline std::string activeStreamsCountText(int count) {
-    return fmt("Active streams on the bot: <b>{n}</b>",
-               {{"n", std::to_string(count)}});
-}
 inline const char* kActiveStreamsEmpty =
     "» Looks like there aren't any active streams on the bot.";
 inline std::string activeChatsText(int count) {
-    return fmt("📊 <b>Active Chats:</b>\n\nThere are <i>{n}</i> active chats "
+    return fmt("<b>Active Chats:</b>\n\nThere are <i>{n}</i> active chats "
                "across the bot system.",
                {{"n", std::to_string(count)}});
 }
-inline std::string activeChatsBrokenText(int count, int broken) {
-    return fmt("📊 <b>Active Chats:</b>\n\nThere are <i>{n}</i> active chats "
-               "across the bot system.\n<i>{b}</i> of them are broken.",
-               {{"n", std::to_string(count)},
-                {"b", std::to_string(broken)}});
-}
 
 // /reload (Parvati/Yukki/Tina + TgMusicBot, §10).
-inline const char* kReloadStart =
-    "⚙️ Reloading admin cache, voice chat status, and assistant status...";
-inline const char* kReloadDoneHeader = "<b>⚙️ Reload complete:</b>\n\n{summary}";
+
 inline const char* kReloadShortOk =
     "Administrator cache reloaded successfully.";
-inline const char* kReloadShortFail =
-    "Failed to reload administrator cache.";
 inline std::string reloadCooldownText(const std::string& mmss) {
     return fmt("Please wait {t} before using this command again.",
                {{"t", mmss}});
 }
-inline const char* kReloadCacheRule =
-    "» You can only refresh the admin cache once every 10 minutes.";
-inline const char* kReloadCacheStart = "» Reloading admin cache...";
-inline const char* kReloadCacheOk = "» Admin cache refreshed successfully!";
 
 // /logs + logger channel (NoxBeats §1.9, Parvati/Yukki §3.8, Arc §4.9, §10).
-inline const char* kLogsFetching = "» Fetching logs...";
-inline std::string logsCaptionText(const std::string& bot) {
-    return fmt("Log file of {bot}", {{"bot", bot}});
-}
+
 inline const char* kLogsMissing = "» Log file doesn't exist.";
 inline const char* kLogsNone = "No logs found";
-inline std::string loggerBotJoinedText(int64_t chat_id) {
-    return fmt("<b>🤖 Bot Joined a New Chat</b>\n📌 <b>Chat ID:</b> "
-               "<code>{id}</code>",
-               {{"id", std::to_string(chat_id)}});
-}
-inline std::string loggerStartedText(const std::string& mention,
-                                     const std::string& username,
-                                     int64_t user_id) {
-    return fmt("▶️ <b>{mention} started the bot</b>\n@{username} "
-               "(<code>{id}</code>)",
-               {{"mention", mention},
-                {"username", username},
-                {"id", std::to_string(user_id)}});
-}
-inline std::string loggerPlaybackText(const std::string& track,
-                                      const std::string& track_url,
-                                      const std::string& source,
-                                      const std::string& group,
-                                      int64_t group_id,
-                                      const std::string& by,
-                                      int64_t by_id,
-                                      const std::string& state) {
-    return fmt("<b>🎧 Track:</b> <a href=\"{url}\">{track}</a>\n"
-               "<b>🔗 Source:</b> {source}\n"
-               "<b>📌 Group:</b> {group} ({gid})\n"
-               "<b>👤 Requested by:</b> {by} (<code>{bid}</code>)\n"
-               "{state}",
-               {{"url", track_url},
-                {"track", track},
-                {"source", source},
-                {"group", group},
-                {"gid", std::to_string(group_id)},
-                {"by", by},
-                {"bid", std::to_string(by_id)},
-                {"state", state}});
-}
-
-// /restart (Yukki/Tina/Parvati, §10).
-inline const char* kRestarting = "♻️ Restarting...";
-inline const char* kRestartOk = "✅ Restart initiated successfully!";
-inline std::string restartFailedText(const std::string& error) {
-    return fmt("❌ Failed to restart: {error}", {{"error", error}});
-}
-inline std::string restartNoticeText(const std::string& bot) {
-    return fmt("{bot} has just restarted. Sorry for the issues.\n\nStart "
-               "playing again after 10–15 seconds.",
-               {{"bot", bot}});
-}
 
 // /eval + /sh (NoxBeats §1.9, §10).
-inline const char* kEvalError = "⚠️ Error executing snippet\n\n";
+inline const char* kEvalError = "Error executing snippet\n\n";
 inline const char* kEvalNoInput = "What?";
 inline std::string evalOutputText(const std::string& out) {
     return fmt("<b>Output:</b>\n<code>{out}</code>", {{"out", out}});
 }
 
 // /speedtest result (Tina staged progress + NoxBeats form, §10).
-inline const char* kSpeedtestDl = "🚀 Running download test...";
-inline const char* kSpeedtestUp = "📤 Running upload test...";
-inline std::string speedtestResultText(const std::string& down,
-                                       const std::string& up,
-                                       const std::string& ping) {
-    return fmt("<b>Speed test</b>\n\nDownload: <b>{down}</b> Mbps\nUpload: "
-               "<b>{up}</b> Mbps\nPing: <b>{ping}</b> ms",
-               {{"down", down}, {"up", up}, {"ping", ping}});
-}
+inline const char* kSpeedtestDl = "Running download test...";
+inline const char* kSpeedtestUp = "Running upload test...";
 inline const char* kSpeedtestFailed = "» The speed test failed.";
 
 // /bug (NoxBeats/Tina/Parvati, §10).
 inline const char* kBugUsage =
-    "⚠️ Please describe the bug. Usage: {cmd} <problem> or reply to a "
+    "Please describe the bug. Usage: {cmd} <problem> or reply to a "
     "message.";
 inline const char* kBugThanks =
-    "✅ Thank you for your bug report! It has been sent to the developers.";
+    "Thank you for your bug report! It has been sent to the developers.";
 inline const char* kBugReport =
     "<b>Bug report</b>\n\nFrom: {from} (<code>{id}</code>)\nWhere: {where}\n\n{text}";
 inline const char* kBugFailed = "» Could not send the report. Try again later.";
 
 // /privacy (Yukki §3.8 full page, §10; bot name + links substituted).
 inline const char* kPrivacy =
-    "<b>🛡 Privacy Policy &amp; Data Handling</b>\n"
+    "<h1>Privacy Policy &amp; Data Handling</h1>\n"
     "\n"
     "Parlay is built with privacy in mind. Below is exactly what it "
     "stores, why it is stored, and how you stay in control.\n"
     "\n"
-    "<b>📦 Data We Store</b>\n"
+    "<h2>Data We Store</h2>\n"
     "Only the information required to run the bot — nothing more:\n"
     "• <b>User &amp; chat IDs</b> — Identify groups and users so your "
     "settings apply\n"
@@ -2215,24 +1833,24 @@ inline const char* kPrivacy =
     "• <b>Access lists</b> — Authorized users, sudo users, and the "
     "blacklist\n"
     "\n"
-    "<b>💬 Messages</b>\n"
+    "<h2>Messages</h2>\n"
     "The bot reads <b>only</b> messages that begin with one of its "
     "commands (for example <code>/play</code>) or button presses on its "
     "own messages. It <b>never</b> reads, stores, or monitors your private "
     "chats or ordinary group conversations.\n"
     "\n"
-    "<b>🌐 Third-Party Services</b>\n"
+    "<h2>Third-Party Services</h2>\n"
     "To find and stream the music you request, the bot sends the search "
     "query to services such as <b>YouTube</b> and <b>Spotify</b>. Only the "
     "query itself is sent — <b>no personal data</b> is shared with these "
     "services.\n"
     "\n"
-    "<b>🔒 Data Sharing</b>\n"
+    "<h2>Data Sharing</h2>\n"
     "Your data is <b>never</b> sold, shared, or traded with third parties. "
     "It is used strictly to operate and improve the bot's music streaming "
     "features.\n"
     "\n"
-    "<b>🗑 Data Removal</b>\n"
+    "<h2>Data Removal</h2>\n"
     "Access can be cleaned up at any time: the owner can manage authorized "
     "users, sudo users, and the blacklist. You may also contact support to "
     "request removal of stored data.\n"
@@ -2241,95 +1859,30 @@ inline const char* kPrivacy =
     "free to join our Support Chat.</i>";
 
 // Assistant errors (Tina/Yukki/Parvati err_* family, §10).
-inline const char* kErrAssistantBanned =
-    "⚠️ <b>Assistant Banned</b>\n"
-    "\n"
-    "The assistant has been banned in this chat.\n"
-    "\n"
-    "✅ Unbanned them already? Use /reload to refresh.";
-inline const char* kErrAssistantAdminPerm =
-    "⚠️ <b>Assistant Needs Admin</b>\n"
-    "\n"
-    "The assistant must be an admin in this chat to play music.";
-inline const char* kErrAssistantGetFailed =
-    "⚠️ Could not get the assistant account. Try again later.";
-inline const char* kErrJoinRequestSent =
-    "⚠️ A join request was sent for the assistant. Approve it, then use "
-    "/reload.";
-inline const char* kErrInviteLinkFetch =
-    "⚠️ Could not fetch an invite link for this chat.";
-inline const char* kErrInviteFailed =
-    "⚠️ Failed to invite the assistant to this chat.";
-inline const char* kErrConnectionTimeout =
-    "⚠️ Connection timed out while reaching the assistant.";
-inline const char* kErrNoActiveVc =
-    "🎙️ <b>No Active Voice Chat</b>\n"
-    "\n"
-    "Start a voice chat first, then use /play.\n"
-    "\n"
-    "Use /reload to refresh.";
-inline const char* kErrFetchFailed = "⚠️ Failed to fetch. Try again later.";
-inline const char* kErrUnknown = "⚠️ An unknown error occurred.";
-inline const char* kErrFetchTracks = "⚠️ Failed to fetch tracks.";
-inline const char* kErrDownloadInternal =
-    "⚠️ Internal download error. Try again later.";
-inline const char* kErrRtmpMissingParams =
-    "⚠️ RTMP is missing parameters. Use /setrtmp in DM first.";
+
 inline std::string assistantRestrictedText(const std::string& assistant,
                                           int64_t id) {
-    return fmt("⚠️ <b>Assistant Restricted</b>\n"
+    return fmt("<h2>Assistant Restricted</h2>\n"
                "\n"
                "The assistant {name} (ID: <code>{id}</code>) has been "
                "<b>banned</b> or restricted in this chat.\n"
                "I cannot play music, manage the queue, or clean up tracks "
                "while this continues.\n"
                "\n"
-               "<i>Unban the assistant to restore all music features 🎵</i>",
+               "<i>Unban the assistant to restore all music features</i>",
                {{"name", assistant}, {"id", std::to_string(id)}});
-}
-inline std::string playBannedText(const std::string& name, int64_t id,
-                                  const std::string& username) {
-    return fmt("{name} is banned in your chat\nID: <code>{id}</code>\n"
-               "Name: {name}\nUsername: @{username}",
-               {{"name", name},
-                {"id", std::to_string(id)},
-                {"username", username}});
-}
-
-// Flood / rate limit (Tina/Yukki/Arc, §10).
-inline std::string floodSecondsText(int seconds) {
-    return fmt("⏳ Slow down! Try again in {n} seconds.",
-               {{"n", std::to_string(seconds)}});
-}
-inline std::string floodMinutesText(int minutes) {
-    return fmt("⏳ Please wait {n} minutes before using this command again.",
-               {{"n", std::to_string(minutes)}});
 }
 
 // /userbot (NoxBeats §1.7, §10).
-inline const char* kUserbotReady = "» The assistant is ready.";
+
 inline std::string userbotAlreadyText(const std::string& name) {
     return fmt("» {name} is already in this chat.", {{"name", name}});
 }
-inline std::string userbotJoinedText(const std::string& name) {
-    return fmt("» {name} joined the chat.", {{"name", name}});
-}
-
-// Anti-spam ban (tmb-rust §4.5, §10).
-inline const char* kSpamBlocked = "🚫 You are blocked for spam.";
-
-// Admin notifications (rustify §7.9, §10).
-inline const char* kAdminNewUser =
-    "🆕 <b>New user joined</b>\n\n<code>{id}</code> {link} {name} {surname} "
-    "{username}\nRef Code: {ref_code}";
-inline const char* kAdminSpotifyConnected =
-    "✅ <b>User connected Spotify</b>\n\nName: {name}\nID: <code>{id}</code> "
-    "<a href=\"tg://user?id={id}\">link</a>";
 
 // --- §11 auth lists ----------------------------------------------------------
 inline std::string authlistText(const std::vector<std::pair<std::string, int64_t>>& users,
                                 int limit) {
-    std::string out = fmt("<b>🔐 Authorized Users</b>\n\n👥 {count}/{limit} "
+    std::string out = fmt("<h2>Authorized Users</h2>\n\n{count}/{limit} "
                           "authorized\n\n",
                           {{"count", std::to_string(users.size())},
                            {"limit", std::to_string(limit)}});
@@ -2353,176 +1906,59 @@ inline InlineKeyboard authlistKeyboard(
     return kb;
 }
 inline const char* kAuthlistEmpty =
-    "ℹ️ There are no authorized users in this chat.";
-inline const char* kAuthlistFetching = "⏳ Fetching authorized users list...";
-inline const char* kToastAuthRevoked = "🗑️ Authorization revoked.";
+    "There are no authorized users in this chat.";
+inline const char* kToastAuthRevoked = "Authorization revoked.";
 inline const char* kAuthNoUser =
-    "⚠️ Please provide a user — use:\n{cmd} [user_id] or reply to a user's "
+    "Please provide a user — use:\n{cmd} [user_id] or reply to a user's "
     "message.";
-inline std::string authExtractFailText(const std::string& error) {
-    return fmt("⚠️ Unable to get that user: <i>{error}</i>",
-               {{"error", error}});
-}
 inline std::string authLimitText(int limit) {
-    return fmt("⚠️ This chat has reached the maximum authorized users limit "
+    return fmt("This chat has reached the maximum authorized users limit "
                "({limit}). Please remove someone before adding a new one.",
                {{"limit", std::to_string(limit)}});
 }
 inline const char* kAuthAlready =
-    "⚠️ That user is already authorized — no need to add them again.";
+    "That user is already authorized — no need to add them again.";
 inline const char* kAuthCannot =
-    "⚠️ This user cannot be authorized.\nThe bot owner, the bot itself, or "
+    "This user cannot be authorized.\nThe bot owner, the bot itself, or "
     "yourself do not require authorization.";
 inline const char* kAuthIsAdmin =
-    "⚠️ This user is already a chat administrator. No authorization is "
+    "This user is already a chat administrator. No authorization is "
     "required.";
-inline const char* kAuthBotUser =
-    "🤖 You can't add a bot to the auth list — auth users must be human!";
 inline std::string authAddedText(const std::string& user, int count,
                                  int limit) {
-    return fmt("✅ Added {user}.\nNow {count}/{limit} authorized users.",
+    return fmt("Added {user}.\nNow {count}/{limit} authorized users.",
                {{"user", user},
                 {"count", std::to_string(count)},
                 {"limit", std::to_string(limit)}});
 }
-inline std::string authAddedAltText(const std::string& user) {
-    return fmt("✅ Successfully added {user} to the authorized users list.",
-               {{"user", user}});
-}
 inline std::string authRemovedText(const std::string& user) {
-    return fmt("✅ Removed {user} from the authorized users list.",
+    return fmt("Removed {user} from the authorized users list.",
                {{"user", user}});
 }
 
 // Sudo list (Tina/Yukki/Parvati, §11).
-inline const char* kSudoHeader = "👑 <b>Current Sudoers:</b>";
-inline const char* kSudoNoExtra = "⚠️ No additional sudoers found.";
+inline const char* kSudoHeader = "<h2>Current Sudoers</h2>";
+inline const char* kSudoNoExtra = "No additional sudoers found.";
 inline const char* kSudoSelfJoke =
-    "😂 Haha, you're the boss already! Why are you even trying to add "
+    "Haha, you're the boss already! Why are you even trying to add "
     "yourself?";
-inline const char* kSudoBotSelfJoke =
-    "🤖 Haha, I'm the bot! I can't add myself to the sudo list — even the "
-    "owner can't cheat me 😎";
-inline const char* kSudoBotUserJoke =
-    "🤖 You can't add a bot to the sudo list — sudoers must be human!";
 inline const char* kSudoOwnerRemoveBlock =
-    "😎 Nice try! You can't remove the owner — they're untouchable.";
+    "Nice try! You can't remove the owner — they're untouchable.";
 
 // Blacklist (Tina/Yukki/Parvati, §11).
-inline const char* kBlacklistTitle = "📛 <b>Blacklisted</b>";
-inline const char* kBlChatBlocked =
-    "🚫 This chat is blocked from using this bot.";
-inline const char* kBlUserBlocked = "🚫 You are blocked from using this bot.";
-inline const char* kBlChatOwnerBlocked =
-    "🚫 This chat owner is blocked from using this bot. Leaving chat.";
+inline const char* kBlacklistTitle = "<h2>Blacklisted</h2>";
 inline std::string blBlockedUserText(int64_t id) {
-    return fmt("✅ User blocked: <code>{id}</code>",
+    return fmt("User blocked: <code>{id}</code>",
                {{"id", std::to_string(id)}});
-}
-inline std::string blFailedUnblockText(const std::string& error) {
-    return fmt("⚠️ Failed to unblock user: {error}", {{"error", error}});
 }
 
 // --- §12 error messages -----------------------------------------------------
-// Error catalogue (remix §2.1 house style, §12).
-inline const char* kErrNoActiveCall = "No active call.";
-inline const char* kErrNoVideo = "No video found.";
-inline const char* kErrGeneric = "An error occurred.";
-inline const char* kErrFileTooBig = "This file is too big.";
-inline const char* kErrAssistantNotHere = "My assistant is not here.";
-inline std::string errWithMessageText(const std::string& message) {
-    return fmt("An error occurred: {message}", {{"message", message}});
-}
-inline const char* kErrNotStreaming =
-    "» The bot isn't streaming in the video chat.";
-inline const char* kErrNoActiveVcChat =
-    "<b>No active video chat found.</b>\n\nPlease start one and <b>try "
-    "again</b>.";
-inline const char* kErrDownloadFailedSupport =
-    "Download failed.\n\nIf the issue persists, report it to the <a "
-    "href=\"{support}\">support chat</a>";
-inline const char* kErrAudioSourceMissing =
-    "» Moving to the next track...\n\nAudio source not found in the file.";
-inline const char* kErrTelegramServer =
-    "<u><b>Telegram server error</b></u>\n\nTelegram is experiencing "
-    "internal issues. Clearing the queue and leaving the video chat.";
-inline const char* kErrRtmpUnsupported =
-    "» RTMP streaming is not supported. Please stop the RTMP stream and "
-    "start a video chat instead.";
 
 // Play guards (NoxBeats §1.9, §12).
-inline const char* kGuardUserNotAdmin =
-    "» Oh sure, go ahead and manage the video chat... oh wait, you're not "
-    "an admin.";
-inline const char* kGuardUserNoPerms =
-    "» You? Manage the video chat? Not with those permissions, sweetie.";
-inline const char* kGuardUserNotFound =
-    "» I'll need a user ID — or would you mind replying to someone's "
-    "message?";
+
 inline const char* kGuardPlayAdmin =
     "<u><b>Admin only play</b></u>\n\nOnly admins are allowed to play in "
     "this chat.";
-inline const char* kGuardPlayUserInvalid =
-    "» You're a hidden admin.\n\nRevert back to user account.";
-inline const char* kGuardPlayExpired = "» This button has expired.";
-inline std::string guardInviteErrorText(const std::string& reason) {
-    return fmt("Failed to invite assistant to the chat.\n\nReason: "
-               "<code>{reason}</code>",
-               {{"reason", reason}});
-}
-inline const char* kGuardAutoLeft =
-    "» I waited, I watched, I yawned... and then I left the video chat.";
-
-// Download / stream failures (TgMusicBot §5.5, Parvati §3.5, §12).
-inline std::string errFetchTrackText(const std::string& err) {
-    return fmt("❌ Error fetching track info: {err}", {{"err", err}});
-}
-inline const char* kErrNoTracks = "No tracks found.";
-inline const char* kErrNoValidMedia = "No valid media found in the message.";
-inline std::string errFileTooLargeText(int mb) {
-    return fmt("File too large. Max size: {n} MB.",
-               {{"n", std::to_string(mb)}});
-}
-inline const char* kErrTrackInQueue = "Track already in queue or playing.";
-inline std::string errDownloadFailedText(const std::string& err) {
-    return fmt("Download failed: {err}", {{"err", err}});
-}
-inline std::string errSearchFailedText(const std::string& err) {
-    return fmt("❌ Search failed: {err}", {{"err", err}});
-}
-inline const char* kErrNoResultsTry =
-    "😕 No results found. Try a different query.";
-inline const char* kErrVideoDisabled =
-    "Video playback is disabled in this chat. Audio-only playback is used "
-    "instead.";
-inline const char* kSupportedPlatforms =
-    "Invalid URL or unsupported platform.\n"
-    "\n"
-    "<b>Supported Platforms:</b>\n"
-    "- YouTube\n"
-    "- Spotify\n"
-    "- JioSaavn\n"
-    "- Apple Music";
-
-// Generic errors (beetube §3.9, lemonic §6.11, openradiobot §2.6, §12).
-inline const char* kErrTryAgain = "🚫 An error occurred, try again later.";
-inline const char* kErrListEmpty = "🚫 The list is empty or limit reached.";
-inline const char* kErrNoResultsPlain = "🚫 No results found.";
-inline const char* kErrInputTooShort = "🚫 Input must be more than a character.";
-inline const char* kErrSomethingWrong = "Something went wrong";
-inline const char* kErrUncaught =
-    "An error has occurred. Please try again later. If this issue persists, "
-    "please contact the bot developer.";
-inline std::string errOccurredText(const std::string& error) {
-    return fmt("An error occurred: {error}", {{"error", error}});
-}
-inline const char* kErrRadioNoResult = "🙅 No Result.";
-inline const char* kErrRegionLocked =
-    "❌ Sorry. We can't play this video due to our server region lock.";
-inline const char* kErrUnsupportedAttachment = "Unsupported Formats";
-inline const char* kErrReportIssue =
-    "<b>Sorry, an error has occurred :(</b>\n\n<a href=\"https://github.com/"
-    "filewrap/ParlayMusic/issues/new\">Report an issue on GitHub</a>";
 
 // --- §13 inline-mode results -------------------------------------------------
 // The core renders every inline result itself from the search.inline
@@ -2571,18 +2007,10 @@ inline const char* kDlDeepLinkExpired =
 // Persistent category keyboard (beetube §3.3, music-only subset, §14).
 inline ReplyKeyboard persistentKeyboard() {
     return ReplyKeyboard{
-        {{"💀 Music"}, {"🔍 Global Search"}, {"⚙ Settings", "📌 About"}},
+        {{"Music"}, {"Global Search"}, {"Settings", "About"}},
         true, false};
 }
-inline const char* kKeyboardEnabled = "⌨ Keyboard enabled.";
-// Start reply keyboard (rustify §7.2, §14) — shown after /start when the
-// user is logged in to Spotify; presses match by exact text.
-inline ReplyKeyboard spotifyStartKeyboard() {
-    return ReplyKeyboard{{{{"👎 Dislike playing track"}},
-                          {{"📈 Stats"}, {"🎤 Details of track"}}}};
-}
-inline const char* kLangChoose = "Choose your language";
-inline const char* kLangNowEnglish = "Your language is now English 🇺🇸";
+inline const char* kKeyboardEnabled = "Keyboard enabled.";
 
 // --- §16 stats / ping / alive ----------------------------------------------
 inline std::string pingCardText(const std::string& bot,
@@ -2592,11 +2020,11 @@ inline std::string pingCardText(const std::string& bot,
                                 const std::string& cpu_usage,
                                 const std::string& disk_usage,
                                 const std::string& ntgcalls_ms) {
-    std::string out = fmt("<b>🏓 Pong!</b> • <code>{lat}ms</code>\n\n<b>🤖 "
-                          "{bot}</b>\n<blockquote>⏱️ <b>Uptime:</b> "
-                          "<code>{up}</code>\n💾 <b>RAM:</b> "
-                          "<code>{ram}</code>\n🖥️ <b>CPU:</b> "
-                          "<code>{cpu}</code>\n💽 <b>Disk:</b> "
+    std::string out = fmt("<h2>Pong!</h2> • <code>{lat}ms</code>\n\n<b>"
+                          "{bot}</b>\n<blockquote><b>Uptime:</b> "
+                          "<code>{up}</code>\n<b>RAM:</b> "
+                          "<code>{ram}</code>\n<b>CPU:</b> "
+                          "<code>{cpu}</code>\n<b>Disk:</b> "
                           "<code>{disk}</code></blockquote>",
                           {{"lat", latency_ms},
                            {"bot", bot},
@@ -2608,41 +2036,30 @@ inline std::string pingCardText(const std::string& bot,
         out += "\n<b>NTgCalls latency:</b> <code>" + ntgcalls_ms + "ms</code>";
     return out;
 }
-inline const char* kPingFirst = "🏓 Pinging...";
 
 // /stats card (Yukki §3.8 wins, §16). {system}/{memory}/{server}/{bot}
 // are pre-built blocks; {library} is the navidrome section (empty when
 // no library is present).
 inline const char* kStatsCard =
-    "<b>📊 Bot Statistics</b>\n"
+    "<h2>Bot Statistics</h2>\n"
     "\n"
     "<i>Live overview of the host, resources and database.</i>\n"
     "\n"
-    "<b>🔧 System</b>\n"
+    "<h2>System</h2>\n"
     "{system}\n"
     "\n"
-    "<b>📦 Memory</b>\n"
+    "<h2>Memory</h2>\n"
     "{memory}\n"
     "\n"
-    "<b>💻 Server</b>\n"
+    "<h2>Server</h2>\n"
     "{server}\n"
     "\n"
-    "<b>👥 Bot Overview</b>\n"
+    "<h2>Bot Overview</h2>\n"
     "{bot}\n"
     "\n"
-    "<b>🧩 Versions</b>\n"
+    "<h2>Versions</h2>\n"
     "{versions}"
     "{library}";
-
-inline std::string libraryStatsText(int artists, int albums, int tracks,
-                                    const std::string& size_gb) {
-    return fmt("\n\n<b>📚 Library</b>\nArtists: {a}\nAlbums: {al}\nTracks: "
-               "{t}\nSize: {s} GB",
-               {{"a", std::to_string(artists)},
-                {"al", std::to_string(albums)},
-                {"t", std::to_string(tracks)},
-                {"s", size_gb}});
-}
 
 // /status (Music163bot §6.9, §16).
 inline const char* kStatusText =
@@ -2651,17 +2068,6 @@ inline const char* kStatusText =
     "Cached songs in current chat [{chat}]: {chatCount}\n"
     "Cached songs for current user [<a href=\"tg://user?id={userID}\">"
     "{userID}</a>]: {userCount}";
-
-// /about (Music163bot §6.9, §16; Parlay values substituted).
-inline const char* kAboutBuild =
-    "<b>Parlay v0.2.0</b>\n"
-    "Github: https://github.com/filewrap/ParlayMusic\n"
-    "\n"
-    "[Build environment] {runtime}\n"
-    "[Build version] {version}\n"
-    "[Build hash] {commit}\n"
-    "[Build date] {buildTime}\n"
-    "[Runtime] {arch}";
 
 // --- §17 playlists ----------------------------------------------------------
 // Personal playlist, single (NoxBeats model, §17).
@@ -2672,18 +2078,10 @@ inline const char* kAddPlaylistUsage =
     "» Usage: <code>/addplaylist [song name | YouTube / Spotify / Apple "
     "Music / JioSaavn / SoundCloud link]</code>\nWhile a song is playing, "
     "<code>/addplaylist</code> alone saves that song.";
-inline const char* kPlaylistAdding = "» Adding to your playlist...";
 inline std::string playlistAddedText(const std::string& title, int total) {
     return fmt("» Added <b>{title}</b> to your playlist. You now have "
                "{total} songs.",
                {{"title", title}, {"total", std::to_string(total)}});
-}
-inline std::string playlistAddedManyText(int added, int dup, int total) {
-    return fmt("» Added <b>{added}</b> songs to your playlist ({dup} were "
-               "already there). You now have {total} songs.",
-               {{"added", std::to_string(added)},
-                {"dup", std::to_string(dup)},
-                {"total", std::to_string(total)}});
 }
 inline const char* kPlaylistDup = "» That song is already in your playlist.";
 inline std::string playlistFullText(int max) {
@@ -2717,48 +2115,38 @@ inline std::string playlistClearedText(int count) {
     return fmt("» Playlist cleared ({n} songs removed).",
                {{"n", std::to_string(count)}});
 }
-inline const char* kPlaylistFetching =
-    "» Fetching the playlist...\n\nPlease hold on.";
-inline const char* kPlaylistFetchError =
-    "» Something went wrong while fetching the playlist.";
-inline std::string playlistQueuedText(int count) {
-    return fmt("<u><b>Added {n} tracks from the playlist to queue:</b></u>\n\n",
-               {{"n", std::to_string(count)}});
-}
 
 // Named playlists (Parvati/TgMusicBot model, §17).
 inline const char* kCreatePlaylistUsage =
     "Usage: <code>/createplaylist &lt;name&gt;</code>";
 inline const char* kNamedPlaylistLimit =
-    "⚠️ You have reached the maximum limit of 10 playlists.";
+    "You have reached the maximum limit of 10 playlists.";
 inline std::string namedPlaylistCreatedText(const std::string& name,
                                             const std::string& id) {
-    return fmt("✅ Playlist <b>{name}</b> has been created successfully.\n"
+    return fmt("Playlist <b>{name}</b> has been created successfully.\n"
                "ID: <code>{id}</code>",
                {{"name", name}, {"id", id}});
 }
 inline std::string namedPlaylistCreateFailText(const std::string& error) {
-    return fmt("❌ Failed to create playlist: {error}", {{"error", error}});
+    return fmt("Failed to create playlist: {error}", {{"error", error}});
 }
 inline const char* kNamedPlaylistNotFound =
-    "❌ The specified playlist could not be found. Please check the "
+    "The specified playlist could not be found. Please check the "
     "playlist ID.";
-inline const char* kNamedPlaylistNotOwner =
-    "⚠️ You can only manage playlists that you created.";
 inline std::string namedPlaylistDeletedText(const std::string& name) {
-    return fmt("🗑️ Playlist <b>{name}</b> has been deleted successfully.",
+    return fmt("Playlist <b>{name}</b> has been deleted successfully.",
                {{"name", name}});
 }
-inline const char* kNamedPlaylistBadNumber = "⚠️ Invalid song number.";
-inline const char* kNamedPlaylistSongNotFound = "❌ Song not found in playlist.";
+inline const char* kNamedPlaylistBadNumber = "Invalid song number.";
+inline const char* kNamedPlaylistSongNotFound = "Song not found in playlist.";
 inline std::string namedPlaylistAddedText(const std::string& song,
                                           const std::string& playlist) {
-    return fmt("✅ Track <b>{song}</b> has been added to playlist "
+    return fmt("Track <b>{song}</b> has been added to playlist "
                "<b>{playlist}</b>.",
                {{"song", song}, {"playlist", playlist}});
 }
 inline std::string namedPlaylistRemovedText(const std::string& name) {
-    return fmt("🗑️ Song removed from playlist <b>{name}</b>.",
+    return fmt("Song removed from playlist <b>{name}</b>.",
                {{"name", name}});
 }
 inline const char* kPlaylistInfoCard =
@@ -2767,92 +2155,25 @@ inline const char* kPlaylistInfoCard =
 inline const char* kPlaylistInfoEmpty =
     "<i>This playlist has no songs yet.</i>";
 inline const char* kMyPlaylistsNone =
-    "📭 You do not have any playlists yet. Use /createplaylist to make one.";
+    "You do not have any playlists yet. Use /createplaylist to make one.";
 inline const char* kMyPlaylistsHeader = "<b>My Playlists</b>\n\n{name} (<code>{id}</code>)";
-
-// Playlist fetch from link (NoxBeats §1.10 + remix §2.6, §17).
-inline std::string playlistLinkStreamText(int count) {
-    return fmt("🎶 | <b>Streaming and queuing {x} items...</b>",
-               {{"x", std::to_string(count)}});
-}
-inline std::string playlistLinkQueueText(int count) {
-    return fmt("🎶 | <b>Queuing {x} items...</b>",
-               {{"x", std::to_string(count)}});
-}
-
-// /mix (TgMusicBot §5.5, §17).
-inline const char* kMixUsage =
-    "<b>Usage:</b>\n/mix [song or URL]\n\nOr run /mix while a song is "
-    "currently playing to create a mix based on it.";
-inline const char* kMixFetching = "Fetching mix tracks...";
-inline const char* kMixFailed = "Failed to get mix: Please try again later.";
-inline const char* kMixNoTracks = "No tracks found for mix.";
-inline const char* kMixAllQueued =
-    "All mix tracks are already in the queue or playing.";
 
 // --- §18 broadcast ----------------------------------------------------------
 // Progress card (Parvati wins, §18), edited in place.
-inline const char* kBcastInit =
-    "📡 Initializing broadcast...\n\nPlease wait...";
-inline const char* kBcastProgress =
-    "📡 Broadcasting...\n"
-    "📊 Total Chats: {doneC}/{totalC} ({pctC}%)\n"
-    "👥 Total Users: {doneU}/{totalU} ({pctU}%)\n"
-    "❌ Failed Chats: {failC}\n"
-    "❌ Failed Users: {failU}\n"
-    "⏱ Delay: {delay}s\n"
-    "⏰ Elapsed: {elapsed}\n"
-    "⏳ ETA: {eta}\n"
-    "✨ Success Rate: {rate}% ({sent}/{total})";
-inline const char* kBcastDone = "✅ Broadcast Completed";
-inline const char* kBcastCancelled = "🚫 Broadcast Cancelled";
-inline const char* kBcastCancelBtn = "🚫 Cancel Broadcast";
+
+inline const char* kBcastCancelled = "Broadcast Cancelled";
+inline const char* kBcastCancelBtn = "Cancel Broadcast";
 inline InlineKeyboard bcastKeyboard() {
     return {{InlineButton::callback(kBcastCancelBtn, kCbBcastCancel)}};
 }
-inline const char* kBcastCancelOk = "🚫 Broadcast cancelled successfully.";
-inline const char* kBcastCancelOwner =
-    "⚠️ Only the owner can cancel broadcasts.";
-inline const char* kBcastCancelNone = "ℹ️ No broadcast is currently running.";
-inline const char* kBcastCancelDone = "🚫 Broadcast cancelled.";
-inline const char* kBcastAlreadyRunning =
-    "⚠️ A broadcast is already running.\n"
-    "\n"
-    "Please wait for it to complete or cancel it first using:\n"
-    "• <code>/broadcast -cancel</code>\n"
-    "• Or click the Cancel button on the progress message";
-inline std::string bcastParseFailText(const std::string& error) {
-    return fmt("❌ Failed to parse broadcast command:\n<code>{error}</code>",
-               {{"error", error}});
-}
-inline const char* kBcastNoContent =
-    "⚠️ No content provided for broadcast.\n"
-    "\n"
-    "<b>Usage:</b> <code>{cmd} [text or reply to message]</code>\n"
-    "\n"
-    "<b>Example:</b>\n"
-    "<code>{cmd} Hello everyone!</code>";
-inline const char* kBcastNoTargets =
-    "⚠️ No targets found for broadcast.\n"
-    "\n"
-    "Make sure you haven't excluded all targets with flags.";
-inline const char* kBcastReplyUsage =
-    "» Reply to a message for broadcasting the message.";
-inline const char* kBcastActive = "» Please wait for the ongoing broadcast to finish.";
-inline const char* kBcastStarted = "» Broadcasting started.";
-inline std::string bcastEndText(int groups, int users) {
-    return fmt("» Broadcasted the message to {g} groups and {u} users.",
-               {{"g", std::to_string(groups)},
-                {"u", std::to_string(users)}});
-}
-inline const char* kBcastNoProgress = "Broadcast started.";
-inline const char* kBcastStopped = "Broadcast stopped.";
+inline const char* kBcastCancelOk = "Broadcast cancelled successfully.";
+inline const char* kBcastCancelDone = "Broadcast cancelled.";
 
 // --- §19 maintenance --------------------------------------------------------
 inline const char* kMaintUser =
-    "⚠️ I'm under maintenance at the moment and temporarily unavailable. "
+    "I'm under maintenance at the moment and temporarily unavailable. "
     "Please check back later.\n\n{reason}";
-inline const char* kMaintReasonLine = "<i>📝 Reason: {reason}</i>";
+inline const char* kMaintReasonLine = "<i>Reason: {reason}</i>";
 inline const char* kMaintUsage =
     "Maintenance is <b>{state}</b> (reason: {reason}).\nUsage: "
     "<code>/maintenance [on|off] [reason]</code>";
@@ -2862,20 +2183,11 @@ inline std::string maintEnabledText(const std::string& reason) {
 }
 inline const char* kMaintDisabled = "» Maintenance mode disabled.";
 inline const char* kMaintAlreadyOn =
-    "ℹ️ Maintenance mode is already enabled 🟢.";
+    "Maintenance mode is already enabled.";
 inline const char* kMaintAlreadyOff =
-    "ℹ️ Maintenance mode is already disabled.";
-inline const char* kMaintEntering = "⚠️ Bot is entering maintenance mode...";
-inline const char* kMaintEnabledReason =
-    "🟢 Enabled\n📝 Reason: {reason}";
-inline const char* kMaintCardTitle = "🛠️ Maintenance";
+    "Maintenance mode is already disabled.";
 
 // --- §20 channel-play -------------------------------------------------------
-inline const char* kCplayUsage =
-    "<b>Usage:</b> <code>/setcplay &lt;channel_id&gt;</code>";
-inline const char* kCplayNotSet =
-    "⚠️ cplay ID not set.\nUse <code>/setcplay &lt;chat_id&gt;</code> to set "
-    "it.";
 inline const char* kCplayResolveFail =
     " <b>Failed to resolve peer:</b> Could not fetch channel details. "
     "Ensure I can access this channel.";
@@ -2884,63 +2196,30 @@ inline const char* kCplayInvalidTarget =
 inline const char* kCplayNotAccessible =
     "<b>Channel Not Accessible:</b> Could not retrieve channel information. "
     "Please ensure I am an administrator in the target channel.";
-inline const char* kCplayMissingInvite =
-    "⚠️ <b>Missing permission:</b> I am admin in target channel but "
-    "<code>invite users</code> permission is disabled. Please enable it and "
-    "try again.";
 inline const char* kCplayNotLinked =
-    "⚠️ <b>Linked channel not found:</b> This chat is not linked to any "
+    "<b>Linked channel not found:</b> This chat is not linked to any "
     "channel / group.";
-inline const char* kCplaySaveError = "<b>Error:</b> Failed to save cplay settings.";
 inline std::string cplayEnabledText(int64_t channel_id) {
-    return fmt("✅ <b>Channel Play enabled.</b> All channel-play commands "
+    return fmt("<b>Channel Play enabled.</b> All channel-play commands "
                "(like <code>/cplay</code>, <code>/cskip</code>) will now work "
                "in channel <code>{id}</code>.",
                {{"id", std::to_string(channel_id)}});
 }
 inline const char* kCplayDisabled =
-    "✅ <b>Channel Play disabled.</b> Channel-play commands (like "
+    "<b>Channel Play disabled.</b> Channel-play commands (like "
     "<code>/cplay</code>, <code>/cskip</code>) are now turned off for this "
     "chat.";
 inline const char* kCplayOwnerRequired =
-    "⚠️ Only the owner of this chat or the target channel can use this "
+    "Only the owner of this chat or the target channel can use this "
     "setup.";
-inline const char* kCplayOwnerCheckFail =
-    "⚠️ Could not verify chat ownership right now. Please try again.";
 inline std::string cplayStatusText(int64_t channel_id) {
     return fmt("» Channel play is linked to <code>{id}</code>.",
                {{"id", std::to_string(channel_id)}});
 }
 
 // RTMP / /stream (Arc guide wins, NoxBeats short usage, §20).
-inline const char* kRtmpUsageDm =
-    "Usage (in private chat):\n"
-    "<code>/setrtmp [chat id] [rtmp://host/app] [stream key]</code>\n"
-    "<code>/setrtmp [chat id] off</code>";
-inline const char* kRtmpGuide =
-    "<b>RTMP Setup</b>\n"
-    "\n"
-    "<b>Parameters:</b>\n"
-    "• <code>[chat id]</code> — the group chat ID to stream into\n"
-    "• <code>[rtmp://host/app]</code> — your RTMP ingest URL\n"
-    "• <code>[stream key]</code> — your stream key (never shown in chat)\n"
-    "\n"
-    "<b>Example:</b>\n"
-    "<code>/setrtmp -1001234567890 rtmp://live.example.com/app "
-    "my-secret-key</code>\n"
-    "\n"
-    "<b>How to get the chat ID:</b> add the bot to the group and run "
-    "<code>/id</code> there.\n"
-    "\n"
-    "🔒 <b>Security Notice:</b> only set RTMP targets in a private chat "
-    "with the bot. Never share your stream key in a group.";
-inline const char* kRtmpDmOnly = "⚠️ Use this command in DM.";
-inline std::string rtmpConfiguredText(int64_t chat_id,
-                                      const std::string& url) {
-    return fmt("✅ RTMP configured successfully for Chat ID: "
-               "<code>{id}</code>\nURL: <code>{url}</code>",
-               {{"id", std::to_string(chat_id)}, {"url", url}});
-}
+
+inline const char* kRtmpDmOnly = "Use this command in DM.";
 inline const char* kRtmpSaved =
     "» RTMP target saved. Use /stream [song/url] in that chat.";
 inline const char* kRtmpRemoved = "» RTMP target removed.";
@@ -2948,7 +2227,6 @@ inline const char* kRtmpNotSet =
     "» No RTMP target is set for this chat. Use /setrtmp in my private chat.";
 inline const char* kRtmpInvalidUrl =
     "» The URL must start with <code>rtmp://</code> or <code>rtmps://</code>.";
-inline const char* kRtmpNotAdmin = "» You must be an admin of that chat.";
 inline std::string rtmpStreamStartedText(const std::string& what,
                                          const std::string& by) {
     return fmt("Streaming <b>{what}</b> to RTMP.\n\n» By {by}",
@@ -2959,29 +2237,24 @@ inline std::string rtmpStatusText(const std::string& what,
     return fmt("» Streaming <b>{what}</b> for {dur}.",
                {{"what", what}, {"dur", duration}});
 }
-inline const char* kRtmpStatusCard =
-    "📡 <b>RTMP Status</b>\n▫ State: ▶️ Streaming\n▫ Position: {position}";
 inline std::string rtmpStoppedText(const std::string& by) {
     return fmt("Stream stopped.\n\n» By {by}", {{"by", by}});
 }
 inline const char* kRtmpNone = "» No stream is running here.";
-inline const char* kRtmpNoneActive = "ℹ️ No active RTMP stream.";
+inline const char* kRtmpNoneActive = "No active RTMP stream.";
 inline const char* kRtmpDelayNote =
-    "⚠️ Note: RTMP has ~15-30s buffering delay";
+    "Note: RTMP has ~15-30s buffering delay";
 inline const char* kRtmpStreamUsage = "Usage: <code>/stream [name or url]</code>";
 inline const char* kRtmpAlreadyRunning =
     "» A stream is already running here. Stop it with /streamstop.";
 inline const char* kRtmpStartFailed = "» Could not start the stream.";
-inline const char* kRtmpRefusal =
-    "⚠️ <b>Can't play in an RTMP/live-stream voice chat.</b>\n\n<i>Playback "
-    "stopped.</i>";
 
 // --- §21 radio --------------------------------------------------------------
-inline const char* kRadioCreated = "✔️ Radio Created";
+inline const char* kRadioCreated = "Radio Created";
 inline const char* kRadioExists =
     "You already created your radio. To manage it, type /manage. To destroy "
     "it, type /destroy";
-inline const char* kRadioDestroyed = "✔️ Radio destroyed.";
+inline const char* kRadioDestroyed = "Radio destroyed.";
 inline const char* kRadioNoRadio =
     "You haven't created a radio yet. Did you mean /new?";
 inline const char* kRadioManageCard =
@@ -2997,60 +2270,14 @@ inline const char* kRadioManageCard =
     "Live on: <a href=\"{host}/{chatId}\">{host}/{chatId}</a>\n"
     "\n"
     "To check song queue, type /queue";
-inline const char* kRadioQueueEmpty = "🏜️ Nothing is in queue....";
-inline const char* kRadioQueueHeader = "<b>Radio Queue</b>";
-inline const char* kRadioQueueFooter =
-    "\n\n⚠️ Some songs are hidden due to a large number of requests. We'll "
-    "improve this soon.\n\nYou may also manage this queue. For more "
-    "information, do <code>/queue help</code>";
-inline const char* kRadioPlayUsage =
-    "Usage: <code>/play [Song name|URL|Reply to Audio/Voice Message]</code>";
-inline std::string radioSearchingText(const std::string& q) {
-    return fmt("Searching <code>{q}</code>...", {{"q", htmlEscape(q)}});
-}
-inline const char* kRadioPreparing = "Preparing to play...";
 inline std::string radioNowPlayingText(const std::string& title,
                                        const std::string& url) {
-    return fmt("▶️ Now playing: <a href=\"{url}\">{title}</a>",
+    return fmt("Now playing: <a href=\"{url}\">{title}</a>",
                {{"url", url}, {"title", title}});
-}
-inline std::string radioNowPlayingRawText(const std::string& url) {
-    return fmt("▶️ Now Playing: <a href=\"{url}\">Raw Stream</a>",
-               {{"url", url}});
-}
-inline const char* kRadioNowVoice = "▶️ Playing Voice/Audio Message....";
-inline const char* kRadioQueuedVoice = "✔️ Voice has been added to queue";
-inline std::string radioQueuedPlaylistText(int count) {
-    return fmt("✔️ {n} songs have been added to queue.",
-               {{"n", std::to_string(count)}});
-}
-inline const char* kRadioQueuedRaw =
-    "✔️ A stream URL has been added to queue.";
-inline std::string radioQueuedVideoText(const std::string& title,
-                                        const std::string& url) {
-    return fmt("✔️ <a href=\"{url}\">{title}</a> has been added to queue.",
-               {{"url", url}, {"title", title}});
-}
-inline const char* kRadioPaused = "⏸️ Paused";
-inline const char* kRadioResumed = "▶️ Resumed";
-inline const char* kRadioSkipping = "⏩ Skipping...";
-inline const char* kRadioStopped = "⏹️ Player Stopped";
-inline const char* kRadioNothingPlaying =
-    "There's nothing playing. Glitched? Do /destroy";
-inline const char* kRadioSkipEmpty = "There's nothing in queue!";
-inline const char* kRadioAutoplayOn = "✔️ Autoplay enabled";
-inline const char* kRadioAutoplayOff = "✔️ Autoplay disabled";
-inline const char* kRadioAutoplayRaw =
-    "Sorry. You can't use autoplay right now.";
-inline const char* kRadioLoopUsage = "Usage: <code>/loop [queue|single|none]</code>";
-inline std::string radioLoopSetText(const std::string& loop_type) {
-    return fmt("✔️ Loop Type has been set as <code>{t}</code>",
-               {{"t", loop_type}});
 }
 inline const char* kRadioGroupOnly = "This Command works on Group Only";
 inline const char* kRadioNeedLink = "Please provide a radio/stream link";
-inline const char* kRadioInvalid = "Invalid";
-inline const char* kRadioStationsHeader = "📻 <b>Radio stations</b>";
+inline const char* kRadioStationsHeader = "<h2>Radio stations</h2>";
 inline std::string radioStationLine(const std::string& name,
                                     const std::string& genre,
                                     const std::string& id) {
@@ -3070,19 +2297,7 @@ inline const char* kShareNoLink =
 // user-target send flow is the sharetok mapping the core keeps at
 // /share time; this text covers a track token opened directly.
 inline const char* kShareTrackOpened =
-    "🎵 Shared track: {track}\n\nUse /play {title} in a group to listen.";
-inline const char* kShareHelp =
-    "Send Music: You can send your music by clicking on a user's unique "
-    "link\n"
-    "\n"
-    "Get your own link: You can get your link by clicking on the 'Get Link' "
-    "button\n"
-    "\n"
-    "Available commands:\n"
-    "\n"
-    "/start: Start the bot and send music or get your link\n"
-    "\n"
-    "/help: See this Description again :)";
+    "Shared track: {track}\n\nUse /play {title} in a group to listen.";
 inline InlineKeyboard shareHelpKeyboard() {
     using B = InlineButton;
     return {{B::callback("Help", kCbHelpMain),
@@ -3093,10 +2308,6 @@ inline const char* kShareSendPrompt =
 inline const char* kShareSelf =
     "Dude?! You have schizophrenia\nWhy you send music to yourself";
 inline const char* kShareInvalidLink = "Oops!\nInvalid link";
-inline const char* kShareServerError =
-    "Something went wrong on server side\nPlease try again";
-inline const char* kShareInvalidCommand = "Invalid Command";
-inline const char* kShareInvalidMessage = "Invalid Message";
 inline const char* kShareSent = "Music Has Been Sent";
 inline const char* kShareCancel = "Cancel sending music";
 inline const char* kShareFeedbackSent = "Feedback is sent";
@@ -3120,62 +2331,21 @@ inline InlineKeyboard shareReceivedKeyboard(const std::string& sender,
 }
 
 // --- §23 voting --------------------------------------------------------------
-inline std::string voteRequestedText(const std::string& track_card) {
-    return fmt("✅ Successfully requested track.\n\n{card}",
-               {{"card", track_card}});
-}
-inline std::string votePostText(const std::string& requester,
-                                const std::string& track_card) {
-    return fmt("User {name} requested:\n{card}",
-               {{"name", requester}, {"card", track_card}});
-}
-inline std::string voteTrackCard(const std::string& name,
-                                 const std::string& duration,
-                                 const std::string& artists,
-                                 const std::string& album,
-                                 const std::string& spotify_url,
-                                 const std::string& cover_url) {
-    std::string out = fmt("🎵 <b>{name}</b> • ⏱️ {dur}\n👥 <b>{artists}</b>\n"
-                          "💿 <b>{album}</b>\n<a href=\"{url}\">Listen</a>",
-                          {{"name", name},
-                           {"dur", duration},
-                           {"artists", artists},
-                           {"album", album},
-                           {"url", spotify_url}});
-    if (!cover_url.empty())
-        out += " • <a href=\"" + cover_url + "\">Cover</a>";
-    return out;
-}
-inline InlineKeyboard voteKeyboard(const std::string& track_id) {
-    using B = InlineButton;
-    return {{B::callback("✅ Add to queue", cbVote("approve", track_id)),
-             B::callback("❌ Decline", cbVote("decline", track_id))}};
-}
 inline std::string voteAcceptedText(const std::string& voter,
                                     const std::string& original) {
-    return fmt("✅ {voter} has added to queue:\n{orig}",
+    return fmt("{voter} has added to queue:\n{orig}",
                {{"voter", voter}, {"orig", original}});
 }
 inline std::string voteQueueFailText(const std::string& error) {
     return fmt("Failed to queue track: {error}", {{"error", error}});
 }
-inline const char* kVoteBadId = "Invalid track ID";
 inline std::string voteDeclinedText(const std::string& voter,
                                     const std::string& original) {
     if (original.empty())
-        return fmt("❌ {voter} declined.", {{"voter", voter}});
-    return fmt("❌ {voter} declined: {orig}",
+        return fmt("{voter} declined.", {{"voter", voter}});
+    return fmt("{voter} declined: {orig}",
                {{"voter", voter}, {"orig", original}});
 }
-inline const char* kVoteFetchFail = "❌ Failed to find track.";
-inline const char* kSpotifyLoginPrompt =
-    "Spotify Login\nOpen this URL in the browser and allow Spotify access: "
-    "{auth_url}\nThen paste and send the redirected URL here.";
-inline std::string spotifyLinkErrorText(const std::string& error) {
-    return fmt("Spotify link error: {error}", {{"error", error}});
-}
-inline const char* kSpotifyTokenSaved = "Token saved";
-inline const char* kSpotifyInvalidCode = "Invalid Code/URL";
 inline std::string idText(int64_t chat_id, int64_t thread_id) {
     if (thread_id != 0)
         return fmt("This chat has ID {chat}, thread {thread}",
@@ -3188,69 +2358,18 @@ inline std::string idText(int64_t chat_id, int64_t thread_id) {
 // --- §25 delete flow / scan / recognize (core-routed) ------------------------
 // Library delete confirm (navidrome §7.7, §25): trigger message is
 // "delete:{path}" from inline del mode (§13).
-inline std::string deleteConfirmAlbumText(const std::string& label, int n) {
-    return fmt("Delete {label} ({n} tracks)?",
-               {{"label", label}, {"n", std::to_string(n)}});
-}
+
 inline std::string deleteConfirmTrackText(const std::string& label) {
     return fmt("Delete {label}?", {{"label", label}});
 }
 inline InlineKeyboard deleteConfirmKeyboard(const std::string& id) {
     using B = InlineButton;
-    return {{B::callback("🗑 Delete", cbDel("yes", id)),
-             B::callback("✖ Cancel", cbDel("no", id))}};
+    return {{B::callback("Delete", cbDel("yes", id)),
+             B::callback("Cancel", cbDel("no", id))}};
 }
-inline const char* kToastDelNotAllowed = "Not allowed.";
-inline const char* kToastDelExpired = "Prompt expired.";
 inline const char* kToastDelCancelled = "Cancelled.";
-inline const char* kDelCancelled = "Cancelled.";
-inline std::string delChangedText(const std::string& path) {
-    return fmt("Changed since the question, not deleted: {path}",
-               {{"path", path}});
-}
-inline std::string delDoneText(const std::string& label,
-                               const std::string& scan_note) {
-    return fmt("Deleted: {label}\n{note}",
-               {{"label", label}, {"note", scan_note}});
-}
 inline const char* kDelInvalidPath = "Invalid path.";
 inline const char* kDelTopLevel = "Cannot delete top-level directories.";
-inline std::string delNotFoundText(const std::string& path) {
-    return fmt("Not found: {path}", {{"path", path}});
-}
-
-// /scan / /sharescan (navidrome §7.5, §25).
-inline const char* kScanTriggered = "Library scan triggered.";
-inline const char* kScanNotConfigured =
-    "Library scan not configured (NAVIDROME_USER/NAVIDROME_PASS not set).";
-inline const char* kScanBadCreds = "Library scan failed: wrong credentials.";
-inline const char* kScanFailed = "Library scan failed.";
-inline const char* kShareScanTriggered = "slskd share scan triggered.";
-inline std::string shareScanScheduledText(int mins) {
-    return fmt("slskd share scan scheduled in ~{n}m.",
-               {{"n", std::to_string(mins)}});
-}
-
-// /recognize (Music163bot §6.8, §25).
-inline const char* kRecognizeNeedVoice =
-    "Please send a voice message containing a music clip first, then reply "
-    "to it with /recognize.";
-inline const char* kRecognizeStatus = "Recognizing music, please wait...";
-inline const char* kRecognizeUnreadable =
-    "Can't read this voice message right now\nPlease try again later, or "
-    "re-send the voice message.";
-inline const char* kRecognizeNone =
-    "No song recognized yet\nPlease try recording a clearer, slightly "
-    "longer music clip, then try again.";
-inline const char* kRecognizeFailed =
-    "Music recognition failed temporarily, please try again later.";
-inline const char* kRecognizeOk =
-    "🎵 Recognized\n「{name}」- {artists}\nAlbum: {album}";
-
-// /rmcache (Music163bot §6.9, §25).
-inline const char* kRmCacheNotCached = "Song not cached";
-inline std::string rmCacheOkText(const std::string& name) {
-    return fmt("Cleared [{name}] cache successfully", {{"name", name}});
-}
 
 }  // namespace parlay::ui_texts
+

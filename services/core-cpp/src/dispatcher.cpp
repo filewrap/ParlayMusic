@@ -19,7 +19,7 @@
 #include <random>
 #include <sstream>
 
-#include "http.hpp"
+#include "scram.hpp"  // base64Encode (TDLib `bytes` fields are base64)
 #include "telemetry.hpp"
 
 namespace parlay {
@@ -177,15 +177,16 @@ std::vector<std::string> Dispatcher::splitArgs(const std::string& args) {
     return out;
 }
 
-Dispatcher::Dispatcher(const Config& cfg, TelegramApi& tg, IpcClient& ipc,
-                       EngineRouter& router, Store& store, VoiceCall& voice,
+Dispatcher::Dispatcher(const Config& cfg, TelegramSender& tg, IpcClient& ipc,
+                       Store& store, TdLibClient& assistant,
+                       RateLimiter& limiter,
                        const std::string& bot_username)
     : cfg_(cfg),
       tg_(tg),
       ipc_(ipc),
-      router_(router),
       store_(store),
-      voice_(voice),
+      assistant_(assistant),
+      limiter_(limiter),
       bot_username_(bot_username) {
     // Seed env sudoers into the store (NoxBeats load_runtime_sets()).
     for (int64_t id : cfg_.sudo_ids)
@@ -470,10 +471,10 @@ bool Dispatcher::forwardShareMedia(const TgMessage& msg) {
     if (msg.media_kind == "audio" || msg.media_kind == "voice") {
         int64_t sent = tg_.sendAudio(
             target_id, msg.media_file_id, "",
-            inlineKeyboardJson(ui_texts::shareReceivedKeyboard(
+            ui_texts::shareReceivedKeyboard(
                 std::to_string(msg.from.id),
                 std::to_string(msg.message_id),
-                msg.media_file_unique_id)),
+                msg.media_file_unique_id),
             &err);
         ok = sent > 0;
     } else {
@@ -500,13 +501,13 @@ static int64_t receiptUs(const CommandContext& ctx) {
 }
 
 // One t_dispatch_to_ipc line for a /play. dispatch_to_post_us /
-// post_to_response_us are present only when an engine IPC post was
+// post_to_response_us are present only when a backend IPC post was
 // issued; paths with no IPC post (replied file, usage error) carry
-// ipc=none instead. engine/fell_back describe the vc.play outcome.
+// ipc=none instead. The single backend is identified by
+// transport=uds.
 static void emitDispatchToIpc(int64_t total_us, int64_t dispatch_to_post_us,
                        int64_t post_to_response_us, int64_t chat_id,
-                       const std::string& engine, bool fell_back, bool ok,
-                       const std::string& error) {
+                       bool ok, const std::string& error) {
     std::vector<std::pair<std::string, std::string>> f;
     if (dispatch_to_post_us >= 0) {
         f.emplace_back("dispatch_to_post_us",
@@ -518,10 +519,7 @@ static void emitDispatchToIpc(int64_t total_us, int64_t dispatch_to_post_us,
     }
     f.emplace_back("action", "play");
     f.emplace_back("chat_id", std::to_string(chat_id));
-    if (!engine.empty()) {
-        f.emplace_back("engine", engine);
-        f.emplace_back("fell_back", fell_back ? "1" : "0");
-    }
+    f.emplace_back("transport", "uds");
     f.emplace_back("ok", ok ? "1" : "0");
     if (!error.empty()) f.emplace_back("error", telemetry::sanitize(error));
     telemetry::emit("t_dispatch_to_ipc", total_us, f);
@@ -569,15 +567,11 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
     }
     if (msg.video_chat_started || msg.video_chat_ended) {
         // Auto-end: a voice chat ending kills the session (tools.cpp).
+        // The backend owns the call, so a vc.stop tells it to end the
+        // session; the core holds no audio of its own to stop.
         setCallActive(msg.chat.id, false);
-        clearCoreStream(msg.chat.id);
-        // Also stop the core backend's own session: the call is gone,
-        // so a recorded core source must not keep streaming into it.
-        voice_.stop(msg.chat.id);
-        Engine used;
-        bool fb = false;
         vcCall({msg, "stop", "", false}, "stop",
-               Json::objectOf({{"chat_id", Json(msg.chat.id)}}), used, fb);
+               Json::objectOf({{"chat_id", Json(msg.chat.id)}}));
         CommandContext ctx;
         ctx.message = msg;
         ctx.message.message_id = 0;
@@ -692,7 +686,7 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
                               ui_texts::htmlEscape(
                                   displayName(msg.from)) +
                               ":\n" + ui_texts::htmlEscape(text0);
-            if (tg_.sendMessageHtml(sender_id, fwd, Json(nullptr),
+            if (tg_.sendMessageHtml(sender_id, fwd, InlineKeyboard{},
                                     orig_msg, &err) < 0) {
                 reply(ctx, "Could not send the feedback: " + err);
                 return;
@@ -786,7 +780,7 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         reply(ctx, "This chat is not allowed to use Parlay.");
         return;
     }
-    if (rateLimited(msg.chat.id)) return;  // silent drop, 1 cmd/s per chat
+    if (!checkRateLimit(ctx)) return;
 
     for (const auto& r : routes_) {
         if (std::find(r.cmds.begin(), r.cmds.end(), ctx.command) ==
@@ -949,17 +943,23 @@ bool Dispatcher::playAllowed(const CommandContext& ctx, bool force) {
     return false;
 }
 
-bool Dispatcher::rateLimited(int64_t chat_id) {
-    auto now = std::chrono::steady_clock::now();
-    auto it = last_cmd_.find(chat_id);
-    if (it != last_cmd_.end() &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second)
-                .count() < 1000) {
-        return true;  // anonx-cpp RateLimiter shape: 1 cmd/sec per chat
-    }
-    last_cmd_[chat_id] = now;
+// Token-bucket gate: one token from the chat bucket AND the user
+// bucket. A denial answers honestly with the limiter's reason string
+// (including the retry-after) instead of dropping the command
+// silently — the old 1 cmd/sec silent drop (dispatcher.cpp:911) is
+// gone. The decision takes nothing on a denial, so a denied user is
+// not charged for the attempt.
+bool Dispatcher::checkRateLimit(const CommandContext& ctx) {
+    RateLimitDecision d =
+        limiter_.tryAcquire(ctx.message.chat.id, ctx.message.from.id);
+    if (d.allowed) return true;
+    std::string reason = d.reason.empty()
+                             ? "Rate limit exceeded, try again shortly."
+                             : d.reason;
+    reply(ctx, reason);
     return false;
 }
+
 
 // --- chat settings ---------------------------------------------------------
 std::string Dispatcher::chatField(int64_t chat_id, const std::string& field,
@@ -995,138 +995,7 @@ double Dispatcher::chatSpeedField(int64_t chat_id) {
     return s;
 }
 
-bool Dispatcher::applyCoreFilter(const CommandContext& ctx, double speed,
-                                 int bass, const std::string& done_msg) {
-    int64_t chat = vcTarget(ctx);
-    if (chatField(chat, "voice_owner", "") != "core") return false;
-    if (!callActive(chat)) {
-        reply(ctx, "Nothing is playing.");
-        return true;
-    }
-    std::string source = chatField(chat, "core_source", "");
-    if (source.empty()) {
-        // A core session with no recorded source (e.g. joined with
-        // /join but never played a replied file through this build):
-        // there is nothing to re-attach, so say so instead of
-        // claiming the filter was applied.
-        reply(ctx, "This chat's audio is on the core voice backend, but "
-                   "no source was recorded for it, so the filter cannot "
-                   "be re-applied. Play a replied file again, then set "
-                   "the speed/bass.");
-        return true;
-    }
-    std::string title = chatField(chat, "core_title", "Replied file");
-    bool video = chatField(chat, "core_video", "0") == "1";
-    int64_t pos = voice_.time(chat);
-    int seek = pos > 0 ? static_cast<int>(pos) : 0;
-    if (!voice_.play(chat, source, title, video, seek, speed, bass)) {
-        std::string why = voice_.lastError();
-        if (why.empty()) why = voice_.describe();
-        reply(ctx, "Could not apply the filter: " + why);
-        return true;
-    }
-    setChatField(chat, "core_pos", std::to_string(seek));
-    reply(ctx, done_msg + " (core voice re-attached" +
-                   (seek > 0 ? " at " + fmtSeconds(seek)
-                             : " from the start (position unknown)") +
-                   " with the filter applied).");
-    return true;
-}
 
-// --- core-stream attach (Phase 7, A1b) --------------------------------------
-// The engines resolve tracks but cannot put audio in a call: their
-// ntgcalls instances never join (no MTProto client in-process —
-// vc-ts/vc-rust delegate the join itself to the core, and vc-go has no
-// audio path at all). The core's TdLibVoiceCall::play is the only
-// join-if-needed + attach path, so every engine-resolved play is
-// attached here. voice_owner="core" means the core backend holds the
-// call AND streams its audio — for engine sessions as well as
-// replied-file ones — which is what makes /mute, /speed and /bass
-// work on them through the existing core-owned branches.
-
-std::string Dispatcher::engineTrackSource(const Json& np,
-                                          const std::string& fallback) {
-    const Json* top = np.find("stream_url");
-    if (top && !top->asString().empty()) return top->asString();
-    const Json* track = np.find("track");
-    if (track) {
-        const Json* u = track->find("stream_url");
-        if (u && !u->asString().empty()) return u->asString();
-    }
-    return fallback;
-}
-
-bool Dispatcher::attachEngineAudio(int64_t chat, const Json& np, bool video,
-                                   int seek_sec,
-                                   const std::string& fallback_source,
-                                   std::string& error) {
-    std::string source = engineTrackSource(np, fallback_source);
-    if (source.empty()) {
-        error = "the engine resolved the track but gave no playable "
-                "audio URL (no stream_url in its now_playing)";
-        return false;
-    }
-    const Json* track = np.find("track");
-    std::string title =
-        track && track->find("title") ? track->find("title")->asString()
-                                      : "Track";
-    std::string track_id =
-        track && track->find("id") ? track->find("id")->asString() : "";
-    // voice_.play joins first when the backend is not already in the
-    // call (TdLibVoiceCall::play: authorize -> offer -> joinVideoChat
-    // -> connect -> setSources); on a live call it only re-attaches
-    // the source. The chat's stored speed/bass apply, as on the
-    // replied-file path.
-    if (!voice_.play(chat, source, title, video, seek_sec,
-                     chatSpeedField(chat), chatIntField(chat, "bass", 0))) {
-        error = voice_.lastError();
-        if (error.empty()) error = voice_.describe();
-        return false;
-    }
-    setChatField(chat, "core_source", source);
-    setChatField(chat, "core_title", title);
-    setChatField(chat, "core_video", video ? "1" : "0");
-    setChatField(chat, "core_track_id", track_id);
-    setChatField(chat, "core_pos", std::to_string(seek_sec));
-    setChatField(chat, "core_follow", "1");
-    setChatField(chat, "voice_owner", "core");
-    setCallActive(chat, true);
-    return true;
-}
-
-bool Dispatcher::reattachCoreAudio(int64_t chat, int seek_sec,
-                                   std::string& error) {
-    std::string source = chatField(chat, "core_source", "");
-    if (source.empty()) {
-        error = "no core source recorded for this chat";
-        return false;
-    }
-    std::string title = chatField(chat, "core_title", "Track");
-    bool video = chatField(chat, "core_video", "0") == "1";
-    if (!voice_.play(chat, source, title, video, seek_sec,
-                     chatSpeedField(chat), chatIntField(chat, "bass", 0))) {
-        error = voice_.lastError();
-        if (error.empty()) error = voice_.describe();
-        return false;
-    }
-    setChatField(chat, "core_pos", std::to_string(seek_sec));
-    return true;
-}
-
-void Dispatcher::clearCoreStream(int64_t chat) {
-    setChatField(chat, "voice_owner", "");
-    setChatField(chat, "core_source", "");
-    setChatField(chat, "core_title", "");
-    setChatField(chat, "core_video", "0");
-    setChatField(chat, "core_track_id", "");
-    setChatField(chat, "core_pos", "0");
-    setChatField(chat, "core_follow", "0");
-}
-
-bool Dispatcher::coreStreaming(int64_t chat) {
-    return chatField(chat, "voice_owner", "") == "core" && callActive(chat) &&
-           !chatField(chat, "core_source", "").empty();
-}
 
 bool Dispatcher::isAuthUser(int64_t chat_id, int64_t user_id) const {
     return store_.sismember("auth:" + std::to_string(chat_id),
@@ -1167,7 +1036,7 @@ void Dispatcher::replyError(const CommandContext& ctx, const IpcResult& r) {
 int64_t Dispatcher::replyHtml(const CommandContext& ctx,
                               const std::string& text) {
     int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text,
-                                     Json(nullptr), ctx.message.message_id);
+                                     InlineKeyboard{}, ctx.message.message_id);
     if (id < 0) {
         std::cerr << "[tg] sendMessageHtml failed\n";
         return -1;
@@ -1180,7 +1049,7 @@ int64_t Dispatcher::replyHtml(const CommandContext& ctx,
 int64_t Dispatcher::replyKb(const CommandContext& ctx, const std::string& text,
                             const InlineKeyboard& kb) {
     int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text,
-                                     inlineKeyboardJson(kb),
+                                     kb,
                                      ctx.message.message_id);
     if (id < 0) {
         std::cerr << "[tg] sendMessageHtml (kb) failed\n";
@@ -1193,9 +1062,12 @@ int64_t Dispatcher::replyKb(const CommandContext& ctx, const std::string& text,
 
 int64_t Dispatcher::replyReplyKb(const CommandContext& ctx,
                                  const std::string& text,
-                                 const Json& reply_markup) {
-    int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text, reply_markup,
-                                     ctx.message.message_id);
+                                 const ReplyKeyboard& kb, bool remove_kb) {
+    int64_t id = remove_kb
+                     ? tg_.sendMessageRemoveKb(ctx.message.chat.id, text,
+                                               ctx.message.message_id)
+                     : tg_.sendMessageReplyKb(ctx.message.chat.id, text, kb,
+                                              ctx.message.message_id);
     if (id < 0) {
         std::cerr << "[tg] sendMessageHtml (reply kb) failed\n";
         return -1;
@@ -1209,9 +1081,7 @@ int64_t Dispatcher::replyPhoto(const CommandContext& ctx,
                                const std::string& photo,
                                const std::string& caption,
                                const InlineKeyboard& kb) {
-    int64_t id = tg_.sendPhoto(ctx.message.chat.id, photo, caption,
-                               kb.empty() ? Json(nullptr)
-                                          : inlineKeyboardJson(kb));
+    int64_t id = tg_.sendPhoto(ctx.message.chat.id, photo, caption, kb);
     if (id < 0) {
         std::cerr << "[tg] sendPhoto failed\n";
         return -1;
@@ -1240,7 +1110,7 @@ bool Dispatcher::editCbCard(const TgCallbackQuery& cq,
     // back to editMessageText.
     bool have_card = cardInfo(cq.chat_id, card_id, is_photo) &&
                      card_id == cq.message_id;
-    Json markup = kb.empty() ? Json(nullptr) : inlineKeyboardJson(kb);
+    InlineKeyboard markup = kb;
     if (have_card && is_photo)
         return tg_.editMessageCaption(cq.chat_id, cq.message_id, text,
                                       markup, &err);
@@ -1254,7 +1124,7 @@ bool Dispatcher::editCbKeyboard(const TgCallbackQuery& cq,
     std::string err;
     return tg_.editMessageReplyMarkup(
         cq.chat_id, cq.message_id,
-        kb.empty() ? Json(nullptr) : inlineKeyboardJson(kb), &err);
+        kb, &err);
 }
 
 // --- Phase 9 card rendering -------------------------------------------------
@@ -1358,11 +1228,6 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     ui_texts::CardTrack ct = cardTrack(*track, requester);
     int64_t pos = np.find("position_sec") ? np.find("position_sec")->asInt()
                                           : 0;
-    if (pos == 0) {
-        // Engines without IPC-1 position_sec: the core's own scratch
-        // position (core_pos) is the fallback.
-        pos = chatIntField(chat_id, "core_pos", 0);
-    }
     int64_t dur =
         track->find("duration_sec") ? track->find("duration_sec")->asInt()
                                     : 0;
@@ -1388,14 +1253,12 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     int64_t id = -1;
     bool is_photo = false;
     if (!thumb.empty() && thumbnailsOn(chat_id)) {
-        id = tg_.sendPhoto(chat_id, thumb, text,
-                           kb.empty() ? Json(nullptr)
-                                      : inlineKeyboardJson(kb));
+        id = tg_.sendPhoto(chat_id, thumb, text, kb);
         if (id > 0) is_photo = true;
     }
     if (id < 0) {
         // No thumbnail, thumbnails off, or sendPhoto failed: text card.
-        id = tg_.sendMessageHtml(chat_id, text, inlineKeyboardJson(kb), 0);
+        id = tg_.sendMessageHtml(chat_id, text, kb, 0);
     }
     if (id > 0) recordCard(chat_id, id, is_photo);
     return id;
@@ -1412,13 +1275,11 @@ bool Dispatcher::buildQueueCard(int64_t chat_id, bool show_all,
     ui_texts::CardTrack now = cardTrack(track, requester);
     CommandContext fake;
     fake.message.chat.id = chat_id;
-    Engine used;
-    bool fb = false;
     Json body = Json::objectOf({
         {"chat_id", Json(chat_id)},
         {"action", Json("list")},
     });
-    IpcResult q = vcCall(fake, "queue", body, used, fb);
+    IpcResult q = vcCall(fake, "queue", body);
     if (!q.ok) return false;
     const Json* items = q.data.find("queue");
     std::vector<ui_texts::CardTrack> up;
@@ -1470,13 +1331,11 @@ bool Dispatcher::resolveQueueToken(int64_t chat_id,
                                    int64_t& position_out) {
     CommandContext fake;
     fake.message.chat.id = chat_id;
-    Engine used;
-    bool fb = false;
     Json body = Json::objectOf({
         {"chat_id", Json(chat_id)},
         {"action", Json("list")},
     });
-    IpcResult q = vcCall(fake, "queue", body, used, fb);
+    IpcResult q = vcCall(fake, "queue", body);
     if (!q.ok) return false;
     const Json* items = q.data.find("queue");
     if (!items) return false;
@@ -1612,21 +1471,17 @@ void Dispatcher::refreshPanel(const TgCallbackQuery& cq, int64_t chat_id) {
     std::string now_url;
     std::string next_title;
     std::string next_url;
-    std::string emoji = "🎵";
-    if (chatIntField(chat_id, "loop", 0) > 0) emoji = "🔁";
     if (nowPlaying(chat_id, np, track)) {
         now_title = track.find("title") ? track.find("title")->asString()
                                         : "";
         now_url = track.find("url") ? track.find("url")->asString() : "";
         CommandContext fake;
         fake.message.chat.id = chat_id;
-        Engine used;
-        bool fb = false;
         Json body = Json::objectOf({
             {"chat_id", Json(chat_id)},
             {"action", Json("list")},
         });
-        IpcResult q = vcCall(fake, "queue", body, used, fb);
+        IpcResult q = vcCall(fake, "queue", body);
         if (q.ok) {
             const Json* items = q.data.find("queue");
             if (items && items->size() > 1) {
@@ -1643,11 +1498,11 @@ void Dispatcher::refreshPanel(const TgCallbackQuery& cq, int64_t chat_id) {
         }
     }
     std::string text = ui_texts::menuPanelText(
-        emoji, ui_texts::htmlEscape(now_title), now_url,
+        ui_texts::htmlEscape(now_title), now_url,
         ui_texts::htmlEscape(next_title), next_url);
     std::string err;
     tg_.editMessageText(chat_id, cq.message_id, text,
-                        inlineKeyboardJson(ui_texts::menuPanelKeyboard(chat_id)),
+                        ui_texts::menuPanelKeyboard(chat_id),
                         &err);
 }
 
@@ -1658,35 +1513,7 @@ void Dispatcher::refreshCard(const TgCallbackQuery& cq, int64_t chat_id) {
     bool is_photo = false;
     if (!cardInfo(chat_id, card_id, is_photo) || card_id != cq.message_id)
         return;
-    std::string requester;
-    auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
-    requester = rn ? *rn : "";
-    ui_texts::CardTrack ct = cardTrack(track, requester);
-    int64_t pos = np.find("position_sec") ? np.find("position_sec")->asInt()
-                                          : 0;
-    if (pos == 0) pos = chatIntField(chat_id, "core_pos", 0);
-    int64_t dur =
-        track.find("duration_sec") ? track.find("duration_sec")->asInt() : 0;
-    bool paused = false;
-    if (const Json* p = np.find("paused")) paused = p->asBool();
-    if (const Json* p = np.find("is_paused")) paused = p->asBool();
-    bool autoplay = false;
-    if (const Json* a = np.find("autoplay")) autoplay = a->asBool();
-    if (const Json* a = np.find("autoplay_enabled")) autoplay = a->asBool();
-    int loop = 0;
-    if (const Json* l = np.find("loop")) loop = static_cast<int>(l->asInt());
-    if (const Json* l = np.find("loop_count"))
-        loop = static_cast<int>(l->asInt());
-    if (loop == 0) loop = chatIntField(chat_id, "loop", 0);
-    std::string text = ui_texts::nowPlayingText(ct);
-    InlineKeyboard kb = ui_texts::playerKeyboard(
-        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
-    std::string err;
-    Json markup = inlineKeyboardJson(kb);
-    if (is_photo)
-        tg_.editMessageCaption(chat_id, cq.message_id, text, markup, &err);
-    else
-        tg_.editMessageText(chat_id, cq.message_id, text, markup, &err);
+    refreshCardText(chat_id, cq.message_id, is_photo, np);
 }
 
 void Dispatcher::logToLogger(const std::string& text) {
@@ -1710,37 +1537,30 @@ void Dispatcher::deleteCommandMessage(const CommandContext& ctx) {
         tg_.deleteMessage(ctx.message.chat.id, ctx.message.message_id);
 }
 
+// One POST to the single unified backend over the persistent UDS
+// socket (contracts/uds-protocol.md). The base_url argument is gone:
+// there is exactly one backend, and IpcClient::post ignores the URL
+// anyway. No fallback, no /healthz pre-probe — a failed call reports
+// the backend's exact error, never a silent retry elsewhere.
 IpcResult Dispatcher::vcCall(const CommandContext& ctx, const std::string& action,
-                             const Json& body, Engine& used, bool& fell_back) {
-    return router_.callVc(ipc_, vcTarget(ctx), action, body, used, fell_back);
+                             const Json& body) {
+    (void)ctx;
+    return ipc_.post("", action, body, 30);
 }
 
-IpcResult Dispatcher::vcGet(const CommandContext& ctx, const std::string& action,
-                            Engine& used, bool& fell_back) {
-    // GET /v1/<action>?chat_id=... with the same fallback order as POST.
-    Engine preferred = router_.engineFor(vcTarget(ctx));
-    fell_back = false;
-    IpcResult last;
-    for (Engine e : fallbackOrder(preferred)) {
-        std::string path = "/v1/" + action +
-                           "?chat_id=" + std::to_string(vcTarget(ctx));
-        last = ipc_.get(router_.baseUrl(e), path, 10);
-        if (!last.unavailable(action)) {
-            used = e;
-            fell_back = (e != preferred);
-            return last;
-        }
-    }
-    used = preferred;
-    return last;
+IpcResult Dispatcher::vcGet(const CommandContext& ctx, const std::string& action) {
+    // GET /v1/<action>?chat_id=... on the one backend (10 s budget).
+    // IpcClient::get translates the legacy path to the dotted contract
+    // action; the base URL is ignored.
+    std::string path = "/v1/" + action +
+                       "?chat_id=" + std::to_string(vcTarget(ctx));
+    return ipc_.get("", path, 10);
 }
 
 bool Dispatcher::nowPlaying(int64_t chat_id, Json& np_out, Json& track_out) {
     CommandContext fake;
     fake.message.chat.id = chat_id;
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcGet(fake, "now-playing", used, fb);
+    IpcResult r = vcGet(fake, "now-playing");
     if (!r.ok) return false;
     const Json* np = r.data.find("now_playing");
     if (!np) return false;
@@ -1752,14 +1572,12 @@ bool Dispatcher::nowPlaying(int64_t chat_id, Json& np_out, Json& track_out) {
 }
 
 // HTTP API seam: the whole now-playing object for one chat, straight
-// from the engines (same vcGet fail-over as the Telegram commands).
+// from the backend (same vcGet as the Telegram commands).
 bool Dispatcher::apiNowPlaying(int64_t chat_id, Json& np_out,
                                std::string& error) {
     CommandContext fake;
     fake.message.chat.id = chat_id;
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcGet(fake, "now-playing", used, fb);
+    IpcResult r = vcGet(fake, "now-playing");
     if (!r.ok) {
         error = r.describe();
         return false;
@@ -1769,8 +1587,8 @@ bool Dispatcher::apiNowPlaying(int64_t chat_id, Json& np_out,
         error = "engine response has no now_playing object";
         return false;
     }
-    // vc-rust answers 200 with an empty room where go/ts 404: a null
-    // track AND an empty queue is no playback state, not a track.
+    // The backend answers 200 with an empty room when nothing plays:
+    // a null track AND an empty queue is no playback state, not a track.
     const Json* track = np->find("track");
     const Json* queue = np->find("queue");
     bool has_track = track && !track->isNull();
@@ -1783,16 +1601,14 @@ bool Dispatcher::apiNowPlaying(int64_t chat_id, Json& np_out,
     return true;
 }
 
-// HTTP API seam: the engine's queue list (POST /v1/queue action=list).
+// HTTP API seam: the backend's queue list (POST /v1/queue action=list).
 bool Dispatcher::apiQueueList(int64_t chat_id, Json& queue_out,
                               std::string& error) {
     CommandContext fake;
     fake.message.chat.id = chat_id;
-    Engine used;
-    bool fb = false;
     Json body = Json::objectOf({{"action", Json("list")},
                                 {"chat_id", Json(chat_id)}});
-    IpcResult r = vcCall(fake, "queue", body, used, fb);
+    IpcResult r = vcCall(fake, "queue", body);
     if (!r.ok) {
         error = r.describe();
         return false;
@@ -1806,66 +1622,45 @@ bool Dispatcher::apiQueueList(int64_t chat_id, Json& queue_out,
     return true;
 }
 
-// HTTP API seam: vc.join (POST /v1/join). The vc-ts / vc-rust engines
-// call this from their join() — they hold no MTProto client, so the
-// core's TDLib backend owns the join (authorize -> createOffer ->
-// getChat/createVideoChat -> joinVideoChat -> ntg.connect, in
-// TdLibVoiceCall::join). Same join as /join, minus the Telegram
-// permission check and reply: the caller is an engine on the IPC
-// network, already authenticated by the X-Parlay-Token header.
+// HTTP API seam: vc.join (POST /v1/join). The backend owns the call:
+// a vc.join asks the backend to join, and the backend drives the
+// duplex JoinRequest handshake (onJoinRequest) for the TDLib
+// joinVideoChat half. Same join as /join, minus the Telegram
+// permission check and reply.
 bool Dispatcher::joinVoice(int64_t chat_id, std::string& error) {
-    // Already in a call (core session from an earlier /join, or an
-    // engine session already playing here): nothing to join.
+    // Already in a call: nothing to join.
     if (callActive(chat_id)) return true;
-    if (!voice_.available()) {
-        error = voice_.describe();
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    IpcResult r = vcCall(fake, "join",
+                         Json::objectOf({{"chat_id", Json(chat_id)}}));
+    if (!r.ok) {
+        error = r.describe();
         return false;
     }
-    if (!voice_.join(chat_id)) {
-        error = voice_.lastError();
-        if (error.empty()) error = voice_.describe();
-        return false;
-    }
-    setChatField(chat_id, "voice_owner", "core");
     setCallActive(chat_id, true);
     return true;
 }
 
 // HTTP API seam: vc.mute (POST /v1/mute). Same mute as /mute, minus
-// the Telegram permission check and reply: the caller is an engine
-// on the IPC network, already authenticated by the X-Parlay-Token
-// header. The "already muted/unmuted" short-circuit of /mute is NOT
-// reproduced here — the endpoint reports the requested state after a
-// real backend mute/unmute (or an honest error), so a repeated mute
-// is a success, not a refusal.
+// the Telegram permission check and reply. The "already muted/unmuted"
+// short-circuit of /mute is NOT reproduced here — the endpoint reports
+// the requested state after a real backend mute/unmute (or an honest
+// error), so a repeated mute is a success, not a refusal.
 bool Dispatcher::muteVoice(int64_t chat_id, bool mute,
                            std::string& error) {
-    // Mute reaches the voice session the core backend itself holds
-    // (/join, replied-file playback, and — since Phase 7 A1b — every
-    // engine play attached via attachEngineAudio) through the
-    // backend's mute() / unmute() — not a stored flag. A session
-    // still owned by a vc engine (stale / pre-fix state, never
-    // core-attached) cannot be muted from the core: the engines hold
-    // the call, so claiming otherwise would be a fake success.
-    std::string owner = chatField(chat_id, "voice_owner", "");
-    if (owner != "core") {
-        Json np, track;
-        if (nowPlaying(chat_id, np, track) || callActive(chat_id)) {
-            error = "the " +
-                    (owner.empty() ? std::string("engine") : owner) +
-                    " session is playing this chat; the core cannot "
-                    "mute it — mute works only on sessions the core "
-                    "voice backend holds (/join, replied-file "
-                    "playback)";
-            return false;
-        }
+    Json np, track;
+    if (!nowPlaying(chat_id, np, track) && !callActive(chat_id)) {
         error = "Nothing is playing.";
         return false;
     }
-    bool ok = mute ? voice_.mute(chat_id) : voice_.unmute(chat_id);
-    if (!ok) {
-        error = voice_.lastError();
-        if (error.empty()) error = voice_.describe();
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    IpcResult r = vcCall(fake, "mute",
+                         Json::objectOf({{"chat_id", Json(chat_id)},
+                                         {"muted", Json(mute)}}));
+    if (!r.ok) {
+        error = r.describe();
         return false;
     }
     setChatField(chat_id, "muted", mute ? "1" : "0");
@@ -1920,16 +1715,6 @@ std::string Dispatcher::fmtTrack(const Json& track) {
     return out;
 }
 
-std::string Dispatcher::fmtNowPlaying(const Json& np, const std::string& verb) {
-    std::string out = verb + "\n";
-    const Json* track = np.find("track");
-    if (track) out += "🎵 " + fmtTrack(*track) + "\n";
-    const Json* engine = np.find("engine");
-    if (engine) out += "Engine: " + engine->asString() + "\n";
-    const Json* paused = np.find("paused");
-    if (paused && paused->asBool()) out += "Paused\n";
-    return out;
-}
 
 std::string Dispatcher::fmtQueue(const Json& data) {
     const Json* q = data.find("queue");
@@ -1952,6 +1737,10 @@ std::string Dispatcher::fmtSeconds(int64_t sec) {
 }
 
 // --- background loops --------------------------------------------------------
+// Clean-mode sweeper only. The 5-second loop/autoplay watcher and the
+// core-follow pass are DELETED (Phase 2): track transitions are
+// backend-driven events (onBackendEvent), and autoplay is the
+// backend's job — the core no longer polls engine state on a timer.
 void Dispatcher::startBackground() {
     bg_stop_ = false;
     bg_thread_ = std::thread([this] { backgroundLoop(); });
@@ -1968,8 +1757,6 @@ void Dispatcher::backgroundLoop() {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         if (bg_stop_) break;
         sweepClean();
-        watchLoopAutoplay();
-        watchCoreFollow();
     }
 }
 
@@ -1988,150 +1775,314 @@ void Dispatcher::sweepClean() {
             }
         }
     }
-    for (auto& d : due) tg_.deleteMessage(d.chat, d.message);
-}
-
-void Dispatcher::watchLoopAutoplay() {
-    // Autoplay: when a chat's session drains (nothing playing, queue
-    // empty) and autoplay is on, queue a related track via vc-ts search
-    // on the last track's title. Loop is enforced at /loop time by
-    // queueing copies, so the watcher only handles autoplay.
-    auto chats = store_.keys("autoplay:");
-    for (const auto& key : chats) {
-        if (bg_stop_) return;
-        std::string chat_s = key.substr(std::string("autoplay:").size());
-        int64_t chat = 0;
-        try {
-            chat = std::stoll(chat_s);
-        } catch (...) {
-            continue;
-        }
-        auto on = store_.get(key);
-        if (!on || *on != "1") continue;
-        if (!callActive(chat)) continue;
-        Json np, track;
-        if (nowPlaying(chat, np, track)) continue;  // still playing
-        std::string last = chatField(chat, "last_track", "");
-        if (last.empty()) continue;
-        Json body = Json::objectOf({
-            {"query", Json(last)},
-            {"source", Json("all")},
-            {"limit", Json(static_cast<int64_t>(3))},
-        });
-        IpcResult r = ipc_.post(cfg_.vc_ts_url, "search", body, 15);
-        if (!r.ok) continue;
-        const Json* results = r.data.find("results");
-        if (!results || results->size() == 0) continue;
-        // First result that is not the track that just ended.
-        const Json* pick = nullptr;
-        for (const auto& t : results->asArray()) {
-            const Json* title = t.find("title");
-            if (title && title->asString() != last) {
-                pick = &t;
-                break;
-            }
-        }
-        if (!pick) continue;
-        Json play = Json::objectOf({
-            {"chat_id", Json(chat)},
-            {"query", Json(pick->find("title") ? pick->find("title")->asString() : "")},
-            {"requested_by", Json(bot_id_)},
-        });
-        Engine used;
-        bool fb = false;
-        CommandContext fake;
-        fake.message.chat.id = chat;
-        IpcResult pr = vcCall(fake, "play", play, used, fb);
-        if (!pr.ok) continue;
-        // The engine resolved the pick — attach its audio to the core
-        // voice backend (see attachEngineAudio): without this the
-        // autoplay pick plays state-only and the call stays silent.
-        const Json* pick_np = pr.data.find("now_playing");
-        std::string err;
-        if (!attachEngineAudio(chat, pick_np ? *pick_np : pr.data, false, 0,
-                               "", err)) {
-            std::cerr << "[autoplay] chat " << chat
-                      << ": could not attach autoplay pick: " << err << "\n";
-            Engine u2;
-            bool fb2 = false;
-            vcCall(fake, "stop",
-                   Json::objectOf({{"chat_id", Json(chat)}}), u2, fb2);
-            voice_.stop(chat);
-            clearCoreStream(chat);
-            setCallActive(chat, false);
-            continue;
-        }
-        setChatField(chat, "last_track",
-                     pick->find("title") ? pick->find("title")->asString()
-                                         : "");
+    // The sweeper runs on the background thread, and TDLib calls belong
+    // on the main thread (see the header note): queue the deletes and
+    // let processPendingWork() run them.
+    for (auto& d : due) {
+        std::lock_guard<std::mutex> lk(work_mu_);
+        pending_work_.push_back(
+            [this, chat = d.chat, message = d.message] {
+                tg_.deleteMessage(chat, message);
+            });
     }
 }
 
-// Follow engine-internal auto-advance (Phase 7, A1b). The vc engines
-// advance their own state machine on a 1 s ticker when a track ends
-// (vc-go Room.DueForAdvance/Advance, vc-ts / vc-rust tickers) — the
-// core is never told, and its ntgcalls session is the only one
-// actually in the call. So every 5 s the watcher asks each
-// core-streaming chat what the engine is playing now and re-attaches
-// when it moved on: a different track id, or the same id with the
-// position jumped backwards (a /loop copy replaying, or a replay —
-// the copies share the track id). The re-attach seeks to the
-// engine's current position, so a track that ended 3 s ago resumes
-// ~3 s in, not from the start. Only engine sessions attached via
-// attachEngineAudio (core_follow=1) are followed: a replied-file
-// session leaves the engine's stale room reporting its old track,
-// and following that would clobber the replied file's audio.
-// On re-attach failure the session is stopped cleanly (engine stop
-// + core stop + state cleared) and the failure is logged: a silent
-// call with a "playing" engine is worse than a stopped one.
-void Dispatcher::watchCoreFollow() {
-    auto calls = store_.keys("call:");
-    for (const auto& key : calls) {
-        if (bg_stop_) return;
-        std::string chat_s = key.substr(std::string("call:").size());
-        int64_t chat = 0;
+// --- backend-driven duplex hooks (Phase 2) ----------------------------------
+// onBackendEvent runs on the IpcClient reader thread: enqueue only,
+// never touch TDLib here.
+void Dispatcher::onBackendEvent(const std::string& event, const Json& data) {
+    std::lock_guard<std::mutex> lk(work_mu_);
+    pending_work_.push_back(
+        [this, event, data] { onTrackEvent(event, data); });
+}
+
+// onJoinRequest runs on an IpcClient worker thread: enqueue the request
+// and block on the future. Main drains it with processPendingWork()
+// and runs the TDLib join there (the worker thread is the one place a
+// block is allowed — see ipc.hpp).
+Json Dispatcher::onJoinRequest(const Json& request) {
+    const Json* chat = request.find("chat_id");
+    const Json* sdp = request.find("local_sdp");
+    if (!chat || !sdp || sdp->asString().empty()) {
+        return Json::objectOf(
+            {{"ok", Json(false)},
+             {"error",
+              Json::objectOf(
+                  {{"code", Json("bad_request")},
+                   {"message",
+                    Json("JoinRequest needs chat_id + local_sdp")}})}});
+    }
+    auto done = std::make_shared<std::promise<Json>>();
+    std::future<Json> fut = done->get_future();
+    {
+        std::lock_guard<std::mutex> lk(joins_mu_);
+        pending_joins_.push_back(
+            {chat->asInt(), sdp->asString(), done});
+    }
+    return fut.get();
+}
+
+// MAIN THREAD ONLY: run queued outbound work, then pending joins.
+void Dispatcher::processPendingWork() {
+    std::vector<std::function<void()>> work;
+    {
+        std::lock_guard<std::mutex> lk(work_mu_);
+        work.swap(pending_work_);
+    }
+    for (auto& w : work) {
         try {
-            chat = std::stoll(chat_s);
-        } catch (...) {
-            continue;
+            w();
+        } catch (const std::exception& e) {
+            std::cerr << "[dispatcher] queued work threw: " << e.what()
+                      << "\n";
         }
-        if (!coreStreaming(chat)) continue;
-        if (chatField(chat, "core_follow", "0") != "1") continue;
-        Json np, track;
-        if (!nowPlaying(chat, np, track)) continue;
-        std::string cur_id =
-            track.find("id") ? track.find("id")->asString() : "";
-        int64_t cur_pos =
-            np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
-        std::string last_id = chatField(chat, "core_track_id", "");
-        int64_t last_pos = chatIntField(chat, "core_pos", 0);
-        bool advanced = !last_id.empty() && cur_id != last_id;
-        bool replayed = cur_pos + 5 < last_pos;
-        if (!advanced && !replayed) {
-            setChatField(chat, "core_pos", std::to_string(cur_pos));
-            continue;
-        }
-        bool video = chatField(chat, "core_video", "0") == "1";
+    }
+    std::vector<PendingJoin> joins;
+    {
+        std::lock_guard<std::mutex> lk(joins_mu_);
+        joins.swap(pending_joins_);
+    }
+    for (auto& j : joins) {
+        Json resp;
         std::string err;
-        if (!attachEngineAudio(chat, np, video, static_cast<int>(cur_pos),
-                               "", err)) {
-            std::cerr << "[core-follow] chat " << chat
-                      << ": engine advanced but the core could not "
-                         "re-attach: "
-                      << err << "\n";
-            CommandContext fake;
-            fake.message.chat.id = chat;
-            Engine used;
-            bool fb = false;
-            vcCall(fake, "stop",
-                   Json::objectOf({{"chat_id", Json(chat)}}), used, fb);
-            voice_.stop(chat);
-            clearCoreStream(chat);
-            setCallActive(chat, false);
-            continue;
+        if (doJoinVideoChat(j.chat_id, j.local_sdp, resp, err)) {
+            j.done->set_value(Json::objectOf(
+                {{"ok", Json(true)}, {"data", resp}}));
+        } else {
+            j.done->set_value(Json::objectOf(
+                {{"ok", Json(false)},
+                 {"error",
+                  Json::objectOf({{"code", Json("internal")},
+                                  {"message", Json(err)}})}}));
         }
     }
 }
+
+// Main-thread handling of one dequeued backend event.
+void Dispatcher::onTrackEvent(const std::string& event, const Json& data) {
+    const Json* chat = data.find("chat_id");
+    int64_t chat_id = chat ? chat->asInt() : 0;
+    if (chat_id == 0) return;
+    if (event == "TrackStarted" || event == "TrackAdvanced" ||
+        event == "TrackChanged") {
+        // The backend advanced the track: refresh the Telegram card
+        // from the backend's now-playing (the event is the trigger;
+        // the backend is the source of truth for the track).
+        Json np, track;
+        if (!nowPlaying(chat_id, np, track)) return;
+        editNowPlayingCard(chat_id, np);
+        return;
+    }
+    if (event == "TrackEnded" || event == "QueueEmpty") {
+        // Nothing follows this track: the backend stopped, so the call
+        // is inactive, and the recorded card goes idle instead of
+        // showing a stale track.
+        setCallActive(chat_id, false);
+        int64_t card_id = 0;
+        bool is_photo = false;
+        if (!cardInfo(chat_id, card_id, is_photo)) return;
+        std::string err;
+        InlineKeyboard empty;
+        if (is_photo)
+            tg_.editMessageCaption(chat_id, card_id, ui_texts::kNowIdle,
+                                   empty, &err);
+        else
+            tg_.editMessageText(chat_id, card_id, ui_texts::kNowIdle, empty,
+                                &err);
+        return;
+    }
+    if (event == "VoiceError") {
+        const Json* msg = data.find("message");
+        std::string text = msg ? msg->asString() : "voice error";
+        const Json* code = data.find("code");
+        std::string err;
+        tg_.sendMessage(chat_id,
+                        "Voice error" +
+                            (code ? " (" + code->asString() + ")" : "") +
+                            ": " + text,
+                        err);
+        return;
+    }
+    // DownloadReady and unknown events: no UI action (forward
+    // compatibility — unknown names are ignored per the protocol).
+}
+
+// Edit the recorded now-playing card for a chat in place; send a fresh
+// card when none is recorded.
+void Dispatcher::editNowPlayingCard(int64_t chat_id, const Json& np) {
+    int64_t card_id = 0;
+    bool is_photo = false;
+    if (cardInfo(chat_id, card_id, is_photo)) {
+        refreshCardText(chat_id, card_id, is_photo, np);
+        return;
+    }
+    sendNowPlayingCard(chat_id, np, "");
+}
+
+// Render the now-playing card text + keyboard for a chat and edit the
+// given card message with it.
+void Dispatcher::refreshCardText(int64_t chat_id, int64_t message_id,
+                                 bool is_photo, const Json& np) {
+    const Json* track = np.find("track");
+    if (!track || track->isNull()) return;
+    std::string requester;
+    auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
+    requester = rn ? *rn : "";
+    ui_texts::CardTrack ct = cardTrack(*track, requester);
+    int64_t pos = np.find("position_sec") ? np.find("position_sec")->asInt()
+                                          : 0;
+    int64_t dur =
+        track->find("duration_sec") ? track->find("duration_sec")->asInt()
+                                    : 0;
+    bool paused = false;
+    if (const Json* p = np.find("paused")) paused = p->asBool();
+    if (const Json* p = np.find("is_paused")) paused = p->asBool();
+    bool autoplay = false;
+    if (const Json* a = np.find("autoplay")) autoplay = a->asBool();
+    if (const Json* a = np.find("autoplay_enabled")) autoplay = a->asBool();
+    int loop = 0;
+    if (const Json* l = np.find("loop")) loop = static_cast<int>(l->asInt());
+    if (const Json* l = np.find("loop_count"))
+        loop = static_cast<int>(l->asInt());
+    if (loop == 0) loop = chatIntField(chat_id, "loop", 0);
+    std::string text = ui_texts::nowPlayingText(ct);
+    InlineKeyboard kb = ui_texts::playerKeyboard(
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
+    std::string err;
+    if (is_photo)
+        tg_.editMessageCaption(chat_id, message_id, text, kb, &err);
+    else
+        tg_.editMessageText(chat_id, message_id, text, kb, &err);
+}
+
+// --- duplex join: TDLib signalling on the shared assistant session --------
+// Ported from the deleted TdLibVoiceCall (voice_call.cpp) minus the
+// ntgcalls half: the backend owns the call and the audio, the core
+// only runs getChat / createVideoChat / joinVideoChat and hands the
+// remote transport payload back.
+int32_t Dispatcher::groupCallId(int64_t chat_id, std::string& error) {
+    Json req = Json::objectOf({
+        {"@type", Json("getChat")},
+        {"chat_id", Json(chat_id)},
+    });
+    Json resp = assistant_.call(req, 30.0);
+    if (resp.isNull()) {
+        error = "getChat timed out for chat " + std::to_string(chat_id);
+        return -1;
+    }
+    const Json* type = resp.find("@type");
+    if (type && type->asString() == "error") {
+        const Json* msg = resp.find("message");
+        error = "getChat failed: " +
+                (msg ? msg->asString() : std::string("?"));
+        return -1;
+    }
+    const Json* vc = resp.find("video_chat");
+    if (!vc) {
+        error = "getChat response has no video_chat";
+        return -1;
+    }
+    const Json* gcid = vc->find("group_call_id");
+    return gcid ? static_cast<int32_t>(gcid->asInt(0)) : 0;
+}
+
+int32_t Dispatcher::createVideoChat(int64_t chat_id, const std::string& title,
+                                    std::string& error) {
+    Json req = Json::objectOf({
+        {"@type", Json("createVideoChat")},
+        {"chat_id", Json(chat_id)},
+        {"title", Json(title)},
+        {"start_date", Json(0)},
+        {"is_rtmp_stream", Json(false)},
+    });
+    Json resp = assistant_.call(req, 30.0);
+    if (resp.isNull()) {
+        error = "createVideoChat timed out for chat " +
+                std::to_string(chat_id);
+        return 0;
+    }
+    const Json* type = resp.find("@type");
+    if (type && type->asString() == "error") {
+        const Json* msg = resp.find("message");
+        error = "createVideoChat failed: " +
+                (msg ? msg->asString() : std::string("?"));
+        return 0;
+    }
+    const Json* id = resp.find("id");
+    return id ? static_cast<int32_t>(id->asInt(0)) : 0;
+}
+
+std::string Dispatcher::joinVideoChat(int32_t group_call_id,
+                                      const std::string& local_sdp,
+                                      bool video, std::string& error) {
+    Json join_params = Json::objectOf({
+        {"@type", Json("groupCallJoinParameters")},
+        {"audio_source_id", Json(0)},
+        {"payload", Json(local_sdp)},
+        {"is_muted", Json(false)},
+        {"is_my_video_enabled", Json(video)},
+    });
+    Json req = Json::objectOf({
+        {"@type", Json("joinVideoChat")},
+        {"group_call_id", Json(static_cast<int64_t>(group_call_id))},
+        {"participant_id", Json(nullptr)},
+        {"join_parameters", join_params},
+        {"invite_hash", Json("")},
+    });
+    Json resp = assistant_.call(req, 30.0);
+    if (resp.isNull()) {
+        error = "joinVideoChat timed out for group call " +
+                std::to_string(group_call_id);
+        return "";
+    }
+    const Json* type = resp.find("@type");
+    if (type && type->asString() == "error") {
+        const Json* msg = resp.find("message");
+        error = "joinVideoChat failed: " +
+                (msg ? msg->asString() : std::string("?"));
+        return "";
+    }
+    // joinVideoChat returns Text; .text is the remote transport payload
+    // for tgcalls (td_api.tl: "Returns join response payload for tgcalls").
+    const Json* text = resp.find("text");
+    if (!text || text->asString().empty()) {
+        error = "joinVideoChat returned no remote payload (type: " +
+                (type ? type->asString() : std::string("?")) + ")";
+        return "";
+    }
+    return text->asString();
+}
+
+bool Dispatcher::doJoinVideoChat(int64_t chat_id,
+                                 const std::string& local_sdp,
+                                 Json& response_out, std::string& error) {
+    if (!assistant_.available()) {
+        error = "assistant session unavailable: " +
+                assistant_.lastError();
+        return false;
+    }
+    if (!assistant_.authorized()) {
+        error = "assistant session not authorized: " +
+                assistant_.lastError();
+        return false;
+    }
+    // Resolve the chat's video chat; create one when none exists.
+    int32_t gcid = groupCallId(chat_id, error);
+    if (gcid < 0) return false;
+    if (gcid == 0) {
+        gcid = createVideoChat(chat_id, "Parlay", error);
+        if (gcid == 0) return false;
+    }
+    std::string remote = joinVideoChat(gcid, local_sdp, false, error);
+    if (remote.empty()) return false;
+    response_out = Json::objectOf(
+        {{"remote_sdp", Json(remote)},
+         {"group_call_id", Json(static_cast<int64_t>(gcid))}});
+    setCallActive(chat_id, true);
+    return true;
+}
+
+
 
 // --- handlers: start / help -------------------------------------------------
 void Dispatcher::onStart(const CommandContext& ctx) {
@@ -2259,7 +2210,7 @@ void Dispatcher::onHelp(const CommandContext& ctx) {
         std::string url = "https://t.me/" + bot_username_ +
                           "?start=pm_help";
         InlineKeyboard kb = {
-            {InlineButton::link("📒 Commands", url)}};
+            {InlineButton::link("Commands", url)}};
         replyKb(ctx, ui_texts::kHelpGroup, kb);
         return;
     }
@@ -2310,9 +2261,10 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     // Reply-to media (or media sent with the command as its caption):
     // /play on a replied audio/video/voice/video_note/document plays
     // that Telegram file (source "file"). The core downloads it via
-    // the Bot API getFile and plays it through its own in-process
-    // voice backend — the vc engines cannot resolve a Telegram
-    // file_id. No query is needed; a missing backend fails honestly.
+    // the TDLib bot session; local-file playback is a backend action
+    // that does not exist yet (Phase 3), so the download is followed
+    // by an honest gap reply — never a fake "Now playing". No query
+    // is needed.
     if (query.empty() && ctx.command != "playplaylist") {
         std::string file_id, title, kind;
         if (ctx.message.has_reply_media) {
@@ -2327,18 +2279,16 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         if (!file_id.empty()) {
             if (!playAllowed(ctx, force)) return;
             bool replied_ok = playRepliedFile(ctx, file_id, title, kind);
-            // No engine IPC on this path: the core voice backend
-            // plays the downloaded file directly. The line still
-            // fires on every /play (ipc=none); the voice-join stages
-            // are timed by t_voice_join in voice_call.cpp. ok is
-            // the replied-file outcome (download + voice attach).
+            // No backend IPC on this path: the line still fires on
+            // every /play (ipc=none). ok is the replied-file outcome
+            // (download + honest gap reply).
             emitDispatchToIpc(telemetry::nowUs() - receiptUs(ctx), -1, -1,
-                              vcTarget(ctx), "", false, replied_ok,
+                              vcTarget(ctx), replied_ok,
                               replied_ok ? "" : "replied_file_failed");
             return;
         }
         emitDispatchToIpc(telemetry::nowUs() - receiptUs(ctx), -1, -1,
-                          vcTarget(ctx), "", false, false, "no_query");
+                          vcTarget(ctx), false, "no_query");
         replyHtml(ctx, ui_texts::fmt(ui_texts::kNoSongQuery,
                                      {{"cmd", "/play"}}));
         return;
@@ -2353,11 +2303,9 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     // duration_sec; a too-long track is stopped right away.
     if (force) {
         // playforce: replace the current track (queue().force_add shape).
-        Engine used;
-        bool fb = false;
         Json stop_body =
             Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-        vcCall(ctx, "stop", stop_body, used, fb);
+        vcCall(ctx, "stop", stop_body);
     }
     // What was playing before this call: a play that lands while
     // something is already playing queues the new track instead, and
@@ -2373,21 +2321,17 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         {"video", Json(video)},
         {"force", Json(force)},
     });
-    Engine used;
-    bool fell_back = false;
     // Phase 1 telemetry: dispatch -> IPC POST issued, and POST
     // issued -> response received. "POST issued" is measured at the
-    // vcCall entry (the core handing the play to the IPC layer);
-    // the router's engine selection and its healthz pre-probes for
-    // a fallback engine run inside vcCall, so they fall in
+    // vcCall entry (the core handing the play to the IPC layer); the
+    // UDS round-trip runs inside vcCall, so it falls in
     // post_to_response_us; the total is exact either way. The line
-    // fires whether the engine answers or not (ok=0 + error).
+    // fires whether the backend answers or not (ok=0 + error).
     const int64_t t_post = telemetry::nowUs();
-    IpcResult r = vcCall(ctx, "play", body, used, fell_back);
+    IpcResult r = vcCall(ctx, "play", body);
     const int64_t t_resp = telemetry::nowUs();
     emitDispatchToIpc(t_resp - receiptUs(ctx), t_post - receiptUs(ctx),
-                      t_resp - t_post, vcTarget(ctx), engineName(used),
-                      fell_back, r.ok,
+                      t_resp - t_post, vcTarget(ctx), r.ok,
                       r.ok ? ""
                            : r.error_code + ": " + r.error_message);
     if (!r.ok) {
@@ -2401,35 +2345,21 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         int64_t dur =
             track->find("duration_sec") ? track->find("duration_sec")->asInt() : 0;
         if (dur > 0 && dur > cfg_.duration_limit_min * 60) {
-            Engine u2;
-            bool fb2 = false;
             vcCall(ctx, "stop",
-                   Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}), u2, fb2);
+                   Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}));
             replyHtml(ctx, ui_texts::playTooLongText(cfg_.duration_limit_min));
             return;
         }
     }
-    // The engine's play is state only — its audio never reaches the
-    // call (Phase 7, A1b). Attach the resolved track to the core's own
-    // voice backend now: on attach failure the engine's playback is
-    // stopped again and the exact error is reported, instead of a
-    // "Now playing" reply over a silent call.
+    // The backend's play is the play: it owns the call and the audio,
+    // so a successful vc.play means the track is really playing — no
+    // core-side attach step exists any more. On failure the exact
+    // backend error was already reported above, never a "Now playing"
+    // over a silent call. The backend accepted the play, so it is in
+    // the call for this chat: record that (the /pause-style gates read
+    // it); /stop and the TrackEnded/QueueEmpty events clear it.
     int64_t chat = vcTarget(ctx);
-    std::string err;
-    if (!attachEngineAudio(chat, now, video, 0, "", err)) {
-        Engine u2;
-        bool fb2 = false;
-        vcCall(ctx, "stop", Json::objectOf({{"chat_id", Json(chat)}}), u2,
-               fb2);
-        // Silence any stale core stream (e.g. a force-replay whose new
-        // track could not attach): the old audio must not keep playing
-        // under the new track's name.
-        voice_.stop(chat);
-        clearCoreStream(chat);
-        setCallActive(chat, false);
-        reply(ctx, "Could not play in the voice chat: " + err);
-        return;
-    }
+    setCallActive(chat, true);
     if (track) {
         setChatField(chat, "last_track",
                      track->find("title") ? track->find("title")->asString() : "");
@@ -2444,9 +2374,9 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
                     (track && track->find("title")
                          ? track->find("title")->asString()
                          : query));
-    // Queued or playing? vc-rust says so outright ("queued": true);
-    // the other engines queue whenever something was already
-    // playing and the current track did not change.
+    // Queued or playing? The backend says so outright ("queued":
+    // true); it also queues whenever something was already playing
+    // and the current track did not change.
     bool queued = false;
     if (const Json* q = r.data.find("queued")) queued = q->asBool();
     if (!queued && was_active && track) {
@@ -2457,13 +2387,11 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     if (queued) {
         // The new track is the tail of the queue: render the queued
         // card for it (Yukki §4) with the Play Now button.
-        Engine uq;
-        bool fbq = false;
         Json qbody = Json::objectOf({
             {"chat_id", Json(chat)},
             {"action", Json("list")},
         });
-        IpcResult qr = vcCall(ctx, "queue", qbody, uq, fbq);
+        IpcResult qr = vcCall(ctx, "queue", qbody);
         const Json* items = qr.ok ? qr.data.find("queue") : nullptr;
         if (items && items->size() > 1) {
             const Json& last = items->asArray()[items->size() - 1];
@@ -2494,15 +2422,11 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         // Queue list unavailable: the current track is still what
         // is playing, so show its card (the queued track is visible
         // in /queue). Never claim the queued track is playing.
-        sendNowPlayingCard(chat, now, "▶ Now playing");
+        sendNowPlayingCard(chat, now, "Now playing");
         deleteCommandMessage(ctx);
         return;
     }
-    std::string state_line = "▶ Now playing";
-    if (fell_back)
-        state_line += "\n(fell back to engine " +
-                      std::string(engineName(used)) +
-                      " — your preferred engine is unavailable)";
+    std::string state_line = "Now playing";
     if (chatIntField(chat, "muted", 0))
         state_line += "\n(muted — use /unmute)";
     sendNowPlayingCard(chat, now, state_line);
@@ -2510,6 +2434,11 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
 }
 
 // --- /play from a replied-to Telegram file ----------------------------------
+// HONEST GAP (Phase 2): the file is downloaded via the TDLib bot
+// session, but local-file playback needs a backend action that does
+// not exist yet (Phase 3). The download is kept (the file is on disk
+// under data_dir/replied for the Phase 3 action to pick up), and the
+// user is told plainly — never a fake "Now playing".
 bool Dispatcher::playRepliedFile(const CommandContext& ctx,
                                  const std::string& file_id,
                                  const std::string& title,
@@ -2520,40 +2449,17 @@ bool Dispatcher::playRepliedFile(const CommandContext& ctx,
         reply(ctx, "Could not fetch the replied file: " + err);
         return false;
     }
-    // The downloaded file is the stream source for the core's own voice
-    // backend (ffmpeg input): a local path, not a vc.play query — the
-    // engines have no Telegram access and would degrade a file_id to a
-    // fake track.
+    (void)kind;
     std::string track_title = title.empty() ? "Replied file" : title;
-    bool video = kind == "video" || kind == "video_note";
-    // The chat's stored speed/bass apply here: the core voice
-    // backend is the only playback path with the filter
-    // (buildFfmpegCmd atempo/bass), so a /speed or /bass set earlier
-    // takes effect on this play, and /speed + /bass later re-attach
-    // this same source (core_source below) with new values.
-    if (!voice_.play(chat, saved, track_title, video, 0,
-                     chatSpeedField(chat), chatIntField(chat, "bass", 0))) {
-        std::string why = voice_.lastError();
-        if (why.empty()) why = voice_.describe();
-        reply(ctx, "Could not play the replied file: " + why);
-        return false;
-    }
     setChatField(chat, "last_track", track_title);
-    setChatField(chat, "voice_owner", "core");
-    setChatField(chat, "core_source", saved);
-    setChatField(chat, "core_title", track_title);
-    setChatField(chat, "core_video", video ? "1" : "0");
-    // Not an engine session: no engine track to follow, so the
-    // watcher must not re-attach the engine's stale room over this
-    // file (see watchCoreFollow).
-    setChatField(chat, "core_track_id", "");
-    setChatField(chat, "core_pos", "0");
-    setChatField(chat, "core_follow", "0");
-    setCallActive(chat, true);
-    reply(ctx, "▶ Now playing " + track_title +
-                   " (replied file, via core voice).");
+    reply(ctx,
+          "Downloaded \"" + track_title +
+              "\" (" + saved +
+              "), but playing a replied file is not available yet — "
+              "local-file playback lands with the Phase 3 backend "
+              "action. Nothing is playing.");
     deleteCommandMessage(ctx);
-    return true;
+    return false;
 }
 
 void Dispatcher::onPause(const CommandContext& ctx) {
@@ -2563,9 +2469,7 @@ void Dispatcher::onPause(const CommandContext& ctx) {
         return;
     }
     Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-    Engine used;
-    bool fell_back = false;
-    IpcResult r = vcCall(ctx, "pause", body, used, fell_back);
+    IpcResult r = vcCall(ctx, "pause", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2573,14 +2477,8 @@ void Dispatcher::onPause(const CommandContext& ctx) {
     const Json* np = r.data.find("now_playing");
     Json state = np ? *np : r.data;
     std::string state_line = ui_texts::kCtlPaused;
-    // The engine's pause is state only — the audio itself is on the
-    // core backend, so pause that too when this chat is core-streaming.
-    if (coreStreaming(vcTarget(ctx)) && !voice_.pause(vcTarget(ctx))) {
-        std::string why = voice_.lastError();
-        if (why.empty()) why = voice_.describe();
-        state_line += "\nNote: the core voice backend could not pause: " +
-                      why + " — the call may keep playing.";
-    }
+    // The backend owns the call and the audio: its pause is the
+    // pause. No core-side voice step remains.
     if (state.find("track"))
         sendNowPlayingCard(vcTarget(ctx), state, state_line);
     else
@@ -2594,9 +2492,7 @@ void Dispatcher::onResume(const CommandContext& ctx) {
         return;
     }
     Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-    Engine used;
-    bool fell_back = false;
-    IpcResult r = vcCall(ctx, "resume", body, used, fell_back);
+    IpcResult r = vcCall(ctx, "resume", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2604,14 +2500,7 @@ void Dispatcher::onResume(const CommandContext& ctx) {
     const Json* np = r.data.find("now_playing");
     Json state = np ? *np : r.data;
     std::string state_line = ui_texts::kCtlResumed;
-    // Mirror of onPause: resume the core backend as well when it is
-    // the one streaming this chat.
-    if (coreStreaming(vcTarget(ctx)) && !voice_.resume(vcTarget(ctx))) {
-        std::string why = voice_.lastError();
-        if (why.empty()) why = voice_.describe();
-        state_line += "\nNote: the core voice backend could not resume: " +
-                      why + " — the call may stay silent.";
-    }
+    // Mirror of onPause: the backend's resume is the resume.
     if (state.find("track"))
         sendNowPlayingCard(vcTarget(ctx), state, state_line);
     else
@@ -2625,9 +2514,7 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
         return;
     }
     Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-    Engine used;
-    bool fell_back = false;
-    IpcResult r = vcCall(ctx, "skip", body, used, fell_back);
+    IpcResult r = vcCall(ctx, "skip", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2635,46 +2522,22 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
     const Json* np = r.data.find("now_playing");
     const Json* track = np ? np->find("track") : nullptr;
     if (np && track && !track->isNull()) {
-        // The engine moved to a new track — its audio is on the core
-        // backend, so re-attach the new track's stream_url. On
-        // failure the stale stream is stopped (the old track's audio
-        // must not keep playing under the new track's name) and the
-        // failure is reported honestly; the engine keeps the new
-        // track as current, so the user can /play or /skip again.
-        int64_t chat = vcTarget(ctx);
-        std::string state_line = ui_texts::kCtlSkipped;
-        if (coreStreaming(chat)) {
-            bool video = chatField(chat, "core_video", "0") == "1";
-            std::string err;
-            if (!attachEngineAudio(chat, *np, video, 0, "", err)) {
-                voice_.stop(chat);
-                clearCoreStream(chat);
-                state_line += "\nNote: the core voice backend could not "
-                              "attach the new track's audio: " +
-                              err + " — the call is silent.";
-                sendNowPlayingCard(chat, *np, state_line);
-                return;
-            }
-        }
-        sendNowPlayingCard(chat, *np, state_line);
+        // The backend moved to a new track and owns its audio: render
+        // the new card. A backend failure would already have been
+        // reported above via replyError.
+        sendNowPlayingCard(vcTarget(ctx), *np, ui_texts::kCtlSkipped);
     } else {
-        // Queue empty: the core's stream of the skipped track must
-        // end too, or its ffmpeg source keeps playing to the end of
-        // the file after the engine already stopped.
-        voice_.stop(vcTarget(ctx));
-        clearCoreStream(vcTarget(ctx));
+        // Queue empty: the backend stopped, so the call is inactive.
         setCallActive(vcTarget(ctx), false);
-        reply(ctx, "⏭ Skipped — the queue is now empty.");
+        reply(ctx, "Skipped — the queue is now empty.");
     }
 }
 
 // /autoplay-skip, /askip (Phase 6): force an autoplay mix pick now.
-// Contract vc.autoplay_skip (POST /v1/autoplay-skip) exists in all
-// three VC engines, but the core exposed no command for it —
-// COMMANDS.md listed it, the route table did not. Same shape as
-// onSkip: the engines answer {now_playing} with the picked track
-// (vc-go: plain skip, same envelope); a 400 "autoplay is off" or a
-// 502 "no autoplay recommendation" surfaces honestly via replyError.
+// Contract vc.autoplay_skip (POST /v1/autoplay-skip). Same shape as
+// onSkip: the backend answers {now_playing} with the picked track;
+// a 400 "autoplay is off" or a 502 "no autoplay recommendation"
+// surfaces honestly via replyError.
 void Dispatcher::onAutoplaySkip(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     if (!callActive(vcTarget(ctx))) {
@@ -2682,9 +2545,7 @@ void Dispatcher::onAutoplaySkip(const CommandContext& ctx) {
         return;
     }
     Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-    Engine used;
-    bool fell_back = false;
-    IpcResult r = vcCall(ctx, "autoplay-skip", body, used, fell_back);
+    IpcResult r = vcCall(ctx, "autoplay-skip", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2692,29 +2553,11 @@ void Dispatcher::onAutoplaySkip(const CommandContext& ctx) {
     const Json* np = r.data.find("now_playing");
     const Json* track = np ? np->find("track") : nullptr;
     if (np && track && !track->isNull()) {
-        // Same re-attach as onSkip: the picked track's audio lives on
-        // the core backend, not in the engine.
-        int64_t chat = vcTarget(ctx);
-        std::string state_line = "⏭ Autoplay skipped — now playing";
-        if (coreStreaming(chat)) {
-            bool video = chatField(chat, "core_video", "0") == "1";
-            std::string err;
-            if (!attachEngineAudio(chat, *np, video, 0, "", err)) {
-                voice_.stop(chat);
-                clearCoreStream(chat);
-                state_line += "\nNote: the core voice backend could not "
-                              "attach the new track's audio: " +
-                              err + " — the call is silent.";
-                sendNowPlayingCard(chat, *np, state_line);
-                return;
-            }
-        }
-        sendNowPlayingCard(chat, *np, state_line);
+        sendNowPlayingCard(vcTarget(ctx), *np,
+                           "Autoplay skipped — now playing");
     } else {
-        voice_.stop(vcTarget(ctx));
-        clearCoreStream(vcTarget(ctx));
         setCallActive(vcTarget(ctx), false);
-        reply(ctx, "⏭ Autoplay skipped — the queue is now empty.");
+        reply(ctx, "Autoplay skipped — the queue is now empty.");
     }
 }
 
@@ -2722,17 +2565,10 @@ void Dispatcher::onStop(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     bool was_active = callActive(vcTarget(ctx));
     Json body = Json::objectOf({{"chat_id", Json(vcTarget(ctx))}});
-    Engine used;
-    bool fell_back = false;
-    IpcResult r = vcCall(ctx, "stop", body, used, fell_back);
+    IpcResult r = vcCall(ctx, "stop", body);
     setCallActive(vcTarget(ctx), false);
-    // Also stop a session the core voice backend itself holds
-    // (replied-file playback, /join, or any engine track attached via
-    // attachEngineAudio): /stop must end that too, and its recorded
-    // source must not survive for a later /speed or follow pass.
-    // Best effort — false when the backend holds no call here.
-    voice_.stop(vcTarget(ctx));
-    clearCoreStream(vcTarget(ctx));
+    // The backend owns the call: its stop ends the session. Reset the
+    // per-chat playback flags the core keeps.
     setChatField(vcTarget(ctx), "loop", "0");
     setChatField(vcTarget(ctx), "speed", "1.0");
     setChatField(vcTarget(ctx), "bass", "0");
@@ -2781,9 +2617,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
                 {"chat_id", Json(chat)},
                 {"action", Json("list")},
             });
-            Engine used;
-            bool fb = false;
-            IpcResult q = vcCall(ctx, "queue", body, used, fb);
+            IpcResult q = vcCall(ctx, "queue", body);
             if (q.ok) {
                 const Json* items = q.data.find("queue");
                 if (items) {
@@ -2804,9 +2638,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
                             {"action", Json("remove")},
                             {"position", Json(*it)},
                         });
-                        Engine u2;
-                        bool fb2 = false;
-                        vcCall(ctx, "queue", rm, u2, fb2);
+                        vcCall(ctx, "queue", rm);
                     }
                 }
             }
@@ -2844,9 +2676,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
             {"track", track},
             {"requested_by", Json(ctx.message.from.id)},
         });
-        Engine used;
-        bool fb = false;
-        IpcResult r = vcCall(ctx, "queue", body, used, fb);
+        IpcResult r = vcCall(ctx, "queue", body);
         if (!r.ok) break;
         ++added;
     }
@@ -2897,9 +2727,7 @@ void Dispatcher::onSeek(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"position_sec", Json(target)},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcCall(ctx, "seek", body, used, fb);
+    IpcResult r = vcCall(ctx, "seek", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2907,19 +2735,8 @@ void Dispatcher::onSeek(const CommandContext& ctx) {
     std::string text = std::string("Seeked ") +
                        (ctx.command == "seekback" ? "backward" : "forward") +
                        " to " + fmtSeconds(target) + ".";
-    // The engine's seek moves its own position state only — the audio
-    // is on the core backend, so re-attach the recorded source at the
-    // new position when this chat is core-streaming.
-    if (coreStreaming(vcTarget(ctx))) {
-        std::string err;
-        if (!reattachCoreAudio(vcTarget(ctx), static_cast<int>(target),
-                               err)) {
-            text += " (But the core voice backend could not re-attach "
-                    "there: " +
-                    err + " — the call may still be playing the old "
-                          "position.)";
-        }
-    }
+    // The backend owns the call and the audio: its seek is the seek.
+    // No core-side re-attach step remains.
     reply(ctx, text);
 }
 
@@ -2933,9 +2750,7 @@ void Dispatcher::onClear(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"action", Json("list")},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult q = vcCall(ctx, "queue", list_body, used, fb);
+    IpcResult q = vcCall(ctx, "queue", list_body);
     if (q.ok) {
         const Json* items = q.data.find("queue");
         if (items && items->size() > 1)
@@ -2946,7 +2761,7 @@ void Dispatcher::onClear(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"action", Json("clear")},
     });
-    IpcResult r = vcCall(ctx, "queue", body, used, fb);
+    IpcResult r = vcCall(ctx, "queue", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -3000,9 +2815,7 @@ void Dispatcher::onRestore(const CommandContext& ctx) {
             {"track", *track},
             {"requested_by", Json(ctx.message.from.id)},
         });
-        Engine used;
-        bool fb = false;
-        IpcResult r = vcCall(ctx, "queue", body, used, fb);
+        IpcResult r = vcCall(ctx, "queue", body);
         if (!r.ok) break;
         ++added;
     }
@@ -3080,9 +2893,7 @@ void Dispatcher::onRemove(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"action", Json("list")},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult q = vcCall(ctx, "queue", list_body, used, fb);
+    IpcResult q = vcCall(ctx, "queue", list_body);
     if (!q.ok) {
         replyError(ctx, q);
         return;
@@ -3112,7 +2923,7 @@ void Dispatcher::onRemove(const CommandContext& ctx) {
             {"action", Json("remove")},
             {"position", Json(p)},
         });
-        IpcResult r = vcCall(ctx, "queue", body, used, fb);
+        IpcResult r = vcCall(ctx, "queue", body);
         if (!r.ok) {
             replyError(ctx, r);
             return;
@@ -3143,9 +2954,7 @@ void Dispatcher::onMove(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"action", Json("list")},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult q = vcCall(ctx, "queue", list_body, used, fb);
+    IpcResult q = vcCall(ctx, "queue", list_body);
     if (!q.ok) {
         replyError(ctx, q);
         return;
@@ -3182,7 +2991,7 @@ void Dispatcher::onMove(const CommandContext& ctx) {
             {"action", Json("remove")},
             {"position", Json(pos)},
         });
-        vcCall(ctx, "queue", rm, used, fb);
+        vcCall(ctx, "queue", rm);
     }
     for (const auto& t : pending) {
         Json add = Json::objectOf({
@@ -3191,7 +3000,7 @@ void Dispatcher::onMove(const CommandContext& ctx) {
             {"track", t},
             {"requested_by", Json(ctx.message.from.id)},
         });
-        vcCall(ctx, "queue", add, used, fb);
+        vcCall(ctx, "queue", add);
     }
     replyHtml(ctx, ui_texts::queueMovedText(static_cast<int>(from),
                                               static_cast<int>(to),
@@ -3208,9 +3017,7 @@ void Dispatcher::onShuffle(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"action", Json("list")},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult q = vcCall(ctx, "queue", list_body, used, fb);
+    IpcResult q = vcCall(ctx, "queue", list_body);
     if (!q.ok) {
         replyError(ctx, q);
         return;
@@ -3235,7 +3042,7 @@ void Dispatcher::onShuffle(const CommandContext& ctx) {
             {"action", Json("remove")},
             {"position", Json(static_cast<int64_t>(i) + 1)},
         });
-        vcCall(ctx, "queue", rm, used, fb);
+        vcCall(ctx, "queue", rm);
         if (i == 1) break;
     }
     for (const auto& t : pending) {
@@ -3245,7 +3052,7 @@ void Dispatcher::onShuffle(const CommandContext& ctx) {
             {"track", t},
             {"requested_by", Json(ctx.message.from.id)},
         });
-        vcCall(ctx, "queue", add, used, fb);
+        vcCall(ctx, "queue", add);
     }
     replyHtml(ctx, ui_texts::queueShuffledText(
                         static_cast<int>(pending.size()), userLabel(ctx)));
@@ -3307,25 +3114,13 @@ void Dispatcher::onJump(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"position_sec", Json(static_cast<int64_t>(to))},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcCall(ctx, "seek", body, used, fb);
+    IpcResult r = vcCall(ctx, "seek", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
     }
     std::string text = "Jumped to " + fmtSeconds(to) + ".";
-    // Same core re-attach as onSeek: the engine's seek moves state
-    // only, the audio is on the core backend.
-    if (coreStreaming(vcTarget(ctx))) {
-        std::string err;
-        if (!reattachCoreAudio(vcTarget(ctx), to, err)) {
-            text += " (But the core voice backend could not re-attach "
-                    "there: " +
-                    err + " — the call may still be playing the old "
-                          "position.)";
-        }
-    }
+    // The backend owns the call and the audio: its seek is the seek.
     reply(ctx, text);
 }
 
@@ -3357,15 +3152,12 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         return;
     }
     setChatField(chat, "speed", std::to_string(s));
-    // Core-owned session first: nowPlaying() below only asks the vc
-    // engines, which know nothing about a core session, so the core
-    // branch must run before it. It applies the speed for real
-    // (buildFfmpegCmd atempo) by re-attaching the source.
+    // The backend owns the audio pipeline: live speed filtering is a
+    // backend DSP job (Phase 5). The value is stored (what /pos and
+    // /speed report) and the stream is restarted at the current
+    // position; the reply says plainly that the speed did not change.
     char b[16];
     std::snprintf(b, sizeof b, "%.2g", s);
-    if (applyCoreFilter(ctx, s, chatIntField(chat, "bass", 0),
-                        std::string("Speed set to ") + b + "x"))
-        return;
     Json np, track;
     if (!nowPlaying(chat, np, track)) {
         reply(ctx, "Nothing is playing.");
@@ -3376,36 +3168,22 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         reply(ctx, "Playback is paused.");
         return;
     }
-    // No core source recorded (stale / pre-fix session, or a session
-    // whose attach failed): the engine seek-restart below only moves
-    // the position. Honest limit (REMAINING.md B11): NO vc engine
-    // applies the value — vc-go keeps queue state only and never
-    // touches audio, and vc-ts / vc-rust run their ffmpeg pipeline
-    // once per track and never re-encode on seek. Sessions attached
-    // through the core (voice_owner "core", including engine plays
-    // since Phase 7 A1b) never reach this branch — applyCoreFilter
-    // above applies the filter for real. The value is stored (what
-    // /pos and /speed report) and takes effect on core-voice
-    // playback; the reply says so instead of claiming the speed was
-    // set.
     int64_t pos =
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     Json body = Json::objectOf({
         {"chat_id", Json(chat)},
         {"position_sec", Json(std::max<int64_t>(1, pos))},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcCall(ctx, "seek", body, used, fb);
+    IpcResult r = vcCall(ctx, "seek", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
     }
     reply(ctx, std::string("Speed ") + b +
-                   "x saved, but the " + std::string(engineName(used)) +
-                   " engine cannot apply audio filters — the stream "
-                   "restarted at the current position at the old speed. "
-                   "It applies to core-voice playback (replied files).");
+                   "x saved, but the backend cannot apply audio filters "
+                   "yet — the stream restarted at the current position "
+                   "at the old speed. Live filtering lands with the "
+                   "Phase 5 backend DSP.");
 }
 
 void Dispatcher::onBass(const CommandContext& ctx) {
@@ -3428,13 +3206,10 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         return;
     }
     setChatField(chat, "bass", std::to_string(lvl));
-    // Core-owned session first: nowPlaying() below only asks the vc
-    // engines, which know nothing about a core session. The core
-    // backend applies the bass boost for real (buildFfmpegCmd lowpass
-    // mix) — see onSpeed.
-    if (applyCoreFilter(ctx, chatSpeedField(chat), lvl,
-                        "Bass set to " + std::to_string(lvl)))
-        return;
+    // Same honest limit as /speed: live bass filtering is a backend
+    // DSP job (Phase 5). The value is stored and the stream is
+    // restarted at the current position; the reply says plainly that
+    // the bass did not change.
     Json np, track;
     if (!nowPlaying(chat, np, track)) {
         reply(ctx, "Nothing is playing.");
@@ -3445,29 +3220,22 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         reply(ctx, "Playback is paused.");
         return;
     }
-    // No core source recorded (stale / pre-fix session): same honest
-    // limit as /speed — the seek below only moves the position; no
-    // engine applies the value. Sessions attached through the core
-    // (including engine plays since Phase 7 A1b) never reach this
-    // branch — applyCoreFilter above applies the bass for real.
     int64_t pos =
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     Json body = Json::objectOf({
         {"chat_id", Json(chat)},
         {"position_sec", Json(std::max<int64_t>(1, pos))},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcCall(ctx, "seek", body, used, fb);
+    IpcResult r = vcCall(ctx, "seek", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
     }
     reply(ctx, "Bass " + std::to_string(lvl) +
-                   " saved, but the " + std::string(engineName(used)) +
-                   " engine cannot apply audio filters — the stream "
-                   "restarted at the current position unchanged. "
-                   "It applies to core-voice playback (replied files).");
+                   " saved, but the backend cannot apply audio filters "
+                   "yet — the stream restarted at the current position "
+                   "unchanged. Live filtering lands with the Phase 5 "
+                   "backend DSP.");
 }
 
 void Dispatcher::onMute(const CommandContext& ctx) {
@@ -3500,28 +3268,17 @@ void Dispatcher::onJoin(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     int64_t chat = vcTarget(ctx);
     if (callActive(chat)) {
-        std::string owner = chatField(chat, "voice_owner", "");
-        if (owner == "core") {
-            replyHtml(ctx, ui_texts::kCtlAlreadyJoined);
-        } else {
-            reply(ctx, "Already in the voice chat (the " +
-                           (owner.empty() ? std::string("engine") : owner) +
-                           " session is playing here).");
-        }
+        replyHtml(ctx, ui_texts::kCtlAlreadyJoined);
         return;
     }
-    if (!voice_.available()) {
-        reply(ctx, "Cannot join the voice chat: " + voice_.describe());
+    // The backend owns the call: vc.join asks it to join, and the
+    // backend drives the duplex JoinRequest handshake (the core runs
+    // TDLib joinVideoChat on the shared assistant session there).
+    std::string err;
+    if (!joinVoice(chat, err)) {
+        reply(ctx, "Could not join the voice chat: " + err);
         return;
     }
-    if (!voice_.join(chat)) {
-        std::string why = voice_.lastError();
-        if (why.empty()) why = voice_.describe();
-        reply(ctx, "Could not join the voice chat: " + why);
-        return;
-    }
-    setChatField(chat, "voice_owner", "core");
-    setCallActive(chat, true);
     replyHtml(ctx, ui_texts::kCtlJoined);
 }
 
@@ -3536,25 +3293,13 @@ void Dispatcher::onReplay(const CommandContext& ctx) {
         {"chat_id", Json(vcTarget(ctx))},
         {"position_sec", Json(static_cast<int64_t>(1))},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcCall(ctx, "seek", body, used, fb);
+    IpcResult r = vcCall(ctx, "seek", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
     }
     std::string text = ui_texts::kToastReplayOk;
-    // Same core re-attach as onSeek: the engine's seek moves state
-    // only, the audio is on the core backend.
-    if (coreStreaming(vcTarget(ctx))) {
-        std::string err;
-        if (!reattachCoreAudio(vcTarget(ctx), 1, err)) {
-            text += " (But the core voice backend could not re-attach "
-                    "at the start: " +
-                    err + " — the call may keep playing from the old "
-                          "position.)";
-        }
-    }
+    // The backend owns the call and the audio: its seek is the seek.
     reply(ctx, text);
 }
 
@@ -3569,7 +3314,7 @@ void Dispatcher::onPlayer(const CommandContext& ctx) {
     bool was_photo = false;
     if (cardInfo(vcTarget(ctx), old_id, was_photo) && old_id != 0)
         tg_.deleteMessage(vcTarget(ctx), old_id);
-    sendNowPlayingCard(vcTarget(ctx), np, "▶ Now playing");
+    sendNowPlayingCard(vcTarget(ctx), np, "Now playing");
 }
 
 void Dispatcher::onLyrics(const CommandContext& ctx) {
@@ -3900,8 +3645,8 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
         if (progress_msg <= 0) return;
         std::string err;
         tg_.editMessageText(ctx.message.chat.id, progress_msg, text,
-                            kb.empty() ? Json(nullptr)
-                                       : inlineKeyboardJson(kb),
+                            kb.empty() ? InlineKeyboard{}
+                                       : kb,
                             &err);
     };
     IpcResult r = ipc_.post(cfg_.dl_url, action, body, 120);
@@ -3912,8 +3657,8 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
     }
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
-        edit_progress("That file is over the 50 MB Bot API cap — queued "
-                      "for a later MTProto send instead of failing.",
+        edit_progress("That file is over the 50 MB send cap — queued "
+                      "for a later send instead of failing.",
                       InlineKeyboard{});
         return;
     }
@@ -4082,7 +3827,7 @@ void Dispatcher::deepLinkDownload(const CommandContext& ctx,
         if (progress_msg <= 0) return;
         std::string err;
         tg_.editMessageText(ctx.message.chat.id, progress_msg, text,
-                            Json(nullptr), &err);
+                            InlineKeyboard{}, &err);
     };
     IpcResult r = ipc_.post(cfg_.dl_url, action, body, 120);
     if (!r.ok) {
@@ -4091,8 +3836,8 @@ void Dispatcher::deepLinkDownload(const CommandContext& ctx,
     }
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
-        edit_progress("That file is over the 50 MB Bot API cap — queued "
-                      "for a later MTProto send instead of failing.");
+        edit_progress("That file is over the 50 MB send cap — queued "
+                      "for a later send instead of failing.");
         return;
     }
     const Json* resp_track = r.data.find("track");
@@ -4143,8 +3888,8 @@ void Dispatcher::deliverSpotifyCollection(const TgCallbackQuery& cq,
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
         answerCb(cq,
-                 "That collection is over the 50 MB Bot API cap — queued "
-                 "for a later MTProto send instead of failing.",
+                 "That collection is over the 50 MB send cap — queued "
+                 "for a later send instead of failing.",
                  true);
         return;
     }
@@ -4247,32 +3992,14 @@ void Dispatcher::onRadio(const CommandContext& ctx) {
         {"query", Json(url->asString())},
         {"requested_by", Json(ctx.message.from.id)},
     });
-    Engine used;
-    bool fell_back = false;
-    IpcResult pr = vcCall(ctx, "play", play, used, fell_back);
+    IpcResult pr = vcCall(ctx, "play", play);
     if (!pr.ok) {
         replyError(ctx, pr);
         return;
     }
-    // Attach the radio audio to the core voice backend (see onPlay):
-    // the engine's play is state only. The station's own stream URL
-    // is the fallback when the engine's now_playing carries no
-    // stream_url of its own.
-    const Json* np = pr.data.find("now_playing");
-    Json now = np ? *np : pr.data;
-    std::string err;
-    if (!attachEngineAudio(vcTarget(ctx), now, false, 0, url->asString(),
-                           err)) {
-        Engine u2;
-        bool fb2 = false;
-        vcCall(ctx, "stop",
-               Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}), u2, fb2);
-        voice_.stop(vcTarget(ctx));
-        clearCoreStream(vcTarget(ctx));
-        setCallActive(vcTarget(ctx), false);
-        reply(ctx, "Could not play the radio in the voice chat: " + err);
-        return;
-    }
+    // The backend's play is the play: it owns the call and the audio,
+    // so a successful vc.play means the radio is really streaming.
+    setCallActive(vcTarget(ctx), true);
     std::string name =
         r.data.find("station_name") ? r.data.find("station_name")->asString()
                                     : station;
@@ -4426,21 +4153,12 @@ void Dispatcher::onEngine(const CommandContext& ctx) {
         replyHtml(ctx, ui_texts::kEngineOnlyAdmin);
         return;
     }
-    std::string arg = lowerStr(trim(ctx.args));
-    if (arg.empty()) {
-        replyHtml(ctx, ui_texts::engineCurrentText(
-                           engineName(router_.engineFor(vcTarget(ctx)))));
-        return;
-    }
-    Engine e;
-    if (!engineFromName(arg, e)) {
-        replyHtml(ctx, ui_texts::engineUnknownText(arg));
-        return;
-    }
-    router_.setEngine(vcTarget(ctx), e);
-    replyHtml(ctx, ui_texts::engineSetText(
-                       engineName(e), engineName(fallbackOrder(e)[1]),
-                       engineName(fallbackOrder(e)[2])));
+    // Engine selection is retired (Phase 2): there is one unified
+    // backend over the persistent UDS socket, so there is no engine
+    // to switch to or report. Any argument is ignored.
+    reply(ctx, "Engine selection is retired — Parlay now runs a single "
+               "unified backend, so there is no engine to switch. "
+               "Playback, queue and voice all go through that backend.");
 }
 
 // --- handlers: playlists -----------------------------------------------------
@@ -4685,30 +4403,14 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
         {"query", Json(first.find("title") ? first.find("title")->asString() : "")},
         {"requested_by", Json(ctx.message.from.id)},
     });
-    Engine used;
-    bool fb = false;
-    IpcResult r = vcCall(ctx, "play", body, used, fb);
+    IpcResult r = vcCall(ctx, "play", body);
     if (!r.ok) {
         replyError(ctx, r);
         return;
     }
-    // Attach the first track to the core voice backend (see onPlay):
-    // without this the playlist plays state-only and the call stays
-    // silent. On failure nothing is queued and the error is honest.
-    const Json* np = r.data.find("now_playing");
-    Json now = np ? *np : r.data;
-    std::string err;
-    if (!attachEngineAudio(vcTarget(ctx), now, false, 0, "", err)) {
-        Engine u2;
-        bool fb2 = false;
-        vcCall(ctx, "stop",
-               Json::objectOf({{"chat_id", Json(vcTarget(ctx))}}), u2, fb2);
-        voice_.stop(vcTarget(ctx));
-        clearCoreStream(vcTarget(ctx));
-        setCallActive(vcTarget(ctx), false);
-        reply(ctx, "Could not play your playlist in the voice chat: " + err);
-        return;
-    }
+    // The backend's play is the play (see onPlay): a successful
+    // vc.play means the first track is really playing.
+    setCallActive(vcTarget(ctx), true);
     int queued = 0;
     for (size_t i = 1; i < tracks.size(); ++i) {
         Json add = Json::objectOf({
@@ -4717,9 +4419,7 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
             {"track", tracks[i]},
             {"requested_by", Json(ctx.message.from.id)},
         });
-        Engine u2;
-        bool fb2 = false;
-        IpcResult ar = vcCall(ctx, "queue", add, u2, fb2);
+        IpcResult ar = vcCall(ctx, "queue", add);
         if (!ar.ok) break;
         ++queued;
     }
@@ -5242,20 +4942,17 @@ void Dispatcher::onUserbot(const CommandContext& ctx) {
             return;
         }
     }
-    if (!voice_.available()) {
-        reply(ctx, "The assistant cannot join from here: " +
-                       voice_.describe() +
+    if (!assistant_.available() || !assistant_.authorized()) {
+        reply(ctx, "The assistant session is not available here: " +
+                       assistant_.lastError() +
                        ". Add the assistant user account to the chat "
-                       "manually, or configure TD_API_ID/TD_API_HASH/"
-                       "TD_SESSION_DIR for the TDLib voice backend.");
+                       "manually, or configure TD_API_ID/TD_API_HASH "
+                       "for the assistant TDLib session.");
         return;
     }
-    // The Telethon voice bridge that used to join via an invite link
-    // was deleted in Phase 5 (user order: ntgcalls is now a native
-    // library linked in-process). There is no in-process path that
-    // adds the assistant account to a chat anymore — it must already
-    // be a member. /join (vc.join) puts the assistant's voice session
-    // into the call once it is a member.
+    // The core cannot add the assistant account to a chat on its own
+    // — it must already be a member. /join (vc.join) puts the
+    // assistant's voice session into the call once it is a member.
     reply(ctx, "The assistant is not in this chat yet. Add the assistant "
                "user account to the chat manually, then use /join to put "
                "it in the voice call.");
@@ -5382,7 +5079,7 @@ void Dispatcher::onBlacklist(const CommandContext& ctx) {
         if (!is_chat) store_.sadd("bl_users", std::to_string(id));
         store_.sadd("bl_chats", std::to_string(id));
         if (is_chat) {
-            replyHtml(ctx, "✅ Chat blocked: <code>" + std::to_string(id) +
+            replyHtml(ctx, "Chat blocked: <code>" + std::to_string(id) +
                                "</code>");
         } else {
             replyHtml(ctx, ui_texts::blBlockedUserText(id));
@@ -5394,7 +5091,7 @@ void Dispatcher::onBlacklist(const CommandContext& ctx) {
         }
         if (!is_chat) store_.srem("bl_users", std::to_string(id));
         store_.srem("bl_chats", std::to_string(id));
-        replyHtml(ctx, "✅ Removed <code>" + std::to_string(id) +
+        replyHtml(ctx, "Removed <code>" + std::to_string(id) +
                            "</code> from the blacklist.");
     }
 }
@@ -5524,18 +5221,18 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
         std::string kb_err;
         tg_.editMessageReplyMarkup(
             ctx.message.chat.id, sent_id,
-            inlineKeyboardJson(ui_texts::bcastKeyboard()), &kb_err);
+            ui_texts::bcastKeyboard(), &kb_err);
     }
     bcast_running_.store(true);
     bcast_cancel_.store(false);
     int count = 0, failed = 0;
     // One id per line, after a header that says what the failure
-    // was: the Bot API forward/copy calls return only
+    // was: the TDLib forward/copy calls return only
     // success/failure, so no per-chat error text exists to list —
     // each id below is a chat that rejected the broadcast.
     std::string failures =
         "# chats that rejected the broadcast (forward/copy failed; "
-        "the Bot API returns no per-chat error text)\n";
+        "TDLib returns no per-chat error text)\n";
     for (int64_t target : targets) {
         if (bcast_cancel_.load()) break;
         bool ok = false;
@@ -5560,7 +5257,7 @@ void Dispatcher::onBroadcast(const CommandContext& ctx) {
     if (sent_id > 0) {
         std::string kb_err;
         tg_.editMessageReplyMarkup(ctx.message.chat.id, sent_id,
-                                   Json(nullptr), &kb_err);
+                                   InlineKeyboard{}, &kb_err);
     }
     std::string text = cancelled
                            ? ui_texts::kBcastCancelDone
@@ -5695,42 +5392,15 @@ std::string Dispatcher::formatSpeedtest(double down_mbps, bool up_ok,
 }
 
 void Dispatcher::onSpeedtest(const CommandContext& ctx) {
-    int64_t prog_id = reply(ctx, ui_texts::kSpeedtestDl);
-    // Cloudflare speed endpoints (NoxBeats bot_tools.cpp::run_speedtest):
-    // download probe (25 MB) + upload probe (4 MB POST to __up, the
-    // endpoint Cloudflare's own speed test uses). Each probe is timed
-    // separately and bounded — the upload is 4 MB / 30 s so a slow
-    // uplink never hangs the chat; an upload failure is reported
-    // honestly next to the download number instead of failing the
-    // whole test.
-    auto t0 = std::chrono::steady_clock::now();
-    HttpResult down = HttpClient::get(
-        "https://speed.cloudflare.com/__down?bytes=25000000", {}, 40);
-    double down_secs =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-            .count();
-    if (!down.ok() || down.body.empty()) {
-        reply(ctx, ui_texts::kSpeedtestFailed);
-        return;
-    }
-    double down_mbps = speedMbps(down.body.size(), down_secs);
-    // Stage two: the upload probe gets its own notice (§16).
-    if (prog_id > 0) {
-        std::string err;
-        tg_.editMessageText(ctx.message.chat.id, prog_id,
-                            ui_texts::kSpeedtestUp, Json(nullptr), &err);
-    }
-    auto u0 = std::chrono::steady_clock::now();
-    std::string up_body(4 * 1024 * 1024, '\0');
-    HttpResult up = HttpClient::postRaw(
-        "https://speed.cloudflare.com/__up", up_body,
-        "application/octet-stream", {}, 30);
-    double up_secs =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - u0)
-            .count();
-    reply(ctx, formatSpeedtest(down_mbps, up.ok(),
-                               speedMbps(up_body.size(), up_secs), up.status,
-                               up.error));
+    // HONEST GAP (Phase 2): the network probes are gone. They ran
+    // over HttpClient (deleted with telegram_api/http.cpp), and the
+    // core no longer ships an HTTPS client — spawning curl per call
+    // is prohibited (FINAL-ARCHITECTURE.md §1.2.3). The pure helpers
+    // speedMbps / formatSpeedtest stay (and stay tested); a live
+    // probe needs a backend action (Phase 3+).
+    reply(ctx, "Speed test is not available yet — the network probes "
+               "need a backend action that does not exist yet. "
+               "Run a speed test from the host shell instead.");
 }
 
 void Dispatcher::onBug(const CommandContext& ctx) {
@@ -5754,7 +5424,7 @@ void Dispatcher::onBug(const CommandContext& ctx) {
          {"id", std::to_string(ctx.message.from.id)},
          {"where", std::to_string(ctx.message.chat.id)},
          {"text", ui_texts::htmlEscape(text)}});
-    if (tg_.sendMessageHtml(dest, report, Json(nullptr), 0, &err)) {
+    if (tg_.sendMessageHtml(dest, report, InlineKeyboard{}, 0, &err)) {
         reply(ctx, ui_texts::kBugThanks);
     } else {
         reply(ctx, ui_texts::kBugFailed);
@@ -5935,7 +5605,9 @@ void Dispatcher::onStats(const CommandContext& ctx) {
         "\nCommands registered: " + std::to_string(routes_.size()) +
         " routes";
     std::string versions_block =
-        "Build: C++20, Bot API + MTProto bridge\nVoice: " + voice_.describe();
+        "Build: C++20, MTProto (TDLib) + UDS backend\nBackend: " +
+        (ipc_.healthz("") ? std::string("reachable")
+                          : std::string("unreachable"));
     replyHtml(ctx, ui_texts::fmt(ui_texts::kStatsCard,
                                  {{"system", system_block},
                                   {"memory", memory_block},
@@ -5952,14 +5624,10 @@ void Dispatcher::onMenu(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     int64_t chat = vcTarget(ctx);
     Json np, track;
-    std::string now_title, now_url, next_title, next_url, emoji = "⏹";
+    std::string now_title, now_url, next_title, next_url;
     if (nowPlaying(chat, np, track)) {
         now_title = track.find("title") ? track.find("title")->asString() : "";
         now_url = track.find("url") ? track.find("url")->asString() : "";
-        bool paused = false;
-        if (const Json* p = np.find("is_paused")) paused = p->asBool();
-        if (const Json* p = np.find("paused")) paused = p->asBool();
-        emoji = paused ? "⏸" : "▶️";
         Json q;
         std::string qerr;
         if (apiQueueList(chat, q, qerr) && q.size() > 1) {
@@ -5969,7 +5637,7 @@ void Dispatcher::onMenu(const CommandContext& ctx) {
         }
     }
     int64_t msg = replyKb(ctx,
-                          ui_texts::menuPanelText(emoji, now_title, now_url,
+                          ui_texts::menuPanelText(now_title, now_url,
                                                   next_title, next_url),
                           ui_texts::menuPanelKeyboard(chat));
     if (msg > 0) {
@@ -5986,11 +5654,11 @@ void Dispatcher::onId(const CommandContext& ctx) {
 void Dispatcher::onKeyboard(const CommandContext& ctx) {
     std::string a = lowerStr(trim(ctx.args));
     if (a == "off" || a == "remove" || a == "hide") {
-        replyReplyKb(ctx, "⌨ Keyboard removed.", removeKeyboardJson());
+        replyReplyKb(ctx, "Keyboard removed.", ReplyKeyboard{}, true);
         return;
     }
     replyReplyKb(ctx, ui_texts::kKeyboardEnabled,
-                 replyKeyboardJson(ui_texts::persistentKeyboard()));
+                 ui_texts::persistentKeyboard());
 }
 
 void Dispatcher::onAbout(const CommandContext& ctx) {
@@ -6039,7 +5707,7 @@ void Dispatcher::onRepo(const CommandContext& ctx) {
                           ? "https://github.com/filewrap/ParlayMusic"
                           : cfg_.source_url;
     InlineKeyboard kb = {
-        {InlineButton::link("🔗 Source Code", url)},
+        {InlineButton::link("Source Code", url)},
     };
     replyKb(ctx, "Source code: <a href=\"" + url + "\">Parlay</a>", kb);
 }
@@ -6729,7 +6397,7 @@ void Dispatcher::handleInlineQuery(const TgInlineQuery& iq) {
 // One player verb for a chat, shared by the /menu panel and the card
 // buttons. No replies here — the caller answers the toast and
 // re-renders the card. Returns false + error when nothing is playing
-// or the engine refuses.
+// or the backend refuses.
 bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
                               int64_t user_id, const TgCallbackQuery* cq,
                               std::string& error) {
@@ -6738,8 +6406,6 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
     ctx.message.from.id = user_id;
     if (cq) ctx.message.from = cq->from;
     ctx.command = "player";
-    Engine used;
-    bool fb = false;
     Json np, track;
     auto need_now = [&]() {
         return nowPlaying(chat_id, np, track);
@@ -6750,13 +6416,12 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
             return false;
         }
         IpcResult r = vcCall(ctx, "pause",
-                             Json::objectOf({{"chat_id", Json(chat_id)}}),
-                             used, fb);
+                             Json::objectOf({{"chat_id", Json(chat_id)}}));
         if (!r.ok) {
             error = r.error_message;
             return false;
         }
-        voice_.pause(chat_id);  // best effort; engine state wins
+        // The backend's pause is the pause (it owns the audio).
         return true;
     }
     if (verb == "resume") {
@@ -6765,13 +6430,12 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
             return false;
         }
         IpcResult r = vcCall(ctx, "resume",
-                             Json::objectOf({{"chat_id", Json(chat_id)}}),
-                             used, fb);
+                             Json::objectOf({{"chat_id", Json(chat_id)}}));
         if (!r.ok) {
             error = ui_texts::kToastResumeFailed;
             return false;
         }
-        voice_.resume(chat_id);  // best effort; engine state wins
+        // The backend's resume is the resume (it owns the audio).
         return true;
     }
     if (verb == "replay") {
@@ -6783,17 +6447,12 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
                                  {"position_sec", Json(static_cast<int64_t>(0))},
-                             }),
-                             used, fb);
+                             }));
         if (!r.ok) {
             error = r.error_message;
             return false;
         }
-        std::string be;
-        if (!attachEngineAudio(chat_id, np, false, 0, "", be)) {
-            error = be;
-            return false;
-        }
+        // The backend's seek is the seek (it owns the audio).
         return true;
     }
     if (verb == "skip") {
@@ -6802,38 +6461,29 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
             return false;
         }
         IpcResult r = vcCall(ctx, "skip",
-                             Json::objectOf({{"chat_id", Json(chat_id)}}),
-                             used, fb);
+                             Json::objectOf({{"chat_id", Json(chat_id)}}));
         if (!r.ok) {
             error = r.error_message;
             return false;
         }
         Json np2, track2;
         if (!nowPlaying(chat_id, np2, track2)) {
-            // Queue ran dry: stop everything (onSkip behaviour).
-            voice_.stop(chat_id);
-            clearCoreStream(chat_id);
+            // Queue ran dry: the backend stopped, so the call is
+            // inactive (onSkip behaviour).
             setCallActive(chat_id, false);
             error = ui_texts::kToastSkipEmpty;
             return false;
         }
-        std::string be;
-        if (!attachEngineAudio(chat_id, np2, false, 0, "", be)) {
-            error = be;
-            return false;
-        }
+        // The backend's skip is the skip (it owns the audio).
         return true;
     }
     if (verb == "stop") {
         IpcResult r = vcCall(ctx, "stop",
-                             Json::objectOf({{"chat_id", Json(chat_id)}}),
-                             used, fb);
+                             Json::objectOf({{"chat_id", Json(chat_id)}}));
         if (!r.ok) {
             error = r.error_message;
             return false;
         }
-        voice_.stop(chat_id);
-        clearCoreStream(chat_id);
         setCallActive(chat_id, false);
         setChatField(chat_id, "loop", "0");
         setChatField(chat_id, "speed", "1.0");
@@ -6860,7 +6510,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         }
         int64_t pos = np.find("position_sec")
                           ? np.find("position_sec")->asInt()
-                          : chatIntField(chat_id, "core_pos", 0);
+                          : 0;
         int64_t dur = track.find("duration_sec")
                           ? track.find("duration_sec")->asInt()
                           : 0;
@@ -6874,18 +6524,13 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
                                  {"position_sec", Json(next)},
-                             }),
-                             used, fb);
+                             }));
         if (!r.ok) {
             error = ui_texts::fmt(ui_texts::kToastSeekFailed,
                                   {{"error", r.error_message}});
             return false;
         }
-        std::string be;
-        if (!attachEngineAudio(chat_id, np, false, next, "", be)) {
-            error = be;
-            return false;
-        }
+        // The backend's seek is the seek (it owns the audio).
         return true;
     }
     if (verb == "autoplay") {
@@ -6897,8 +6542,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
                                  {"enabled", Json(on)},
-                             }),
-                             used, fb);
+                             }));
         if (!r.ok) {
             // The engine refused: roll the toggle back, honestly.
             setChatField(chat_id, "autoplay", on ? "off" : "on");
@@ -6923,8 +6567,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
             return false;
         }
         IpcResult r = vcCall(ctx, "shuffle",
-                             Json::objectOf({{"chat_id", Json(chat_id)}}),
-                             used, fb);
+                             Json::objectOf({{"chat_id", Json(chat_id)}}));
         if (!r.ok) {
             error = r.error_message;
             return false;
@@ -6941,8 +6584,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
                                  {"volume", Json(static_cast<int64_t>(v))},
-                             }),
-                             used, fb);
+                             }));
         if (!r.ok) {
             error = r.error_message;
             return false;
@@ -7137,10 +6779,8 @@ void Dispatcher::cbPlayer(const TgCallbackQuery& cq,
         ctx.args = q;
         // Play-now interrupts: stop the current track first, then
         // play the chosen one (onPlay attaches the audio).
-        Engine used;
-        bool fb = false;
         vcCall(ctx, "stop",
-               Json::objectOf({{"chat_id", Json(chat_id)}}), used, fb);
+               Json::objectOf({{"chat_id", Json(chat_id)}}));
         onPlay(ctx);
         answerCb(cq, ui_texts::kToastSkipped);
         refreshCard(cq, chat_id);
@@ -7214,7 +6854,7 @@ void Dispatcher::cbPlayer(const TgCallbackQuery& cq,
     int64_t pos = 0;
     if (nowPlaying(chat_id, np, track)) {
         pos = np.find("position_sec") ? np.find("position_sec")->asInt()
-                                      : chatIntField(chat_id, "core_pos", 0);
+                                      : 0;
     }
     std::string err;
     if (!playerAction(chat_id, verb, cq.from.id, &cq, err)) {
@@ -7296,15 +6936,12 @@ void Dispatcher::cbQueue(const TgCallbackQuery& cq,
         ctx.message.chat.id = chat_id;
         ctx.message.from = cq.from;
         ctx.command = "queue";
-        Engine used;
-        bool fb = false;
         IpcResult r = vcCall(ctx, "queue",
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
                                  {"action", Json("remove")},
                                  {"position", Json(pos)},
-                             }),
-                             used, fb);
+                             }));
         if (!r.ok) {
             answerCb(cq, r.error_message, true);
             return;
@@ -8070,6 +7707,870 @@ void Dispatcher::cbSpotify(const TgCallbackQuery& cq,
         return;
     }
     answerCb(cq, ui_texts::kToastDisliked);
+}
+
+
+// --- TdLibTelegramSender ----------------------------------------------------
+// The dispatcher's Telegram transport over the TDLib bot session
+// (TdLibClient::call). Every method builds the TDLib request JSON and
+// returns TDLib's exact error (code + message) on failure — nothing is
+// faked, and a failed send is reported, never swallowed. All calls run
+// on the thread that invokes the sender; the dispatcher guarantees
+// that is the main thread (see dispatcher.hpp header note).
+
+TdLibTelegramSender::TdLibTelegramSender(TdLibClient& bot,
+                                         std::string data_dir)
+    : bot_(bot), data_dir_(std::move(data_dir)) {}
+
+// parseTextEntities (HTML/Markdown) or a plain formattedText when
+// parse_mode is empty. File-local so the static inlineResult helper
+// can use it too; the member formattedText below delegates to it.
+static Json tdFormattedText(TdLibClient& bot, const std::string& text,
+                            const std::string& parse_mode,
+                            std::string& error_out) {
+    if (parse_mode.empty()) {
+        return Json::objectOf({
+            {"@type", Json("formattedText")},
+            {"text", Json(text)},
+        });
+    }
+    Json mode;
+    if (parse_mode == "HTML") {
+        mode = Json::objectOf({{"@type", Json("textParseModeHTML")}});
+    } else if (parse_mode == "Markdown") {
+        mode = Json::objectOf({
+            {"@type", Json("textParseModeMarkdown")},
+            {"version", Json(static_cast<int64_t>(2))},
+        });
+    } else {
+        error_out = "unknown parse_mode \"" + parse_mode +
+                    "\" (expected \"\", \"HTML\" or \"Markdown\")";
+        return Json();
+    }
+    Json req = Json::objectOf({
+        {"@type", Json("parseTextEntities")},
+        {"text", Json(text)},
+        {"parse_mode", mode},
+    });
+    // parseTextEntities is a local computation: 10 s is ample, and a
+    // timeout is reported as a parse failure (nothing is sent).
+    Json resp = bot.call(req, 10.0);
+    if (resp.isNull()) {
+        error_out = "parseTextEntities timed out";
+        return Json();
+    }
+    if (TdLibClient::isError(resp)) {
+        error_out = "parseTextEntities failed: " +
+                    TdLibClient::errorMessage(resp);
+        return Json();
+    }
+    return resp;  // parseTextEntities returns the formattedText object
+}
+
+Json TdLibTelegramSender::formattedText(const std::string& text,
+                                        const std::string& parse_mode,
+                                        std::string& error_out) {
+    return tdFormattedText(bot_, text, parse_mode, error_out);
+}
+
+Json TdLibTelegramSender::inputMessageText(const std::string& text,
+                                           const std::string& parse_mode,
+                                           std::string& error_out) {
+    Json ft = formattedText(text, parse_mode, error_out);
+    if (ft.isNull()) return Json();
+    return Json::objectOf({
+        {"@type", Json("inputMessageText")},
+        {"text", ft},
+        {"disable_web_page_preview", Json(true)},
+        {"clear_draft", Json(true)},
+    });
+}
+
+// One button -> its TDLib inlineKeyboardButton. callback_data travels
+// as base64 (TDLib `bytes`); a URL button is a plain URL; a switch
+// button targets the current chat or a chosen chat.
+static Json tdButton(const InlineButton& b) {
+    Json type;
+    if (!b.callback_data.empty()) {
+        type = Json::objectOf({
+            {"@type", Json("inlineKeyboardButtonTypeCallback")},
+            {"data", Json(scram::base64Encode(b.callback_data))},
+        });
+    } else if (!b.url.empty()) {
+        type = Json::objectOf({
+            {"@type", Json("inlineKeyboardButtonTypeUrl")},
+            {"url", Json(b.url)},
+        });
+    } else if (b.has_switch) {
+        Json target = b.switch_current_chat
+                          ? Json::objectOf(
+                                {{"@type", Json("targetChatCurrent")}})
+                          : Json::objectOf({
+                                {"@type", Json("targetChatChosen")},
+                                {"allow_user_chats", Json(true)},
+                                {"allow_bot_chats", Json(true)},
+                                {"allow_group_chats", Json(true)},
+                                {"allow_channel_chats", Json(true)},
+                            });
+        type = Json::objectOf({
+            {"@type", Json("inlineKeyboardButtonTypeSwitchInline")},
+            {"query", Json(b.switch_inline_query)},
+            {"target_chat", target},
+        });
+    } else {
+        // A button with no action: a no-op callback with empty data.
+        type = Json::objectOf({
+            {"@type", Json("inlineKeyboardButtonTypeCallback")},
+            {"data", Json("")},
+        });
+    }
+    return Json::objectOf({
+        {"text", Json(b.text)},
+        {"type", type},
+    });
+}
+
+Json TdLibTelegramSender::inlineMarkup(const InlineKeyboard& kb) {
+    if (kb.empty()) return Json(nullptr);
+    Json::Array rows;
+    for (const auto& row : kb) {
+        Json::Array buttons;
+        for (const auto& b : row) buttons.push_back(tdButton(b));
+        rows.push_back(Json(buttons));
+    }
+    return Json::objectOf({
+        {"@type", Json("replyMarkupInlineKeyboard")},
+        {"rows", Json(rows)},
+    });
+}
+
+Json TdLibTelegramSender::replyMarkup(const ReplyKeyboard& kb) {
+    if (kb.rows.empty()) return Json(nullptr);
+    Json::Array rows;
+    for (const auto& row : kb.rows) {
+        Json::Array buttons;
+        for (const auto& label : row) {
+            buttons.push_back(Json::objectOf({
+                {"text", Json(label)},
+                {"type", Json::objectOf(
+                             {{"@type",
+                               Json("keyboardButtonTypeText")}})},
+            }));
+        }
+        rows.push_back(Json(buttons));
+    }
+    return Json::objectOf({
+        {"@type", Json("replyMarkupShowKeyboard")},
+        {"rows", Json(rows)},
+        {"is_persistent", Json(true)},
+        {"resize_keyboard", Json(kb.resize)},
+        {"one_time", Json(kb.one_time)},
+        {"is_personal", Json(true)},
+    });
+}
+
+int64_t TdLibTelegramSender::sendWithContent(int64_t chat_id,
+                                             const Json& content,
+                                             const Json& reply_markup,
+                                             int64_t reply_to,
+                                             std::string* error_out) {
+    if (content.isNull()) {
+        if (error_out) *error_out = "could not build message content";
+        return -1;
+    }
+    Json req = Json::objectOf({
+        {"@type", Json("sendMessage")},
+        {"chat_id", Json(chat_id)},
+        {"reply_markup", reply_markup},
+        {"input_message_content", content},
+    });
+    if (reply_to != 0) {
+        req.set("reply_to", Json::objectOf({
+            {"@type", Json("inputMessageReplyToMessage")},
+            {"message_id", Json(reply_to)},
+        }));
+    }
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "sendMessage timed out";
+        return -1;
+    }
+    if (TdLibClient::isError(resp)) {
+        if (error_out) *error_out = TdLibClient::errorMessage(resp);
+        return -1;
+    }
+    const Json* id = resp.find("id");
+    if (!id) {
+        if (error_out) *error_out = "sendMessage: no id in response";
+        return -1;
+    }
+    return id->asInt();
+}
+
+bool TdLibTelegramSender::sendMessage(int64_t chat_id,
+                                      const std::string& text,
+                                      std::string& error_out) {
+    return sendMessageId(chat_id, text, 0, &error_out) >= 0;
+}
+
+int64_t TdLibTelegramSender::sendMessageId(int64_t chat_id,
+                                           const std::string& text,
+                                           int64_t reply_to,
+                                           std::string* error_out) {
+    std::string err;
+    Json content = inputMessageText(text, "", err);
+    if (content.isNull()) {
+        if (error_out) *error_out = err;
+        return -1;
+    }
+    return sendWithContent(chat_id, content, Json(nullptr), reply_to,
+                           error_out);
+}
+
+int64_t TdLibTelegramSender::sendMessageHtml(int64_t chat_id,
+                                             const std::string& text,
+                                             const InlineKeyboard& kb,
+                                             int64_t reply_to,
+                                             std::string* error_out) {
+    std::string err;
+    Json content = inputMessageText(text, "HTML", err);
+    if (content.isNull()) {
+        if (error_out) *error_out = err;
+        return -1;
+    }
+    return sendWithContent(chat_id, content, inlineMarkup(kb), reply_to,
+                           error_out);
+}
+
+int64_t TdLibTelegramSender::sendMessageReplyKb(int64_t chat_id,
+                                                const std::string& text,
+                                                const ReplyKeyboard& kb,
+                                                int64_t reply_to,
+                                                std::string* error_out) {
+    std::string err;
+    Json content = inputMessageText(text, "HTML", err);
+    if (content.isNull()) {
+        if (error_out) *error_out = err;
+        return -1;
+    }
+    return sendWithContent(chat_id, content, replyMarkup(kb), reply_to,
+                           error_out);
+}
+
+int64_t TdLibTelegramSender::sendMessageRemoveKb(int64_t chat_id,
+                                                 const std::string& text,
+                                                 int64_t reply_to,
+                                                 std::string* error_out) {
+    std::string err;
+    Json content = inputMessageText(text, "HTML", err);
+    if (content.isNull()) {
+        if (error_out) *error_out = err;
+        return -1;
+    }
+    Json markup = Json::objectOf({
+        {"@type", Json("replyMarkupRemoveKeyboard")},
+        {"is_personal", Json(true)},
+    });
+    return sendWithContent(chat_id, content, markup, reply_to, error_out);
+}
+
+int64_t TdLibTelegramSender::sendPhoto(int64_t chat_id,
+                                       const std::string& photo,
+                                       const std::string& caption,
+                                       const InlineKeyboard& kb,
+                                       std::string* error_out) {
+    std::string err;
+    Json ft = formattedText(caption, "HTML", err);
+    if (ft.isNull()) {
+        if (error_out) *error_out = err;
+        return -1;
+    }
+    // A remote HTTP(S) URL is NOT a valid inputFileRemote id: TDLib
+    // answers with its exact error, and the caller (sendNowPlayingCard)
+    // falls back to a text card. A local path becomes inputFileLocal;
+    // anything else is treated as a TDLib remote file id.
+    Json file;
+    std::error_code ec;
+    if (!photo.empty() && photo[0] == '/' &&
+        std::filesystem::exists(photo, ec)) {
+        file = Json::objectOf({
+            {"@type", Json("inputFileLocal")},
+            {"path", Json(photo)},
+        });
+    } else {
+        file = Json::objectOf({
+            {"@type", Json("inputFileRemote")},
+            {"id", Json(photo)},
+        });
+    }
+    Json content = Json::objectOf({
+        {"@type", Json("inputMessagePhoto")},
+        {"photo", file},
+        {"caption", ft},
+    });
+    return sendWithContent(chat_id, content, inlineMarkup(kb), 0, error_out);
+}
+
+bool TdLibTelegramSender::editMessageText(int64_t chat_id,
+                                          int64_t message_id,
+                                          const std::string& text,
+                                          const InlineKeyboard& kb,
+                                          std::string* error_out) {
+    std::string err;
+    Json content = inputMessageText(text, "HTML", err);
+    if (content.isNull()) {
+        if (error_out) *error_out = err;
+        return false;
+    }
+    Json req = Json::objectOf({
+        {"@type", Json("editMessageText")},
+        {"chat_id", Json(chat_id)},
+        {"message_id", Json(message_id)},
+        {"reply_markup", inlineMarkup(kb)},
+        {"input_message_content", content},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "editMessageText timed out";
+        return false;
+    }
+    if (TdLibClient::isError(resp)) {
+        if (error_out) *error_out = TdLibClient::errorMessage(resp);
+        return false;
+    }
+    return true;
+}
+
+bool TdLibTelegramSender::editMessageCaption(int64_t chat_id,
+                                             int64_t message_id,
+                                             const std::string& caption,
+                                             const InlineKeyboard& kb,
+                                             std::string* error_out) {
+    std::string err;
+    Json ft = formattedText(caption, "HTML", err);
+    if (ft.isNull()) {
+        if (error_out) *error_out = err;
+        return false;
+    }
+    Json req = Json::objectOf({
+        {"@type", Json("editMessageCaption")},
+        {"chat_id", Json(chat_id)},
+        {"message_id", Json(message_id)},
+        {"reply_markup", inlineMarkup(kb)},
+        {"caption", ft},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "editMessageCaption timed out";
+        return false;
+    }
+    if (TdLibClient::isError(resp)) {
+        if (error_out) *error_out = TdLibClient::errorMessage(resp);
+        return false;
+    }
+    return true;
+}
+
+bool TdLibTelegramSender::editMessageReplyMarkup(int64_t chat_id,
+                                                 int64_t message_id,
+                                                 const InlineKeyboard& kb,
+                                                 std::string* error_out) {
+    Json req = Json::objectOf({
+        {"@type", Json("editMessageReplyMarkup")},
+        {"chat_id", Json(chat_id)},
+        {"message_id", Json(message_id)},
+        {"reply_markup", inlineMarkup(kb)},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "editMessageReplyMarkup timed out";
+        return false;
+    }
+    if (TdLibClient::isError(resp)) {
+        if (error_out) *error_out = TdLibClient::errorMessage(resp);
+        return false;
+    }
+    return true;
+}
+
+bool TdLibTelegramSender::answerCallbackQuery(
+    const std::string& callback_query_id, const std::string& text,
+    bool show_alert, int cache_time_sec, std::string* error_out) {
+    Json resp = bot_.answerCallbackQuery(callback_query_id, text, show_alert,
+                                         cache_time_sec);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "answerCallbackQuery timed out";
+        return false;
+    }
+    if (TdLibClient::isError(resp)) {
+        if (error_out) *error_out = TdLibClient::errorMessage(resp);
+        return false;
+    }
+    return true;
+}
+
+// One Bot API-shaped InlineQueryResult -> its TDLib
+// inputInlineQueryResult. Audio results keep their audio_url (a native
+// TDLib field); the message sent on pick is the caption as
+// inputMessageText — an audio URL is not a TDLib InputFile, so it
+// cannot be the inputMessageAudio payload. Article results keep their
+// message_text (plain, no parse mode — titles can contain '<' '>' '&').
+Json TdLibTelegramSender::inlineResult(const Json& r, TdLibClient& bot) {
+    const Json* type = r.find("type");
+    std::string kind = type ? type->asString() : "";
+    const Json* id = r.find("id");
+    std::string rid = id ? id->asString() : "";
+    const Json* title = r.find("title");
+    std::string rtitle = title ? title->asString() : "";
+    // reply_markup arrives in the Bot API shape
+    // {inline_keyboard: [[{text, url|callback_data}]]}; translate it
+    // through the same button builder as the live keyboards.
+    Json markup = Json(nullptr);
+    if (const Json* rm = r.find("reply_markup")) {
+        if (const Json* rows = rm->find("inline_keyboard")) {
+            InlineKeyboard kb;
+            for (const auto& row : rows->asArray()) {
+                std::vector<InlineButton> brow;
+                for (const auto& b : row.asArray()) {
+                    const Json* bt = b.find("text");
+                    std::string btext = bt ? bt->asString() : "";
+                    if (const Json* u = b.find("url"))
+                        brow.push_back(
+                            InlineButton::link(btext, u->asString()));
+                    else if (const Json* d = b.find("callback_data"))
+                        brow.push_back(InlineButton::callback(
+                            btext, d->asString()));
+                }
+                kb.push_back(brow);
+            }
+            markup = inlineMarkup(kb);
+        }
+    }
+    if (kind == "audio") {
+        const Json* stream = r.find("audio_url");
+        const Json* perf = r.find("performer");
+        const Json* dur = r.find("audio_duration");
+        const Json* cap = r.find("caption");
+        std::string caption = cap ? cap->asString() : rtitle;
+        std::string err;
+        Json ft = tdFormattedText(bot, caption, "HTML", err);
+        if (ft.isNull())
+            ft = tdFormattedText(bot, caption, "", err);
+        Json content = Json::objectOf({
+            {"@type", Json("inputMessageText")},
+            {"text", ft},
+            {"disable_web_page_preview", Json(true)},
+            {"clear_draft", Json(true)},
+        });
+        return Json::objectOf({
+            {"@type", Json("inputInlineQueryResultAudio")},
+            {"id", Json(rid)},
+            {"title", Json(rtitle)},
+            {"performer", Json(perf ? perf->asString() : "")},
+            {"audio_url", Json(stream ? stream->asString() : "")},
+            {"audio_duration",
+             Json(dur ? dur->asInt() : static_cast<int64_t>(0))},
+            {"reply_markup", markup},
+            {"input_message_content", content},
+        });
+    }
+    // Article (and anything unrecognised): message_text as plain text.
+    std::string msg;
+    if (const Json* imc = r.find("input_message_content")) {
+        if (const Json* mt = imc->find("message_text"))
+            msg = mt->asString();
+    }
+    if (msg.empty()) msg = rtitle;
+    std::string err;
+    Json ft = tdFormattedText(bot, msg, "", err);
+    Json content = Json::objectOf({
+        {"@type", Json("inputMessageText")},
+        {"text", ft},
+        {"disable_web_page_preview", Json(true)},
+        {"clear_draft", Json(true)},
+    });
+    const Json* desc = r.find("description");
+    const Json* thumb = r.find("thumb_url");
+    return Json::objectOf({
+        {"@type", Json("inputInlineQueryResultArticle")},
+        {"id", Json(rid)},
+        {"url", Json("")},
+        {"title", Json(rtitle)},
+        {"description", Json(desc ? desc->asString() : "")},
+        {"thumbnail_url", Json(thumb ? thumb->asString() : "")},
+        {"thumbnail_width", Json(static_cast<int64_t>(0))},
+        {"thumbnail_height", Json(static_cast<int64_t>(0))},
+        {"reply_markup", markup},
+        {"input_message_content", content},
+    });
+}
+
+bool TdLibTelegramSender::answerInlineQuery(
+    const std::string& inline_query_id, const Json& results,
+    int cache_time_sec, const std::string& switch_pm_text,
+    const std::string& switch_pm_parameter, std::string* error_out) {
+    int64_t qid = 0;
+    try {
+        qid = std::stoll(inline_query_id);
+    } catch (...) {
+        if (error_out)
+            *error_out = "inline_query_id is not numeric: " + inline_query_id;
+        return false;
+    }
+    Json::Array out;
+    if (results.isArray()) {
+        for (const auto& r : results.asArray())
+            out.push_back(inlineResult(r, bot_));
+    }
+    Json button = Json(nullptr);
+    if (!switch_pm_text.empty()) {
+        button = Json::objectOf({
+            {"@type", Json("inlineQueryResultsButton")},
+            {"text", Json(switch_pm_text)},
+            {"type", Json::objectOf({
+                {"@type", Json("inlineQueryResultsButtonTypeStartBot")},
+                {"parameter", Json(switch_pm_parameter)},
+            })},
+        });
+    }
+    Json req = Json::objectOf({
+        {"@type", Json("answerInlineQuery")},
+        {"inline_query_id", Json(qid)},
+        {"is_personal", Json(false)},
+        {"button", button},
+        {"results", Json(out)},
+        {"cache_time", Json(static_cast<int64_t>(cache_time_sec))},
+        {"next_offset", Json("")},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull()) {
+        if (error_out) *error_out = "answerInlineQuery timed out";
+        return false;
+    }
+    if (TdLibClient::isError(resp)) {
+        if (error_out) *error_out = TdLibClient::errorMessage(resp);
+        return false;
+    }
+    return true;
+}
+
+bool TdLibTelegramSender::downloadFile(const std::string& file_id,
+                                       const std::string& dest_dir,
+                                       std::string& saved_path_out,
+                                       std::string& error_out) {
+    // Resolve the remote id, then download synchronously: TDLib
+    // blocks until the file is on disk (or fails). No 20 MB Bot API
+    // cap — TDLib downloads any size.
+    Json req = Json::objectOf({
+        {"@type", Json("getRemoteFile")},
+        {"remote_file_id", Json(file_id)},
+        {"file_type", Json::objectOf({{"@type", Json("fileTypeNone")}})},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull()) {
+        error_out = "getRemoteFile timed out for " + file_id;
+        return false;
+    }
+    if (TdLibClient::isError(resp)) {
+        error_out = "getRemoteFile failed: " +
+                    TdLibClient::errorMessage(resp);
+        return false;
+    }
+    const Json* fid = resp.find("id");
+    if (!fid) {
+        error_out = "getRemoteFile response has no file id";
+        return false;
+    }
+    Json dl = Json::objectOf({
+        {"@type", Json("downloadFile")},
+        {"file_id", Json(fid->asInt())},
+        {"priority", Json(static_cast<int64_t>(1))},
+        {"offset", Json(static_cast<int64_t>(0))},
+        {"limit", Json(static_cast<int64_t>(0))},
+        {"synchronous", Json(true)},
+    });
+    Json done = bot_.call(dl, 300.0);
+    if (done.isNull()) {
+        error_out = "downloadFile timed out for " + file_id;
+        return false;
+    }
+    if (TdLibClient::isError(done)) {
+        error_out = "downloadFile failed: " +
+                    TdLibClient::errorMessage(done);
+        return false;
+    }
+    const Json* local = done.find("local");
+    const Json* path = local ? local->find("path") : nullptr;
+    if (!path || path->asString().empty()) {
+        error_out = "downloadFile returned no local path for " + file_id;
+        return false;
+    }
+    // Keep the old contract: the caller gets a path under dest_dir
+    // named after the (sanitised) file id, extension from the TDLib
+    // local path.
+    std::string safe;
+    for (char c : file_id) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_')
+            safe += c;
+        else
+            safe += '_';
+    }
+    std::string ext;
+    std::string local_path = path->asString();
+    size_t dot = local_path.rfind('.');
+    if (dot != std::string::npos) ext = local_path.substr(dot);
+    std::error_code ec;
+    std::filesystem::create_directories(dest_dir, ec);
+    std::string dest = dest_dir + "/" + safe + ext;
+    std::filesystem::copy_file(local_path, dest,
+                               std::filesystem::copy_options::overwrite_existing,
+                               ec);
+    if (ec) {
+        error_out = "could not copy downloaded file to " + dest + ": " +
+                    ec.message();
+        return false;
+    }
+    saved_path_out = dest;
+    return true;
+}
+
+std::string TdLibTelegramSender::getChatMemberStatus(int64_t chat_id,
+                                                     int64_t user_id) {
+    Json req = Json::objectOf({
+        {"@type", Json("getChatMember")},
+        {"chat_id", Json(chat_id)},
+        {"member_id", Json::objectOf({
+            {"@type", Json("messageSenderUser")},
+            {"user_id", Json(user_id)},
+        })},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull() || TdLibClient::isError(resp)) return "";
+    const Json* status = resp.find("status");
+    if (!status) return "";
+    const Json* type = status->find("@type");
+    if (!type) return "";
+    std::string t = type->asString();
+    const std::string prefix = "chatMemberStatus";
+    if (t.rfind(prefix, 0) == 0) t = t.substr(prefix.size());
+    if (t == "Creator") return "creator";
+    if (t == "Administrator") return "administrator";
+    if (t == "Member") return "member";
+    if (t == "Restricted") return "restricted";
+    if (t == "Left") return "left";
+    if (t == "Banned") return "kicked";
+    return "";
+}
+
+std::vector<int64_t> TdLibTelegramSender::getChatAdministrators(
+    int64_t chat_id) {
+    Json req = Json::objectOf({
+        {"@type", Json("getChatAdministrators")},
+        {"chat_id", Json(chat_id)},
+    });
+    Json resp = bot_.call(req, 30.0);
+    std::vector<int64_t> out;
+    if (resp.isNull() || TdLibClient::isError(resp)) return out;
+    const Json* admins = resp.find("administrators");
+    if (!admins) return out;
+    for (const auto& a : admins->asArray()) {
+        const Json* uid = a.find("user_id");
+        if (uid) out.push_back(uid->asInt());
+    }
+    return out;
+}
+
+int64_t TdLibTelegramSender::getChatId(const std::string& username_or_id) {
+    try {
+        size_t used = 0;
+        int64_t id = std::stoll(username_or_id, &used);
+        if (used == username_or_id.size()) return id;
+    } catch (...) {
+    }
+    std::string name = username_or_id;
+    if (!name.empty() && name[0] == '@') name = name.substr(1);
+    Json req = Json::objectOf({
+        {"@type", Json("searchPublicChat")},
+        {"username", Json(name)},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull() || TdLibClient::isError(resp)) return 0;
+    const Json* id = resp.find("id");
+    return id ? id->asInt() : 0;
+}
+
+bool TdLibTelegramSender::deleteMessage(int64_t chat_id,
+                                        int64_t message_id) {
+    Json req = Json::objectOf({
+        {"@type", Json("deleteMessages")},
+        {"chat_id", Json(chat_id)},
+        {"message_ids", Json(Json::Array{Json(message_id)})},
+        {"revoke", Json(true)},
+    });
+    Json resp = bot_.call(req, 30.0);
+    return !resp.isNull() && !TdLibClient::isError(resp);
+}
+
+bool TdLibTelegramSender::leaveChat(int64_t chat_id) {
+    Json req = Json::objectOf({
+        {"@type", Json("leaveChat")},
+        {"chat_id", Json(chat_id)},
+    });
+    Json resp = bot_.call(req, 30.0);
+    return !resp.isNull() && !TdLibClient::isError(resp);
+}
+
+static bool tdForward(TdLibClient& bot, int64_t to_chat, int64_t from_chat,
+                      int64_t message_id, bool send_copy) {
+    Json req = Json::objectOf({
+        {"@type", Json("forwardMessages")},
+        {"chat_id", Json(to_chat)},
+        {"topic_id", Json(nullptr)},
+        {"from_chat_id", Json(from_chat)},
+        {"message_ids", Json(Json::Array{Json(message_id)})},
+        {"options", Json::objectOf({
+            {"@type", Json("messageSendOptions")},
+            {"disable_notification", Json(false)},
+            {"from_background", Json(false)},
+            {"protect_content", Json(false)},
+            {"update_order_of_installed_sticker_sets", Json(false)},
+        })},
+        {"send_copy", Json(send_copy)},
+        {"remove_caption", Json(false)},
+    });
+    Json resp = bot.call(req, 30.0);
+    return !resp.isNull() && !TdLibClient::isError(resp);
+}
+
+bool TdLibTelegramSender::forwardMessage(int64_t to_chat, int64_t from_chat,
+                                         int64_t message_id) {
+    return tdForward(bot_, to_chat, from_chat, message_id, false);
+}
+
+bool TdLibTelegramSender::copyMessage(int64_t to_chat, int64_t from_chat,
+                                      int64_t message_id) {
+    return tdForward(bot_, to_chat, from_chat, message_id, true);
+}
+
+int64_t TdLibTelegramSender::sendDocument(int64_t chat_id,
+                                          const std::string& filename,
+                                          const std::string& content,
+                                          const std::string& caption,
+                                          std::string* error_out) {
+    // TDLib sends documents from disk: stage the content under
+    // data_dir, send, then unlink the temp file.
+    std::error_code ec;
+    std::filesystem::create_directories(data_dir_, ec);
+    std::string tmp = data_dir_ + "/send-" +
+                      std::to_string(chat_id) + "-" + filename;
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            if (error_out) *error_out = "could not write " + tmp;
+            return -1;
+        }
+        out << content;
+    }
+    std::string err;
+    Json ft = formattedText(caption, "HTML", err);
+    if (ft.isNull()) ft = formattedText(caption, "", err);
+    Json doc = Json::objectOf({
+        {"@type", Json("inputMessageDocument")},
+        {"document", Json::objectOf({
+            {"@type", Json("inputFileLocal")},
+            {"path", Json(tmp)},
+        })},
+        {"caption", ft},
+    });
+    int64_t id = sendWithContent(chat_id, doc, Json(nullptr), 0, error_out);
+    std::filesystem::remove(tmp, ec);
+    return id;
+}
+
+int64_t TdLibTelegramSender::sendLocalFile(int64_t chat_id,
+                                           const std::string& file_path,
+                                           const std::string& caption,
+                                           bool audio,
+                                           std::string* error_out) {
+    std::string err;
+    Json ft = formattedText(caption, "HTML", err);
+    if (ft.isNull()) ft = formattedText(caption, "", err);
+    Json file = Json::objectOf({
+        {"@type", Json("inputFileLocal")},
+        {"path", Json(file_path)},
+    });
+    Json content;
+    if (audio) {
+        content = Json::objectOf({
+            {"@type", Json("inputMessageAudio")},
+            {"audio", file},
+            {"duration", Json(static_cast<int64_t>(0))},
+            {"title", Json("")},
+            {"performer", Json("")},
+            {"caption", ft},
+        });
+    } else {
+        content = Json::objectOf({
+            {"@type", Json("inputMessageDocument")},
+            {"document", file},
+            {"caption", ft},
+        });
+    }
+    return sendWithContent(chat_id, content, Json(nullptr), 0, error_out);
+}
+
+int64_t TdLibTelegramSender::sendAudioFile(int64_t chat_id,
+                                           const std::string& file_path,
+                                           const std::string& caption,
+                                           std::string* error_out) {
+    return sendLocalFile(chat_id, file_path, caption, true, error_out);
+}
+
+int64_t TdLibTelegramSender::sendFile(int64_t chat_id,
+                                      const std::string& file_path,
+                                      const std::string& caption,
+                                      std::string* error_out) {
+    return sendLocalFile(chat_id, file_path, caption, false, error_out);
+}
+
+int64_t TdLibTelegramSender::sendAudio(int64_t chat_id,
+                                       const std::string& audio,
+                                       const std::string& caption,
+                                       const InlineKeyboard& kb,
+                                       std::string* error_out) {
+    std::string err;
+    Json ft = formattedText(caption, "HTML", err);
+    if (ft.isNull()) ft = formattedText(caption, "", err);
+    Json content = Json::objectOf({
+        {"@type", Json("inputMessageAudio")},
+        {"audio", Json::objectOf({
+            {"@type", Json("inputFileRemote")},
+            {"id", Json(audio)},
+        })},
+        {"duration", Json(static_cast<int64_t>(0))},
+        {"title", Json("")},
+        {"performer", Json("")},
+        {"caption", ft},
+    });
+    return sendWithContent(chat_id, content, inlineMarkup(kb), 0, error_out);
+}
+
+std::string TdLibTelegramSender::getUserMention(int64_t user_id) {
+    Json req = Json::objectOf({
+        {"@type", Json("getUser")},
+        {"user_id", Json(user_id)},
+    });
+    Json resp = bot_.call(req, 30.0);
+    if (resp.isNull() || TdLibClient::isError(resp))
+        return std::to_string(user_id);
+    const Json* first = resp.find("first_name");
+    const Json* username = resp.find("username");
+    std::string name = first ? first->asString() : "";
+    std::string uname = username ? username->asString() : "";
+    if (name.empty()) return std::to_string(user_id);
+    if (!uname.empty()) return name + " (@" + uname + ")";
+    return name;
 }
 
 }  // namespace parlay

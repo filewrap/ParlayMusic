@@ -511,12 +511,70 @@ not plain-text fallbacks. Rules:
   on a given surface, the message is redesigned for that surface — never
   silently downgraded to plain text.
 - The rich-message component set used is the one established by the
-  Hermes/richgram work. Which concrete components the core's renderer binds
-  to is a Phase 2 work item (open decision OD-8); the requirement is that
-  the renderer is the rich layer, not ad-hoc HTML strings.
+  Hermes/richgram work. **DECIDED in Phase 2 (OD-8)** — see the binding
+  note below. The renderer is the rich layer, not ad-hoc HTML strings.
 - Phase 9's UI inventory (785 elements, `UI_INVENTORY.md`) remains the
   content source: what each message says, what each card shows, what each
   menu contains. §7 governs **how** it is rendered, not what it says.
+
+**Binding (OD-8, decided Phase 2).** The concrete layer is the
+**Hermes/richgram rich-message layer**, as it exists in the sandbox in two
+Python implementations: (1) the **richgram** package —
+`~/workspace/richgram/richgram/rich_ui.py` (component builders) and
+`telethon.py` (Telethon transport); (2) **Hermes's own MTProto layer** —
+`~/workspace/hermes-agent/plugins/platforms/telegram/mtproto_rich.py` and
+`rich_blocks.py`, documented in
+`RICH_MESSAGES_LAYER_232.md` (Telethon v1.45.0, MTProto layer 232).
+**Both implementations are Python-only; the C++ core cannot link either.**
+The binding is therefore a wire-model binding, not a link binding: the
+C++ renderer (`services/core-cpp/src/ui_texts.hpp`) emits richgram's exact
+component vocabulary as Rich HTML and sends it as a native rich message
+over the core's own TDLib bot session (OD-7, `data/tdlib-bot`), with no
+Python in the path and no Bot API traffic.
+
+*Component set (richgram `rich_ui.py` line refs) and C++ mapping:*
+
+| Component | Source | C++ core renders as |
+|---|---|---|
+| Heading h1–h6 | `rich_heading` (:226) | `<h1>`–`<h6>` |
+| Note (blockquote, expandable) | `rich_note` (:231) | `<blockquote expandable>` |
+| Inline code | `rich_code` (:236) | `<code>` |
+| Pre / pre-with-language | `rich_pre` / `rich_pre_rich` (:240, :247) | `<pre><code class="language-…">` |
+| List (ul/ol) | `rich_list` (:390) | `<ul>` / `<ol>` / `<li>` |
+| To-do list (checkboxes) | `rich_todo_list` (:424) | checkbox `<li>` |
+| Table / key–value table | `rich_table` / `rich_kv_table` (:757, :773) | `<table>` / `<th>` / `<td>` |
+| Details / collapsible group / nested (max 16 levels) | `rich_details` / `rich_details_group` / `rich_details_nested` (:804, :852, :891) | `<details><summary>` |
+| In-body button / button row | `rich_button` / `rich_button_row` (:723, :750) | in-body `<tg-button>` pills (`url` / `callback_data` / `copy_text` / `disabled`; styles primary / success / danger / link / default); ordinary `ReplyInlineMarkup` carries the `pl:` callbacks (§7.2) |
+| Footer / page index (italic) | `rich_footer` / `rich_page_index` (:460, :464) | `<footer><i>` |
+| Pull quote | `rich_pull_quote` (:497) | `<aside>` |
+| Math | `rich_math` (:501) | `<tg-math-block>` |
+| Anchor | `rich_anchor` (:505) | `<a name>` |
+| Thinking | `rich_thinking` (:509) | `<tg-thinking>` |
+| Image | `rich_img` (:222) | `<img>` / photo caption |
+| Custom emoji (`<tg-emoji>`) | `rich_emoji` (:547) | **NOT USED** — forbidden by §7.3 |
+| Escaping / plain-text conversion / captions | `rich_esc` (:187), `rich_to_plain` (:1011), `rich_caption` (:1032) | C++ equivalents in the renderer; no plain-text fallback mode (§7.1) |
+
+*Wire model (verified against TDLib 1.8.69 in-tree,
+`phase4/tdlib-src/td/generate/scheme/td_api.tl`):* TDLib natively supports
+rich messages — `richMessage` (:128), `inputRichMessage` (:154),
+`inputRichMessageMedia` (:133), `richMessageSourceHtml` (:144, "for bots
+only"), `richMessageSourceMarkdown` (:141, "for bots only"),
+`richMessageSourceBlocks` (:138), `inputMessageRichMessage` (:6683) —
+accepted by `sendMessage` / `editMessageText`, with limits exposed as
+options `rich_message_text_length_max` / `block_count_max` / `depth_max` /
+`media_count_max` / `table_column_count_max` and the `InputPageBlock`
+vocabulary at :6577–6670. The core sends each rendered message as
+`inputMessageRichMessage { message: { "@type": "inputRichMessage",
+source: { "@type": "richMessageSourceHtml", text: <rich HTML>, media: [] },
+is_rtl: false, detect_automatic_blocks: false } }`. Components with no
+TDLib/HTML equivalent are redesigned per §7.1, never silently downgraded
+to plain text. (Send-side reference: richgram `telethon.py`
+`telethon_send_request` / `telethon_edit_request` build
+`messages.SendMessageRequest` with
+`rich_message=InputRichMessageHTML/Markdown/blocks` (:180, :211, :153),
+telethon ≥1.45; `telegram_api.tl:2257–2259` `InputRichMessage/HTML/Markdown`,
+`:2628` `sendMessage` `rich_message` flag. No `tg-button` string exists
+client-side in tdlib-src — the server parses it.)
 
 ### §7.2 Both button kinds
 
@@ -595,6 +653,20 @@ Requirements:
   `callback_data` value and every reply-keyboard button and asserts a
   handler exists and the callback is ≤64 bytes. This test is part of the
   Phase 2 exit benchmark (§9).
+
+  *Phase 2 completion (Worker E2, 2026-11-03): routing table done —
+  `contracts/routing-table.md`, 223 rows (95 callbacks §A, 4 reply-keyboard
+  buttons §B.1, 11 URL/switch-inline buttons §B.2, 101 command rows §C
+  covering 112 names + 70 aliases + 40 channel commands, 12 inline-mode
+  rows §D); 10 OD-3 rows marked "implemented in Phase 3"; 0 blank cells
+  (script-checked). Routing test `services/core-cpp/tests/routing_test.cpp`
+  green: 935 checks, 0 failures — every callback ≤64 bytes proven by the
+  test, zero unrouted buttons, zero unhandled callbacks (2 documented
+  §7.5 gaps pinned in the table: reply-keyboard buttons dropped in
+  groups, vote callbacks unanswered). Default branch verified present in
+  `handleCallback` (unknown callbacks answered with the "Unknown action."
+  alert); no code change needed for it. Emoji parameter removed from
+  `menuPanelText`/`stateCardText` in the same wave.*
 
 ### §7.6 UI parity counting (carries into §10)
 
@@ -867,14 +939,14 @@ not-applicable; the parity denominator is the 648 applicable elements
 | # | Question | Locked text's position | What is needed from the user |
 |---|---|---|---|
 | OD-1 | Opus encoder configuration: libntgcalls.so 3.0.5 exposes NO Opus config API (§3.3). | §1.4 demands OPUS_APPLICATION_AUDIO, complexity 10, VBR on, FEC off, bitrate 320→256→192. The requirement stands; the mechanism does not exist. | **DECIDED 2026-11-03 ~13:20 IST by the user: option (a) — patch and rebuild ntgcalls from source to expose encoder config.** Recorded in Phase 1. Blocks Phase 5's audio path; the patch/rebuild itself is Phase 5 work (Phase 1 only records the verdict). |
-| OD-2 | Existing Mongo/Redis/JSON state when the embedded store replaces them. | Locked text orders the embedded store, says nothing about existing state. | Fresh start (lose queues, engine choices, Spotify OAuth tokens — every Spotify user logs in again, share links, votes, settings) vs one-time migration into bbolt/pebble. Blocks Phase 3 store work. |
-| OD-3 | Phase 9 unimplemented live surfaces: `download.cancel`, `library.delete`, `/mix`, `/recognize`, `/scan`, `/sharescan`, `/rmcache`, Spotify companion surfaces, download prefs contract fields, inline `Song not cached`, inline `np` oversize. | §1.2 demands 100% parity; the surfaces exist but have no backend action. | Per item: implement (new backend actions) or cut (remove the button/command and record it in the routing table). Blocks the §7.5 zero-unrouted-buttons test. |
-| OD-4 | Persistent transport: Unix Domain Socket (length-prefixed binary frames) or gRPC over UDS. | Locked text allows either ("Unix Domain Socket or gRPC over UDS"). | Pick one, or delegate to Phase 2. Recommendation: plain UDS frames (lowest latency, no extra dependency) unless Phase 2 justifies gRPC. Blocks Phase 2. |
-| OD-5 | Embedded store: bbolt or pebble. | Locked text says "e.g., bbolt or pebble". | Pick one, or delegate to Phase 3. Recommendation: bbolt (single file, simplest) unless Phase 3 justifies pebble. Blocks Phase 3. |
-| OD-6 | Config file format: `parlay.toml` or `parlay.yaml`. | Locked text says "parlay.toml / parlay.yaml + Env Overrides". | Pick one. Blocks Phase 2 (config schema). |
-| OD-7 | Bot-session TDLib dir: the assistant session lives in `data/tdlib` (0700); the locked text never says where the bot session lives. | Silent. | Convention: `data/tdlib-bot` (0700), or a single dir with two clients. Minor; Phase 2 can decide unless the user objects. |
-| OD-8 | Rich-message layer binding: which concrete component set from the Hermes/richgram work the core's renderer binds to. | §7.1 requires the latest rich layer, names no API. | Name the layer, or delegate to Phase 2. Blocks Phase 2 UI work. |
-| OD-9 | Live VPS proof prerequisites: the Opus bitrate test (OD-1), the >50 MB upload test (§6-R8), and a real-Telegram callback test all need the user's VPS + a live group call. | Phase 6 requires them. | Confirm the VPS, the test group, and the window for the live proof run. Needed before Phase 6. |
+| OD-2 | Existing Mongo/Redis/JSON state when the embedded store replaces them. | Locked text orders the embedded store, says nothing about existing state. | **DECIDED 2026-11-03 ~13:51 IST by the user ("Start fresh. You already have everything you need."): FRESH START.** Existing Mongo/Redis/JSON state is NOT migrated; the embedded store starts empty. Lost by this choice: per-chat queues, engine choices, Spotify OAuth tokens (every Spotify user logs in again), share links/tokens, votes, per-chat settings, radio state. Blocks Phase 3 store work (entry now satisfied). |
+| OD-3 | Phase 9 unimplemented live surfaces: `download.cancel`, `library.delete`, `/mix`, `/recognize`, `/scan`, `/sharescan`, `/rmcache`, Spotify companion surfaces, download prefs contract fields, inline `Song not cached`, inline `np` oversize. | §1.2 demands 100% parity; the surfaces exist but have no backend action. | **DECIDED 2026-11-03 ~13:51 IST (delegated by the user: "Start fresh. You already have everything you need." — the locked parity rule decides it): IMPLEMENT all of them. No cuts.** Cutting any of these would violate the locked §1.2 100%-parity rule. Each needs a new backend action, which lands in Phase 3. Blocks the §7.5 zero-unrouted-buttons test until Phase 3 implements the actions; the routing table records each as "implemented in Phase 3" in Phase 2. |
+| OD-4 | Persistent transport: Unix Domain Socket (length-prefixed binary frames) or gRPC over UDS. | Locked text allows either ("Unix Domain Socket or gRPC over UDS"). | **DECIDED 2026-11-03 ~13:51 IST (delegated by the user; spec recommendation adopted): plain UDS length-prefixed binary frames** (lowest latency, no extra dependency). Blocks Phase 2 — entry now satisfied. |
+| OD-5 | Embedded store: bbolt or pebble. | Locked text says "e.g., bbolt or pebble". | **DECIDED 2026-11-03 ~13:51 IST (delegated by the user; spec recommendation adopted): bbolt** (single file, simplest). Recorded now; Phase 3's store entry is satisfied. |
+| OD-6 | Config file format: `parlay.toml` or `parlay.yaml`. | Locked text says "parlay.toml / parlay.yaml + Env Overrides". | **DECIDED 2026-11-03 ~13:51 IST (delegated by the user): `parlay.toml`.** Rationale: Go and Rust both speak TOML natively, strict types, no YAML indentation ambiguity, and it is the locked text's first-listed option. Blocks Phase 2 (config schema) — entry now satisfied. |
+| OD-7 | Bot-session TDLib dir: the assistant session lives in `data/tdlib` (0700); the locked text never says where the bot session lives. | Silent. | **DECIDED 2026-11-03 ~13:51 IST (delegated by the user; spec convention adopted): bot-session TDLib dir is `data/tdlib-bot` (0700), separate from the assistant session's `data/tdlib` (0700).** |
+| OD-8 | Rich-message layer binding: which concrete component set from the Hermes/richgram work the core's renderer binds to. | §7.1 requires the latest rich layer, names no API. | **DECIDED 2026-11-03 in Phase 2 (delegated by the user to Phase 2): the Hermes/richgram rich-message layer** — richgram package (`richgram/rich_ui.py`, `telethon.py`) + Hermes's own MTProto layer (`plugins/platforms/telegram/mtproto_rich.py`, `rich_blocks.py`, Telethon 1.45.0 / layer 232). Both are Python-only, so the binding is a wire-model binding, not a link binding: the C++ renderer emits richgram's exact component vocabulary as Rich HTML and sends it as TDLib 1.8.69 `inputMessageRichMessage` (`richMessageSourceHtml`) via `sendMessage`/`editMessageText` on the bot session. Full component table + wire mapping in §7.1. Custom emoji (`rich_emoji`) NOT used (§7.3). Blocks Phase 2 UI work — entry now satisfied. |
+| OD-9 | Live VPS proof prerequisites: the Opus bitrate test (OD-1), the >50 MB upload test (§6-R8), and a real-Telegram callback test all need the user's VPS + a live group call. | Phase 6 requires them. | **DEFERRED to Phase 6 entry (2026-11-03 ~13:51 IST, delegated by the user).** The live VPS proof needs the user's VPS, a test group, and a window; the user is already live-testing on their VPS, so confirm those with the user at Phase 6, not now. Not decided. |
 
 ---
 

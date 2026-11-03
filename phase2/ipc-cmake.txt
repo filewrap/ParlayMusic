@@ -1,0 +1,50 @@
+# phase2/ipc-cmake.txt — exact CMake change for the Phase 2 IPC transport
+# swap (Worker A). Apply in Wave 2 when the CMake suite integration lands.
+# Do NOT apply the parlay-core part until telegram_api.* is deleted and
+# dispatcher.cpp is rewritten (both still #include "http.hpp" — see the
+# BLOCKER note below); the test targets build standalone today.
+#
+# --- 1. parlay-core: drop the deleted curl client -------------------------
+# In services/core-cpp/CMakeLists.txt, remove this line from
+# add_executable(parlay-core ...):
+#     src/http.cpp
+# Nothing else changes in that target for this swap: src/ipc.cpp is
+# already listed, and the new UDS client needs no new libraries
+# (POSIX sockets + std::thread only, same as the old http_server.cpp).
+#
+# --- 2. New test targets (standalone-verified by Worker A) ----------------
+# add_executable(uds_test
+#     tests/uds_test.cpp
+#     src/ipc.cpp
+#     src/json.cpp
+#     src/config.cpp
+#     src/toml.cpp
+# )
+# target_include_directories(uds_test PRIVATE src)
+# target_link_libraries(uds_test PRIVATE ${CMAKE_DL_LIBS})
+#
+# add_executable(stub_backend
+#     tests/stub_backend.cpp
+#     src/ipc.cpp
+#     src/json.cpp
+# )
+# target_include_directories(stub_backend PRIVATE src)
+#
+# Run: ./uds_test ./stub_backend
+# (uds_test spawns stub_backend itself; the socket path defaults to
+# /tmp/parlay-uds-test.sock. Verified: 41 checks pass, 56/56 actions
+# answer, UDS round-trip median ~123-500 us. See the test header.)
+#
+# --- BLOCKER (Wave 2 must resolve before the parlay-core target builds) ---
+# Deleting src/http.cpp + src/http.hpp is correct per
+# FINAL-ARCHITECTURE.md §8.2, but two files outside Worker A's scope
+# still include it:
+#   services/core-cpp/src/telegram_api.cpp  (#include "http.hpp")
+#   services/core-cpp/src/dispatcher.cpp    (#include "http.hpp")
+# telegram_api.* is DELETE in Wave 2 (§8.2) and dispatcher.cpp is
+# REWRITE (its only HttpClient use is the /speedtest probe). Until
+# those land, the parlay-core target will fail to compile — the
+# failure is expected and is Wave 2's, not this swap's. The new IPC
+# files themselves compile standalone (g++ -std=c++20 -c src/ipc.cpp)
+# and router_test.cpp builds + passes with the new ipc.cpp and no
+# http.cpp, proving the engine_router / FakeIpc seam holds.

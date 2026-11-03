@@ -1,0 +1,80 @@
+# phase2/config-cmake.txt — CMake snippet for Worker C's unified config
+# + token-bucket rate limiter (Phase 2, FINAL-ARCHITECTURE.md §1.4/§9).
+#
+# DO NOT apply by hand-editing CMakeLists.txt piecemeal: paste the
+# "parlay-core" block into services/core-cpp/CMakeLists.txt in place of
+# the existing add_executable(parlay-core ...) source list (adding the
+# two new sources; config.cpp was already listed), and append the test
+# block at the end of the same file. The tests join the suite here so
+# Wave 2 does not have to re-derive the build lines.
+#
+# New files (all Worker C, this wave):
+#   services/core-cpp/src/toml.cpp / toml.hpp        (in-tree TOML parser)
+#   services/core-cpp/src/rate_limiter.cpp / .hpp    (token-bucket limiter)
+#   services/core-cpp/src/config.cpp / config.hpp    (rewritten, unified)
+#   parlay.toml.example                              (repo root)
+#   services/core-cpp/tests/config_test.cpp
+#   services/core-cpp/tests/rate_limiter_test.cpp
+#
+# Notes:
+# - No new libraries, no downloads: the TOML parser is in-tree, the
+#   limiter is std-only. C++20, same flags as the rest of the target.
+# - config_test needs the example file at run time: it takes the path
+#   as argv[1] (default "parlay.toml.example"); the add_test line
+#   below passes ${CMAKE_SOURCE_DIR}/../../parlay.toml.example, i.e.
+#   the repo root. Run from any cwd with that argument and it works.
+# - rate_limiter_test has no file dependencies.
+# - dispatcher.cpp is NOT touched in this wave: Wave 2 wires
+#   RateLimiter into Dispatcher::rateLimited() (dispatcher.cpp:911)
+#   and switches main.cpp from Config::fromEnv() to Config::load().
+
+# --- 1. parlay-core: add the two new sources ---------------------------
+# add_executable(parlay-core
+#     src/main.cpp
+#     src/json.cpp
+#     src/http.cpp            # <- deleted by the IPC worker in Phase 2;
+#                             #    keep or drop this line per that worker
+#     src/http_server.cpp
+#     src/core_api.cpp
+#     src/config.cpp
+#     src/toml.cpp            # NEW (Worker C)
+#     src/rate_limiter.cpp    # NEW (Worker C)
+#     src/telegram_api.cpp
+#     src/ipc.cpp
+#     src/engine_router.cpp
+#     src/store.cpp
+#     src/scram.cpp
+#     src/tdlib_client.cpp
+#     src/voice_call.cpp
+#     src/dispatcher.cpp
+# )
+
+# --- 2. new tests (append to services/core-cpp/CMakeLists.txt) --------
+# enable_testing()
+#
+# add_executable(config_test
+#     tests/config_test.cpp
+#     src/config.cpp
+#     src/toml.cpp
+# )
+# target_include_directories(config_test PRIVATE src)
+# target_compile_options(config_test PRIVATE -Wall -Wextra -Wpedantic)
+# add_test(NAME config_test
+#     COMMAND config_test ${CMAKE_SOURCE_DIR}/../../parlay.toml.example)
+#
+# add_executable(rate_limiter_test
+#     tests/rate_limiter_test.cpp
+#     src/rate_limiter.cpp
+#     src/config.cpp
+#     src/toml.cpp
+# )
+# target_include_directories(rate_limiter_test PRIVATE src)
+# target_compile_options(rate_limiter_test PRIVATE -Wall -Wextra -Wpedantic)
+# add_test(NAME rate_limiter_test COMMAND rate_limiter_test)
+#
+# Standalone equivalents (verified this wave, no CMake needed):
+#   g++ -std=c++20 -I src tests/config_test.cpp src/config.cpp src/toml.cpp \
+#       -o /tmp/config_test && /tmp/config_test ../../parlay.toml.example
+#   g++ -std=c++20 -I src tests/rate_limiter_test.cpp src/rate_limiter.cpp \
+#       src/config.cpp src/toml.cpp -o /tmp/rate_limiter_test \
+#       && /tmp/rate_limiter_test
