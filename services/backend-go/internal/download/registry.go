@@ -7,7 +7,7 @@
 // and finishes it after (downloaders server.py do_POST); the run_id
 // rides back in the response. Files over the 50 MB Bot API cap
 // (MaxBotAPIBYTES) are reported oversize:true and NOT failed — the
-// core queues them for a later MTProto pass. Partial files are deleted
+// core reports them unsent (no later MTProto pass exists yet).
 // on failure. Runs are kept for late polls; the registry caps at 200
 // finished runs, oldest first; live runs are never evicted.
 //

@@ -289,3 +289,125 @@ func TestSocketPermissions(t *testing.T) {
 		t.Errorf("socket must be 0600, got %o", fi.Mode().Perm())
 	}
 }
+
+// TestJoinResponseDeliveredWhileHandlerWaits is the Phase 6
+// regression test for the vc.join wedge (Phase 3/5 dispatch:
+// vc.join abandoned at the full 60 s deadline): a handler that
+// waits in RequestJoin must receive the core's join response
+// WHILE it waits. The server's read loop must keep reading
+// frames — including join responses — while a handler is running,
+// or the handler and the read loop deadlock until the request
+// deadline: the response sits unread in the socket while the
+// handler waits for it.
+func TestJoinResponseDeliveredWhileHandlerWaits(t *testing.T) {
+	s, sock := startTestServer(t)
+	s.Register("test.join", func(ctx context.Context, req Request) (any, error) {
+		remoteSDP, gid, err := s.RequestJoin(ctx, -1001, "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=go\r\n")
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"remote_sdp": remoteSDP, "group_call_id": gid}, nil
+	})
+	peer := dialPeer(t, sock)
+	defer peer.c.Close()
+
+	// Send the request with a long deadline: if the deadlock is
+	// present, the response only arrives at the deadline (30 s),
+	// not after the peer answers the JoinRequest.
+	frame, _ := json.Marshal(map[string]any{
+		"type": "request", "request_id": 7, "action": "test.join",
+		"deadline_ms": 30000, "payload": map[string]any{},
+	})
+	peer.send(frame)
+
+	// The handler must reach RequestJoin and the server must emit
+	// the join_request frame promptly.
+	peer.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	raw, err := ReadFrame(peer.c)
+	if err != nil {
+		t.Fatalf("read join_request: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Type != "join_request" {
+		t.Fatalf("expected join_request, got %q", env.Type)
+	}
+	// Answer it immediately, like the core's join handler.
+	resp, _ := json.Marshal(map[string]any{
+		"type": "response", "request_id": env.RequestID, "ok": true,
+		"data": map[string]any{"remote_sdp": "fake-remote", "group_call_id": 777},
+	})
+	start := time.Now()
+	peer.send(resp)
+	// The test.join response must follow within 5 s — long before
+	// the 30 s request deadline. A read timeout here is the
+	// deadlock: the read loop was stuck inside handleRequest
+	// while the handler waited for this very frame.
+	peer.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	raw, err = ReadFrame(peer.c)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("join response never arrived after answering the JoinRequest (%s): %v", elapsed, err)
+	}
+	t.Logf("join response arrived %s after the JoinRequest answer", elapsed)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["ok"] != true {
+		t.Fatalf("join response must be ok:true, got %v", out)
+	}
+}
+
+// TestSlowHandlerDoesNotStarveNextRequest is the Phase 5
+// vc.lyrics flake in miniature: while one request's handler is
+// wedged (waiting out its deadline), a second request on the
+// same connection must still be answered within its own
+// deadline. The read loop must dispatch requests concurrently;
+// a slow handler must never stall the reading of the next frame.
+func TestSlowHandlerDoesNotStarveNextRequest(t *testing.T) {
+	s, sock := startTestServer(t)
+	started := make(chan struct{})
+	s.Register("test.slow", func(ctx context.Context, _ Request) (any, error) {
+		close(started)
+		<-ctx.Done()
+		return map[string]any{"late": true}, nil
+	})
+	peer := dialPeer(t, sock)
+	defer peer.c.Close()
+
+	slow, _ := json.Marshal(map[string]any{
+		"type": "request", "request_id": 7, "action": "test.slow",
+		"deadline_ms": 30000, "payload": map[string]any{},
+	})
+	peer.send(slow)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow handler never started")
+	}
+	// The slow handler is now wedged for 30 s. A ping sent now
+	// must still be answered within its own 5 s deadline.
+	start := time.Now()
+	ping, _ := json.Marshal(map[string]any{
+		"type": "request", "request_id": 8, "action": "ping",
+		"deadline_ms": 5000, "payload": map[string]any{},
+	})
+	peer.send(ping)
+	peer.c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	raw, err := ReadFrame(peer.c)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("ping was starved behind the wedged handler (%s): %v", elapsed, err)
+	}
+	t.Logf("ping answered %s after the slow handler wedged", elapsed)
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out["ok"] != true {
+		t.Fatalf("ping must answer ok:true, got %v", out)
+	}
+}

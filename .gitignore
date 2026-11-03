@@ -32,7 +32,12 @@ scripts/yt-dlp-venv/
 *.sqlite3
 *.sqlite
 *.node
-phase6/
+# Phase 6 scratch (build artifacts, logs, smoke scripts) stays out of
+# git, but the Phase 6 reports are tracked: ignore everything in
+# phase6/ except *.md (was a blanket phase6/ rule when the dir held
+# tdlib-src/mongo-data build artifacts; narrowed 2026-11-03, Worker D).
+phase6/*
+!phase6/*.md
 phase6-mongo-data/
 release/
 phase7/

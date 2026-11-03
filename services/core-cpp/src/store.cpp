@@ -43,14 +43,17 @@ namespace parlay {
 //   autoleave (kv: auto-leave toggle)
 //   + the in-memory TTL admin cache (cacheGet/cacheSet; never
 //     persisted).
-// SETTINGS live in backend bbolt (chat.settings) — the panel fields
-// of the chat:<chat_id> hash must NOT be duplicated here (see
-// phase4/worker-a-state.md §Q7: the rewire is flagged, blocked on
-// unruled Q8/Q9 and on the runtime fields below sharing the hash).
-// The chat:<chat_id> hash ALSO carries per-chat RUNTIME fields with
-// no backend home yet — loop, speed, bass, muted, rtmp_url,
-// rtmp_key, cplay, last_track, logger_on — which stay in state.json
-// as runtime state until a backend home exists for them.
+// SETTINGS live in backend bbolt (chat.settings) — the 15 keys are
+// NEVER duplicated here (Q7 rewire, Phase 6: Dispatcher::settingsFor
+// fetches them over UDS and caches the snapshot in memory only).
+// Per-chat RUNTIME fields with no backend home live under the
+// "chatrt:" hash — loop, speed, bass, muted, volume, rtmp_url,
+// rtmp_key, cplay, last_track — core-voice session + routing state,
+// not settings. The legacy "chat:" hash is a read-only fallback for
+// those runtime fields (pre-rewire values survive the upgrade);
+// nothing writes it. The chat-level logger_on field was dead (never
+// written) and was dropped in the rewire; only the global logger_on
+// key above remains.
 // DELETED in Phase 4 (Q1): the autoplay:<chat_id> kv was write-only
 // (never read anywhere — the autoplay flag is read from the
 // chat:<chat_id> hash) and duplicated the hash field; its writes

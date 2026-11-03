@@ -1,0 +1,1 @@
+{"compilerOptions":{"exactOptionalPropertyTypes":false,"forceConsistentCasingInFileNames":true,"lib":["ES2020","DOM","DOM.Iterable"],"module":"ES2020","moduleResolution":"bundler","noFallthroughCasesInSwitch":true,"noImplicitReturns":true,"noUncheckedIndexedAccess":true,"outDir":"dist","rootDir":"src","skipLibCheck":true,"strict":true,"target":"ES2020"},"include":["src"]}

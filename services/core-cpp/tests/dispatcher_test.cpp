@@ -383,6 +383,27 @@ public:
     mutable std::string np_track_id = "t1";
     mutable std::string np_stream_url = "https://example.invalid/audio.webm";
     mutable int64_t np_position = 30;
+    // Scripted chat.settings store (Phase 6, Q7): chat_id -> full
+    // 15-key settings JSON object. GET /v1/chat/settings returns it
+    // (or the backend defaults when unseeded); POST chat.settings
+    // applies one key and returns the updated object, like the real
+    // backend. settings_fail=true simulates the backend down: GET
+    // and POST both fail with engine_unavailable.
+    mutable std::map<int64_t, std::string> settings_store;
+    mutable bool settings_fail = false;
+    static std::string defaultSettingsJson() {
+        return R"({"admin_mode":0,"play_mode":"everyone","cmd_delete":false,"clean_mode":false,"clean_delay_min":0,"thumbnails":true,"autoplay":false,"autoplay_lang":"","autoplay_mood":"","silent_mode":false,"auto_delete":false,"auto_delete_min":5,"language":"en","paginate_purge_old":true,"chat_music_download":true})";
+    }
+    // Seed one settings key for a chat (creates the stored object
+    // from the defaults when absent). value is a JSON literal.
+    void seedSetting(int64_t chat_id, const std::string& key,
+                     const std::string& value_json) const {
+        auto it = settings_store.find(chat_id);
+        parlay::Json obj = parlay::Json::parse(
+            it == settings_store.end() ? defaultSettingsJson() : it->second);
+        obj.set(key, parlay::Json::parse(value_json));
+        settings_store[chat_id] = obj.dump();
+    }
     parlay::IpcResult post(const std::string& base_url,
                            const std::string& action, const parlay::Json& body,
                            int timeout_sec = 30) const override {
@@ -561,6 +582,45 @@ public:
                 R"({"now_playing":{"track":{"title":"Mix Pick","artist":"Mix Artist","duration_sec":200}}})");
             return r;
         }
+        if (action == "chat.settings") {
+            if (settings_fail) {
+                r.http_status = 503;
+                r.error_code = "engine_unavailable";
+                r.error_message = "fake: backend down";
+                return r;
+            }
+            // One-key set, like the real backend: validate the key,
+            // apply it to the stored object, return the full object.
+            const parlay::Json* cid = body.find("chat_id");
+            const parlay::Json* key = body.find("key");
+            const parlay::Json* value = body.find("value");
+            if (!cid || !key || !value || !key->isString()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = "fake: chat.settings needs chat_id, key, value";
+                return r;
+            }
+            int64_t chat_id = cid->asInt();
+            auto it = settings_store.find(chat_id);
+            parlay::Json obj = parlay::Json::parse(
+                it == settings_store.end() ? defaultSettingsJson()
+                                           : it->second);
+            obj.set(key->asString(), *value);
+            // The backend keeps clean_mode in sync with the delay.
+            if (key->asString() == "clean_delay_min") {
+                const parlay::Json* d = obj.find("clean_delay_min");
+                obj.set("clean_mode",
+                        parlay::Json(d && d->asInt() > 0));
+            }
+            settings_store[chat_id] = obj.dump();
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::objectOf({
+                {"chat_id", parlay::Json(chat_id)},
+                {"settings", obj},
+            });
+            return r;
+        }
         r.http_status = 404;
         r.error_code = "not_found";
         r.error_message = "fake: no engine here";
@@ -573,6 +633,33 @@ public:
         (void)timeout_sec;
         gets.push_back(path);
         parlay::IpcResult r;
+        if (path.rfind("/v1/chat/settings", 0) == 0) {
+            if (settings_fail) {
+                r.http_status = 503;
+                r.error_code = "engine_unavailable";
+                r.error_message = "fake: backend down";
+                return r;
+            }
+            int64_t chat_id = 0;
+            size_t at = path.find("chat_id=");
+            if (at != std::string::npos) {
+                try {
+                    chat_id = std::stoll(path.substr(at + 8));
+                } catch (...) {
+                }
+            }
+            auto it = settings_store.find(chat_id);
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::objectOf({
+                {"chat_id", parlay::Json(chat_id)},
+                {"settings",
+                 parlay::Json::parse(it == settings_store.end()
+                                         ? defaultSettingsJson()
+                                         : it->second)},
+            });
+            return r;
+        }
         if (path.rfind("/v1/spotify/details", 0) == 0 &&
             !spotify_details_response.empty()) {
             r.ok = true;
@@ -879,7 +966,7 @@ int main() {
     {
         Rig rig;
         rig.store.set("call:-1011", "1");
-        rig.store.hset("chat:-1011", "muted", "0");
+        rig.store.hset("chatrt:-1011", "muted", "0");
         rig.d.handleMessage(makeMsg(-1011, 111, "/mute"));
         CHECK(!rig.ipc.posts.empty() &&
                   rig.ipc.posts[0].find("|mute") != std::string::npos,
@@ -887,13 +974,13 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   rig.tg.replies[0] == "<b>Muted.</b>",
               "mute session: exact reply is the emoji-free string");
-        auto f = rig.store.hgetall("chat:-1011");
+        auto f = rig.store.hgetall("chatrt:-1011");
         CHECK(f["muted"] == "1", "mute session: muted flag stored");
     }
     {
         Rig rig;
         rig.store.set("call:-1012", "1");
-        rig.store.hset("chat:-1012", "muted", "1");
+        rig.store.hset("chatrt:-1012", "muted", "1");
         rig.d.handleMessage(makeMsg(-1012, 111, "/mute"));
         CHECK(rig.ipc.posts.empty(),
               "mute already muted: no vc.mute issued");
@@ -905,7 +992,7 @@ int main() {
     {
         Rig rig;
         rig.store.set("call:-1013", "1");
-        rig.store.hset("chat:-1013", "muted", "1");
+        rig.store.hset("chatrt:-1013", "muted", "1");
         rig.d.handleMessage(makeMsg(-1013, 111, "/unmute"));
         CHECK(!rig.ipc.posts.empty() &&
                   rig.ipc.posts[0].find("|mute") != std::string::npos,
@@ -913,7 +1000,7 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   rig.tg.replies[0] == "<b>Unmuted.</b>",
               "unmute session: exact reply is the emoji-free string");
-        auto f = rig.store.hgetall("chat:-1013");
+        auto f = rig.store.hgetall("chatrt:-1013");
         CHECK(f["muted"] == "0", "unmute session: muted flag cleared");
     }
     {
@@ -930,7 +1017,7 @@ int main() {
         // nothing-playing check lets the mute through.
         Rig rig;
         rig.ipc.np_ok = true;
-        rig.store.hset("chat:-1015", "muted", "0");
+        rig.store.hset("chatrt:-1015", "muted", "0");
         rig.d.handleMessage(makeMsg(-1015, 111, "/mute"));
         CHECK(!rig.ipc.posts.empty() &&
                   rig.ipc.posts[0].find("|mute") != std::string::npos,
@@ -942,14 +1029,14 @@ int main() {
     {
         Rig rig;
         rig.store.set("call:-1016", "1");
-        rig.store.hset("chat:-1016", "muted", "0");
+        rig.store.hset("chatrt:-1016", "muted", "0");
         rig.ipc.mute_error = "ntgcalls mute failed";
         rig.d.handleMessage(makeMsg(-1016, 111, "/mute"));
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Could not mute") &&
                   contains(rig.tg.replies[0], "ntgcalls mute failed"),
               "mute backend fails: exact backend error reported");
-        auto f = rig.store.hgetall("chat:-1016");
+        auto f = rig.store.hgetall("chatrt:-1016");
         CHECK(f["muted"] == "0",
               "mute backend fails: muted flag stays 0");
     }
@@ -1210,8 +1297,8 @@ int main() {
         // room (§4.4): the room carries them for the Phase 5 DSP.
         Rig rig;
         rig.ipc.play_response = play_np;
-        rig.store.hset("chat:-1052", "speed", "1.5");
-        rig.store.hset("chat:-1052", "bass", "40");
+        rig.store.hset("chatrt:-1052", "speed", "1.5");
+        rig.store.hset("chatrt:-1052", "bass", "40");
         rig.d.handleMessage(makeMsg(-1052, 111, "/play Test Song"));
         CHECK(has_post(rig, "play"),
               "play query: vc.play issued with stored speed/bass");
@@ -1226,7 +1313,7 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Now playing"),
               "play query: Now playing reply with stored speed/bass");
-        auto f = rig.store.hgetall("chat:-1052");
+        auto f = rig.store.hgetall("chatrt:-1052");
         CHECK(f["speed"] == "1.5" && f["bass"] == "40",
               "play query: stored speed/bass survive the play");
     }
@@ -1375,16 +1462,16 @@ int main() {
     {
         Rig rig;
         rig.store.set("call:-1064", "1");
-        rig.store.hset("chat:-1064", "loop", "1");
-        rig.store.hset("chat:-1064", "speed", "1.5");
-        rig.store.hset("chat:-1064", "bass", "40");
-        rig.store.hset("chat:-1064", "muted", "1");
+        rig.store.hset("chatrt:-1064", "loop", "1");
+        rig.store.hset("chatrt:-1064", "speed", "1.5");
+        rig.store.hset("chatrt:-1064", "bass", "40");
+        rig.store.hset("chatrt:-1064", "muted", "1");
         rig.d.handleMessage(makeMsg(-1064, 111, "/stop"));
         CHECK(has_post(rig, "stop"),
               "stop: vc.stop issued to the backend");
         auto c = rig.store.get("call:-1064");
         CHECK(!c || *c != "1", "stop: call marked inactive");
-        auto f = rig.store.hgetall("chat:-1064");
+        auto f = rig.store.hgetall("chatrt:-1064");
         CHECK(f["loop"] == "0" && f["speed"] == "1.0" &&
                   f["bass"] == "0" && f["muted"] == "0",
               "stop: loop/speed/bass/muted reset");
@@ -1622,7 +1709,7 @@ int main() {
     {
         // playAllowed denial uses the admin-only-play card.
         Rig rig;
-        rig.store.hset("chat:-1001", "play_mode", "admins");
+        rig.ipc.seedSetting(-1001, "play_mode", "\"admins\"");
         rig.d.handleMessage(makeMsg(-1001, 222, "/play test song"));
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Admin only play"),
@@ -1823,16 +1910,16 @@ int main() {
         CHECK(rig3.tg.replies.size() == 1 &&
                   contains(rig3.tg.replies[0], "No active RTMP stream"),
               "streamstatus: nothing active");
-        rig3.store.hset("chat:-1001", "rtmp_url", "rtmp://x/app");
-        rig3.store.hset("chat:-1001", "rtmp_key", "k");
+        rig3.store.hset("chatrt:-1001", "rtmp_url", "rtmp://x/app");
+        rig3.store.hset("chatrt:-1001", "rtmp_key", "k");
         Rig rig4;
         rig4.d.handleMessage(makeMsg(-1001, 111, "/stream"));
         CHECK(rig4.tg.replies.size() == 1 &&
                   contains(rig4.tg.replies[0], "Usage:") &&
                   contains(rig4.tg.replies[0], "/stream"),
               "stream: no query + nothing playing shows usage");
-        rig4.store.hset("chat:-1001", "rtmp_url", "");
-        rig4.store.hset("chat:-1001", "rtmp_key", "");
+        rig4.store.hset("chatrt:-1001", "rtmp_url", "");
+        rig4.store.hset("chatrt:-1001", "rtmp_key", "");
     }
     {
         // /queue help renders the ops card.
@@ -1929,15 +2016,259 @@ int main() {
                            "Auto delete old messages"),
               "set page: screen renders");
         rig.d.handleCallback(makeCq("pl:set:page:0", -1001, 111));
-        auto v = rig.store.hget("chat:-1001", "page_purge");
-        CHECK(v && *v == "off" &&
-                  !rig.tg.toasts.empty() &&
-                  contains(rig.tg.toasts.back().text, "updated"),
-              "set page:0 persists off + confirms");
+        {
+            // Q7: the toggle posts paginate_purge_old=false to the
+            // backend (FakeIpc store) — never to the state.json
+            // chat: hash.
+            auto it = rig.ipc.settings_store.find(-1001);
+            bool off = false;
+            if (it != rig.ipc.settings_store.end()) {
+                parlay::Json st = parlay::Json::parse(it->second);
+                const parlay::Json* pg = st.find("paginate_purge_old");
+                off = pg && !pg->asBool(true);
+            }
+            CHECK(off && !rig.tg.toasts.empty() &&
+                      contains(rig.tg.toasts.back().text, "updated"),
+                  "set page:0 persists off + confirms");
+        }
         rig.d.handleCallback(makeCq("pl:set:musicdl", -1001, 111));
         CHECK(contains(rig.tg.edits.back().text,
                        "Download music via chat"),
               "set musicdl: screen renders");
+    }
+
+    // --- Q7. Settings rewire (Phase 6): backend bbolt is the single
+    // --- home for all 15 settings keys; the core's state.json keeps
+    // --- only runtime state (chatrt:) and never a second copy. ----
+    {
+        // (a) Settings fetch renders the panel from backend values
+        // and writes nothing to the state.json chat: hash.
+        Rig rig;
+        rig.ipc.seedSetting(-1201, "play_mode", "\"admins\"");
+        rig.ipc.seedSetting(-1201, "clean_delay_min", "30");
+        rig.d.handleMessage(makeMsg(-1201, 111, "/settings"));
+        bool got_settings = false;
+        for (const auto& g : rig.ipc.gets)
+            if (g == "/v1/chat/settings?chat_id=-1201") got_settings = true;
+        auto all = rig.store.hgetall("chat:-1201");
+        CHECK(got_settings && !rig.tg.replies.empty() &&
+                  contains(rig.tg.replies[0], "Chat Settings") &&
+                  all.count("play_mode") == 0 &&
+                  all.count("clean_delay_min") == 0,
+              "q7 fetch: panel from backend GET, no chat: hash writes");
+    }
+    {
+        // (b) A panel toggle posts only the changed key to the
+        // backend and confirms; nothing lands in state.json.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:set:playmode", -1202, 111));
+        int settings_posts = 0;
+        std::string settings_body;
+        for (size_t i = 0; i < rig.ipc.posts.size(); ++i)
+            if (rig.ipc.posts[i].find("|chat.settings") !=
+                std::string::npos) {
+                ++settings_posts;
+                settings_body = rig.ipc.post_bodies[i];
+            }
+        parlay::Json b = parlay::Json::parse(settings_body);
+        auto it = rig.ipc.settings_store.find(-1202);
+        bool stored_admins = false;
+        if (it != rig.ipc.settings_store.end()) {
+            parlay::Json st = parlay::Json::parse(it->second);
+            const parlay::Json* pm = st.find("play_mode");
+            stored_admins = pm && pm->asString() == "admins";
+        }
+        CHECK(settings_posts == 1 && b.find("key") &&
+                  b.find("key")->asString() == "play_mode" &&
+                  b.find("value") &&
+                  b.find("value")->asString() == "admins" &&
+                  stored_admins &&
+                  !rig.tg.toasts.empty() &&
+                  contains(rig.tg.toasts.back().text,
+                           "Settings updated") &&
+                  rig.store.hgetall("chat:-1202")
+                          .count("play_mode") == 0,
+              "q7 toggle: one-key post, stored in backend, no state copy");
+    }
+    {
+        // (c) clean_mode shape split: the core posts only the int
+        // minutes (clean_delay_min); the backend derives clean_mode.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1203, 111, "/cleanmode 30"));
+        auto it = rig.ipc.settings_store.find(-1203);
+        bool on = false, off = false;
+        if (it != rig.ipc.settings_store.end()) {
+            parlay::Json st = parlay::Json::parse(it->second);
+            const parlay::Json* cm = st.find("clean_mode");
+            const parlay::Json* cd = st.find("clean_delay_min");
+            on = cm && cm->asBool(false) && cd && cd->asInt() == 30;
+        }
+        CHECK(on && !rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(), "Clean mode on"),
+              "q7 cleanmode: /cleanmode 30 stores delay 30 + mode true");
+        rig.d.handleMessage(makeMsg(-1203, 111, "/cleanmode off"));
+        it = rig.ipc.settings_store.find(-1203);
+        if (it != rig.ipc.settings_store.end()) {
+            parlay::Json st = parlay::Json::parse(it->second);
+            const parlay::Json* cm = st.find("clean_mode");
+            const parlay::Json* cd = st.find("clean_delay_min");
+            off = cm && !cm->asBool(true) && cd && cd->asInt() == 0;
+        }
+        CHECK(off && !rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(), "Clean mode off"),
+              "q7 cleanmode: /cleanmode off stores delay 0 + mode false");
+    }
+    {
+        // (d) Backend down: reads fall back to locked defaults with
+        // the degraded note; writes fail honestly, nothing is
+        // claimed saved, and nothing is written anywhere.
+        Rig rig;
+        rig.ipc.settings_fail = true;
+        rig.d.handleMessage(makeMsg(-1204, 111, "/playmode"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(), "everyone") &&
+                  contains(rig.tg.replies.back(),
+                           "settings unreachable"),
+              "q7 down: /playmode shows defaults + degraded note");
+        rig.d.handleMessage(makeMsg(-1204, 111, "/playmode admins"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(),
+                           "Could not save play mode") &&
+                  rig.ipc.settings_store.find(-1204) ==
+                      rig.ipc.settings_store.end(),
+              "q7 down: /playmode admins fails honestly, nothing stored");
+    }
+    {
+        // (e) Runtime fields live in the chatrt: hash; a legacy
+        // chat: cplay is still read (read-only fallback) and a new
+        // write lands only in chatrt:.
+        Rig rig;
+        rig.store.set("call:-1205", "1");
+        rig.store.hset("chatrt:-1205", "loop", "3");
+        rig.d.handleMessage(makeMsg(-1205, 111, "/loop"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(), "Turned loop on"),
+              "q7 runtime: loop reads from chatrt:");
+        rig.store.hset("chat:-1206", "cplay", "-1207");
+        rig.d.handleMessage(makeMsg(-1206, 111, "/channelplay"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies.back(), "-1207") &&
+                  !rig.store.hget("chatrt:-1206", "cplay").has_value(),
+              "q7 runtime: legacy chat: cplay read, not migrated");
+        rig.store.set("call:-1208", "1");
+        rig.d.handleMessage(makeMsg(-1208, 111, "/loop 2"));
+        auto rt = rig.store.hget("chatrt:-1208", "loop");
+        CHECK(rt && *rt == "2" &&
+                  !rig.store.hget("chat:-1208", "loop").has_value(),
+              "q7 runtime: new loop write lands in chatrt: only");
+    }
+    {
+        // (f) After a full settings sequence (toggle, clean mode,
+        // thumbnail) the state.json chat: hash holds no settings
+        // keys at all — the backend is the only copy.
+        Rig rig;
+        rig.d.handleCallback(makeCq("pl:set:playmode", -1209, 111));
+        rig.d.handleMessage(makeMsg(-1209, 111, "/cleanmode 30"));
+        rig.d.handleMessage(makeMsg(-1209, 111, "/thumbnail off"));
+        auto all = rig.store.hgetall("chat:-1209");
+        CHECK(all.empty(), "q7 no-copy: chat: hash stays empty after "
+                           "playmode + cleanmode + thumbnail");
+    }
+
+    // --- Q7b. >50MB upload path (Phase 6): the bot->Telegram path
+    // --- passes a file PATH to TDLib (inputFileLocal); the core
+    // --- never reads the bytes and no size cap rejects it. The
+    // --- file here is a 60 MiB sparse synthetic file: the size is
+    // --- real, the bytes are zeros, and the proof is the path-only
+    // --- request, not a live Telegram send. -------------------------
+    {
+        const std::string dir = "/tmp/parlay-upload-test";
+        std::filesystem::create_directories(dir);
+        const std::string big = dir + "/big-60m.bin";
+        {
+            std::ofstream out(big, std::ios::binary | std::ios::trunc);
+            out.seekp(60LL * 1024 * 1024 - 1);
+            out.put('\0');
+        }
+        CHECK(std::filesystem::file_size(big) == 60ULL * 1024 * 1024,
+              "q7b upload: 60 MiB synthetic file exists");
+        // Fake bot-session client: answers parseTextEntities with a
+        // formattedText and captures every sendMessage request.
+        class FakeBotClient : public parlay::TdLibClient {
+        public:
+            FakeBotClient()
+                : parlay::TdLibClient(parlay::SessionKind::Bot) {}
+            mutable std::vector<std::string> requests;
+            mutable std::string fail_message;
+            parlay::Json call(const parlay::Json& req,
+                              double timeout_sec = 30.0) override {
+                (void)timeout_sec;
+                requests.push_back(req.dump());
+                const parlay::Json* type = req.find("@type");
+                if (type && type->asString() == "parseTextEntities") {
+                    const parlay::Json* t = req.find("text");
+                    return parlay::Json::objectOf({
+                        {"@type", parlay::Json("formattedText")},
+                        {"text", t ? *t : parlay::Json("")},
+                        {"entities",
+                         parlay::Json(parlay::Json::Array{})},
+                    });
+                }
+                if (!fail_message.empty()) {
+                    return parlay::Json::objectOf({
+                        {"@type", parlay::Json("error")},
+                        {"code", parlay::Json(static_cast<int64_t>(400))},
+                        {"message", parlay::Json(fail_message)},
+                    });
+                }
+                return parlay::Json::objectOf({
+                    {"@type", parlay::Json("message")},
+                    {"id", parlay::Json(static_cast<int64_t>(777))},
+                });
+            }
+        };
+        FakeBotClient bot;
+        parlay::TdLibTelegramSender sender(bot, dir);
+        std::string err;
+        int64_t id = sender.sendFile(-1201, big, "", &err);
+        CHECK(id == 777 && err.empty(),
+              "q7b upload: sendFile >50MB succeeds via TDLib");
+        CHECK(bot.requests.size() == 2,
+              "q7b upload: exactly one parse + one sendMessage");
+        parlay::Json req = parlay::Json::parse(bot.requests.back());
+        const parlay::Json* content = req.find("input_message_content");
+        const parlay::Json* doc = content ? content->find("document") : nullptr;
+        bool path_only = content && content->find("@type") &&
+                         content->find("@type")->asString() ==
+                             "inputMessageDocument" &&
+                         doc && doc->find("@type") &&
+                         doc->find("@type")->asString() ==
+                             "inputFileLocal" &&
+                         doc->find("path") &&
+                         doc->find("path")->asString() == big;
+        CHECK(path_only && bot.requests.back().size() < 2048,
+              "q7b upload: request carries the path only (<2 KiB, no "
+              "file bytes embedded)");
+        // Audio variant: same file, inputMessageAudio.
+        bot.requests.clear();
+        id = sender.sendAudioFile(-1201, big, "", &err);
+        CHECK(id == 777 && err.empty(),
+              "q7b upload: sendAudioFile >50MB succeeds via TDLib");
+        parlay::Json areq = parlay::Json::parse(bot.requests.back());
+        const parlay::Json* acontent =
+            areq.find("input_message_content");
+        CHECK(acontent && acontent->find("@type") &&
+                  acontent->find("@type")->asString() ==
+                      "inputMessageAudio",
+              "q7b upload: audio request is inputMessageAudio");
+        // Honest failure: a TDLib error surfaces verbatim, no fake
+        // success and no silent drop.
+        bot.requests.clear();
+        bot.fail_message = "FILE_TOO_BIG (test)";
+        id = sender.sendFile(-1201, big, "", &err);
+        CHECK(id == -1 && err == "400: FILE_TOO_BIG (test)",
+              "q7b upload: TDLib error surfaces verbatim");
+        std::filesystem::remove(big);
     }
 
     // --- L. Phase 9 gaps: inline queries, deep link, lrc_path, share
@@ -2751,13 +3082,13 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Turned loop on"),
               "/loop 3: loop-on reply");
-        auto f = rig.store.hgetall("chat:-1101");
+        auto f = rig.store.hgetall("chatrt:-1101");
         CHECK(f["loop"] == "3", "/loop 3: count recorded in the room");
     }
     {
         Rig rig;
         rig.store.set("call:-1102", "1");
-        rig.store.hset("chat:-1102", "loop", "3");
+        rig.store.hset("chatrt:-1102", "loop", "3");
         rig.d.handleMessage(makeMsg(-1102, 111, "/loop off"));
         {
             parlay::Json b = parlay::Json::parse(last_post_body(rig));
@@ -2768,13 +3099,13 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "Turned loop off"),
               "/loop off: loop-off reply");
-        auto f = rig.store.hgetall("chat:-1102");
+        auto f = rig.store.hgetall("chatrt:-1102");
         CHECK(f["loop"] == "0", "/loop off: count cleared in the room");
     }
     {
         Rig rig;
         rig.store.set("call:-1103", "1");
-        rig.store.hset("chat:-1103", "loop", "2");
+        rig.store.hset("chatrt:-1103", "loop", "2");
         rig.d.handleMessage(makeMsg(-1103, 111, "/loop"));
         CHECK(!has_post(rig, "loop"),
               "/loop no args: no vc.loop call, state only");

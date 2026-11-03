@@ -40,8 +40,12 @@ namespace {
 // back) so existing callers and tests are unaffected. Only the NEW
 // unified PARLAY_* keys are strict (below).
 std::string envStr(const char* name, const std::string& fallback = "") {
+    // A set-but-empty var means "unset" (same rule as envInt below
+    // and the PARLAY_DATA_DIR handling in applyLegacyEnv): .env
+    // ships TD_API_HASH= empty, and an empty value must fall back
+    // to API_HASH instead of shadowing it with "".
     const char* v = std::getenv(name);
-    return v ? std::string(v) : fallback;
+    return (v && *v) ? std::string(v) : fallback;
 }
 
 int64_t envInt(const char* name, int64_t fallback = 0) {

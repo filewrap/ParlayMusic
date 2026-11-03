@@ -996,7 +996,7 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         }
         // Clean mode: the command message goes too (Everyone commands).
         if (r.perm == Perm::Everyone) {
-            int mins = chatIntField(msg.chat.id, "clean_mode", 0);
+            int mins = settingsFor(msg.chat.id).clean_delay_min;
             if (mins > 0)
                 scheduleDelete(msg.chat.id, msg.message_id, mins);
         }
@@ -1086,7 +1086,7 @@ bool Dispatcher::canManageVc(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     int64_t user = ctx.message.from.id;
     if (isSudo(user)) return true;
-    int mode = chatIntField(chat, "admin_mode", 0);
+    int mode = settingsFor(chat).admin_mode;
     if (mode == 2) return true;  // everyone
     if (isChatAdmin(chat, user)) return true;
     if (mode == 0 && isAuthUser(chat, user)) return true;
@@ -1096,7 +1096,7 @@ bool Dispatcher::canManageVc(const CommandContext& ctx) {
 
 bool Dispatcher::playAllowed(const CommandContext& ctx, bool force) {
     int64_t chat = vcTarget(ctx);
-    bool admin_only = chatField(chat, "play_mode", "everyone") == "admins";
+    bool admin_only = settingsFor(chat).play_mode == "admins";
     if (!admin_only && !force) return true;
     int64_t user = ctx.message.from.id;
     if (isSudo(user) || isChatAdmin(chat, user) || isAuthUser(chat, user))
@@ -1123,21 +1123,195 @@ bool Dispatcher::checkRateLimit(const CommandContext& ctx) {
 }
 
 
-// --- chat settings ---------------------------------------------------------
-std::string Dispatcher::chatField(int64_t chat_id, const std::string& field,
-                                  const std::string& def) {
-    auto v = store_.hget("chat:" + std::to_string(chat_id), field);
-    return v ? *v : def;
+// --- chat settings (Q7 rewire) ------------------------------------------------
+// The backend's bbolt store is the single home for the 15
+// chat.settings keys; the core keeps only an in-memory cache, never
+// a second copy in state.json.
+namespace {
+
+// Locked defaults, as the backend's DefaultChatSettings (Go) renders
+// them. Used when the backend is down and no snapshot is cached.
+ui_texts::ChatSettings defaultChatSettings() {
+    return ui_texts::ChatSettings{};
 }
 
-void Dispatcher::setChatField(int64_t chat_id, const std::string& field,
-                              const std::string& value) {
-    store_.hset("chat:" + std::to_string(chat_id), field, value);
+// Parse a backend "settings" object (all 15 keys) into the panel
+// snapshot. Unknown/absent keys keep the locked defaults; the
+// backend validator is the authority on ranges, so no second
+// validation happens here.
+ui_texts::ChatSettings parseSettingsJson(const Json& settings) {
+    ui_texts::ChatSettings s;
+    const Json* v = nullptr;
+    if ((v = settings.find("admin_mode")) != nullptr)
+        s.admin_mode = static_cast<int>(v->asInt(s.admin_mode));
+    if ((v = settings.find("play_mode")) != nullptr && v->isString())
+        s.play_mode = v->asString();
+    if ((v = settings.find("cmd_delete")) != nullptr)
+        s.cmd_delete = v->asBool(s.cmd_delete);
+    if ((v = settings.find("clean_delay_min")) != nullptr)
+        s.clean_delay_min = static_cast<int>(v->asInt(s.clean_delay_min));
+    if ((v = settings.find("thumbnails")) != nullptr)
+        s.thumbnails = v->asBool(s.thumbnails);
+    if ((v = settings.find("autoplay")) != nullptr)
+        s.autoplay = v->asBool(s.autoplay);
+    if ((v = settings.find("autoplay_lang")) != nullptr && v->isString())
+        s.autoplay_lang = v->asString();
+    if ((v = settings.find("autoplay_mood")) != nullptr && v->isString())
+        s.autoplay_mood = v->asString();
+    if ((v = settings.find("silent_mode")) != nullptr)
+        s.silent = v->asBool(s.silent);
+    if ((v = settings.find("auto_delete")) != nullptr)
+        s.auto_delete = v->asBool(s.auto_delete);
+    if ((v = settings.find("auto_delete_min")) != nullptr)
+        s.auto_delete_min =
+            static_cast<int>(v->asInt(s.auto_delete_min));
+    if ((v = settings.find("language")) != nullptr && v->isString())
+        s.language = v->asString();
+    if ((v = settings.find("paginate_purge_old")) != nullptr)
+        s.paginate_purge_old = v->asBool(s.paginate_purge_old);
+    if ((v = settings.find("chat_music_download")) != nullptr)
+        s.chat_music_download = v->asBool(s.chat_music_download);
+    return s;
 }
 
-int Dispatcher::chatIntField(int64_t chat_id, const std::string& field,
-                             int def) {
-    std::string v = chatField(chat_id, field, "");
+// Patch one key of a cached snapshot from a set value (the fallback
+// when the backend's set response carries no settings object).
+void applySettingKey(ui_texts::ChatSettings& s, const std::string& key,
+                     const Json& value) {
+    if (key == "admin_mode") s.admin_mode = static_cast<int>(value.asInt(s.admin_mode));
+    else if (key == "play_mode" && value.isString()) s.play_mode = value.asString();
+    else if (key == "cmd_delete") s.cmd_delete = value.asBool(s.cmd_delete);
+    else if (key == "clean_delay_min") s.clean_delay_min = static_cast<int>(value.asInt(s.clean_delay_min));
+    else if (key == "thumbnails") s.thumbnails = value.asBool(s.thumbnails);
+    else if (key == "autoplay") s.autoplay = value.asBool(s.autoplay);
+    else if (key == "autoplay_lang" && value.isString()) s.autoplay_lang = value.asString();
+    else if (key == "autoplay_mood" && value.isString()) s.autoplay_mood = value.asString();
+    else if (key == "silent_mode") s.silent = value.asBool(s.silent);
+    else if (key == "auto_delete") s.auto_delete = value.asBool(s.auto_delete);
+    else if (key == "auto_delete_min") s.auto_delete_min = static_cast<int>(value.asInt(s.auto_delete_min));
+    else if (key == "language" && value.isString()) s.language = value.asString();
+    else if (key == "paginate_purge_old") s.paginate_purge_old = value.asBool(s.paginate_purge_old);
+    else if (key == "chat_music_download") s.chat_music_download = value.asBool(s.chat_music_download);
+    // clean_mode has no field: it is derived from clean_delay_min > 0.
+}
+
+// Appended to status replies when the settings snapshot is served
+// from cache/defaults because the backend is down (Q7 fallback):
+// the "current" value shown may not be the chat's stored value.
+const char* kSettingsDegradedSuffix =
+    " (settings unreachable — showing defaults)";
+
+}  // namespace
+
+ui_texts::ChatSettings Dispatcher::settingsFor(int64_t chat_id) {
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(settings_mu_);
+        auto it = settings_cache_.find(chat_id);
+        if (it != settings_cache_.end()) {
+            auto ttl = it->second.live ? seconds(60) : seconds(5);
+            if (now - it->second.fetched_at < ttl)
+                return it->second.settings;
+        }
+    }
+    // Cache miss / stale: one UDS GET (chat.settings get-all).
+    IpcResult r = ipc_.get("/v1/chat/settings?chat_id=" +
+                               std::to_string(chat_id),
+                           10);
+    std::lock_guard<std::mutex> lk(settings_mu_);
+    if (r.ok) {
+        const Json* settings = r.data.find("settings");
+        ui_texts::ChatSettings s =
+            settings ? parseSettingsJson(*settings) : defaultChatSettings();
+        settings_cache_[chat_id] = SettingsCacheEntry{s, now, true};
+        return s;
+    }
+    // Backend down (fallback semantics, Q7 blocker (d)): keep serving
+    // the last snapshot when there is one (stale but best-known),
+    // else the locked defaults — never a second copy in state.json.
+    // The 5 s TTL above re-probes soon. Gates fail OPEN on the
+    // defaults (play_mode "everyone", admin_mode 0) while the backend
+    // is down; that policy is flagged for the user in
+    // phase6/worker-c-parity.md — a fail-closed gate is a one-line
+    // change at the playAllowed/canManageVc call sites.
+    std::cerr << "[settings] chat.settings fetch failed for chat "
+              << chat_id << " (" << r.describe()
+              << "); serving cached/default settings\n";
+    auto it = settings_cache_.find(chat_id);
+    if (it != settings_cache_.end()) {
+        it->second.live = false;
+        it->second.fetched_at = now;
+        return it->second.settings;
+    }
+    ui_texts::ChatSettings def = defaultChatSettings();
+    settings_cache_[chat_id] = SettingsCacheEntry{def, now, false};
+    return def;
+}
+
+bool Dispatcher::settingsLive(int64_t chat_id) {
+    using namespace std::chrono;
+    std::lock_guard<std::mutex> lk(settings_mu_);
+    auto it = settings_cache_.find(chat_id);
+    if (it == settings_cache_.end() || !it->second.live) return false;
+    return steady_clock::now() - it->second.fetched_at < seconds(60);
+}
+
+bool Dispatcher::setSetting(int64_t chat_id, const std::string& key,
+                            const Json& value) {
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat_id)},
+        {"key", Json(key)},
+        {"value", value},
+    });
+    IpcResult r = ipc_.post("chat.settings", body, 10);
+    if (!r.ok) {
+        std::cerr << "[settings] chat.settings set " << key << " for chat "
+                  << chat_id << " failed (" << r.describe() << ")\n";
+        return false;
+    }
+    // Write-through: the cache matches the backend for this key. The
+    // set response carries the updated settings object; prefer it
+    // (it also carries the backend's clean_mode / clean_delay_min
+    // sync), else patch the one key locally.
+    std::lock_guard<std::mutex> lk(settings_mu_);
+    const Json* settings = r.data.find("settings");
+    if (settings) {
+        ui_texts::ChatSettings s = parseSettingsJson(*settings);
+        settings_cache_[chat_id] =
+            SettingsCacheEntry{s, std::chrono::steady_clock::now(), true};
+        return true;
+    }
+    auto it = settings_cache_.find(chat_id);
+    if (it != settings_cache_.end()) {
+        applySettingKey(it->second.settings, key, value);
+        it->second.fetched_at = std::chrono::steady_clock::now();
+        it->second.live = true;
+    }
+    return true;
+}
+
+// --- per-chat runtime fields (NOT settings) ------------------------------
+// Core-voice session + routing state with no backend home. Reads fall
+// back to the legacy "chat:" hash once (pre-rewire values survive the
+// upgrade); writes go to "chatrt:" only.
+std::string Dispatcher::chatRtField(int64_t chat_id,
+                                    const std::string& field,
+                                    const std::string& def) const {
+    auto v = store_.hget("chatrt:" + std::to_string(chat_id), field);
+    if (v) return *v;
+    auto legacy = store_.hget("chat:" + std::to_string(chat_id), field);
+    return legacy ? *legacy : def;
+}
+
+void Dispatcher::setChatRtField(int64_t chat_id, const std::string& field,
+                                const std::string& value) {
+    store_.hset("chatrt:" + std::to_string(chat_id), field, value);
+}
+
+int Dispatcher::chatRtIntField(int64_t chat_id, const std::string& field,
+                               int def) const {
+    std::string v = chatRtField(chat_id, field, "");
     if (v.empty()) return def;
     try {
         return std::stoi(v);
@@ -1146,8 +1320,8 @@ int Dispatcher::chatIntField(int64_t chat_id, const std::string& field,
     }
 }
 
-double Dispatcher::chatSpeedField(int64_t chat_id) {
-    std::string v = chatField(chat_id, "speed", "");
+double Dispatcher::chatRtSpeedField(int64_t chat_id) const {
+    std::string v = chatRtField(chat_id, "speed", "");
     if (v.empty()) return 1.0;
     char* end = nullptr;
     double s = std::strtod(v.c_str(), &end);
@@ -1166,11 +1340,9 @@ bool Dispatcher::isAuthUser(int64_t chat_id, int64_t user_id) const {
 
 int64_t Dispatcher::vcTarget(const CommandContext& ctx) const {
     if (!ctx.via_channel) return ctx.message.chat.id;
-    auto v = store_.hget("chat:" + std::to_string(ctx.message.chat.id),
-                         "cplay");
-    if (!v) return ctx.message.chat.id;
+    std::string v = chatRtField(ctx.message.chat.id, "cplay", "0");
     try {
-        int64_t ch = std::stoll(*v);
+        int64_t ch = std::stoll(v);
         return ch != 0 ? ch : ctx.message.chat.id;
     } catch (...) {
         return ctx.message.chat.id;
@@ -1185,7 +1357,7 @@ int64_t Dispatcher::reply(const CommandContext& ctx, const std::string& text) {
         std::cerr << "[tg] sendMessage failed\n";
         return -1;
     }
-    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
     if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
     return id;
 }
@@ -1203,7 +1375,7 @@ int64_t Dispatcher::replyHtml(const CommandContext& ctx,
         std::cerr << "[tg] sendMessageHtml failed\n";
         return -1;
     }
-    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
     if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
     return id;
 }
@@ -1217,7 +1389,7 @@ int64_t Dispatcher::replyKb(const CommandContext& ctx, const std::string& text,
         std::cerr << "[tg] sendMessageHtml (kb) failed\n";
         return -1;
     }
-    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
     if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
     return id;
 }
@@ -1234,7 +1406,7 @@ int64_t Dispatcher::replyReplyKb(const CommandContext& ctx,
         std::cerr << "[tg] sendMessageHtml (reply kb) failed\n";
         return -1;
     }
-    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
     if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
     return id;
 }
@@ -1248,7 +1420,7 @@ int64_t Dispatcher::replyPhoto(const CommandContext& ctx,
         std::cerr << "[tg] sendPhoto failed\n";
         return -1;
     }
-    int mins = chatIntField(ctx.message.chat.id, "clean_mode", 0);
+    int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
     if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
     return id;
 }
@@ -1319,39 +1491,56 @@ ui_texts::CardTrack Dispatcher::cardTrack(const Json& track,
 }
 
 ui_texts::ChatSettings Dispatcher::chatSettings(int64_t chat_id) {
-    ui_texts::ChatSettings s;
-    s.admin_mode = chatIntField(chat_id, "admin_mode", 0);
-    s.play_mode = chatField(chat_id, "play_mode", "everyone");
-    s.cmd_delete = chatField(chat_id, "cmd_delete", "off") == "on";
-    s.clean_delay_min = chatIntField(chat_id, "clean_mode", 0);
-    s.thumbnails = chatField(chat_id, "thumb", "on") == "on";
-    s.autoplay = chatField(chat_id, "autoplay", "off") == "on";
-    s.silent = chatField(chat_id, "silent", "off") == "on";
-    s.auto_delete = chatField(chat_id, "autodelete", "off") == "on";
-    s.auto_delete_min = chatIntField(chat_id, "autodelete_min", 5);
-    s.language = chatField(chat_id, "lang", "en");
-    s.paginate_purge_old =
-        chatField(chat_id, "page_purge", "on") == "on";
-    s.chat_music_download =
-        chatField(chat_id, "musicdl", "on") == "on";
-    return s;
+    return settingsFor(chat_id);
 }
 
-void Dispatcher::saveChatSettings(int64_t chat_id,
+bool Dispatcher::saveChatSettings(int64_t chat_id,
                                   const ui_texts::ChatSettings& s) {
-    setChatField(chat_id, "admin_mode", std::to_string(s.admin_mode));
-    setChatField(chat_id, "play_mode", s.play_mode);
-    setChatField(chat_id, "cmd_delete", s.cmd_delete ? "on" : "off");
-    setChatField(chat_id, "clean_mode", std::to_string(s.clean_delay_min));
-    setChatField(chat_id, "thumb", s.thumbnails ? "on" : "off");
-    setChatField(chat_id, "autoplay", s.autoplay ? "on" : "off");
-    setChatField(chat_id, "silent", s.silent ? "on" : "off");
-    setChatField(chat_id, "autodelete", s.auto_delete ? "on" : "off");
-    setChatField(chat_id, "autodelete_min",
-                 std::to_string(s.auto_delete_min));
-    setChatField(chat_id, "lang", s.language);
-    setChatField(chat_id, "page_purge", s.paginate_purge_old ? "on" : "off");
-    setChatField(chat_id, "musicdl", s.chat_music_download ? "on" : "off");
+    // Diffed write-back: only keys that changed vs the fetched
+    // snapshot are posted, so a panel toggle is one UDS call and a
+    // stale read can never clobber an untouched key. clean_mode has
+    // no field of its own: the backend derives it from
+    // clean_delay_min > 0, so the delay is posted first and the bool
+    // follows when it changed. Stops at the first failed write and
+    // returns false — the caller must not claim the save worked.
+    ui_texts::ChatSettings cur = settingsFor(chat_id);
+    bool ok = true;
+    auto postIfChanged = [&](const std::string& key, const Json& value,
+                             bool changed) {
+        if (!changed || !ok) return;
+        if (!setSetting(chat_id, key, value)) ok = false;
+    };
+    postIfChanged("admin_mode", Json(static_cast<int64_t>(s.admin_mode)),
+                  s.admin_mode != cur.admin_mode);
+    postIfChanged("play_mode", Json(s.play_mode),
+                  s.play_mode != cur.play_mode);
+    postIfChanged("cmd_delete", Json(s.cmd_delete),
+                  s.cmd_delete != cur.cmd_delete);
+    postIfChanged("clean_delay_min",
+                  Json(static_cast<int64_t>(s.clean_delay_min)),
+                  s.clean_delay_min != cur.clean_delay_min);
+    postIfChanged("clean_mode", Json(s.clean_delay_min > 0),
+                  (s.clean_delay_min > 0) != (cur.clean_delay_min > 0));
+    postIfChanged("thumbnails", Json(s.thumbnails),
+                  s.thumbnails != cur.thumbnails);
+    postIfChanged("autoplay", Json(s.autoplay), s.autoplay != cur.autoplay);
+    postIfChanged("autoplay_lang", Json(s.autoplay_lang),
+                  s.autoplay_lang != cur.autoplay_lang);
+    postIfChanged("autoplay_mood", Json(s.autoplay_mood),
+                  s.autoplay_mood != cur.autoplay_mood);
+    postIfChanged("silent_mode", Json(s.silent), s.silent != cur.silent);
+    postIfChanged("auto_delete", Json(s.auto_delete),
+                  s.auto_delete != cur.auto_delete);
+    postIfChanged("auto_delete_min",
+                  Json(static_cast<int64_t>(s.auto_delete_min)),
+                  s.auto_delete_min != cur.auto_delete_min);
+    postIfChanged("language", Json(s.language),
+                  s.language != cur.language);
+    postIfChanged("paginate_purge_old", Json(s.paginate_purge_old),
+                  s.paginate_purge_old != cur.paginate_purge_old);
+    postIfChanged("chat_music_download", Json(s.chat_music_download),
+                  s.chat_music_download != cur.chat_music_download);
+    return ok;
 }
 
 void Dispatcher::recordCard(int64_t chat_id, int64_t message_id,
@@ -1399,7 +1588,7 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     if (const Json* l = np.find("loop")) loop = static_cast<int>(l->asInt());
     if (const Json* l = np.find("loop_count"))
         loop = static_cast<int>(l->asInt());
-    if (loop == 0) loop = chatIntField(chat_id, "loop", 0);
+    if (loop == 0) loop = chatRtIntField(chat_id, "loop", 0);
     std::string text = ui_texts::nowPlayingText(ct);
     if (!state_line.empty()) text = state_line + "\n\n" + text;
     InlineKeyboard kb = ui_texts::playerKeyboard(
@@ -1626,7 +1815,7 @@ bool Dispatcher::callbackCanControl(int64_t chat_id, int64_t user_id) {
     if (isSudo(user_id)) return true;
     if (isChatAdmin(chat_id, user_id)) return true;
     if (isAuthUser(chat_id, user_id)) return true;
-    return chatIntField(chat_id, "admin_mode", 0) == 2;
+    return settingsFor(chat_id).admin_mode == 2;
 }
 
 void Dispatcher::refreshPanel(const TgCallbackQuery& cq, int64_t chat_id) {
@@ -1699,7 +1888,7 @@ void Dispatcher::scheduleDelete(int64_t chat_id, int64_t message_id,
 }
 
 void Dispatcher::deleteCommandMessage(const CommandContext& ctx) {
-    if (chatField(ctx.message.chat.id, "cmd_delete", "off") == "on")
+    if (settingsFor(ctx.message.chat.id).cmd_delete)
         tg_.deleteMessage(ctx.message.chat.id, ctx.message.message_id);
 }
 
@@ -1829,7 +2018,7 @@ bool Dispatcher::muteVoice(int64_t chat_id, bool mute,
         error = r.describe();
         return false;
     }
-    setChatField(chat_id, "muted", mute ? "1" : "0");
+    setChatRtField(chat_id, "muted", mute ? "1" : "0");
     return true;
 }
 
@@ -2110,7 +2299,7 @@ void Dispatcher::refreshCardText(int64_t chat_id, int64_t message_id,
     if (const Json* l = np.find("loop")) loop = static_cast<int>(l->asInt());
     if (const Json* l = np.find("loop_count"))
         loop = static_cast<int>(l->asInt());
-    if (loop == 0) loop = chatIntField(chat_id, "loop", 0);
+    if (loop == 0) loop = chatRtIntField(chat_id, "loop", 0);
     std::string text = ui_texts::nowPlayingText(ct);
     InlineKeyboard kb = ui_texts::playerKeyboard(
         chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
@@ -2457,7 +2646,7 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
         return;
     }
     if (!playAllowed(ctx, force)) return;
-    if (ctx.via_channel && chatField(ctx.message.chat.id, "cplay", "0") == "0") {
+    if (ctx.via_channel && chatRtField(ctx.message.chat.id, "cplay", "0") == "0") {
         reply(ctx, "No channel linked. Use /channelplay first.");
         return;
     }
@@ -2513,8 +2702,8 @@ Json Dispatcher::vcPlayBody(int64_t chat, const std::string& query,
         {"chat_id", Json(chat)},
         {"query", Json(query)},
         {"requested_by", Json(requested_by)},
-        {"speed", Json(chatSpeedField(chat))},
-        {"bass", Json(static_cast<int64_t>(chatIntField(chat, "bass", 0)))},
+        {"speed", Json(chatRtSpeedField(chat))},
+        {"bass", Json(static_cast<int64_t>(chatRtIntField(chat, "bass", 0)))},
     });
 }
 
@@ -2543,15 +2732,17 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
     // it); /stop and the TrackEnded/QueueEmpty events clear it.
     setCallActive(chat, true);
     if (track) {
-        setChatField(chat, "last_track",
+        setChatRtField(chat, "last_track",
                      track->find("title") ? track->find("title")->asString() : "");
         store_.set("last_requester_name:" + std::to_string(chat),
                    displayName(ctx.message.from));
         store_.set("last_requester_id:" + std::to_string(chat),
                    std::to_string(ctx.message.from.id));
     }
-    if (chatField(chat, "logger_on", "") == "1" ||
-        store_.get("logger_on") == std::optional<std::string>("1"))
+    // The per-chat logger_on field was never written anywhere (only
+    // the global logger_on key is, by /logger) — the read is dropped
+    // with the Q7 rewire; the global key stays the toggle.
+    if (store_.get("logger_on") == std::optional<std::string>("1"))
         logToLogger("Play in " + std::to_string(chat) + ": " +
                     (track && track->find("title")
                          ? track->find("title")->asString()
@@ -2611,7 +2802,7 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
         return;
     }
     std::string state_line = "Now playing";
-    if (chatIntField(chat, "muted", 0))
+    if (chatRtIntField(chat, "muted", 0))
         state_line += "\n(muted — use /unmute)";
     sendNowPlayingCard(chat, now, state_line);
     deleteCommandMessage(ctx);
@@ -2635,7 +2826,7 @@ bool Dispatcher::playRepliedFile(const CommandContext& ctx,
         return false;
     }
     std::string track_title = title.empty() ? "Replied file" : title;
-    setChatField(chat, "last_track", track_title);
+    setChatRtField(chat, "last_track", track_title);
     // What was playing before this call: a play_file that lands while
     // something is already playing queues the file instead, and the
     // reply is the queued card (§4), not the now-playing card.
@@ -2773,10 +2964,10 @@ void Dispatcher::onStop(const CommandContext& ctx) {
     setCallActive(vcTarget(ctx), false);
     // The backend owns the call: its stop ends the session. Reset the
     // per-chat playback flags the core keeps.
-    setChatField(vcTarget(ctx), "loop", "0");
-    setChatField(vcTarget(ctx), "speed", "1.0");
-    setChatField(vcTarget(ctx), "bass", "0");
-    setChatField(vcTarget(ctx), "muted", "0");
+    setChatRtField(vcTarget(ctx), "loop", "0");
+    setChatRtField(vcTarget(ctx), "speed", "1.0");
+    setChatRtField(vcTarget(ctx), "bass", "0");
+    setChatRtField(vcTarget(ctx), "muted", "0");
     if (!r.ok) {
         replyError(ctx, r);
         return;
@@ -2806,7 +2997,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     int64_t chat = vcTarget(ctx);
     if (args.empty()) {
-        int n = chatIntField(chat, "loop", 0);
+        int n = chatRtIntField(chat, "loop", 0);
         replyHtml(ctx, n > 0 ? ui_texts::kCtlLoopOn
                              : "Usage: /loop <1-10|off>");
         return;
@@ -2837,7 +3028,7 @@ void Dispatcher::onLoop(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    setChatField(chat, "loop", std::to_string(count));
+    setChatRtField(chat, "loop", std::to_string(count));
     replyHtml(ctx, count > 0 ? ui_texts::kCtlLoopOn
                              : ui_texts::kCtlLoopOff);
 }
@@ -3236,7 +3427,7 @@ void Dispatcher::onPos(const CommandContext& ctx) {
         np.find("position_sec") ? np.find("position_sec")->asInt() : 0;
     int64_t dur =
         track.find("duration_sec") ? track.find("duration_sec")->asInt() : 0;
-    std::string speed = chatField(vcTarget(ctx), "speed", "1.0");
+    std::string speed = chatRtField(vcTarget(ctx), "speed", "1.0");
     replyHtml(ctx, ui_texts::fmt(ui_texts::kPositionText,
                                  {{"title",
                                    ui_texts::htmlEscape(
@@ -3296,7 +3487,7 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
-        reply(ctx, "Current speed: " + chatField(chat, "speed", "1.0") +
+        reply(ctx, "Current speed: " + chatRtField(chat, "speed", "1.0") +
                        "x. Usage: /speed <0.5-4.0|normal>");
         return;
     }
@@ -3319,7 +3510,7 @@ void Dispatcher::onSpeed(const CommandContext& ctx) {
         reply(ctx, "Speed must be 0.5x to 4.0x.");
         return;
     }
-    setChatField(chat, "speed", std::to_string(s));
+    setChatRtField(chat, "speed", std::to_string(s));
     // The backend owns the audio pipeline: live speed filtering is a
     // backend DSP job (Phase 5). The value is stored (what /pos and
     // /speed report) and the stream is restarted at the current
@@ -3358,7 +3549,7 @@ void Dispatcher::onBass(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
-        reply(ctx, "Current bass: " + std::to_string(chatIntField(chat, "bass", 0)) +
+        reply(ctx, "Current bass: " + std::to_string(chatRtIntField(chat, "bass", 0)) +
                        ". Usage: /bass <0-100|on|off|max>");
         return;
     }
@@ -3373,7 +3564,7 @@ void Dispatcher::onBass(const CommandContext& ctx) {
         reply(ctx, "Bass must be 0-100.");
         return;
     }
-    setChatField(chat, "bass", std::to_string(lvl));
+    setChatRtField(chat, "bass", std::to_string(lvl));
     // Same honest limit as /speed: live bass filtering is a backend
     // DSP job (Phase 5). The value is stored and the stream is
     // restarted at the current position; the reply says plainly that
@@ -3410,7 +3601,7 @@ void Dispatcher::onMute(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     bool mute = ctx.command == "mute";
     int64_t chat = vcTarget(ctx);
-    int cur = chatIntField(chat, "muted", 0);
+    int cur = chatRtIntField(chat, "muted", 0);
     if ((cur != 0) == mute) {
         replyHtml(ctx, mute ? ui_texts::kCtlAlreadyMuted
                             : ui_texts::kCtlNotMuted);
@@ -3870,8 +4061,8 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
     }
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
-        edit_progress("That file is over the 50 MB send cap — queued "
-                      "for a later send instead of failing.",
+        edit_progress("That file is over the 50 MB send cap — not "
+                      "sent. There is no large-file send yet.",
                       InlineKeyboard{});
         return;
     }
@@ -4048,8 +4239,8 @@ void Dispatcher::deepLinkDownload(const CommandContext& ctx,
     }
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
-        edit_progress("That file is over the 50 MB send cap — queued "
-                      "for a later send instead of failing.");
+        edit_progress("That file is over the 50 MB send cap — not "
+                      "sent. There is no large-file send yet.");
         return;
     }
     const Json* resp_track = r.data.find("track");
@@ -4100,8 +4291,8 @@ void Dispatcher::deliverSpotifyCollection(const TgCallbackQuery& cq,
     const Json* oversize = r.data.find("oversize");
     if (oversize && oversize->asBool()) {
         answerCb(cq,
-                 "That collection is over the 50 MB send cap — queued "
-                 "for a later send instead of failing.",
+                 "That collection is over the 50 MB send cap — not "
+                 "sent. There is no large-file send yet.",
                  true);
         return;
     }
@@ -4864,9 +5055,11 @@ void Dispatcher::onMyPlaylists(const CommandContext& ctx) {
 void Dispatcher::onPlaymode(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     auto args = splitArgs(ctx.args);
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
     if (args.empty()) {
         reply(ctx, "Usage: /playmode admin|everyone (current: " +
-                       chatField(chat, "play_mode", "everyone") + ")");
+                       s.play_mode + ")" + degraded);
         return;
     }
     std::string a = lowerStr(args[0]);
@@ -4874,11 +5067,16 @@ void Dispatcher::onPlaymode(const CommandContext& ctx) {
     bool all = a == "everyone" || a == "all";
     if (!admins && !all) {
         reply(ctx, "Usage: /playmode admin|everyone (current: " +
-                       chatField(chat, "play_mode", "everyone") + ")");
+                       s.play_mode + ")" + degraded);
         return;
     }
     if (!adminCheck(ctx)) return;
-    setChatField(chat, "play_mode", admins ? "admins" : "everyone");
+    if (!setSetting(chat, "play_mode",
+                    Json(admins ? "admins" : "everyone"))) {
+        reply(ctx, "Could not save play mode — the settings backend is "
+                   "unreachable. Your change was not stored.");
+        return;
+    }
     replyHtml(ctx, admins ? ui_texts::kPlayModeAdmin
                           : ui_texts::kPlayModeEveryone);
 }
@@ -4894,19 +5092,24 @@ void Dispatcher::onSettings(const CommandContext& ctx) {
     std::string title = ctx.message.chat.title;
     if (title.empty()) title = std::to_string(chat);
     store_.set("chat_title:" + std::to_string(chat), title);
-    replyKb(ctx, ui_texts::fmt(ui_texts::kSettingsText,
-                               {{"title", ui_texts::htmlEscape(title)},
-                                {"id", std::to_string(chat)}}),
-            ui_texts::settingsKeyboard(chatSettings(chat)));
+    ui_texts::ChatSettings s = chatSettings(chat);
+    std::string text = ui_texts::fmt(ui_texts::kSettingsText,
+                                     {{"title", ui_texts::htmlEscape(title)},
+                                      {"id", std::to_string(chat)}});
+    if (!settingsLive(chat)) text += kSettingsDegradedSuffix;
+    replyKb(ctx, text, ui_texts::settingsKeyboard(s));
 }
 
 void Dispatcher::onLang(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     int64_t chat = vcTarget(ctx);
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
     if (args.empty()) {
-        reply(ctx, "Current language: " + chatField(chat, "lang", "en") +
+        reply(ctx, "Current language: " + s.language +
                        ". This build ships English only; /lang <code> "
-                       "stores your choice for when more locales land.");
+                       "stores your choice for when more locales land." +
+                       degraded);
         return;
     }
     std::string code = lowerStr(args[0]);
@@ -4917,20 +5120,27 @@ void Dispatcher::onLang(const CommandContext& ctx) {
         return;
     }
     if (!adminCheck(ctx)) return;
-    setChatField(chat, "lang", code);
+    if (!setSetting(chat, "language", Json(code))) {
+        reply(ctx, "Could not save the language — the settings backend "
+                   "is unreachable. Your change was not stored.");
+        return;
+    }
     reply(ctx, "Language set to " + code + ".");
 }
 
 void Dispatcher::onAdminmode(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     auto args = splitArgs(ctx.args);
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
     if (args.empty()) {
-        int mode = chatIntField(chat, "admin_mode", 0);
+        int mode = s.admin_mode;
         reply(ctx, std::string("Admin mode: ") +
                        (mode == 1 ? "admins only"
                                   : mode == 2 ? "everyone"
                                               : "admins + authorized") +
-                       ". Usage: /adminmode admin|adminauth|everyone");
+                       ". Usage: /adminmode admin|adminauth|everyone" +
+                       degraded);
         return;
     }
     if (!adminCheck(ctx)) return;
@@ -4943,7 +5153,11 @@ void Dispatcher::onAdminmode(const CommandContext& ctx) {
         replyHtml(ctx, ui_texts::kAdminModeInvalid);
         return;
     }
-    setChatField(chat, "admin_mode", std::to_string(mode));
+    if (!setSetting(chat, "admin_mode", Json(static_cast<int64_t>(mode)))) {
+        reply(ctx, "Could not save admin mode — the settings backend "
+                   "is unreachable. Your change was not stored.");
+        return;
+    }
     replyHtml(ctx, ui_texts::adminModeUpdatedText(
                        mode == 1 ? "admins only"
                                  : mode == 2 ? "everyone"
@@ -4953,25 +5167,38 @@ void Dispatcher::onAdminmode(const CommandContext& ctx) {
 void Dispatcher::onCmdDelete(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     auto args = splitArgs(ctx.args);
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
     if (args.empty() || (!flagOn(args[0]) && !flagOff(args[0]))) {
-        reply(ctx, "Cmd delete is " + chatField(chat, "cmd_delete", "off") +
-                       ". Usage: /cmddelete on|off");
+        reply(ctx, "Cmd delete is " + std::string(s.cmd_delete ? "on" : "off") +
+                       ". Usage: /cmddelete on|off" + degraded);
         return;
     }
     if (!adminCheck(ctx)) return;
-    setChatField(chat, "cmd_delete", flagOn(args[0]) ? "on" : "off");
+    if (!setSetting(chat, "cmd_delete", Json(flagOn(args[0])))) {
+        reply(ctx, "Could not save cmd delete — the settings backend "
+                   "is unreachable. Your change was not stored.");
+        return;
+    }
     reply(ctx, std::string("Cmd delete: ") +
                    (flagOn(args[0]) ? "on" : "off") + ".");
 }
 
 void Dispatcher::onCleanmode(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
-    int cur = chatIntField(chat, "clean_mode", 0);
+    // clean_mode split (Q7 blocker (b)): the core keeps ONE number —
+    // the delay in minutes, 0 = off. The backend stores it as bool
+    // clean_mode + int clean_delay_min and keeps the two in sync, so
+    // the core posts only clean_delay_min.
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
+    int cur = s.clean_delay_min;
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
         replyHtml(ctx, ui_texts::fmt(ui_texts::kCleanModeStatus,
                                      {{"action", cur ? "on" : "off"},
-                                      {"duration", std::to_string(cur)}}));
+                                      {"duration", std::to_string(cur)}}) +
+                       degraded);
         return;
     }
     std::string a = lowerStr(args[0]);
@@ -4984,12 +5211,16 @@ void Dispatcher::onCleanmode(const CommandContext& ctx) {
         return;
     }
     if (!adminCheck(ctx)) return;
+    if (!setSetting(chat, "clean_delay_min",
+                    Json(static_cast<int64_t>(off ? 0 : minutes)))) {
+        reply(ctx, "Could not save clean mode — the settings backend "
+                   "is unreachable. Your change was not stored.");
+        return;
+    }
     if (off) {
-        setChatField(chat, "clean_mode", "0");
         reply(ctx, "Clean mode off.");
         return;
     }
-    setChatField(chat, "clean_mode", std::to_string(minutes));
     reply(ctx, "Clean mode on: bot messages are deleted after " +
                    std::to_string(minutes) + " minute(s).");
 }
@@ -4998,16 +5229,23 @@ void Dispatcher::onThumb(const CommandContext& ctx) {
     int64_t chat = vcTarget(ctx);
     bool is_nothumb = ctx.command == "nothumb" || ctx.command == "nothumbs";
     auto args = splitArgs(ctx.args);
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
     if (args.empty() || (!flagOn(args[0]) && !flagOff(args[0]))) {
-        bool on = chatField(chat, "thumb", "on") == "on";
+        bool on = s.thumbnails;
         replyHtml(ctx, ui_texts::fmt(ui_texts::kThumbStatus,
-                                     {{"on", on ? "on" : "off"}}));
+                                     {{"on", on ? "on" : "off"}}) +
+                       degraded);
         return;
     }
     if (!canManageVc(ctx)) return;
     // /nothumb on -> thumbnails off; /thumbnail on -> thumbnails on.
     bool thumb_on = is_nothumb ? flagOff(args[0]) : flagOn(args[0]);
-    setChatField(chat, "thumb", thumb_on ? "on" : "off");
+    if (!setSetting(chat, "thumbnails", Json(thumb_on))) {
+        reply(ctx, "Could not save thumbnails — the settings backend "
+                   "is unreachable. Your change was not stored.");
+        return;
+    }
     reply(ctx, thumb_on ? "Thumbnails enabled." : "Thumbnails disabled.");
 }
 
@@ -5020,39 +5258,62 @@ void Dispatcher::onAutoplay(const CommandContext& ctx) {
                                                    "marathi"};
     static const std::vector<std::string> moods = {
         "any", "happy", "sad", "romantic", "party", "chill", "devotional"};
+    ui_texts::ChatSettings s = settingsFor(chat);
+    std::string degraded = settingsLive(chat) ? "" : kSettingsDegradedSuffix;
+    // Wire "" means "any"; the status text displays it as auto/any.
+    std::string lang = s.autoplay_lang.empty() ? "auto" : s.autoplay_lang;
+    std::string mood = s.autoplay_mood.empty() ? "any" : s.autoplay_mood;
     if (args.empty()) {
-        replyHtml(ctx, ui_texts::autoplayStatusText(
-                           chatField(chat, "autoplay", "off") == "on",
-                           chatField(chat, "ap_lang", "auto"),
-                           chatField(chat, "ap_mood", "any")));
+        replyHtml(ctx, ui_texts::autoplayStatusText(s.autoplay, lang, mood) +
+                       degraded);
         return;
     }
     if (!canManageVc(ctx)) return;
     std::string a = lowerStr(args[0]);
     if (a == "on" || a == "enable" || a == "start") {
-        setChatField(chat, "autoplay", "on");
+        if (!setSetting(chat, "autoplay", Json(true))) {
+            reply(ctx, "Could not save autoplay — the settings backend "
+                       "is unreachable. Your change was not stored.");
+            return;
+        }
         replyKb(ctx, ui_texts::autoplayCardText(true),
                 ui_texts::autoplayCardKeyboard(true));
     } else if (a == "off" || a == "disable" || a == "stop") {
-        setChatField(chat, "autoplay", "off");
+        if (!setSetting(chat, "autoplay", Json(false))) {
+            reply(ctx, "Could not save autoplay — the settings backend "
+                       "is unreachable. Your change was not stored.");
+            return;
+        }
         replyKb(ctx, ui_texts::autoplayCardText(false),
                 ui_texts::autoplayCardKeyboard(false));
     } else if ((a == "lang" || a == "language") && args.size() >= 2 &&
                std::find(langs.begin(), langs.end(), lowerStr(args[1])) !=
                    langs.end()) {
-        setChatField(chat, "ap_lang", lowerStr(args[1]));
+        // "auto" is the wire "" (any language).
+        std::string v = lowerStr(args[1]);
+        if (!setSetting(chat, "autoplay_lang",
+                        Json(v == "auto" ? "" : v))) {
+            reply(ctx, "Could not save autoplay language — the settings "
+                       "backend is unreachable. Your change was not "
+                       "stored.");
+            return;
+        }
         replyHtml(ctx, ui_texts::autoplayStatusText(
-                           chatField(chat, "autoplay", "off") == "on",
-                           lowerStr(args[1]),
-                           chatField(chat, "ap_mood", "any")));
+                           settingsFor(chat).autoplay, v, mood));
     } else if (a == "mood" && args.size() >= 2 &&
                std::find(moods.begin(), moods.end(), lowerStr(args[1])) !=
                    moods.end()) {
-        setChatField(chat, "ap_mood", lowerStr(args[1]));
+        // "any" is the wire "" (any mood).
+        std::string v = lowerStr(args[1]);
+        if (!setSetting(chat, "autoplay_mood",
+                        Json(v == "any" ? "" : v))) {
+            reply(ctx, "Could not save autoplay mood — the settings "
+                       "backend is unreachable. Your change was not "
+                       "stored.");
+            return;
+        }
         replyHtml(ctx, ui_texts::autoplayStatusText(
-                           chatField(chat, "autoplay", "off") == "on",
-                           chatField(chat, "ap_lang", "auto"),
-                           lowerStr(args[1])));
+                           settingsFor(chat).autoplay, lang, v));
     } else {
         reply(ctx, "Usage: /autoplay on|off|lang <lang>|mood <mood>");
     }
@@ -5064,7 +5325,7 @@ void Dispatcher::onChannelplay(const CommandContext& ctx) {
     if (args.empty()) {
         int64_t cur = 0;
         try {
-            cur = std::stoll(chatField(chat, "cplay", "0"));
+            cur = std::stoll(chatRtField(chat, "cplay", "0"));
         } catch (...) {
         }
         if (cur) {
@@ -5078,7 +5339,7 @@ void Dispatcher::onChannelplay(const CommandContext& ctx) {
     if (!adminCheck(ctx)) return;
     std::string a = lowerStr(args[0]);
     if (a == "disable" || a == "off" || a == "none") {
-        setChatField(chat, "cplay", "0");
+        setChatRtField(chat, "cplay", "0");
         replyHtml(ctx, ui_texts::kCplayDisabled);
         return;
     }
@@ -5121,7 +5382,7 @@ void Dispatcher::onChannelplay(const CommandContext& ctx) {
         replyHtml(ctx, ui_texts::kCplayOwnerRequired);
         return;
     }
-    setChatField(chat, "cplay", std::to_string(ch));
+    setChatRtField(chat, "cplay", std::to_string(ch));
     replyHtml(ctx, ui_texts::cplayEnabledText(ch));
 }
 
@@ -5130,7 +5391,7 @@ void Dispatcher::onUserbot(const CommandContext& ctx) {
     int64_t target = 0;
     if (ctx.via_channel) {
         try {
-            target = std::stoll(chatField(chat, "cplay", "0"));
+            target = std::stoll(chatRtField(chat, "cplay", "0"));
         } catch (...) {
         }
         if (!target) {
@@ -6043,7 +6304,7 @@ void Dispatcher::onSetRtmp(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     int64_t chat = ctx.message.chat.id;
     if (args.empty()) {
-        std::string url = chatField(chat, "rtmp_url", "");
+        std::string url = chatRtField(chat, "rtmp_url", "");
         reply(ctx, url.empty()
                        ? ui_texts::kRtmpNotSet
                        : "RTMP target is set (key hidden). Use /setrtmp "
@@ -6051,8 +6312,8 @@ void Dispatcher::onSetRtmp(const CommandContext& ctx) {
         return;
     }
     if (args.size() == 1 && lowerStr(args[0]) == "off") {
-        setChatField(chat, "rtmp_url", "");
-        setChatField(chat, "rtmp_key", "");
+        setChatRtField(chat, "rtmp_url", "");
+        setChatRtField(chat, "rtmp_key", "");
         reply(ctx, ui_texts::kRtmpRemoved);
         return;
     }
@@ -6066,16 +6327,16 @@ void Dispatcher::onSetRtmp(const CommandContext& ctx) {
         return;
     }
     // The key is stored but never echoed back (NoxBeats rtmp.cpp scrub()).
-    setChatField(chat, "rtmp_url", args[0]);
-    setChatField(chat, "rtmp_key", args[1]);
+    setChatRtField(chat, "rtmp_url", args[0]);
+    setChatRtField(chat, "rtmp_key", args[1]);
     reply(ctx, ui_texts::kRtmpSaved);
 }
 
 void Dispatcher::onStream(const CommandContext& ctx) {
     if (!canManageVc(ctx)) return;
     int64_t chat = vcTarget(ctx);
-    std::string url = chatField(chat, "rtmp_url", "");
-    std::string key = chatField(chat, "rtmp_key", "");
+    std::string url = chatRtField(chat, "rtmp_url", "");
+    std::string key = chatRtField(chat, "rtmp_key", "");
     if (url.empty()) {
         reply(ctx, ui_texts::kRtmpNotSet);
         return;
@@ -6188,7 +6449,7 @@ void Dispatcher::onStreamStatus(const CommandContext& ctx) {
             tail += lines[i] + "\n";
     }
     // Scrub the stream key out of the log tail before showing it.
-    std::string key = chatField(chat, "rtmp_key", "");
+    std::string key = chatRtField(chat, "rtmp_key", "");
     if (!key.empty()) {
         size_t p = 0;
         while ((p = tail.find(key, p)) != std::string::npos) {
@@ -6707,10 +6968,10 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
             return false;
         }
         setCallActive(chat_id, false);
-        setChatField(chat_id, "loop", "0");
-        setChatField(chat_id, "speed", "1.0");
-        setChatField(chat_id, "bass", "0");
-        setChatField(chat_id, "muted", "0");
+        setChatRtField(chat_id, "loop", "0");
+        setChatRtField(chat_id, "speed", "1.0");
+        setChatRtField(chat_id, "bass", "0");
+        setChatRtField(chat_id, "muted", "0");
         return true;
     }
     if (verb == "mute" || verb == "unmute") {
@@ -6756,8 +7017,16 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         return true;
     }
     if (verb == "autoplay") {
-        bool on = chatField(chat_id, "autoplay", "off") != "on";
-        setChatField(chat_id, "autoplay", on ? "on" : "off");
+        bool on = !settingsFor(chat_id).autoplay;
+        // The setting is written first (chat.settings autoplay also
+        // writes through to the backend room); the vc.autoplay call
+        // then confirms the engine side. Either failure rolls the
+        // setting back, honestly — never a toast claiming success
+        // over a refused toggle.
+        if (!setSetting(chat_id, "autoplay", Json(on))) {
+            error = ui_texts::kSettingsSaveFailed;
+            return false;
+        }
         IpcResult r = vcCall(ctx, "autoplay",
                              Json::objectOf({
                                  {"chat_id", Json(chat_id)},
@@ -6765,7 +7034,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
                              }));
         if (!r.ok) {
             // The engine refused: roll the toggle back, honestly.
-            setChatField(chat_id, "autoplay", on ? "off" : "on");
+            setSetting(chat_id, "autoplay", Json(!on));
             error = r.error_message;
             return false;
         }
@@ -6774,8 +7043,11 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         return true;
     }
     if (verb == "thumb") {
-        bool on = chatField(chat_id, "thumb", "on") != "on";
-        setChatField(chat_id, "thumb", on ? "on" : "off");
+        bool on = !settingsFor(chat_id).thumbnails;
+        if (!setSetting(chat_id, "thumbnails", Json(on))) {
+            error = ui_texts::kSettingsSaveFailed;
+            return false;
+        }
         error = on ? ui_texts::kToastThumbOn : ui_texts::kToastThumbOff;
         return true;
     }
@@ -6794,7 +7066,11 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         return true;
     }
     if (verb == "voldec" || verb == "volinc") {
-        int v = static_cast<int>(chatIntField(chat_id, "volume", 100));
+        // Volume is NOT one of the 15 settings keys — the backend
+        // room owns the live volume. The core keeps only the last
+        // stepped value (runtime hash) so the +/- buttons can step
+        // from it; the vc.volume call is the authority.
+        int v = static_cast<int>(chatRtIntField(chat_id, "volume", 100));
         v += verb == "volinc" ? 10 : -10;
         if (v < 0) v = 0;
         if (v > 200) v = 200;
@@ -6807,7 +7083,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
             error = r.error_message;
             return false;
         }
-        setChatField(chat_id, "volume", std::to_string(v));
+        setChatRtField(chat_id, "volume", std::to_string(v));
         error = ui_texts::toastVolumeSet(v);
         return true;
     }
@@ -7046,7 +7322,7 @@ void Dispatcher::cbPlayer(const TgCallbackQuery& cq,
             if (const Json* p = np.find("paused")) paused = p->asBool();
             if (const Json* p = np.find("is_paused")) paused = p->asBool();
             if (const Json* m = np.find("is_muted")) muted = m->asBool();
-            if (chatField(chat_id, "muted", "0") == "1") muted = true;
+            if (chatRtField(chat_id, "muted", "0") == "1") muted = true;
         }
         if (!paused && !muted) {
             std::string err;
@@ -7191,9 +7467,11 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
         std::string title;
         auto t = store_.get("chat_title:" + std::to_string(cq.chat_id));
         title = t ? *t : std::to_string(cq.chat_id);
-        return ui_texts::fmt(ui_texts::kSettingsText,
-                             {{"title", ui_texts::htmlEscape(title)},
-                              {"id", std::to_string(cq.chat_id)}});
+        std::string text = ui_texts::fmt(ui_texts::kSettingsText,
+                                         {{"title", ui_texts::htmlEscape(title)},
+                                          {"id", std::to_string(cq.chat_id)}});
+        if (!settingsLive(cq.chat_id)) text += kSettingsDegradedSuffix;
+        return text;
     };
     if (parts[2] == "main") {
         answerCb(cq, "");
@@ -7214,6 +7492,8 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
         return;
     }
     ui_texts::ChatSettings s = chatSettings(cq.chat_id);
+    ui_texts::ChatSettings before = s;  // pre-toggle snapshot: a failed
+    // save re-renders the panel from this, never from the toggled copy.
     const std::string& key = parts[2];
     // Pagination / chat-music-download sub-screens (§9, IPC-6 keys):
     // bare tap shows the screen, the toggle keyboard sends :0/:1.
@@ -7228,8 +7508,12 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
                 s.paginate_purge_old = parts[3] == "1";
             else
                 s.chat_music_download = parts[3] == "1";
-            saveChatSettings(cq.chat_id, s);
-            answerCb(cq, ui_texts::kSettingsUpdated);
+            if (!saveChatSettings(cq.chat_id, s)) {
+                s = before;
+                answerCb(cq, ui_texts::kSettingsSaveFailed, true);
+            } else {
+                answerCb(cq, ui_texts::kSettingsUpdated);
+            }
         } else {
             answerCb(cq, "");
         }
@@ -7279,7 +7563,12 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
         answerCb(cq, ui_texts::kToastUnknownAction, true);
         return;
     }
-    saveChatSettings(cq.chat_id, s);
+    if (!saveChatSettings(cq.chat_id, s)) {
+        answerCb(cq, ui_texts::kSettingsSaveFailed, true);
+        editCbCard(cq, panel_text(),
+                   ui_texts::settingsKeyboard(before));
+        return;
+    }
     answerCb(cq, ui_texts::kSettingsUpdated);
     editCbCard(cq, panel_text(), ui_texts::settingsKeyboard(s));
 }
@@ -7303,11 +7592,12 @@ void Dispatcher::cbLang(const TgCallbackQuery& cq,
         return;
     }
     // Parlay is English-only; the picker offers English alone.
-    if (chatField(cq.chat_id, "lang", "en") == "en") {
+    if (settingsFor(cq.chat_id).language == "en") {
         answerCb(cq, ui_texts::kLangAlready);
-    } else {
-        setChatField(cq.chat_id, "lang", "en");
+    } else if (setSetting(cq.chat_id, "language", Json("en"))) {
         answerCb(cq, ui_texts::langUpdatedText("English"));
+    } else {
+        answerCb(cq, ui_texts::kSettingsSaveFailed, true);
     }
     // Return to the menu the picker came from.
     if (origin == "help") {

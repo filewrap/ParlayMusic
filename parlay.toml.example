@@ -38,6 +38,14 @@ refill_rate_per_sec = 1.0
 # --- Timeouts: per-action budgets, milliseconds -------------------------
 # resolve_ms: track/stream resolution budget (today: IPC post, 30 s).
 # join_ms: voice-chat join budget (today: TDLib call, 30 s).
+#   Also the cap on the ntg_connect stage (voice.Client connect
+#   timeout, wired in cmd/backend/main.go): the join's context
+#   bounds the whole join, and Connect alone never runs past
+#   join_ms, so a Connect wedged inside the library returns by
+#   the deadline instead of holding the join handler past it.
+#   There is no separate connect_ms key: the C++ core's parser
+#   enforces a known-keys list for [timeouts], so a Go-only key
+#   would break the shared file.
 # ipc_cmd_ms: generic IPC command budget (today: vcGet, 10 s).
 # download_ms: file download budget (today: Telegram file fetch, 300 s).
 # healthz_ms: backend health-probe budget (today: 5 s).
@@ -91,7 +99,8 @@ url_cache_ttl_sec = 120
 # unset (PARLAY_UDS_PATH > [backend] uds_path > [ipc] socket_path >
 # default) — never set uds_path and socket_path to different values:
 # the backend would listen on one while the core connects to the
-# other. Set at most one file key (prefer this one).
+# other. Set at most one file key (prefer this one). The backend logs
+# a startup WARNING when the two disagree (it still starts).
 # Env: PARLAY_UDS_PATH
 [ipc]
 # socket_path = "data/parlay-backend.sock"
@@ -129,3 +138,5 @@ spotify_redirect_uri = "http://127.0.0.1:8080/callback"  # must match the Spotif
 # navidrome_pass = ""  # env: NAVIDROME_PASSWORD (canonical) or NAVIDROME_PASS (legacy alias)
 # gemini_api_key = ""  # AI lyrics classifier (GEMINI_API_KEY)
 # audd_api_token = ""  # AudD music recognition (AUDD_API_TOKEN)
+# http_addr = "127.0.0.1:8081"  # Mini App + /api/v1 HTTP listen address (Phase 6); loopback only by default — there is no Telegram WebApp initData validation in-tree, so a non-loopback address must sit behind a trusted reverse proxy. Empty disables the HTTP server. Env: PARLAY_HTTP_ADDR
+# miniapp_dir = ""  # built Mini App bundle dir; empty = auto-search services/miniapp/dist. Env: PARLAY_MINIAPP_DIR

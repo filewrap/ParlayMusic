@@ -22,6 +22,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -84,8 +85,13 @@ type LimitConfig struct {
 // dev setup can spell them out without env vars, and must never be
 // committed with real values.
 type BackendConfig struct {
-	DataDir             string `toml:"data_dir"`
-	UDSPath             string `toml:"uds_path"`
+	DataDir string `toml:"data_dir"`
+	UDSPath string `toml:"uds_path"`
+	// UDSPathFromEnv records that UDSPath came from PARLAY_UDS_PATH
+	// (not the file): the core reads the same env var and it wins
+	// over [ipc] socket_path there too, so the two sides agree even
+	// when the file keys differ.
+	UDSPathFromEnv      bool   `toml:"-"`
 	SlskdURL            string `toml:"slskd_url"`
 	DeezerARL           string `toml:"deezer_arl"`
 	NetEaseMusicU       string `toml:"netease_music_u"`
@@ -102,6 +108,26 @@ type BackendConfig struct {
 	// configured and the action answers an honest 502; the token is
 	// never logged. Env override AUDD_API_TOKEN.
 	AuddAPIToken string `toml:"audd_api_token"`
+	// HTTPAddr is the listen address of the backend's HTTP server
+	// (Phase 6): the TypeScript Mini App static bundle, the
+	// /api/v1 state + control endpoints, and the FLAC streaming
+	// endpoint. Default 127.0.0.1:8081 — loopback only. Empty
+	// disables the HTTP server entirely. This is the ONLY gate
+	// the HTTP surface has today: there is no Telegram WebApp
+	// initData validation in-tree (the bot token lives in the
+	// core, not the backend), so a non-loopback address must sit
+	// behind a reverse proxy the operator trusts, and the gap is
+	// a live-test item (see internal/httpapi). Env override
+	// PARLAY_HTTP_ADDR.
+	HTTPAddr string `toml:"http_addr"`
+	// MiniAppDir is the directory holding the built Mini App
+	// bundle (services/miniapp/dist). Empty = auto-search
+	// (services/miniapp/dist under the working directory, then
+	// next to the backend binary). When no bundle is found the
+	// HTTP server still runs the API + stream endpoints and
+	// answers / with an honest 503 naming the missing build.
+	// Env override PARLAY_MINIAPP_DIR.
+	MiniAppDir string `toml:"miniapp_dir"`
 }
 
 // IPCConfig is the core-owned [ipc] table (Q6, Phase 4): the UDS
@@ -156,10 +182,74 @@ func (c *Config) SocketPath() string {
 	return filepath.Join(c.Backend.DataDir, "parlay-backend.sock")
 }
 
+// SocketPathSplitWarning reports the [backend] uds_path vs [ipc]
+// socket_path split hazard (Phase 4 §6 item 3, warned at startup
+// since Phase 6): the core never reads [backend] uds_path, so when
+// that key is set in the FILE and differs from the path the core will
+// use ([ipc] socket_path, else <data_dir>/parlay-backend.sock), the
+// backend listens where the core never connects and every IPC call
+// fails. Empty when the setup is consistent (no [backend] key, both
+// keys agree, or the path came from PARLAY_UDS_PATH — the core reads
+// the same env var and it wins over [ipc] socket_path there too, so
+// the two sides agree; this assumes the core runs with the same env,
+// a split env is invisible to this check). It is a warning, not a
+// fatal error: a split setup still starts (the operator may run the
+// backend standalone), but the startup log names both paths so the
+// split is visible instead of silent.
+func (c *Config) SocketPathSplitWarning() string {
+	if c.Backend.UDSPath == "" {
+		return ""
+	}
+	if c.Backend.UDSPathFromEnv {
+		// Env wins on both sides: no split, whatever the file says.
+		return ""
+	}
+	corePath := c.IPC.SocketPath
+	if corePath == "" {
+		corePath = filepath.Join(c.Backend.DataDir, "parlay-backend.sock")
+	}
+	if c.Backend.UDSPath == corePath {
+		return ""
+	}
+	return fmt.Sprintf("SOCKET PATH SPLIT: backend listens on [backend] uds_path %q but the core connects to %q ([ipc] socket_path or the default) — set at most one socket path (prefer [ipc]) or make them agree; until then the core cannot reach this backend", c.Backend.UDSPath, corePath)
+}
+
 // DBPath returns the embedded store path:
 // <data_dir>/parlay.db.
 func (c *Config) DBPath() string {
 	return filepath.Join(c.Backend.DataDir, "parlay.db")
+}
+
+// ResolveMiniAppDir returns the directory holding the built Mini
+// App bundle, or "" when none is found. An explicit [backend]
+// miniapp_dir (or PARLAY_MINIAPP_DIR) wins and is returned
+// verbatim — even when it does not exist yet, so a missing bundle
+// is reported at request time with the exact configured path
+// instead of silently falling back to a different bundle. With
+// no explicit dir, the search is: services/miniapp/dist under
+// the working directory, then the same path next to the backend
+// binary, then <exeDir>/../../miniapp/dist (binary in
+// services/backend-go/bin). The first existing directory wins.
+func (c *Config) ResolveMiniAppDir() string {
+	if strings.TrimSpace(c.Backend.MiniAppDir) != "" {
+		return c.Backend.MiniAppDir
+	}
+	if _, err := os.Stat(filepath.Join("services", "miniapp", "dist")); err == nil {
+		return filepath.Join("services", "miniapp", "dist")
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, p := range []string{
+			filepath.Join(dir, "services", "miniapp", "dist"),
+			filepath.Join(dir, "..", "..", "miniapp", "dist"),
+			filepath.Join(dir, "..", "miniapp", "dist"),
+		} {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
 }
 
 // defaults returns the built-in configuration, matching
@@ -180,6 +270,7 @@ func defaults() *Config {
 	c.Backend = BackendConfig{
 		DataDir:  "data",
 		SlskdURL: "http://127.0.0.1:5030",
+		HTTPAddr: "127.0.0.1:8081",
 	}
 	return c
 }
@@ -268,6 +359,19 @@ func (c *Config) validate() error {
 	}
 	if c.Backend.DataDir == "" {
 		return fail("backend.data_dir", "must not be empty")
+	}
+	if c.Backend.HTTPAddr != "" {
+		host, port, err := net.SplitHostPort(c.Backend.HTTPAddr)
+		if err != nil {
+			return fail("backend.http_addr", fmt.Sprintf("must be host:port, got %q: %v", c.Backend.HTTPAddr, err))
+		}
+		if host != "" && net.ParseIP(host) == nil && host != "localhost" {
+			return fail("backend.http_addr", fmt.Sprintf("host %q is not an IP address or localhost", host))
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fail("backend.http_addr", fmt.Sprintf("port %q must be an integer in 1..65535", port))
+		}
 	}
 	return nil
 }
@@ -410,6 +514,9 @@ func applyEnv(c *Config) {
 		c.Backend.DataDir = strings.TrimSpace(v)
 	}
 	setStr("PARLAY_UDS_PATH", &c.Backend.UDSPath)
+	if strings.TrimSpace(os.Getenv("PARLAY_UDS_PATH")) != "" {
+		c.Backend.UDSPathFromEnv = true
+	}
 	setStr("SLSKD_URL", &c.Backend.SlskdURL)
 	setStr("DEEZER_ARL", &c.Backend.DeezerARL)
 	setStr("NETEASE_MUSIC_U", &c.Backend.NetEaseMusicU)
@@ -431,4 +538,6 @@ func applyEnv(c *Config) {
 	}
 	setStr("GEMINI_API_KEY", &c.Backend.GeminiAPIKey)
 	setStr("AUDD_API_TOKEN", &c.Backend.AuddAPIToken)
+	setStr("PARLAY_HTTP_ADDR", &c.Backend.HTTPAddr)
+	setStr("PARLAY_MINIAPP_DIR", &c.Backend.MiniAppDir)
 }

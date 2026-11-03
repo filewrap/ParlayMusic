@@ -43,9 +43,11 @@ extern void handleVoiceConnectionChange(ntg_instance* handle, int64_t chatID, nt
 import "C"
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -169,15 +171,47 @@ type StreamEndFunc func(chatID int64, streamType StreamType, device StreamDevice
 // ConnectionChangeFunc is called when a call's connection state changes.
 type ConnectionChangeFunc func(chatID int64, state ConnectionState, kind ConnectionKind)
 
+// DefaultConnectTimeout bounds one ntg_connect call. It mirrors
+// the parlay.toml [timeouts] join_ms default (30000 ms): Connect
+// is a stage of the join, so the join budget is its cap, and the
+// join's context (the UDS deadline) bounds it earlier whenever the
+// caller set one. main.go overrides it with the configured
+// timeouts.join_ms; New keeps the default for direct users.
+// There is no separate connect_ms key: the C++ core's parser
+// enforces a known-keys list for [timeouts]
+// (services/core-cpp/src/config.cpp checkKnownKeys), so a Go-only
+// key would break the shared file.
+const DefaultConnectTimeout = 30 * time.Second
+
 // Client is one ntgcalls instance: a cgo binding to libntgcalls.so.
 // A Client is safe for concurrent use; ntgcalls calls are synchronous.
+//
+// Concurrency is a shared read lock: every voice operation holds
+// mu read-only, so a Connect stuck inside ntg_connect does not
+// block other operations on the client — they proceed on the
+// shared lock instead of queueing behind a dead Connect. Only
+// Close takes the write lock, so it waits for in-flight calls to
+// finish rather than destroying the instance under a running cgo
+// call.
 type Client struct {
-	mu                       sync.Mutex
+	mu                       sync.RWMutex
 	handle                   *C.ntg_instance
 	closed                   bool
+	connectTimeout           time.Duration
 	streamEndHandlers        []StreamEndFunc
 	connectionChangeHandlers []ConnectionChangeFunc
 	handlersMu               sync.RWMutex
+	// connectFn runs one ntg_connect call for chatID with the
+	// remote parameters. It is a field — not a global — so a test
+	// can replace it on one client with a blocking stand-in and
+	// prove the timeout path; production code never sets it.
+	// The signature is pure Go because a test file may not
+	// import "C" (the go tool rejects cgo in test files); the
+	// default is a closure over realConnect, which does the
+	// cgo call and converts the result on the calling thread
+	// (so ntg_last_error() is read on the thread that ran the
+	// call).
+	connectFn func(chatID int64, remoteSDP string) error
 }
 
 func (c *Client) copyStreamEndHandlers() []StreamEndFunc {
@@ -197,13 +231,32 @@ func (c *Client) copyConnectionChangeHandlers() []ConnectionChangeFunc {
 }
 
 // New creates a ntgcalls instance and registers the stream-end and
-// connection-change callbacks on it.
+// connection-change callbacks on it. The connect timeout is
+// DefaultConnectTimeout (the parlay.toml join_ms default); use
+// NewWithConnectTimeout to apply the configured value.
 func New() (*Client, error) {
+	return NewWithConnectTimeout(DefaultConnectTimeout)
+}
+
+// NewWithConnectTimeout is New with the connect timeout set
+// explicitly: the bound on one ntg_connect call (see Connect). A
+// non-positive timeout falls back to DefaultConnectTimeout — a
+// zero timeout would fail every Connect at once.
+func NewWithConnectTimeout(timeout time.Duration) (*Client, error) {
+	if timeout <= 0 {
+		timeout = DefaultConnectTimeout
+	}
 	handle := C.ntg_instance_create()
 	if handle == nil {
 		return nil, errors.New("voice: ntg_instance_create returned nil")
 	}
-	c := &Client{handle: handle}
+	c := &Client{handle: handle, connectTimeout: timeout}
+	c.connectFn = func(chatID int64, remoteSDP string) error {
+		// Called only from the Connect worker, which holds the
+		// read lock, so c.handle cannot be destroyed under
+		// the call.
+		return c.realConnect(c.handle, chatID, remoteSDP)
+	}
 	registerClient(c)
 	if rc := C.ntg_on_stream_end_callback(handle, (C.ntg_stream_end_callback_cb)(unsafe.Pointer(C.handleVoiceStreamEnd)), nil); rc != C.NTG_OK {
 		c.Close()
@@ -216,6 +269,18 @@ func New() (*Client, error) {
 	return c, nil
 }
 
+// realConnect runs one ntg_connect cgo call against handle and
+// converts the result. It must be called with the client's read
+// lock held (only the Connect worker calls it), so the instance
+// stays alive for the whole call. The result is converted here,
+// on the thread that ran the call, because ntg_last_error() is
+// read by resultError on the calling thread.
+func (c *Client) realConnect(handle *C.ntg_instance, chatID int64, remoteSDP string) error {
+	params := C.CString(remoteSDP)
+	defer C.free(unsafe.Pointer(params))
+	return checkResult(C.ntg_connect(handle, C.int64_t(chatID), params, C.bool(false)))
+}
+
 // Version returns the linked libntgcalls version string.
 func Version() string {
 	p := C.ntg_get_version()
@@ -226,6 +291,14 @@ func Version() string {
 }
 
 // Close destroys the ntgcalls instance. It is safe to call more than once.
+// It waits for in-flight calls to finish: it takes the write lock,
+// and every voice operation — including a Connect worker still
+// inside ntg_connect — holds the read lock. In practice that wait
+// is bounded by the connect timeout, because every Connect returns
+// by its deadline; only a library call that never returns can hold
+// Close up, and destroying the instance under such a call would be
+// a use-after-free, so waiting is the safe behaviour. Close runs
+// at shutdown, where the wait is the correct trade.
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -287,8 +360,8 @@ func checkResult(rc C.ntg_result) error {
 // core passes verbatim to TDLib joinVideoChat as params. Callers
 // must not parse it as SDP and must not reformat it.
 func (c *Client) CreateCall(chatID int64) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return "", errors.New("voice: CreateCall on closed client")
 	}
@@ -308,23 +381,67 @@ func (c *Client) CreateCall(chatID int64) (string, error) {
 }
 
 // Connect completes the handshake for chatID with the remote SDP
-// (the transport parameters returned by the TDLib join).
-func (c *Client) Connect(chatID int64, remoteSDP string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// (the transport parameters returned by the TDLib join). It is
+// bounded by ctx and by the client's connect timeout, whichever
+// fires first: ntg_connect is a cgo call, so it takes no context
+// and cannot be interrupted — it runs in a worker goroutine and
+// Connect returns when the call completes, the context is done,
+// or the timeout elapses.
+//
+// On a timeout or cancellation Connect returns at once and the
+// worker keeps running detached: it holds the client's read lock
+// until the library call returns, so the ntgcalls instance cannot
+// be destroyed under it, and the params string is freed by the
+// default implementation when the call ends. The caller tears the
+// half-connected call down with Stop (the Manager's fail path
+// does), which lets the worker finish and releases the lock. The
+// worker therefore never holds client state past the return of
+// the underlying call, and a Connect that returns an error never
+// wedges the handler goroutine that called it.
+//
+// A cgo call that never returns cannot be killed from Go — the
+// worker goroutine outlives the timeout until the call returns —
+// but it is detached, holds no Go-side lock exclusively (the read
+// lock is shared, so other operations proceed), and frees its
+// resources when the call ends. The timeout and the context bound
+// the *wait*, not the library call itself; that is the honest
+// limit of a timeout around a cgo call.
+func (c *Client) Connect(ctx context.Context, chatID int64, remoteSDP string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.RLock()
 	if c.closed {
+		c.mu.RUnlock()
 		return errors.New("voice: Connect on closed client")
 	}
-	params := C.CString(remoteSDP)
-	defer C.free(unsafe.Pointer(params))
-	return checkResult(C.ntg_connect(c.handle, C.int64_t(chatID), params, C.bool(false)))
+	call := c.connectFn
+	// The worker owns the read lock until the library call
+	// returns: the instance stays alive for the whole call even
+	// if Connect itself has already returned on a timeout or
+	// cancellation.
+	done := make(chan error, 1)
+	go func() {
+		defer c.mu.RUnlock()
+		done <- call(chatID, remoteSDP)
+	}()
+	timer := time.NewTimer(c.connectTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("timed out after %s", c.connectTimeout)
+	}
 }
 
 // SetStreamSources binds the media sources described by desc to chatID
 // in the given direction.
 func (c *Client) SetStreamSources(chatID int64, mode StreamMode, desc MediaDescription) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return errors.New("voice: SetStreamSources on closed client")
 	}
@@ -359,8 +476,8 @@ func (c *Client) SendExternalFrame(chatID int64, data []byte) error {
 	if len(data) != FrameBytes {
 		return fmt.Errorf("voice: SendExternalFrame: frame must be exactly %d bytes, got %d", FrameBytes, len(data))
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return errors.New("voice: SendExternalFrame on closed client")
 	}
@@ -384,8 +501,8 @@ func (c *Client) SendFrame(chatID int64, data []byte) error {
 // package uses, the library-level pause is a no-op — the Manager
 // pauses the decode feed instead (see feeder.go).
 func (c *Client) Pause(chatID int64) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return false, errors.New("voice: Pause on closed client")
 	}
@@ -399,8 +516,8 @@ func (c *Client) Pause(chatID int64) (bool, error) {
 // Resume resumes playback in chatID. The returned bool reports
 // whether any track's state actually changed (see Pause).
 func (c *Client) Resume(chatID int64) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return false, errors.New("voice: Resume on closed client")
 	}
@@ -415,8 +532,8 @@ func (c *Client) Resume(chatID int64) (bool, error) {
 // any track's state actually changed. Unlike pause, mute works for
 // the external source: it toggles the outgoing track's enabled state.
 func (c *Client) Mute(chatID int64) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return false, errors.New("voice: Mute on closed client")
 	}
@@ -430,8 +547,8 @@ func (c *Client) Mute(chatID int64) (bool, error) {
 // Unmute unmutes playback in chatID. The returned bool reports
 // whether any track's state actually changed (see Mute).
 func (c *Client) Unmute(chatID int64) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return false, errors.New("voice: Unmute on closed client")
 	}
@@ -444,8 +561,8 @@ func (c *Client) Unmute(chatID int64) (bool, error) {
 
 // Stop ends the call in chatID.
 func (c *Client) Stop(chatID int64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return errors.New("voice: Stop on closed client")
 	}
@@ -454,8 +571,8 @@ func (c *Client) Stop(chatID int64) error {
 
 // GetState returns the mute/pause state of the call in chatID.
 func (c *Client) GetState(chatID int64) (MediaState, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return MediaState{}, errors.New("voice: GetState on closed client")
 	}
@@ -475,8 +592,8 @@ func (c *Client) GetState(chatID int64) (MediaState, error) {
 
 // Time returns the playback clock of chatID in milliseconds.
 func (c *Client) Time(chatID int64) (uint64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.closed {
 		return 0, errors.New("voice: Time on closed client")
 	}

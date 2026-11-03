@@ -29,8 +29,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -43,6 +45,7 @@ import (
 	"parlay/backend-go/internal/fx"
 	"parlay/backend-go/internal/gui"
 	"parlay/backend-go/internal/handlers"
+	"parlay/backend-go/internal/httpapi"
 	"parlay/backend-go/internal/library"
 	"parlay/backend-go/internal/lyrics"
 	"parlay/backend-go/internal/netease"
@@ -75,6 +78,13 @@ func run() error {
 	}
 	log.Printf("backend-go: config from %s", cfg.Source)
 	log.Printf("backend-go: data_dir=%s opus=%dkbps ladder=%v", cfg.Backend.DataDir, cfg.Quality.OpusBitrateKbps(), cfg.Quality.SourceLadder)
+	// The [backend] uds_path vs [ipc] socket_path split hazard
+	// (Phase 4 §6 item 3): warn loudly at startup when the two
+	// keys disagree — the core never reads [backend] uds_path, so
+	// a split setup starts fine and then fails every IPC call.
+	if w := cfg.SocketPathSplitWarning(); w != "" {
+		log.Printf("backend-go: WARNING: %s", w)
+	}
 
 	st, err := store.Open(cfg.Backend.DataDir)
 	if err != nil {
@@ -130,8 +140,14 @@ func run() error {
 	// Voice: the ntgcalls client, then the Manager whose join
 	// handshake runs through the UDS server (the core runs
 	// joinVideoChat on the assistant session and returns the
-	// remote SDP; see contracts/uds-protocol.md §6).
-	client, err := voice.New()
+	// remote SDP; see contracts/uds-protocol.md §6). The connect
+	// timeout is timeouts.join_ms: Connect is a stage of the
+	// join, so the join budget is its cap (the join's context
+	// bounds it earlier whenever the core set a shorter
+	// deadline), and a Connect wedged inside the library returns
+	// by the deadline instead of holding the join handler past
+	// it (see Client.Connect).
+	client, err := voice.NewWithConnectTimeout(time.Duration(cfg.Timeouts.JoinMs) * time.Millisecond)
 	if err != nil {
 		return fmt.Errorf("voice client: %w", err)
 	}
@@ -188,6 +204,25 @@ func run() error {
 	deps := app.New(st, cfg, reg, voiceMgr, server, rooms, lyr)
 
 	registerAll(server, deps)
+
+	// Phase 6: the HTTP server — Mini App bundle, /api/v1 state
+	// + control (a transport into the same gui.* / vc.* actions
+	// above), and the FLAC stream endpoint. It runs beside the
+	// UDS server, never instead of it. An empty http_addr
+	// disables it; a bind failure is logged loudly but does not
+	// take the voice path down with it.
+	httpSrv := httpapi.New(server, rooms, library.SharedIndex(), cfg.ResolveMiniAppDir())
+	if cfg.Backend.HTTPAddr != "" {
+		go func() {
+			if err := httpSrv.Start(cfg.Backend.HTTPAddr); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("backend-go: WARNING http server failed (%v); Mini App + /api/v1 unavailable", err)
+			}
+		}()
+		log.Printf("backend-go: http api on %s (miniapp dir %q)", cfg.Backend.HTTPAddr, cfg.ResolveMiniAppDir())
+	} else {
+		log.Printf("backend-go: http api disabled (empty backend.http_addr)")
+	}
+	defer func() { _ = httpSrv.Close() }()
 
 	if err := server.Listen(); err != nil {
 		return err

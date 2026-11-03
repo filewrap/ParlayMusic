@@ -11,7 +11,7 @@
 // honestly (download_failed). Oversize (NetEase-specific, stricter
 // than the downloaders rule): the 50 MB cap is checked before
 // writing and mid-download; an oversize track returns 200 with an
-// empty file_path (queued for a later MTProto pass, not downloaded).
+// empty file_path (no later MTProto pass exists; not downloaded).
 //
 // SEAM (landed, Wave 2 verification): lyrics go through the shared
 // lyrics.Fetcher (internal/lyrics) — its FetchNetEase path only,
@@ -153,7 +153,8 @@ func (s *Service) handleDownload(ctx context.Context, req uds.Request) (any, err
 	if result.Oversize {
 		// Oversize rule (§5.2): no oversize file is written — the
 		// partial file is deleted and the response is a 200 with
-		// an empty path (queued for a later MTProto pass).
+		// an empty path (no later MTProto pass exists; the file
+		// is simply not sent).
 		if result.FilePath != "" {
 			_ = os.Remove(result.FilePath)
 		}
@@ -161,7 +162,7 @@ func (s *Service) handleDownload(ctx context.Context, req uds.Request) (any, err
 			"file_path": "", "track": track, "oversize": true,
 			"size_bytes": result.SizeBytes, "auth": auth,
 			"run_id": result.RunID,
-			"note":   "file exceeds the 50 MB Bot API cap — queued for a later MTProto pass, not downloaded",
+			"note":   "file exceeds the 50 MB Bot API cap — not downloaded (no large-file send path yet)",
 		}, nil
 	}
 	if derr != nil {

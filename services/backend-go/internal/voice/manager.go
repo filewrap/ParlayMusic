@@ -300,7 +300,13 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return fail("connect", fmt.Errorf("context done before connect: %w", err))
 	}
-	if err := m.client.Connect(chatID, remoteSDP); err != nil {
+	// Connect is bounded by ctx and by the client's connect
+	// timeout (timeouts.join_ms): a Connect wedged inside the
+	// library returns by the deadline instead of holding the
+	// join handler — and the per-chat lock — past it, and the
+	// call record lands in StateFailed so the next voice-state
+	// action (and a retry) is not starved behind the dead join.
+	if err := m.client.Connect(ctx, chatID, remoteSDP); err != nil {
 		return fail("connect", err)
 	}
 	m.mu.Lock()

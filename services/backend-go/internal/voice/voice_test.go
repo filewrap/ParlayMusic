@@ -153,7 +153,7 @@ func TestConnectRejectsBadPayload(t *testing.T) {
 		t.Fatalf("CreateCall failed: %v", err)
 	}
 	t.Cleanup(func() { _ = c.Stop(chatID) })
-	err := c.Connect(chatID, "this is not an SDP offer")
+	err := c.Connect(context.Background(), chatID, "this is not an SDP offer")
 	if err == nil {
 		t.Fatal("Connect accepted a garbage payload; expected an error")
 	}

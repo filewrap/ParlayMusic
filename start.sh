@@ -123,7 +123,11 @@ resolve_service() { # name
             if [ -n "$bin" ]; then [ -x "$bin" ] || { echo "MISSING:$bin"; return 1; }; CMD=("$bin");
             elif [ -n "$GO_BIN" ]; then
                 say "building backend (no binary yet — one-time, cgo + ntgcalls)…"
-                ( cd "$ROOT/services/backend-go" && "$GO_BIN" build -trimpath -o "$ROOT/bin/parlay-backend" ./cmd/backend ) \
+                # -tags parlaydsp is REQUIRED: without it the binary logs
+                # "parlay-dsp NOT linked" and every Play fails with
+                # dsp.ErrUnavailable (same rule as
+                # scripts/package-release.sh step 2).
+                ( cd "$ROOT/services/backend-go" && "$GO_BIN" build -tags parlaydsp -trimpath -o "$ROOT/bin/parlay-backend" ./cmd/backend ) \
                     || { echo "MISSING:backend build failed (see above)"; return 1; }
                 CMD=("$ROOT/bin/parlay-backend")
             else echo "MISSING:go (no parlay-backend binary and no Go toolchain)"; return 1; fi

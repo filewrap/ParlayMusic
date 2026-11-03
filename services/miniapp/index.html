@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parlay — Lossless Player</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main>
+    <h1>Parlay</h1>
+
+    <section id="now-playing" aria-label="Now playing">
+      <p id="np-status" class="status">Idle</p>
+      <h2 id="np-title">Nothing playing</h2>
+      <p id="np-artist" class="artist"></p>
+      <p class="times"><span id="np-position">0:00</span> / <span id="np-duration">0:00</span></p>
+      <audio id="audio" preload="none"></audio>
+      <div class="controls">
+        <button id="btn-play-pause" type="button" disabled>Pause</button>
+        <button id="btn-skip" type="button" disabled>Skip</button>
+        <button id="btn-stream" type="button">Stream FLAC</button>
+      </div>
+      <label class="volume">
+        Volume
+        <input id="volume" type="range" min="0" max="200" step="1" value="100">
+        <span id="volume-value">100</span>
+      </label>
+    </section>
+
+    <section aria-label="Queue">
+      <h2>Queue</h2>
+      <ol id="queue-list"></ol>
+    </section>
+
+    <p id="error" class="error" role="alert" hidden></p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

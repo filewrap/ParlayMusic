@@ -15,14 +15,14 @@
 // The durable API is key/value + sets + hashes, mirroring NoxBeats'
 // DB object (sudoers, blacklists, auth users, per-chat runtime
 // fields, playlists, active calls) — now backed by the JSON file:
-//   kv    : engine choice, loop/speed/bass/muted, maintenance, logger ...
+//   kv    : engine choice, maintenance, logger ...
 //   sets  : sudoers, blacklisted users/chats, auth users, known chats/users
 //   hashes: per-chat runtime fields, per-user playlists (as JSON arrays)
 // Ephemeral data (admin cache with TTL) is an in-memory map with
 // expiry.
 //
-// Key inventory — what state.json holds after Phase 4 (see store.cpp
-// for the same list with per-key notes):
+// Key inventory — what state.json holds after the Phase 6 Q7 rewire
+// (see store.cpp for the same list with per-key notes):
 //   BOOT / EPHEMERAL (stay here — the core needs them with the
 //   backend down or before it is up): sudoers, chats, users,
 //   bl_users, bl_chats, auth:<user_id>, shareblocked, maintenance,
@@ -37,15 +37,19 @@
 //   last_requester_name:/last_requester_id:<chat_id>, autoleave,
 //   and the in-memory TTL admin cache (cacheGet/cacheSet).
 //   SETTINGS (single home is backend bbolt via chat.settings —
-//   NOT stored here; see phase4/worker-a-state.md §Q7 for the
-//   flagged blockers): the chat:<chat_id> hash panel fields
-//   (admin_mode, play_mode, cmd_delete, clean_mode, thumb, autoplay,
-//   silent, autodelete, autodelete_min, lang, page_purge, musicdl).
-//   The same chat:<chat_id> hash ALSO carries per-chat runtime
-//   fields with no backend home (loop, speed, bass, muted,
-//   rtmp_url, rtmp_key, cplay, last_track, logger_on) — those stay
-//   in state.json until a backend home exists for them; they are
-//   runtime state, not settings-panel settings.
+//   NEVER stored here; Dispatcher::settingsFor fetches them over
+//   UDS and caches the snapshot in memory only): the 15 keys
+//   (admin_mode, play_mode, cmd_delete, clean_mode, clean_delay_min,
+//   thumbnails, autoplay, autoplay_lang, autoplay_mood, silent_mode,
+//   auto_delete, auto_delete_min, language, paginate_purge_old,
+//   chat_music_download).
+//   RUNTIME (stay here, under the "chatrt:" hash — runtime state,
+//   not settings-panel settings, with no backend home): loop, speed,
+//   bass, muted, volume, rtmp_url, rtmp_key, cplay, last_track.
+//   The legacy "chat:" hash is read-only fallback for those fields
+//   (pre-rewire values survive the upgrade); nothing writes it.
+//   The chat-level logger_on field was dead (never written) and was
+//   dropped in the rewire; only the global logger_on key remains.
 #pragma once
 
 #include <chrono>

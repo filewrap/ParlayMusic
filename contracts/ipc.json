@@ -955,7 +955,7 @@
   },
   "description": "Single contract for all Parlay actions. UDS + JSON: the core calls each action by name over one persistent Unix domain socket (data/parlay-backend.sock); there are no HTTP routes and no per-service endpoints. Error envelope everywhere: {ok:false, error:{code, message}}. Success: {ok:true, data:{...}}.",
   "notes": [
-    "Files over the 50 MB Bot API cap: download.* returns oversize=true; the core queues them for a later MTProto pass instead of failing.",
+    "Files over the 50 MB Bot API cap: download.* returns oversize=true; the core reports the file unsent — no later MTProto pass exists (a large-file send is a future job).",
     "New actions are added here first, then in the backend package, then in the core handler.",
     "v0.3.0 (Phase 9): IPC-1 vc.now_playing UI fields, IPC-2 vc.progress, IPC-3 search Track fields, IPC-4 download.progress, IPC-5 lyrics fields, IPC-6 chat.settings, IPC-7 spotify.details/analyze. download.spotify_playlist gains file_paths (files mode). radio.status response corrected to the radio-js shape.",
     "v0.3.1 (Phase 9 gaps): search.inline request gains optional chat_id (np/s/l modes only — the core passes the chat the inline user is playing in; without it those modes return empty results); netease.lyrics response gains lrc_path (the .lrc file the service wrote under the download dir, empty string when the write fails); every download.* POST response gains run_id (12-hex progress-run id — the core reads it from the response for the IPC-4 snapshot. Live polling DURING the transfer is still not possible: the downloaders POST blocks until the transfer completes, so the run_id is only known after the POST returns.)",

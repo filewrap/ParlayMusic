@@ -275,6 +275,27 @@ func (s *Server) Register(action string, h Handler) {
 	s.regCounts[action]++
 }
 
+// Dispatch invokes the handler for req.Action in-process and
+// returns its data or error, with the same lookup rules as the
+// socket path (handleRequest): an unknown action — including
+// test.sleep_ms — answers ErrNotFound. It exists so the HTTP
+// server (internal/httpapi, Phase 6) can serve the Mini App
+// through the exact vc.* / gui.* handlers the core uses over the
+// socket, instead of a second implementation of the same actions.
+// The caller owns timeouts: Dispatch runs the handler
+// synchronously on the caller's goroutine, so pass a context
+// with a deadline (the socket path applies deadline_ms the same
+// way). Dispatch never touches the socket or the peer connection.
+func (s *Server) Dispatch(ctx context.Context, req Request) (any, error) {
+	s.mu.Lock()
+	h, ok := s.handlers[req.Action]
+	s.mu.Unlock()
+	if req.Action == "test.sleep_ms" || !ok {
+		return nil, NewHandlerError(ErrNotFound, "unknown action "+req.Action)
+	}
+	return h(ctx, req)
+}
+
 // RegistrationCount reports how many times action was registered
 // (0 when never). The full-wiring test asserts 1 for every
 // contract action: a duplicate registration silently overwrites
@@ -388,7 +409,24 @@ func (s *Server) serveConn(c *conn) {
 		}
 		switch env.Type {
 		case "request":
-			s.handleRequest(c, env)
+			// Dispatch concurrently: the read loop must keep
+			// reading while a handler runs. A handler that
+			// waits on a backend-initiated frame (RequestJoin
+			// waits for the core's join response) deadlocks
+			// against a serial read loop — the response sits
+			// unread in the socket while the handler waits for
+			// it, until the request deadline (Phase 3/5 vc.join
+			// wedge: abandoned at the full 60 s deadline) —
+			// and every later request on the connection starves
+			// behind the wedged handler (Phase 5 vc.lyrics
+			// flake). Responses are multiplexed by request_id
+			// (§3), so order between requests is not
+			// significant; concurrent writes are serialised by
+			// writeMu. Each handler is still bounded by its own
+			// deadline ctx in handleRequest, so a slow handler
+			// cannot run past its deadline even though the
+			// read loop no longer waits for it.
+			go s.handleRequest(c, env)
 		case "response":
 			s.deliverJoinResponse(env)
 		default:

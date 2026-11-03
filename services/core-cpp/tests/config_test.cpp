@@ -264,6 +264,25 @@ int main(int argc, char** argv) {
               "config: missing BOT_TOKEN + PARLAY_TOKEN both reported");
     }
 
+    // --- F2. empty TD_API_* fall back to API_* (Worker D, Phase 6) ---
+    // .env ships TD_API_ID= / TD_API_HASH= empty; a set-but-empty var
+    // must mean "unset", or the documented fallback is shadowed by "".
+    {
+        setenv("API_ID", "12345678", 1);
+        setenv("API_HASH", "0123456789abcdef0123456789abcdef", 1);
+        setenv("TD_API_ID", "", 1);
+        setenv("TD_API_HASH", "", 1);
+        parlay::Config c = parlay::Config::fromEnv();
+        CHECK(c.td_api_id == 12345678,
+              "config: empty TD_API_ID falls back to API_ID");
+        CHECK(c.td_api_hash == "0123456789abcdef0123456789abcdef",
+              "config: empty TD_API_HASH falls back to API_HASH");
+        unsetenv("API_ID");
+        unsetenv("API_HASH");
+        unsetenv("TD_API_ID");
+        unsetenv("TD_API_HASH");
+    }
+
     // --- G. malformed TOML / bad values: exact errors, no silent -----
     // --- defaults ------------------------------------------------------
     {

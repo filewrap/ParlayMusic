@@ -47,6 +47,12 @@ func TestDefaultsMatchExample(t *testing.T) {
 	if cfg.Backend.DataDir != "data" {
 		t.Errorf("data_dir default drifted: %q", cfg.Backend.DataDir)
 	}
+	if cfg.Backend.HTTPAddr != "127.0.0.1:8081" {
+		t.Errorf("http_addr default drifted: %q", cfg.Backend.HTTPAddr)
+	}
+	if cfg.Backend.MiniAppDir != "" {
+		t.Errorf("miniapp_dir default drifted: %q", cfg.Backend.MiniAppDir)
+	}
 	if got := cfg.SocketPath(); got != filepath.Join("data", "parlay-backend.sock") {
 		t.Errorf("SocketPath default drifted: %q", got)
 	}
@@ -153,5 +159,66 @@ func TestExampleFileLoads(t *testing.T) {
 	}
 	if cfg.Quality.OpusBitrateKbps() != 192 {
 		t.Errorf("example voice profile bitrate: got %d, want 192", cfg.Quality.OpusBitrateKbps())
+	}
+}
+
+// SocketPathSplitWarning (Phase 6): the backend warns at startup
+// when [backend] uds_path and [ipc] socket_path disagree, because
+// the core never reads [backend] and would connect elsewhere.
+func TestSocketPathSplitWarning(t *testing.T) {
+	base := func() *Config {
+		c := &Config{}
+		c.Backend.DataDir = "data"
+		return c
+	}
+	// No [backend] key: consistent, no warning.
+	if w := base().SocketPathSplitWarning(); w != "" {
+		t.Errorf("no backend key: unexpected warning %q", w)
+	}
+	// Both keys agree: consistent, no warning.
+	c := base()
+	c.Backend.UDSPath = "/run/parlay.sock"
+	c.IPC.SocketPath = "/run/parlay.sock"
+	if w := c.SocketPathSplitWarning(); w != "" {
+		t.Errorf("agreeing keys: unexpected warning %q", w)
+	}
+	// [backend] key only: the core falls back to the default path,
+	// so the setup splits — warning names both paths.
+	c = base()
+	c.Backend.UDSPath = "/run/backend.sock"
+	w := c.SocketPathSplitWarning()
+	if w == "" {
+		t.Fatalf("backend-only key: expected a warning, got none")
+	}
+	if !strings.Contains(w, "/run/backend.sock") || !strings.Contains(w, filepath.Join("data", "parlay-backend.sock")) {
+		t.Errorf("backend-only warning names the wrong paths: %q", w)
+	}
+	// Both keys set, different: warning names both paths.
+	c = base()
+	c.Backend.UDSPath = "/run/backend.sock"
+	c.IPC.SocketPath = "/run/core.sock"
+	w = c.SocketPathSplitWarning()
+	if w == "" {
+		t.Fatalf("differing keys: expected a warning, got none")
+	}
+	if !strings.Contains(w, "/run/backend.sock") || !strings.Contains(w, "/run/core.sock") {
+		t.Errorf("differing-keys warning names the wrong paths: %q", w)
+	}
+	// [ipc] key only: the backend honours it (SocketPath falls
+	// back), no split, no warning.
+	c = base()
+	c.IPC.SocketPath = "/run/core.sock"
+	if w := c.SocketPathSplitWarning(); w != "" {
+		t.Errorf("ipc-only key: unexpected warning %q", w)
+	}
+	// PARLAY_UDS_PATH: the core reads the same env var and it wins
+	// over [ipc] socket_path there too, so the two sides agree even
+	// when the file keys disagree — no warning.
+	c = base()
+	c.Backend.UDSPath = "/run/env.sock"
+	c.Backend.UDSPathFromEnv = true
+	c.IPC.SocketPath = "/run/core.sock"
+	if w := c.SocketPathSplitWarning(); w != "" {
+		t.Errorf("env path: unexpected warning %q", w)
 	}
 }

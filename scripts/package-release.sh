@@ -12,7 +12,10 @@
 # lib/libparlay_dsp.so (Phase 5 Rust DSP engine, rebuilt from
 # services/parlay-dsp sources in step 2b — never ship a stale .so:
 # a stale artifact fails exactly at EOS, after all audio played),
-# scripts/yt_dlp_worker.py (the yt-dlp daemon the
+# services/miniapp/dist (Phase 6 TypeScript Mini App bundle, built
+# in step 2c — the backend auto-searches services/miniapp/dist
+# under its working directory, which start.sh sets to the install
+# root), scripts/yt_dlp_worker.py (the yt-dlp daemon the
 # backend spawns at boot; its venv is created by install.sh, never
 # bundled), launchers, parlay.toml.example, .env.example, README,
 # INSTALL.md, VERSION.
@@ -106,6 +109,28 @@ CARGO_BIN="${PARLAY_CARGO_BIN:-$ROOT/.cargo/bin/cargo}"
 need_file "$DSP_SO"
 (cd services/backend-go && CGO_ENABLED=1 "$GO_BIN" build -tags parlaydsp -trimpath -o "$STAGE/bin/parlay-backend" ./cmd/backend)
 need_exec "$STAGE/bin/parlay-backend"
+
+# --- 2c. Mini App bundle (Phase 6: TypeScript lossless player) -----------
+# The backend serves the built bundle from services/miniapp/dist
+# (auto-search: services/miniapp/dist under the working directory —
+# start.sh runs the backend with CWD=$ROOT, so the staged path
+# below is found with no config). Without it the backend answers
+# 503 miniapp_not_built. The build needs node (typescript is a
+# dev-only tool; node_modules is gitignored and installed once by
+# build.sh itself). Override PARLAY_PACKAGE_SKIP_MINIAPP=1 exists
+# only so the build+pack pipeline can be tested without node, and
+# prints a loud warning when used (same pattern as the launcher
+# override above).
+echo "==> miniapp"
+if [ "${PARLAY_PACKAGE_SKIP_MINIAPP:-0}" = "1" ]; then
+  echo "WARNING: miniapp build skipped (test override active): the tarball will 503 the Mini App."
+else
+  command -v node >/dev/null 2>&1 || fail "node is required to build the Mini App (services/miniapp/build.sh)"
+  (cd services/miniapp && ./build.sh)
+  need_file services/miniapp/dist/app.js
+  mkdir -p "$STAGE/services/miniapp"
+  cp -r services/miniapp/dist "$STAGE/services/miniapp/dist"
+fi
 
 # --- 3. Native voice libs (copy only — NEVER rebuild here) ------------------
 echo "==> native libs (copy only)"

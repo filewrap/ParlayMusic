@@ -1451,7 +1451,10 @@ inline const char* kAudioCaption =
 
 // --- §9 settings menus ------------------------------------------------------
 // Per-chat settings snapshot the panel renders from. The dispatcher
-// fills it from the Store (chat:<id> fields); toggles write back.
+// fills it from the backend (chat.settings, all 15 keys — Q7 rewire,
+// Phase 6); toggles write back. autoplay_lang/autoplay_mood are ""
+// (any) on the wire; the /autoplay status text displays them as
+// "auto"/"any".
 struct ChatSettings {
     int admin_mode = 0;  // 0 admins+auth, 1 admins only, 2 everyone
     std::string play_mode = "everyone";
@@ -1459,6 +1462,8 @@ struct ChatSettings {
     int clean_delay_min = 0;  // 0 = off; the clean delay cycles 15→30→60→5
     bool thumbnails = true;
     bool autoplay = false;
+    std::string autoplay_lang;   // "" = any language (display "auto")
+    std::string autoplay_mood;   // "" = any mood (display "any")
     bool silent = false;
     bool auto_delete = false;
     int auto_delete_min = 5;  // valid 2–7
@@ -1580,6 +1585,9 @@ inline std::string settingInfoText(const std::string& key) {
 }
 
 inline const char* kSettingsUpdated = "Settings updated!";
+inline const char* kSettingsSaveFailed =
+    "Could not save settings — the backend is unreachable. Nothing "
+    "was changed.";
 inline const char* kSettingsGroupOnly =
     "These settings are available only in groups.";
 

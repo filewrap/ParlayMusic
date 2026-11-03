@@ -445,16 +445,42 @@ private:
     bool checkRateLimit(const CommandContext& ctx);
     bool maintenanceOn() const;
 
-    // --- chat settings (NoxBeats DB per-chat fields, stored in Store) ---
-    std::string chatField(int64_t chat_id, const std::string& field,
-                          const std::string& def = "");
-    void setChatField(int64_t chat_id, const std::string& field,
-                      const std::string& value);
-    int chatIntField(int64_t chat_id, const std::string& field, int def = 0);
+    // --- chat settings (Q7 rewire, Phase 6) -------------------------
+    // The backend's bbolt store is the SINGLE home for the 15
+    // chat.settings keys (FINAL-ARCHITECTURE.md §1.3 Part 2); the
+    // core never keeps a second copy in state.json. settingsFor()
+    // fetches them over UDS (chat.settings get-all) and caches the
+    // snapshot in memory (60 s TTL, write-through on set); when the
+    // backend is down it serves the cached snapshot if one exists,
+    // else the locked defaults, and settingsLive() reports false so
+    // status replies can say so honestly. setSetting() posts one key
+    // and updates the cache on success. chatSettings() /
+    // saveChatSettings() are the panel snapshot + diffed write-back
+    // (only changed keys are posted); saveChatSettings() returns
+    // false when a write failed so the caller never claims success.
+    ui_texts::ChatSettings settingsFor(int64_t chat_id);
+    bool settingsLive(int64_t chat_id);
+    bool setSetting(int64_t chat_id, const std::string& key,
+                    const Json& value);
+    // Per-chat RUNTIME fields (NOT settings): core-voice session
+    // state (loop/speed/bass/muted), channel-play link (cplay),
+    // RTMP ingest (rtmp_url/rtmp_key), last played track
+    // (last_track). They live in state.json under the "chatrt:"
+    // hash — never in the settings hash — because no backend home
+    // exists for them (they describe the core's own voice session
+    // and routing, not the backend room). Reads fall back to the
+    // legacy "chat:" hash once, so a pre-rewire cplay/rtmp link
+    // survives the upgrade; writes go to "chatrt:" only.
+    std::string chatRtField(int64_t chat_id, const std::string& field,
+                            const std::string& def = "") const;
+    void setChatRtField(int64_t chat_id, const std::string& field,
+                        const std::string& value);
+    int chatRtIntField(int64_t chat_id, const std::string& field,
+                       int def = 0) const;
     // Stored playback speed (0.5-2.0) for the chat, 1.0 when unset or
     // unparseable. Used by /speed reporting; the backend owns live
     // playback, so the value is stored for the backend's FX path.
-    double chatSpeedField(int64_t chat_id);
+    double chatRtSpeedField(int64_t chat_id) const;
     bool isAuthUser(int64_t chat_id, int64_t user_id) const;
     // Effective voice-chat target: linked channel when via_channel.
     int64_t vcTarget(const CommandContext& ctx) const;
@@ -545,11 +571,12 @@ private:
                                     const std::string& artist,
                                     const std::string& bot_username);
     static ui_texts::CardTrack cardTrack(const Json& track, int64_t requested_by);
-    // Per-chat settings snapshot (Store chat:<id> fields) + write-back.
+    // Per-chat settings snapshot (backend chat.settings, Q7) +
+    // diffed write-back. False when a backend write failed.
     ui_texts::ChatSettings chatSettings(int64_t chat_id);
-    void saveChatSettings(int64_t chat_id, const ui_texts::ChatSettings& s);
+    bool saveChatSettings(int64_t chat_id, const ui_texts::ChatSettings& s);
     bool thumbnailsOn(int64_t chat_id) {
-        return chatField(chat_id, "thumb", "on") == "on";
+        return settingsFor(chat_id).thumbnails;
     }
     // Display name for a user: "FirstName (@username)" / "FirstName" /
     // the bare id when nothing else is known.
@@ -871,6 +898,21 @@ private:
     std::vector<Route> routes_;
     std::map<std::string, std::string> aliases_;
     std::map<std::string, std::pair<std::string, bool>> channel_cmds_;
+
+    // Settings cache (Q7): one snapshot per chat, fetched from the
+    // backend over UDS. live=true means the snapshot came from the
+    // backend (fetch or write-through); live=false means locked
+    // defaults (or a stale snapshot) served while the backend is
+    // down. Live entries are fresh for 60 s; non-live entries for
+    // 5 s, so a down backend is re-probed promptly without spamming
+    // a connect per reply.
+    struct SettingsCacheEntry {
+        ui_texts::ChatSettings settings;
+        std::chrono::steady_clock::time_point fetched_at;
+        bool live = false;
+    };
+    std::mutex settings_mu_;
+    std::map<int64_t, SettingsCacheEntry> settings_cache_;
 
     // Clean-mode deletion queue: (chat, message, delete_at).
     struct PendingDelete {

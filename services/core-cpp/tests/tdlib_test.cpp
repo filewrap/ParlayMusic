@@ -296,6 +296,25 @@ int main() {
         }
         std::error_code ec;
         std::filesystem::remove_all("/tmp/tdlib-test-session", ec);
+        // Empty TD_API_* fall back to API_* (Worker D, Phase 6):
+        // .env ships TD_API_ID= / TD_API_HASH= empty; a set-but-empty
+        // var must mean "unset", or the documented fallback is
+        // shadowed by "" and authorize() fails with "no credentials".
+        setenv("API_ID", "12345678", 1);
+        setenv("API_HASH", "0123456789abcdef0123456789abcdef", 1);
+        setenv("TD_API_ID", "", 1);
+        setenv("TD_API_HASH", "", 1);
+        {
+            parlay::TdLibClient::Params p =
+                parlay::TdLibClient::Params::botFromEnv();
+            CHECK(p.configured() && p.api_id == 12345678 &&
+                      p.api_hash == "0123456789abcdef0123456789abcdef",
+                  "botFromEnv: empty TD_API_ID/TD_API_HASH fall back to API_ID/API_HASH");
+        }
+        unsetenv("API_ID");
+        unsetenv("API_HASH");
+        unsetenv("TD_API_ID");
+        unsetenv("TD_API_HASH");
         restore();
     }
 
