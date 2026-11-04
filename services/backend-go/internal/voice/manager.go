@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -275,6 +276,7 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 		return 0, fmt.Errorf("voice: join chat %d: %s: %w", chatID, stage, err)
 	}
 
+	log.Printf("voice: initiating join for chat %d", chatID)
 	if err := ctx.Err(); err != nil {
 		return fail("create_call", fmt.Errorf("context done before create_call: %w", err))
 	}
@@ -282,6 +284,7 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	if err != nil {
 		return fail("create_call", err)
 	}
+	log.Printf("voice: CreateCall succeeded for chat %d (local_sdp len: %d)", chatID, len(localSDP))
 	m.mu.Lock()
 	call.LocalSDP = localSDP
 	call.State = StateJoining
@@ -290,13 +293,17 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	if m.join == nil {
 		return fail("join", errors.New("no JoinFunc configured: the voice package never calls TDLib itself; Wave 2 must wire Join to the UDS JoinRequest"))
 	}
+	log.Printf("voice: invoking JoinFunc for chat %d", chatID)
 	remoteSDP, groupCallID, err := m.join(ctx, chatID, localSDP)
 	if err != nil {
+		log.Printf("voice: JoinFunc returned error for chat %d: %v", chatID, err)
 		return fail("join", err)
 	}
 	if remoteSDP == "" {
+		log.Printf("voice: JoinFunc returned empty remote SDP for chat %d", chatID)
 		return fail("join", errors.New("JoinFunc returned an empty remote SDP"))
 	}
+	log.Printf("voice: JoinFunc succeeded for chat %d (remote_sdp len: %d, group_call_id: %d), connecting ntgcalls...", chatID, len(remoteSDP), groupCallID)
 	if err := ctx.Err(); err != nil {
 		return fail("connect", fmt.Errorf("context done before connect: %w", err))
 	}
@@ -307,8 +314,10 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	// call record lands in StateFailed so the next voice-state
 	// action (and a retry) is not starved behind the dead join.
 	if err := m.client.Connect(ctx, chatID, remoteSDP); err != nil {
+		log.Printf("voice: ntgcalls Connect failed for chat %d: %v", chatID, err)
 		return fail("connect", err)
 	}
+	log.Printf("voice: ntgcalls Connect succeeded for chat %d (group_call_id %d)", chatID, groupCallID)
 	m.mu.Lock()
 	call.RemoteSDP = remoteSDP
 	call.GroupCallID = groupCallID

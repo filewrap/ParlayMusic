@@ -149,10 +149,24 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 	if len(tracks) == 0 {
 		return Track{}, engineUnavailable(SourceYouTube, "no YouTube results for %q", q)
 	}
+	// A search result only provides metadata and video ID; fetchVideo
+	// resolves the playable audio StreamURL (Opus 251 / AAC 140).
+	resolved, err := y.fetchVideo(ctx, tracks[0].ID)
+	if err == nil && resolved.StreamURL != "" {
+		if resolved.Title == "" {
+			resolved.Title = tracks[0].Title
+		}
+		return resolved, nil
+	}
+	if y.ytdlp != nil {
+		if dt, derr := y.resolveViaDaemon(ctx, tracks[0].ID); derr == nil && dt.StreamURL != "" {
+			return dt, nil
+		}
+	}
 	return tracks[0], nil
 }
 
-// Search runs a WEB InnerTube search (params=CAASAhAB: videos only).
+// Search runs an InnerTube search (WEB first, falling back to ANDROID, then daemon).
 func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) ([]Track, error) {
 	if limit <= 0 {
 		limit = 5
@@ -160,7 +174,9 @@ func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) (
 	if strings.TrimSpace(query) == "" {
 		return nil, engineUnavailable(SourceYouTube, "empty search query")
 	}
-	payload := map[string]any{
+
+	// 1. Try WEB search
+	webPayload := map[string]any{
 		"context": map[string]any{"client": map[string]any{
 			"clientName": innerTubeWeb, "clientVersion": innerTubeWebVer,
 		}},
@@ -168,16 +184,38 @@ func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) (
 		"params": "CAASAhAB",
 	}
 	var result map[string]any
-	if err := y.callInnerTube(ctx, "search", innerTubeWeb, innerTubeWebVer, payload, &result); err != nil {
-		return nil, err
+	if err := y.callInnerTube(ctx, "search", innerTubeWeb, innerTubeWebVer, webPayload, &result); err == nil {
+		var tracks []Track
+		parseVideoNodes(result, &tracks, limit)
+		if len(tracks) > 0 {
+			return tracks, nil
+		}
 	}
-	contents, ok := dig(result, "contents", "twoColumnSearchResultsRenderer", "primaryContents", "sectionListRenderer", "contents").([]any)
-	if !ok {
-		return nil, engineUnavailable(SourceYouTube, "invalid search results structure")
+
+	// 2. Fallback to ANDROID search (resilient against WAF 403 on WEB)
+	androidPayload := map[string]any{
+		"context": map[string]any{"client": map[string]any{
+			"clientName": innerTubeAndroid, "clientVersion": innerTubeAndroidVer,
+		}},
+		"query": query,
 	}
-	var tracks []Track
-	parseVideoNodes(contents, &tracks, limit)
-	return tracks, nil
+	result = nil
+	if err := y.callInnerTube(ctx, "search", innerTubeAndroid, innerTubeAndroidVer, androidPayload, &result); err == nil {
+		var tracks []Track
+		parseVideoNodes(result, &tracks, limit)
+		if len(tracks) > 0 {
+			return tracks, nil
+		}
+	}
+
+	// 3. Fallback to yt-dlp daemon search
+	if y.ytdlp != nil {
+		if dt, derr := y.searchViaDaemon(ctx, query); derr == nil && dt.ID != "" {
+			return []Track{dt}, nil
+		}
+	}
+
+	return nil, engineUnavailable(SourceYouTube, "no YouTube results for %q", query)
 }
 
 // fetchVideo resolves one video id via the ANDROID_VR player call
@@ -291,6 +329,26 @@ func (y *YouTubeResolver) resolveViaDaemon(ctx context.Context, videoID string) 
 	return trackFromYtDlpInfo(info, videoID), nil
 }
 
+// searchViaDaemon is the warm yt-dlp fallback for search: runs
+// ytsearch1:<query> over the persistent daemon. Used when InnerTube
+// search fails or is throttled.
+func (y *YouTubeResolver) searchViaDaemon(ctx context.Context, query string) (Track, error) {
+	if y.ytdlp == nil {
+		return Track{}, engineUnavailable(SourceYouTube, "yt-dlp daemon is not configured")
+	}
+	info, err := y.ytdlp.Extract(ctx, "ytsearch1:"+query)
+	if err != nil {
+		return Track{}, err
+	}
+	if entries, ok := info["entries"].([]any); ok && len(entries) > 0 {
+		if first, ok := entries[0].(map[string]any); ok {
+			vid, _ := first["id"].(string)
+			return trackFromYtDlpInfo(first, vid), nil
+		}
+	}
+	return trackFromYtDlpInfo(info, ""), nil
+}
+
 // Download downloads a YouTube track via the warm daemon (bestaudio,
 // extracted to mp3) into destDir.
 func (y *YouTubeResolver) Download(ctx context.Context, track Track, destDir string, onProgress ProgressFunc) (DownloadResult, error) {
@@ -315,7 +373,13 @@ func (y *YouTubeResolver) callInnerTube(ctx context.Context, endpoint, clientNam
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", innerTubeUA)
+	if clientName == innerTubeWeb {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+		req.Header.Set("Origin", "https://www.youtube.com")
+		req.Header.Set("Referer", "https://www.youtube.com/")
+	} else {
+		req.Header.Set("User-Agent", innerTubeUA)
+	}
 	resp, err := httpClient(30 * time.Second).Do(req)
 	if err != nil {
 		return fmt.Errorf("innertube %s request failed: %w", endpoint, err)
@@ -463,14 +527,15 @@ func pickYtDlpAudioURL(formats []any) string {
 		if url == "" || acodec == "none" || acodec == "" || (vcodec != "" && vcodec != "none") {
 			continue
 		}
+		fid, _ := fm["format_id"].(string)
 		itag := int64(0)
 		if v, ok := fm["itag"].(float64); ok {
 			itag = int64(v)
 		}
-		if itag == 251 {
+		if fid == "251" || itag == 251 {
 			return url
 		}
-		if itag == 140 {
+		if fid == "140" || itag == 140 {
 			best = url
 			bestAbr = 1 << 30
 			continue
@@ -501,7 +566,7 @@ func parseVideoNodes(node any, tracks *[]Track, limit int) {
 			}
 		}
 	case map[string]any:
-		for _, key := range []string{"videoRenderer", "playlistVideoRenderer"} {
+		for _, key := range []string{"videoRenderer", "playlistVideoRenderer", "compactVideoRenderer"} {
 			if vid, ok := v[key].(map[string]any); ok {
 				id, _ := vid["videoId"].(string)
 				if id == "" {

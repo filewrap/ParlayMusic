@@ -21,7 +21,12 @@ SERVICES=(
 )
 
 say() { printf '%s\n' "$*"; }
-pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+pid_alive() {
+    [ -n "${1:-}" ] || return 1
+    local st
+    st="$(ps -o state= -p "$1" 2>/dev/null | tr -d ' ')" || return 1
+    [ -n "$st" ] && [ "$st" != "Z" ]
+}
 port_free() { # 0 = free, 1 = still bound
     ( exec 3<>"/dev/tcp/127.0.0.1/$1" ) 2>/dev/null && return 1 || return 0
 }

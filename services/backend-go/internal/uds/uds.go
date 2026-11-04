@@ -646,6 +646,7 @@ func (s *Server) RequestJoin(ctx context.Context, chatID int64, localSDP string)
 		delete(s.pendingJoins, id)
 		s.joinsMu.Unlock()
 	}()
+	log.Printf("uds: sending JoinRequest %d for chat %d (local_sdp len: %d)", id, chatID, len(localSDP))
 	s.writeFrame(c, frame)
 	select {
 	case <-ctx.Done():
@@ -657,10 +658,21 @@ func (s *Server) RequestJoin(ctx context.Context, chatID int64, localSDP string)
 		var data struct {
 			RemoteSDP   string `json:"remote_sdp"`
 			GroupCallID int64  `json:"group_call_id"`
+			Data        *struct {
+				RemoteSDP   string `json:"remote_sdp"`
+				GroupCallID int64  `json:"group_call_id"`
+			} `json:"data"`
 		}
 		if err := json.Unmarshal(res.data, &data); err != nil {
 			return "", 0, fmt.Errorf("uds: JoinRequest %d: bad response: %w", id, err)
 		}
-		return data.RemoteSDP, data.GroupCallID, nil
+		remoteSDP := data.RemoteSDP
+		groupCallID := data.GroupCallID
+		if remoteSDP == "" && data.Data != nil {
+			remoteSDP = data.Data.RemoteSDP
+			groupCallID = data.Data.GroupCallID
+		}
+		log.Printf("uds: JoinRequest %d response: groupCallID=%d remoteSDP len=%d", id, groupCallID, len(remoteSDP))
+		return remoteSDP, groupCallID, nil
 	}
 }

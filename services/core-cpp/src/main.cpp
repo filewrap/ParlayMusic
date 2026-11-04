@@ -619,7 +619,30 @@ int main() {
         dispatcher.onBackendEvent(event, data);
     });
     ipc.setJoinRequestHandler([&dispatcher](const parlay::Json& request) {
-        return dispatcher.onJoinRequest(request);
+        int64_t chat_id = 0;
+        if (const auto* c = request.find("chat_id")) chat_id = c->asInt();
+        std::cout << "parlay-core: incoming JoinRequest for chat " << chat_id << std::endl;
+        parlay::Json res = dispatcher.onJoinRequest(request);
+        const parlay::Json* ok = res.find("ok");
+        if (ok && ok->asBool()) {
+            const parlay::Json* data = res.find("data");
+            if (data) {
+                size_t sdp_len = 0;
+                if (const auto* s = data->find("remote_sdp")) sdp_len = s->asString().size();
+                std::cout << "parlay-core: JoinRequest succeeded for chat " << chat_id
+                          << " (remote_sdp length: " << sdp_len << ")" << std::endl;
+                return *data;
+            }
+            return parlay::Json::objectOf({});
+        }
+        const parlay::Json* err = res.find("error");
+        std::string msg = "join failed";
+        if (err) {
+            const parlay::Json* m = err->find("message");
+            if (m) msg = m->asString();
+        }
+        std::cerr << "parlay-core: JoinRequest failed for chat " << chat_id << ": " << msg << std::endl;
+        throw std::runtime_error(msg);
     });
     dispatcher.startBackground();
 

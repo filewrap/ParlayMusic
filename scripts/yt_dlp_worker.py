@@ -47,18 +47,41 @@ except ImportError as exc:  # pragma: no cover - startup failure
 _YDL = None
 
 
+def _find_cookie_file():
+    """Locate YouTube/yt-dlp cookies file if available."""
+    for env_k in ("YTDLP_COOKIEFILE", "YTDLP_COOKIES", "YOUTUBE_COOKIEFILE", "YOUTUBE_COOKIES", "COOKIE_FILE"):
+        val = os.environ.get(env_k)
+        if val and os.path.isfile(val):
+            return val
+    candidates = [
+        "/root/cookies.txt",
+        os.path.expanduser("~/cookies.txt"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cookies.txt"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.abspath(c)
+    return None
+
+
 def _ydl():
     """One warm YoutubeDL instance for the life of the process."""
     global _YDL
     if _YDL is None:
-        _YDL = yt_dlp.YoutubeDL({
+        opts = {
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
             "noplaylist": True,
             "socket_timeout": 30,
             "retries": 3,
-        })
+            "remote_components": ["ejs:github"],
+        }
+        cf = _find_cookie_file()
+        if cf:
+            opts["cookiefile"] = cf
+        _YDL = yt_dlp.YoutubeDL(opts)
     return _YDL
 
 
@@ -78,13 +101,14 @@ def _download(params):
         raise ValueError("download: dir is required")
     os.makedirs(outdir, exist_ok=True)
     outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
-    ydl = yt_dlp.YoutubeDL({
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
         "noplaylist": True,
         "socket_timeout": 30,
         "retries": 3,
+        "remote_components": ["ejs:github"],
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "restrictfilenames": True,
@@ -100,7 +124,11 @@ def _download(params):
             "preferredcodec": "mp3",
             "preferredquality": "0",
         }],
-    })
+    }
+    cf = _find_cookie_file()
+    if cf:
+        opts["cookiefile"] = cf
+    ydl = yt_dlp.YoutubeDL(opts)
     before = set(os.listdir(outdir))
     ydl.download([url])
     after = sorted(

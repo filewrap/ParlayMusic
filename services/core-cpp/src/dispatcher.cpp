@@ -2151,10 +2151,10 @@ void Dispatcher::onBackendEvent(const std::string& event, const Json& data) {
         [this, event, data] { onTrackEvent(event, data); });
 }
 
-// onJoinRequest runs on an IpcClient worker thread: enqueue the request
-// and block on the future. Main drains it with processPendingWork()
-// and runs the TDLib join there (the worker thread is the one place a
-// block is allowed — see ipc.hpp).
+// onJoinRequest runs on an IpcClient worker thread: execute the TDLib join
+// directly on the shared assistant session and return the response.
+// Previously enqueued to main thread, which caused a distributed deadlock
+// when main thread was blocked inside vcCall("play").
 Json Dispatcher::onJoinRequest(const Json& request) {
     const Json* chat = request.find("chat_id");
     const Json* sdp = request.find("local_sdp");
@@ -2167,14 +2167,17 @@ Json Dispatcher::onJoinRequest(const Json& request) {
                    {"message",
                     Json("JoinRequest needs chat_id + local_sdp")}})}});
     }
-    auto done = std::make_shared<std::promise<Json>>();
-    std::future<Json> fut = done->get_future();
-    {
-        std::lock_guard<std::mutex> lk(joins_mu_);
-        pending_joins_.push_back(
-            {chat->asInt(), sdp->asString(), done});
+    Json resp;
+    std::string err;
+    if (doJoinVideoChat(chat->asInt(), sdp->asString(), resp, err)) {
+        return Json::objectOf(
+            {{"ok", Json(true)}, {"data", resp}});
     }
-    return fut.get();
+    return Json::objectOf(
+        {{"ok", Json(false)},
+         {"error",
+          Json::objectOf({{"code", Json("internal")},
+                          {"message", Json(err)}})}});
 }
 
 // MAIN THREAD ONLY: run queued outbound work, then pending joins.
@@ -2370,9 +2373,21 @@ int32_t Dispatcher::createVideoChat(int64_t chat_id, const std::string& title,
 std::string Dispatcher::joinVideoChat(int32_t group_call_id,
                                       const std::string& local_sdp,
                                       bool video, std::string& error) {
+    int32_t audio_source_id = 0;
+    try {
+        Json sdp_json = Json::parse(local_sdp);
+        const Json* ssrc_val = sdp_json.find("ssrc");
+        if (ssrc_val) {
+            audio_source_id = static_cast<int32_t>(ssrc_val->asInt(0));
+        }
+    } catch (...) {}
+    if (audio_source_id == 0) {
+        audio_source_id = 1;
+    }
+
     Json join_params = Json::objectOf({
         {"@type", Json("groupCallJoinParameters")},
-        {"audio_source_id", Json(0)},
+        {"audio_source_id", Json(static_cast<int64_t>(audio_source_id))},
         {"payload", Json(local_sdp)},
         {"is_muted", Json(false)},
         {"is_my_video_enabled", Json(video)},

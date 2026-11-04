@@ -31,6 +31,29 @@
 #   the report names the failed ones.
 set -uo pipefail
 
+FOLLOW=0
+NO_BUILD=0
+DEBUG_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --follow|-f) FOLLOW=1 ;;
+        --no-build) NO_BUILD=1 ;;
+        --debug|-d) DEBUG_MODE=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--follow] [--no-build] [--debug]"
+            exit 0
+            ;;
+    esac
+done
+
+if [ "${DEBUG:-0}" = "1" ] || [ "${PARLAY_DEBUG:-0}" = "1" ]; then
+    DEBUG_MODE=1
+fi
+if [ "$DEBUG_MODE" = "1" ]; then
+    export DEBUG=1
+    export PARLAY_DEBUG=1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
@@ -74,6 +97,11 @@ for entry in "${SERVICES[@]}"; do
 done
 if [ "${#RUNNING[@]}" -gt 0 ]; then
     die "Parlay is already running: ${RUNNING[*]} — run ./stop.sh first."
+fi
+
+# ---------------------------------------------------------------- build
+if [ "$NO_BUILD" != "1" ] && [ -x "$ROOT/build.sh" ]; then
+    "$ROOT/build.sh" || die "build failed — see error above."
 fi
 
 # ---------------------------------------------------------------- readiness
@@ -132,6 +160,9 @@ resolve_service() { # name
                 CMD=("$ROOT/bin/parlay-backend")
             else echo "MISSING:go (no parlay-backend binary and no Go toolchain)"; return 1; fi
             ENVS+=("PARLAY_DATA_DIR=$ROOT/data")
+            if [ "$DEBUG_MODE" = "1" ]; then
+                ENVS+=("DEBUG=1" "PARLAY_DEBUG=1")
+            fi
             # The backend binary's baked rpath points at the repo's
             # refs/ntgcalls dir; in the tarball layout libntgcalls.so
             # lives in lib/ instead, so put lib/ first on the search.
@@ -150,6 +181,9 @@ resolve_service() { # name
             # (bot) and $PARLAY_DATA_DIR/tdlib (assistant); the core
             # creates them mode 0700 itself.
             ENVS+=("PARLAY_DATA_DIR=$ROOT/data")
+            if [ "$DEBUG_MODE" = "1" ]; then
+                ENVS+=("DEBUG=1" "PARLAY_DEBUG=1")
+            fi
             ;;
         slskd)
             if [ -x "$ROOT/bin/slskd" ]; then bin="$ROOT/bin/slskd";
@@ -169,6 +203,9 @@ slskd_enabled() {
 
 # ---------------------------------------------------------------- start loop
 say "Parlay ${LAYOUT} layout at $ROOT — starting the engine…"
+if [ "$DEBUG_MODE" = "1" ]; then
+    say "==> [DEBUG MODE ACTIVE] Verbose debug logging enabled for core and backend."
+fi
 echo ""
 print_row "SERVICE" "PORT" "STATUS" "DETAIL"
 FAILED=()
@@ -191,8 +228,9 @@ for entry in "${SERVICES[@]}"; do
     rm -f "$ROOT/run/.resolve.out"
     log="$ROOT/logs/$name.log"
     pidf="$ROOT/run/$name.pid"
-    ( cd "$WORKDIR" && exec env "${ENVS[@]}" "${CMD[@]}" ) >>"$log" 2>&1 &
+    ( cd "$WORKDIR" && exec setsid env "${ENVS[@]}" "${CMD[@]}" ) >>"$log" 2>&1 < /dev/null &
     echo $! > "$pidf"
+    disown $! 2>/dev/null || true
     pid="$(cat "$pidf")"
     if [ "$kind" = "socket" ]; then
         # The backend warms the yt-dlp daemon (up to 30 s) before it
@@ -239,3 +277,8 @@ if [ "${#FAILED[@]}" -gt 0 ]; then
 fi
 say "Engine up: backend on $BACKEND_SOCK — core API: http://127.0.0.1:$CORE_PORT/healthz"
 say "Stop everything with ./stop.sh; check status with ./status.sh."
+
+if [ "$FOLLOW" = "1" ]; then
+    say "Following logs in real time (Ctrl+C to stop following; services keep running)..."
+    exec tail -n 0 -f "$ROOT"/logs/*.log
+fi

@@ -248,7 +248,10 @@ class TdClient:
 
 def prompt_phone():
     while True:
-        phone = input("Phone number (international format, e.g. +15551234567): ").strip()
+        try:
+            phone = input("Phone number (international format, e.g. +15551234567): ").strip()
+        except EOFError:
+            return ""
         if phone:
             return phone
         print("Phone number is required.")
@@ -256,7 +259,11 @@ def prompt_phone():
 
 def prompt_code():
     while True:
-        code = getpass.getpass("Login code sent to Telegram: ").strip()
+        try:
+            code = input("Login code sent to Telegram (5 digits, check Telegram app): ").strip()
+        except EOFError:
+            return ""
+        code = code.replace(" ", "").replace("-", "")
         if code:
             return code
         print("Code is required.")
@@ -264,7 +271,10 @@ def prompt_code():
 
 def prompt_password():
     while True:
-        pw = getpass.getpass("Two-step verification (2FA) password: ")
+        try:
+            pw = getpass.getpass("Two-step verification (2FA) password: ")
+        except EOFError:
+            return ""
         if pw:
             return pw
         print("Password is required.")
@@ -308,6 +318,36 @@ class Login:
         self.state = ""
         self.other_device_link = ""
         self._handled = set()
+
+    def display_qr_code(self, link):
+        self.other_device_link = link
+        import datetime
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        sys.stdout.write("\033[H\033[2J")
+        sys.stdout.flush()
+        print("=" * 66)
+        print("TELEGRAM ASSISTANT LOGIN (QR CODE)")
+        print(f"Time: {now_str}  |  Status: ACTIVE (Valid for ~30 seconds)")
+        print("=" * 66)
+        print("1. Open Telegram on your phone (assistant account)")
+        print("2. Go to: Settings -> Devices -> Link Desktop Device")
+        print("3. Point your camera at the QR code below:")
+        print("------------------------------------------------------------------\n")
+        try:
+            import subprocess
+            p = subprocess.run(["qrencode", "-t", "UTF8", link],
+                               capture_output=True, text=True, check=False)
+            if p.returncode == 0 and p.stdout:
+                print(p.stdout)
+            else:
+                print("Link: %s\n" % link)
+        except Exception:
+            print("Link: %s\n" % link)
+        print("------------------------------------------------------------------")
+        print("Raw link: %s" % link)
+        print("Waiting for phone scan... (Auto-refreshes every ~30 seconds)")
+        print("=" * 66 + "\n")
+        sys.stdout.flush()
 
     def drive_state(self, state):
         """Drive one auth state once. Returns True to keep pumping."""
@@ -363,13 +403,17 @@ class Login:
             return True
 
         if state == "authorizationStateWaitOtherDeviceConfirmation":
+            if not self.qr:
+                raise RuntimeError(
+                    "Session directory was previously initialized in QR mode. "
+                    "To switch to phone login, run with --clean:\n"
+                    "  python3 scripts/tdlib_login.py --phone --clean"
+                )
             if self.other_device_link:
-                print("Auth state: WaitOtherDeviceConfirmation")
-                print("Scan this link with Telegram on another device:")
-                print("  %s" % self.other_device_link)
+                self.display_qr_code(self.other_device_link)
             else:
                 print("Auth state: WaitOtherDeviceConfirmation — "
-                      "waiting for the login link ...")
+                      "waiting for login link from Telegram ...")
             return True
 
         if state == "authorizationStateWaitEmailAddress":
@@ -443,13 +487,19 @@ class Login:
             if mtype == "updateAuthorizationState":
                 st = msg.get("authorization_state", {})
                 new_state = st.get("@type", "")
+                link = st.get("link", "")
+                if new_state == "authorizationStateWaitOtherDeviceConfirmation":
+                    if link and link != self.other_device_link:
+                        self.display_qr_code(link)
+                        deadline = time.time() + timeout
+                        continue
+
                 if new_state != self.state:
                     self.state = new_state
                     print("-> %s" % new_state)
                     if new_state == "authorizationStateWaitOtherDeviceConfirmation":
-                        link = st.get("link", "")
                         if link:
-                            self.other_device_link = link
+                            self.display_qr_code(link)
                     if new_state == "authorizationStateReady":
                         return True
                     # A state change resets the wait budget (prompts block).
@@ -457,8 +507,71 @@ class Login:
                     self.drive_state(new_state)
                 continue
             if mtype == "error":
+                errmsg = msg.get("message", "")
+                if "td.binlog" in errmsg and "in use" in errmsg:
+                    raise RuntimeError(
+                        "TDLib error %s: %s\n--> Hint: Another process (such as parlay-core) is holding the session lock. Stop it with ./stop.sh first."
+                        % (msg.get("code"), errmsg))
+                if errmsg == "PHONE_CODE_EXPIRED":
+                    print("\n" + "=" * 62)
+                    print("⚠️  TELEGRAM: The authentication code has expired.")
+                    print("Requesting Telegram to send a fresh login code...")
+                    print("=" * 62)
+                    c.send({"@type": "resendAuthenticationCode"})
+                    code = prompt_code()
+                    if not code:
+                        raise RuntimeError("Login code entry cancelled.")
+                    print("Auth state: WaitCode — checking fresh login code ...")
+                    c.send({"@type": "checkAuthenticationCode", "code": code})
+                    continue
+                if errmsg == "PHONE_CODE_INVALID":
+                    print("\n" + "=" * 62)
+                    print("⚠️  TELEGRAM: Invalid authentication code.")
+                    print("Please check the 5 digits in your Telegram app and re-enter:")
+                    print("=" * 62)
+                    code = prompt_code()
+                    if not code:
+                        raise RuntimeError("Login code entry cancelled.")
+                    print("Auth state: WaitCode — checking login code ...")
+                    c.send({"@type": "checkAuthenticationCode", "code": code})
+                    continue
+                if errmsg == "PASSWORD_HASH_INVALID":
+                    print("\n" + "=" * 62)
+                    print("⚠️  TELEGRAM: Incorrect two-step verification (2FA) password.")
+                    print("Please try again:")
+                    print("=" * 62)
+                    pw = prompt_password()
+                    if not pw:
+                        raise RuntimeError("2FA password entry cancelled.")
+                    print("Auth state: WaitPassword — checking 2FA password ...")
+                    c.send({"@type": "checkAuthenticationPassword", "password": pw})
+                    continue
+                if errmsg == "PHONE_NUMBER_INVALID":
+                    print("\n" + "=" * 62)
+                    print("⚠️  TELEGRAM: Phone number is invalid.")
+                    print("Please enter in international format (e.g. +15551234567):")
+                    print("=" * 62)
+                    phone = prompt_phone()
+                    if not phone:
+                        raise RuntimeError("Phone number entry cancelled.")
+                    print("Auth state: WaitPhoneNumber — sending phone number ...")
+                    c.send({
+                        "@type": "setAuthenticationPhoneNumber",
+                        "phone_number": phone,
+                        "settings": {
+                            "@type": "phoneNumberAuthenticationSettings",
+                            "allow_flash_call": False,
+                            "allow_missed_call": False,
+                            "is_current_phone_number": False,
+                            "has_unknown_phone_number": False,
+                            "allow_sms_retriever_api": False,
+                            "firebase_authentication_settings": None,
+                            "authentication_tokens": [],
+                        },
+                    })
+                    continue
                 raise RuntimeError("TDLib error %s: %s"
-                                   % (msg.get("code"), msg.get("message")))
+                                   % (msg.get("code"), errmsg))
             if mtype == "authorizationStateReady":
                 self.state = mtype
                 return True
@@ -488,11 +601,10 @@ def prepare_session_dir(session_dir):
 def main(argv=None):
     # Refuse credential flags before argparse sees them: credentials in
     # argv leak into shell history and process listings.
-    forbidden = ("--phone", "--code", "--password", "--api-hash",
-                 "--api_hash")
+    forbidden = ("--code", "--password", "--api-hash", "--api_hash")
     for arg in (argv if argv is not None else sys.argv[1:]):
         name = arg.split("=", 1)[0]
-        if name in forbidden:
+        if name in forbidden or (name == "--phone" and "=" in arg):
             sys.stderr.write(
                 "ERROR: %s is refused: credentials must come from a prompt "
                 "or an env var (TD_PHONE / TD_CODE / TD_PASSWORD), never "
@@ -509,6 +621,10 @@ def main(argv=None):
     p.add_argument("--qr", action="store_true",
                    help="QR login instead of phone+code (also TD_QR=1); "
                         "prints the login link to scan on another device")
+    p.add_argument("--phone", action="store_true",
+                   help="Phone number login instead of QR code")
+    p.add_argument("--clean", "--reset", dest="clean", action="store_true",
+                   help="Wipe session directory and start fresh login")
     p.add_argument("--timeout", type=float, default=600.0,
                    help="seconds to wait for each auth step "
                         "(default: 600)")
@@ -519,6 +635,27 @@ def main(argv=None):
 
     if args.lib:
         os.environ["TDJSON_LIB"] = args.lib
+
+    # --- auto-load .env if credentials are not in environment --------
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for env_path in [os.path.join(repo_root, ".env"), ".env"]:
+        if os.path.isfile(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.split("#")[0].strip()
+                        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                            v = v[1:-1]
+                        if k and not os.environ.get(k) and v:
+                            os.environ[k] = v
+                break
+            except Exception:
+                pass
 
     # --- credentials: env first, prompt if missing (never argv) --------
     api_id_raw = os.environ.get("TD_API_ID") or os.environ.get("API_ID")
@@ -538,7 +675,31 @@ def main(argv=None):
                    or os.environ.get("TD_SESSION_DIR")
                    or default_session_dir())
     session_dir = os.path.abspath(session_dir)
-    qr = args.qr or os.environ.get("TD_QR", "") in ("1", "true", "yes")
+
+    if args.phone:
+        qr = False
+    elif args.qr:
+        qr = True
+    elif os.environ.get("TD_PHONE"):
+        qr = False
+    elif sys.stdin.isatty():
+        print("\nSelect Telegram login method for assistant account:")
+        print("  1) QR Code scan (Telegram app -> Settings -> Devices -> Link Desktop Device) [Default]")
+        print("  2) Phone number & verification code")
+        try:
+            ans = input("Choice [1/2, default: 1]: ").strip()
+        except EOFError:
+            ans = "1"
+        qr = (ans != "2")
+    elif os.environ.get("TD_QR", "") in ("1", "true", "yes"):
+        qr = True
+    else:
+        qr = True
+
+    if args.clean and os.path.exists(session_dir):
+        print("Cleaning session directory %s..." % session_dir)
+        import shutil
+        shutil.rmtree(session_dir, ignore_errors=True)
 
     try:
         prepare_session_dir(session_dir)
