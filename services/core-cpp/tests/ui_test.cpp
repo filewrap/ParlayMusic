@@ -266,10 +266,11 @@ int main() {
         CHECK(kb[10].size() == 6, "settingsKeyboard: timer row has 2-7");
         CHECK(kb[10][3].text == "5 (current)",
               "settingsKeyboard: current timer value is marked");
-        CHECK(kb[12].size() == 2 &&
+        CHECK(kb[12].size() == 3 &&
                   kb[12][0].callback_data == "pl:set:page" &&
-                  kb[12][1].callback_data == "pl:set:musicdl",
-              "settingsKeyboard: index row links page/musicdl screens");
+                  kb[12][1].callback_data == "pl:set:musicdl" &&
+                  kb[12][2].callback_data == "pl:set:quality",
+              "settingsKeyboard: index row links page/musicdl/quality screens");
         CHECK(kb[13][0].callback_data == "pl:close",
               "settingsKeyboard: last row closes");
     }
@@ -410,14 +411,76 @@ int main() {
           "kSettingsMusicDlScreen: music-download screen");
     {
         InlineKeyboard idx = settingsIndexKeyboard();
-        CHECK(idx.size() == 1 && idx[0].size() == 2 &&
+        CHECK(idx.size() == 1 && idx[0].size() == 3 &&
                   idx[0][0].callback_data == "pl:set:page" &&
-                  idx[0][1].callback_data == "pl:set:musicdl",
-              "settingsIndexKeyboard: page + musicdl buttons");
+                  idx[0][1].callback_data == "pl:set:musicdl" &&
+                  idx[0][2].callback_data == "pl:set:quality",
+              "settingsIndexKeyboard: page + musicdl + quality buttons");
         InlineKeyboard tog = settingsToggleKeyboard("page", true);
         CHECK(tog[0][0].callback_data == "pl:set:page:0" &&
                   tog[0][1].callback_data == "pl:set:main",
               "settingsToggleKeyboard: enabled page offers :0 + back");
+    }
+
+    // --- Opus quality card + keyboard (quality.get surface) -----------
+    {
+        QualityInfo q;
+        q.effective.bitrate_bps = 256000;
+        q.effective.frame_ms = 40;
+        q.effective.complexity = 7;
+        q.effective.vbr = false;
+        q.effective.fec = true;
+        q.effective.dtx = false;
+        q.library = q.effective;
+        q.sources = {{"bitrate_bps", "store"},
+                     {"frame_ms", "config"},
+                     {"complexity", "profile"},
+                     {"vbr", "default"},
+                     {"fec", "store"},
+                     {"dtx", "default"}};
+        std::string card = qualityCardText(q);
+        CHECK(contains(card, "Audio Quality") &&
+                  contains(card, "256 kbps (chat setting)") &&
+                  contains(card, "40 ms (config file)") &&
+                  contains(card, "7 (voice profile)") &&
+                  contains(card, "VBR:</b> off (default)") &&
+                  contains(card, "FEC:</b> on (chat setting)") &&
+                  contains(card, "next join"),
+              "qualityCardText: effective values + source per field + "
+              "next-join note");
+        CHECK(!contains(card, "library currently holds"),
+              "qualityCardText: no library note when library == effective");
+        q.library.bitrate_bps = 192000;
+        q.library.frame_ms = 20;
+        std::string card2 = qualityCardText(q);
+        CHECK(contains(card2, "library currently holds 192 kbps / 20 ms"),
+              "qualityCardText: library note when library differs");
+        q.active_call = true;
+        CHECK(contains(qualityCardText(q), "live in this chat"),
+              "qualityCardText: active-call note");
+        InlineKeyboard kb = settingsQualityKeyboard(q);
+        CHECK(kb.size() == 4 && kb[0].size() == 5 && kb[1].size() == 4,
+              "settingsQualityKeyboard: bitrate row (5) + frame row (4) "
+              "+ reset + back");
+        CHECK(kb[0][3].callback_data == "pl:set:quality:br:256" &&
+                  kb[0][3].text == "256 kbps (current)" &&
+                  kb[0][0].text == "128 kbps",
+              "settingsQualityKeyboard: bitrate buttons, current marked");
+        CHECK(kb[1][2].callback_data == "pl:set:quality:fr:40" &&
+                  kb[1][2].text == "40 ms (current)",
+              "settingsQualityKeyboard: frame buttons, current marked");
+        CHECK(kb[2][0].callback_data == "pl:set:quality:reset" &&
+                  kb[3][0].callback_data == "pl:set:main",
+              "settingsQualityKeyboard: reset + back to settings");
+        CHECK(cbSetQualityBr(320).size() <= 64 &&
+                  cbSetQualityFr(60) == "pl:set:quality:fr:60",
+              "quality callbacks: builder shapes within 64 bytes");
+        {
+            InlineKeyboard back = qualityBackKeyboard();
+            CHECK(back.size() == 1 &&
+                      back[0][0].callback_data == "pl:set:main",
+                  "qualityBackKeyboard: load-failure screen offers Back");
+        }
     }
     CHECK(contains(kRtmpDmOnly, "DM"), "kRtmpDmOnly: DM-only refusal");
     CHECK(contains(kRtmpNotSet, "No RTMP target"),

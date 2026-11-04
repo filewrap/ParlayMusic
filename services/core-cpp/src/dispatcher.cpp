@@ -434,6 +434,8 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onPlaymode(c); });
     add({"settings"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onSettings(c); });
+    add({"quality"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onQuality(c); });
     add({"lang", "language"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onLang(c); });
     add({"adminmode"}, Scope::Group, Perm::Everyone,
@@ -1195,6 +1197,27 @@ void applySettingKey(ui_texts::ChatSettings& s, const std::string& key,
     // clean_mode has no field: it is derived from clean_delay_min > 0.
 }
 
+// Parse one quality.get Opus values object (effective or library)
+// into QualityValues. Absent/wrong-typed fields keep the locked
+// defaults; the backend validator is the authority on ranges.
+ui_texts::QualityValues parseQualityValues(const Json& o) {
+    ui_texts::QualityValues v;
+    const Json* f = nullptr;
+    if ((f = o.find("bitrate_bps")) != nullptr)
+        v.bitrate_bps = static_cast<int>(f->asInt(v.bitrate_bps));
+    if ((f = o.find("frame_ms")) != nullptr)
+        v.frame_ms = static_cast<int>(f->asInt(v.frame_ms));
+    if ((f = o.find("complexity")) != nullptr)
+        v.complexity = static_cast<int>(f->asInt(v.complexity));
+    if ((f = o.find("vbr")) != nullptr) v.vbr = f->asBool(v.vbr);
+    if ((f = o.find("fec")) != nullptr) v.fec = f->asBool(v.fec);
+    if ((f = o.find("dtx")) != nullptr) v.dtx = f->asBool(v.dtx);
+    if ((f = o.find("max_playback_rate_hz")) != nullptr)
+        v.max_playback_rate_hz =
+            static_cast<int>(f->asInt(v.max_playback_rate_hz));
+    return v;
+}
+
 // Appended to status replies when the settings snapshot is served
 // from cache/defaults because the backend is down (Q7 fallback):
 // the "current" value shown may not be the chat's stored value.
@@ -1289,6 +1312,67 @@ bool Dispatcher::setSetting(int64_t chat_id, const std::string& key,
         it->second.live = true;
     }
     return true;
+}
+
+// --- Opus quality (quality.get surface, 2026-11-05) ---------------------
+// One UDS read; no caching: the card must show the values in force
+// now (a set just landed, or another admin changed them). The
+// backend resolves the precedence (store > config > profile >
+// default); the core never recomputes it.
+bool Dispatcher::fetchQuality(int64_t chat_id,
+                              ui_texts::QualityInfo& out) {
+    Json body = Json::objectOf({{"chat_id", Json(chat_id)}});
+    IpcResult r = ipc_.post("quality.get", body, 10);
+    if (!r.ok) {
+        std::cerr << "[quality] quality.get failed for chat " << chat_id
+                  << " (" << r.describe() << ")\n";
+        return false;
+    }
+    const Json* eff = r.data.find("effective");
+    if (eff == nullptr || !eff->isObject()) {
+        std::cerr << "[quality] quality.get for chat " << chat_id
+                  << " has no effective object\n";
+        return false;
+    }
+    out = ui_texts::QualityInfo{};
+    out.effective = parseQualityValues(*eff);
+    const Json* lib = r.data.find("library");
+    if (lib != nullptr && lib->isObject())
+        out.library = parseQualityValues(*lib);
+    else
+        out.library = out.effective;
+    static const char* kFields[] = {"bitrate_bps", "frame_ms",
+                                    "complexity", "vbr", "fec", "dtx"};
+    const Json* sources = r.data.find("sources");
+    if (sources != nullptr && sources->isObject()) {
+        for (const char* f : kFields) {
+            const Json* v = sources->find(f);
+            if (v != nullptr && v->isString())
+                out.sources[f] = v->asString();
+        }
+    }
+    const Json* active = r.data.find("active_call");
+    if (active != nullptr) out.active_call = active->asBool(false);
+    const Json* applies = r.data.find("applies_on");
+    if (applies != nullptr && applies->isString())
+        out.applies_on = applies->asString();
+    return true;
+}
+
+// Edit the tapped message to the quality sub-screen. Answers
+// nothing: the caller answers the callback query exactly once
+// before calling this. On a backend failure the screen is the
+// honest load-failure text with a Back button — never a silent
+// no-op, never a dead end.
+void Dispatcher::renderQualityScreen(const TgCallbackQuery& cq) {
+    ui_texts::QualityInfo q;
+    if (!fetchQuality(cq.chat_id, q)) {
+        editCbCard(cq, ui_texts::kQualityLoadFailed,
+                   ui_texts::qualityBackKeyboard());
+        return;
+    }
+    editCbCard(cq, ui_texts::qualityCardText(q),
+               ui_texts::settingsQualityKeyboard(q));
 }
 
 // --- per-chat runtime fields (NOT settings) ------------------------------
@@ -5115,6 +5199,24 @@ void Dispatcher::onSettings(const CommandContext& ctx) {
     replyKb(ctx, text, ui_texts::settingsKeyboard(s));
 }
 
+void Dispatcher::onQuality(const CommandContext& ctx) {
+    // Group only (routing row C102): the quality card describes this
+    // chat's effective Opus config. Everyone may read it; changing a
+    // value goes through the settings panel (admin-only callbacks).
+    if (isPrivate(ctx)) {
+        replyHtml(ctx, ui_texts::kSettingsGroupOnly);
+        return;
+    }
+    int64_t chat = vcTarget(ctx);
+    ui_texts::QualityInfo q;
+    if (!fetchQuality(chat, q)) {
+        replyHtml(ctx, ui_texts::kQualityLoadFailed);
+        return;
+    }
+    replyKb(ctx, ui_texts::qualityCardText(q),
+            ui_texts::settingsQualityKeyboard(q));
+}
+
 void Dispatcher::onLang(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     int64_t chat = vcTarget(ctx);
@@ -7538,6 +7640,63 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
                    ui_texts::settingsToggleKeyboard(
                        key, is_page ? s.paginate_purge_old
                                     : s.chat_music_download));
+        return;
+    }
+    // Quality sub-screen (routing rows A96–A99): pl:set:quality shows
+    // the screen; :br:<kbps> / :fr:<ms> write one per-chat override
+    // via the generic chat.settings set path (quality_bitrate_bps /
+    // quality_frame_ms); :reset clears all six quality_* overrides
+    // (JSON null) so the chat falls back to parlay.toml / profile /
+    // default. Out-of-range values are Unknown action, never stored.
+    // Every change applies on the NEXT join (the card says so); the
+    // screen is re-rendered from a fresh quality.get after the write.
+    if (key == "quality") {
+        if (parts.size() == 3) {
+            answerCb(cq, "");
+            renderQualityScreen(cq);
+            return;
+        }
+        if (parts.size() == 4 && parts[3] == "reset") {
+            static const char* kQualityKeys[] = {
+                "quality_bitrate_bps", "quality_frame_ms",
+                "quality_complexity", "quality_vbr", "quality_fec",
+                "quality_dtx"};
+            bool ok = true;
+            for (const char* k : kQualityKeys)
+                ok = setSetting(cq.chat_id, k, Json(nullptr)) && ok;
+            answerCb(cq, ok ? ui_texts::kSettingsUpdated
+                            : ui_texts::kSettingsSaveFailed,
+                     !ok);
+            renderQualityScreen(cq);
+            return;
+        }
+        if (parts.size() == 5 &&
+            (parts[3] == "br" || parts[3] == "fr")) {
+            bool is_br = parts[3] == "br";
+            int v = -1;
+            try {
+                v = std::stoi(parts[4]);
+            } catch (...) {
+            }
+            bool valid =
+                is_br ? (v == 128 || v == 160 || v == 192 || v == 256 ||
+                         v == 320)
+                      : (v == 10 || v == 20 || v == 40 || v == 60);
+            if (!valid) {
+                answerCb(cq, ui_texts::kToastUnknownAction, true);
+                return;
+            }
+            bool ok = setSetting(
+                cq.chat_id,
+                is_br ? "quality_bitrate_bps" : "quality_frame_ms",
+                Json(static_cast<int64_t>(is_br ? v * 1000 : v)));
+            answerCb(cq, ok ? ui_texts::kSettingsUpdated
+                            : ui_texts::kSettingsSaveFailed,
+                     !ok);
+            renderQualityScreen(cq);
+            return;
+        }
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
         return;
     }
     if (key == "timer") {

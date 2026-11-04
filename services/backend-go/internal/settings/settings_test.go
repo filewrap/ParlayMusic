@@ -29,15 +29,15 @@ func call(t *testing.T, svc *Service, payload string) map[string]any {
 	return data.(map[string]any)
 }
 
-func TestDefaultsAll15Keys(t *testing.T) {
+func TestDefaultsAll21Keys(t *testing.T) {
 	svc := testService(t)
 	m := call(t, svc, `{"chat_id":-100}`)
 	settings, ok := m["settings"].(map[string]any)
 	if !ok {
 		t.Fatalf("settings missing: %v", m)
 	}
-	if len(settings) != 15 {
-		t.Fatalf("settings has %d keys, want 15: %v", len(settings), settings)
+	if len(settings) != 21 {
+		t.Fatalf("settings has %d keys, want 21: %v", len(settings), settings)
 	}
 	want := map[string]any{
 		"admin_mode": 0, "play_mode": "everyone", "cmd_delete": false,
@@ -49,6 +49,14 @@ func TestDefaultsAll15Keys(t *testing.T) {
 	for k, v := range want {
 		if settings[k] != v {
 			t.Fatalf("default %s = %v (%T), want %v", k, settings[k], settings[k], v)
+		}
+	}
+	// The quality overrides default to null (no per-chat
+	// override): the effective config falls through to the
+	// file/profile/default.
+	for _, k := range []string{"quality_bitrate_bps", "quality_frame_ms", "quality_complexity", "quality_vbr", "quality_fec", "quality_dtx"} {
+		if settings[k] != nil {
+			t.Fatalf("default %s = %v, want null (no override)", k, settings[k])
 		}
 	}
 }

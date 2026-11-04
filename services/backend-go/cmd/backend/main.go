@@ -49,6 +49,7 @@ import (
 	"parlay/backend-go/internal/library"
 	"parlay/backend-go/internal/lyrics"
 	"parlay/backend-go/internal/netease"
+	"parlay/backend-go/internal/quality"
 	"parlay/backend-go/internal/radio"
 	"parlay/backend-go/internal/recognize"
 	"parlay/backend-go/internal/resolver"
@@ -154,28 +155,34 @@ func run() error {
 	defer client.Close()
 	log.Printf("backend-go: ntgcalls %s", voice.Version())
 
-	// Opus encoder: apply the locked bitrate from [quality]
-	// (voice_profile → kbps) BEFORE the first join. The
-	// settings are process-global and only affect Opus encoders
-	// created after the call (see internal/voice/opus.go), so
-	// this must run before the UDS server listens and any join
-	// can happen. A failure here is fatal: the encoder would
-	// otherwise run at the library default 320k instead of the
-	// configured profile, silently. The readback proves the
-	// setting stuck.
-	if err := voice.SetOpusBitrate(int32(cfg.Quality.OpusBitrateKbps() * 1000)); err != nil {
-		return fmt.Errorf("opus bitrate: %w", err)
-	}
-	if oc, err := voice.OpusConfig(); err != nil {
-		return fmt.Errorf("opus config readback: %w", err)
-	} else {
-		log.Printf("backend-go: opus encoder bitrate=%d complexity=%d vbr=%v fec=%v dtx=%v frame=%dms maxplay=%d (profile %s)",
-			oc.BitrateBps, oc.Complexity, oc.VBREnabled, oc.FECEnabled, oc.DTXEnabled, oc.FrameSizeMs, oc.MaxPlaybackRateHz, cfg.Quality.VoiceProfile)
+	// Opus encoder: apply the full effective config from
+	// parlay.toml [quality] (explicit keys > voice_profile
+	// preset > built-in default 192k/20ms) BEFORE the first
+	// join. The settings are process-global and only affect
+	// Opus encoders created after the call (see
+	// internal/voice/opus.go), so this must run before the
+	// UDS server listens and any join can happen. A failure
+	// here is fatal: the encoder would otherwise run at the
+	// library default 320k/60ms instead of the configured
+	// profile, silently. The readback inside Apply proves
+	// the setting stuck (it fails loudly on a mismatch).
+	// Per-chat store overrides are applied by the pre-join
+	// hook below, not here — there is no chat at startup.
+	if _, _, err := quality.ApplyStartup(cfg); err != nil {
+		return fmt.Errorf("opus config: %w", err)
 	}
 
 	server := uds.NewServer(cfg.SocketPath())
 	voiceMgr := voice.NewManager(client, func(ctx context.Context, chatID int64, localSDP string) (string, int64, error) {
 		return server.RequestJoin(ctx, chatID, localSDP)
+	})
+	// Pre-join Opus apply: before every join (before
+	// CreateCall creates the encoder), resolve the effective
+	// config for the joining chat — its stored quality_*
+	// overrides over the file-level config — and apply it.
+	// A hook error fails that join at stage "opus_config".
+	voiceMgr.SetPreJoinHook(func(ctx context.Context, chatID int64) error {
+		return quality.ApplyForChat(cfg, st, chatID)
 	})
 	// DSP engine: the real parlay-dsp library with -tags
 	// parlaydsp, the honest-unavailable engine otherwise (see
@@ -264,4 +271,5 @@ func registerAll(server *uds.Server, deps *app.Deps) {
 	gui.Register(server, deps)
 	radio.Register(server, deps)
 	netease.Register(server, deps)
+	quality.Register(server, deps)
 }

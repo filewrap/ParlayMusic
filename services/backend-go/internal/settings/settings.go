@@ -1,12 +1,12 @@
 // Package settings implements the chat.settings UDS action
-// (phase3/actions-inventory.md §8.1): per-chat settings, all 15 keys
+// (phase3/actions-inventory.md §8.1): per-chat settings, all 21 keys
 // from contracts/ipc.json. The backend owns them in Phase 3 (no
 // engine ever implemented this action; the old implementation was
 // core-local). Values persist in the store settings bucket, key
-// chat:<chat_id>, one JSON object with all 15 keys. Fresh start
+// chat:<chat_id>, one JSON object with all 21 keys. Fresh start
 // (OD-2): every chat starts at the defaults below.
 //
-// The 15 keys (ipc.json types; the inventory's §8.1 table agrees
+// The 21 keys (ipc.json types; the inventory's §8.1 table agrees
 // except where noted):
 //
 //	admin_mode int 0-2 (0), play_mode string everyone|admins,
@@ -16,6 +16,14 @@
 //	auto_delete_min int 2-7 (5), language string "en",
 //	paginate_purge_old bool, chat_music_download bool.
 //
+// Plus the 6 quality overrides (nil = no per-chat override;
+// the effective Opus config falls through to parlay.toml
+// [quality] — see internal/quality.Resolve):
+//
+//	quality_bitrate_bps int|null, quality_frame_ms int|null,
+//	quality_complexity int|null, quality_vbr bool|null,
+//	quality_fec bool|null, quality_dtx bool|null.
+//
 // clean_mode / clean_delay_min are ONE field read through two
 // names: clean_mode is whether auto-clean is on, clean_delay_min
 // is the delay in minutes (0 = off); they are kept in sync.
@@ -24,9 +32,20 @@
 //
 // GET/POST over UDS: the envelope carries no method, so a payload
 // with key+value is a set, a payload with key only (or neither) is
-// a get. GET with no key returns all 15; GET with a key returns
-// that key only (still under "settings"). autoplay writes through
-// to the room so the two views never disagree.
+// a get. GET with no key returns all 21; GET with a key returns
+// that key only (still under "settings"). A JSON null value on a
+// quality key CLEARS the per-chat override (falls back to the
+// file/profile/default); null on any other key is a GET, as
+// before. autoplay writes through to the room so the two views
+// never disagree.
+//
+// A quality set only persists the override: nothing about a
+// running encoder changes (the encoder is created per call and
+// reads the process-global settings at creation — see
+// internal/voice/opus.go), so the new values apply on the next
+// join in that chat, never mid-call. The pre-join hook
+// (internal/quality, installed by main.go) resolves and applies
+// the effective config before every join.
 package settings
 
 import (
@@ -40,6 +59,7 @@ import (
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/store"
 	"parlay/backend-go/internal/uds"
+	"parlay/backend-go/internal/voice"
 )
 
 // Service owns the chat.settings handler.
@@ -61,6 +81,24 @@ var knownKeys = []string{
 	"thumbnails", "autoplay", "autoplay_lang", "autoplay_mood", "silent_mode",
 	"auto_delete", "auto_delete_min", "language", "paginate_purge_old",
 	"chat_music_download",
+	"quality_bitrate_bps", "quality_frame_ms", "quality_complexity",
+	"quality_vbr", "quality_fec", "quality_dtx",
+}
+
+// qualityKeys are the per-chat Opus override keys: a nil value
+// means "no override". A JSON null set clears the override.
+var qualityKeys = []string{
+	"quality_bitrate_bps", "quality_frame_ms", "quality_complexity",
+	"quality_vbr", "quality_fec", "quality_dtx",
+}
+
+func isQualityKey(k string) bool {
+	for _, known := range qualityKeys {
+		if known == k {
+			return true
+		}
+	}
+	return false
 }
 
 func isKnownKey(k string) bool {
@@ -72,8 +110,25 @@ func isKnownKey(k string) bool {
 	return false
 }
 
-// settingsMap renders the 15-key object for the wire. clean_mode is
+// ptrInt renders a nullable int setting: nil stays nil (JSON
+// null = "no override"), otherwise the value.
+func ptrInt(p *int) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func ptrBool(p *bool) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// settingsMap renders the 21-key object for the wire. clean_mode is
 // a bool on the wire (ipc.json); clean_delay_min carries the minutes.
+// The quality keys render null when unset (no per-chat override).
 func settingsMap(st model.ChatSettings) map[string]any {
 	return map[string]any{
 		"admin_mode":          st.AdminMode,
@@ -91,10 +146,16 @@ func settingsMap(st model.ChatSettings) map[string]any {
 		"language":            st.Language,
 		"paginate_purge_old":  st.PaginatePurgeOld,
 		"chat_music_download": st.ChatMusicDownload,
+		"quality_bitrate_bps": ptrInt(st.QualityBitrateBps),
+		"quality_frame_ms":    ptrInt(st.QualityFrameMs),
+		"quality_complexity":  ptrInt(st.QualityComplexity),
+		"quality_vbr":         ptrBool(st.QualityVBR),
+		"quality_fec":         ptrBool(st.QualityFEC),
+		"quality_dtx":         ptrBool(st.QualityDTX),
 	}
 }
 
-// defaults returns the 15-key defaults for a fresh chat.
+// defaults returns the 21-key defaults for a fresh chat.
 func defaults() model.ChatSettings {
 	st := model.DefaultChatSettings()
 	st.AutoplayLang = "" // inventory §8.1 / U3: "" (any language)
@@ -264,10 +325,75 @@ func setKey(st *model.ChatSettings, key string, raw json.RawMessage) error {
 			return err
 		}
 		st.ChatMusicDownload = b
+	case "quality_bitrate_bps":
+		n, err := parseInt(raw)
+		if err != nil {
+			return err
+		}
+		if n < voice.OpusMinBitrateBps || n > voice.OpusMaxBitrateBps {
+			return fmt.Errorf("quality_bitrate_bps must be %d..%d, got %d", voice.OpusMinBitrateBps, voice.OpusMaxBitrateBps, n)
+		}
+		st.QualityBitrateBps = &n
+	case "quality_frame_ms":
+		n, err := parseInt(raw)
+		if err != nil {
+			return err
+		}
+		if !voice.ValidOpusFrameSize(int32(n)) {
+			return fmt.Errorf("quality_frame_ms must be one of 10, 20, 40, 60, got %d", n)
+		}
+		st.QualityFrameMs = &n
+	case "quality_complexity":
+		n, err := parseInt(raw)
+		if err != nil {
+			return err
+		}
+		if n < voice.OpusMinComplexity || n > voice.OpusMaxComplexity {
+			return fmt.Errorf("quality_complexity must be %d..%d, got %d", voice.OpusMinComplexity, voice.OpusMaxComplexity, n)
+		}
+		st.QualityComplexity = &n
+	case "quality_vbr":
+		b, err := parseBool(raw)
+		if err != nil {
+			return err
+		}
+		st.QualityVBR = &b
+	case "quality_fec":
+		b, err := parseBool(raw)
+		if err != nil {
+			return err
+		}
+		st.QualityFEC = &b
+	case "quality_dtx":
+		b, err := parseBool(raw)
+		if err != nil {
+			return err
+		}
+		st.QualityDTX = &b
 	default:
 		return fmt.Errorf("unknown settings key %q (known: %s)", key, strings.Join(knownKeys, ", "))
 	}
 	return nil
+}
+
+// clearQualityKey removes a per-chat quality override: the
+// effective config falls back to parlay.toml [quality] (or the
+// profile/default). Only called for quality keys.
+func clearQualityKey(st *model.ChatSettings, key string) {
+	switch key {
+	case "quality_bitrate_bps":
+		st.QualityBitrateBps = nil
+	case "quality_frame_ms":
+		st.QualityFrameMs = nil
+	case "quality_complexity":
+		st.QualityComplexity = nil
+	case "quality_vbr":
+		st.QualityVBR = nil
+	case "quality_fec":
+		st.QualityFEC = nil
+	case "quality_dtx":
+		st.QualityDTX = nil
+	}
 }
 
 func (s *Service) handleSettings(ctx context.Context, req uds.Request) (any, error) {
@@ -298,12 +424,20 @@ func (s *Service) handleSettings(ctx context.Context, req uds.Request) (any, err
 		st = defaults()
 	}
 
+	// An unknown key is a 400 whether the payload reads or
+	// writes (same message as before, hoisted so the null
+	// clear below does not treat it as a GET).
+	if body.Key != "" && !isKnownKey(body.Key) {
+		return nil, uds.NewHandlerError(uds.ErrBadRequest, fmt.Sprintf("unknown settings key %q (known: %s)", body.Key, strings.Join(knownKeys, ", ")))
+	}
 	isSet := body.Key != "" && len(body.Value) > 0 && string(body.Value) != "null"
-	if isSet {
-		if !isKnownKey(body.Key) {
-			return nil, uds.NewHandlerError(uds.ErrBadRequest, fmt.Sprintf("unknown settings key %q (known: %s)", body.Key, strings.Join(knownKeys, ", ")))
-		}
-		if err := setKey(&st, body.Key, body.Value); err != nil {
+	// A JSON null on a quality key clears the per-chat
+	// override (falls back to the file/profile/default).
+	isClear := body.Key != "" && isQualityKey(body.Key) && len(body.Value) > 0 && string(body.Value) == "null"
+	if isSet || isClear {
+		if isClear {
+			clearQualityKey(&st, body.Key)
+		} else if err := setKey(&st, body.Key, body.Value); err != nil {
 			return nil, uds.NewHandlerError(uds.ErrBadRequest, fmt.Sprintf("key %s: %v", body.Key, err))
 		}
 		if err := s.store.PutSettings(chatID, st); err != nil {
@@ -321,9 +455,6 @@ func (s *Service) handleSettings(ctx context.Context, req uds.Request) (any, err
 		}
 	} else if body.Key != "" {
 		// GET one key.
-		if !isKnownKey(body.Key) {
-			return nil, uds.NewHandlerError(uds.ErrBadRequest, fmt.Sprintf("unknown settings key %q (known: %s)", body.Key, strings.Join(knownKeys, ", ")))
-		}
 		return map[string]any{
 			"chat_id":  chatID,
 			"settings": map[string]any{body.Key: settingsMap(st)[body.Key]},

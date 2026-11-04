@@ -301,6 +301,70 @@ func TestManagerJoinStageErrors(t *testing.T) {
 	}
 }
 
+func TestManagerPreJoinHook(t *testing.T) {
+	c := newTestClient(t)
+	restore := saveOpusConfig(t)
+	defer restore()
+
+	// A hook error fails the join at stage "opus_config"
+	// before CreateCall runs: the JoinFunc is never invoked.
+	joinCalled := false
+	m := NewManager(c, func(ctx context.Context, chatID int64, localSDP string) (string, int64, error) {
+		joinCalled = true
+		return "{}", 12345, nil
+	})
+	t.Cleanup(m.Close)
+	m.SetPreJoinHook(func(ctx context.Context, chatID int64) error {
+		return errors.New("opus config refused (test double)")
+	})
+	_, err := m.Join(context.Background(), -1001234567897)
+	if err == nil {
+		t.Fatal("Join succeeded although the pre-join hook failed")
+	}
+	if !strings.Contains(err.Error(), "opus_config:") {
+		t.Errorf("error does not name the opus_config stage: %v", err)
+	}
+	if joinCalled {
+		t.Error("JoinFunc ran although the pre-join hook failed first")
+	}
+	call, _ := m.Get(-1001234567897)
+	if call.FailedStage != "opus_config" {
+		t.Errorf("FailedStage=%q, want %q", call.FailedStage, "opus_config")
+	}
+
+	// A hook that applies a config runs before CreateCall:
+	// the library holds the hook's config even though the
+	// join then fails at the join stage (no JoinFunc here,
+	// so CreateCall succeeds and the join stage fails).
+	m2 := NewManager(c, nil)
+	t.Cleanup(m2.Close)
+	m2.SetPreJoinHook(func(ctx context.Context, chatID int64) error {
+		return SetOpusConfig(OpusEncoderConfig{BitrateBps: 160000, Complexity: 10, VBREnabled: true, FECEnabled: false, DTXEnabled: false, FrameSizeMs: 20, MaxPlaybackRateHz: 48000})
+	})
+	_, err = m2.Join(context.Background(), -1001234567898)
+	if err == nil {
+		t.Fatal("Join without JoinFunc succeeded; expected a failure naming the join stage")
+	}
+	if !strings.Contains(err.Error(), "join:") {
+		t.Errorf("error does not name the join stage: %v", err)
+	}
+	got, err := OpusConfig()
+	if err != nil {
+		t.Fatalf("OpusConfig: %v", err)
+	}
+	if got.BitrateBps != 160000 || got.FrameSizeMs != 20 {
+		t.Errorf("pre-join hook config not applied: %+v", got)
+	}
+
+	// Clearing the hook restores the old behaviour (no hook
+	// runs, join fails at the join stage as before).
+	m2.SetPreJoinHook(nil)
+	_, err = m2.Join(context.Background(), -1001234567899)
+	if err == nil || !strings.Contains(err.Error(), "join:") {
+		t.Errorf("join after clearing the hook: err=%v, want a join-stage failure", err)
+	}
+}
+
 func TestManagerPauseWithoutCall(t *testing.T) {
 	c := newTestClient(t)
 	m := NewManager(c, nil)

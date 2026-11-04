@@ -4,8 +4,8 @@
 #
 # Stock libntgcalls 3.0.5 has no Opus encoder configuration surface;
 # the patch adds ntg_opus_set_config / ntg_opus_get_config /
-# ntg_opus_set_bitrate (defaults 320000 bps, complexity 10, VBR on,
-# FEC off, 60 ms frames) by wrapping WebRTC's builtin audio encoder
+# ntg_opus_set_bitrate (defaults 192000 bps, complexity 10, VBR on,
+# FEC off, 20 ms frames) by wrapping WebRTC's builtin audio encoder
 # factory. See patches/ntgcalls-opus-encoder/README.md.
 #
 # Layout: refs/ is gitignored in the outer repo, so a fresh clone

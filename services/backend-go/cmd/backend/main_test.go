@@ -17,11 +17,13 @@ import (
 	"parlay/backend-go/internal/voice"
 )
 
-// allContractActions is the full 65-action surface: the 56 IPC
+// allContractActions is the full 66-action surface: the 56 IPC
 // actions of FINAL-ARCHITECTURE.md §10.1 plus the 9 OD-3 actions
-// of phase3/actions-inventory.md §9 (E1–E7, E9, E12). It mirrors
-// contracts/uds-protocol.md §4 rows 1–65 exactly; if the protocol
-// table grows, this list must grow with it.
+// of phase3/actions-inventory.md §9 (E1–E7, E9, E12) plus
+// quality.get (the Opus quality surface: effective-config read
+// for /quality and the settings-panel quality section). It
+// mirrors contracts/uds-protocol.md §4 rows 1–66 exactly; if
+// the protocol table grows, this list must grow with it.
 var allContractActions = []string{
 	// 56 contract actions (§10.1).
 	"chat.settings",
@@ -47,6 +49,8 @@ var allContractActions = []string{
 	"download.cancel", "library.delete", "mix.generate", "audio.recognize",
 	"library.scan", "library.sharescan", "cache.clear", "download.prefs",
 	"vc.play_file",
+	// 1 quality action (Opus quality surface).
+	"quality.get",
 }
 
 // TestRegisterAllExactlyOnce runs the exact production wiring
@@ -58,8 +62,8 @@ var allContractActions = []string{
 // (including the old download/handlers vc.play_file duplicate,
 // which would have shown count 2).
 func TestRegisterAllExactlyOnce(t *testing.T) {
-	if len(allContractActions) != 65 {
-		t.Fatalf("allContractActions has %d entries, want 65 — update it with contracts/uds-protocol.md §4", len(allContractActions))
+	if len(allContractActions) != 66 {
+		t.Fatalf("allContractActions has %d entries, want 66 — update it with contracts/uds-protocol.md §4", len(allContractActions))
 	}
 	dir := t.TempDir()
 	tomlPath := filepath.Join(dir, "parlay.toml")
@@ -96,10 +100,10 @@ func TestRegisterAllExactlyOnce(t *testing.T) {
 
 	registerAll(server, deps)
 
-	// Exactly 65 contract actions + the protocol-level ping.
+	// Exactly 66 contract actions + the protocol-level ping.
 	actions := server.Actions()
-	if len(actions) != 66 {
-		t.Fatalf("registered %d actions, want 66 (65 contract + ping): %v", len(actions), actions)
+	if len(actions) != 67 {
+		t.Fatalf("registered %d actions, want 67 (66 contract + ping): %v", len(actions), actions)
 	}
 	for _, action := range allContractActions {
 		if n := server.RegistrationCount(action); n != 1 {
@@ -116,7 +120,7 @@ func TestRegisterAllExactlyOnce(t *testing.T) {
 	}
 	for _, a := range actions {
 		if !want[a] {
-			t.Errorf("unexpected registered action %q (not in the 65-action contract list)", a)
+			t.Errorf("unexpected registered action %q (not in the 66-action contract list)", a)
 		}
 	}
 }

@@ -31,7 +31,7 @@ design + verification evidence):
   delegating `AudioEncoderFactory` that constructs
   `AudioEncoderOpusImpl` directly with a full config for Opus
   (application `kAudio` always, complexity 10, CBR iff !VBR,
-  frame 60 ms) and delegates everything else to the builtin
+  frame 20 ms) and delegates everything else to the builtin
   factory.
 - `wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp`
   (1 line): install the factory.
@@ -42,8 +42,8 @@ design + verification evidence):
 - NEW `targets/c/ntgcalls_opus.h` + NEW
   `ntgcalls/src/opus_encoder_config_c.cpp` — hand-written C API
   (NOT NTL schema): `ntg_opus_set_config` / `ntg_opus_get_config` /
-  `ntg_opus_set_bitrate`. Defaults: 320000 bps, complexity 10,
-  VBR on, FEC off, DTX off, 60 ms frames, 48000 Hz max playback.
+  `ntg_opus_set_bitrate`. Defaults: 192000 bps, complexity 10,
+  VBR on, FEC off, DTX off, 20 ms frames, 48000 Hz max playback.
 - `targets/c/build.cmake` (+2 lines): install the new header into
   `shared-output/include`.
 
@@ -52,7 +52,7 @@ design + verification evidence):
 `OPUS_SIGNAL_MUSIC` is **not** literally set. WebRTC M152's
 `AudioEncoderOpusConfig` has no signal field and nothing reaches
 the live `OpusEncInst`; the encoder runs libopus `OPUS_AUTO` with
-`OPUS_APPLICATION_AUDIO`. At the locked 192–320 kbps stereo rates
+`OPUS_APPLICATION_AUDIO`. At the locked 128–192 kbps stereo rates
 the audible difference vs explicit `OPUS_SIGNAL_MUSIC` is nil, but
 it is not literally `OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC)`. A literal
 signal would need a ~600-line custom `AudioEncoder` subclass.

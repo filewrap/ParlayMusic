@@ -38,8 +38,8 @@
       "method": "UDS chat.settings",
       "request": {
         "chat_id": "ChatId",
-        "key": "string (set only: admin_mode|play_mode|cmd_delete|clean_mode|clean_delay_min|thumbnails|autoplay|autoplay_lang|autoplay_mood|silent_mode|auto_delete|auto_delete_min|language|paginate_purge_old|chat_music_download)",
-        "value": "string|boolean|integer (set only)"
+        "key": "string (set only: admin_mode|play_mode|cmd_delete|clean_mode|clean_delay_min|thumbnails|autoplay|autoplay_lang|autoplay_mood|silent_mode|auto_delete|auto_delete_min|language|paginate_purge_old|chat_music_download|quality_bitrate_bps|quality_frame_ms|quality_complexity|quality_vbr|quality_fec|quality_dtx)",
+        "value": "string|boolean|integer|null (set only; null on a quality_* key clears the per-chat override)"
       },
       "response": {
         "chat_id": "ChatId",
@@ -58,7 +58,13 @@
           "auto_delete_min": "integer",
           "language": "string",
           "paginate_purge_old": "boolean",
-          "chat_music_download": "boolean"
+          "chat_music_download": "boolean",
+          "quality_bitrate_bps": "integer|null (per-chat Opus bitrate override, 6000..510000; null = no override, fall through to parlay.toml [quality])",
+          "quality_frame_ms": "integer|null (per-chat Opus frame-size override, one of 10, 20, 40, 60; null = no override)",
+          "quality_complexity": "integer|null (per-chat Opus complexity override, 0..10; null = no override)",
+          "quality_vbr": "boolean|null (per-chat Opus VBR override; null = no override)",
+          "quality_fec": "boolean|null (per-chat Opus FEC override; null = no override)",
+          "quality_dtx": "boolean|null (per-chat Opus DTX override; null = no override)"
         }
       },
       "service": "backend-go:settings"
@@ -397,6 +403,30 @@
         ]
       },
       "service": "backend-go:netease"
+    },
+    "quality.get": {
+      "from": "Opus quality surface (2026-11-05): effective-config read for /quality and the settings-panel quality section",
+      "method": "UDS quality.get",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "chat_id": "ChatId",
+        "effective": {
+          "bitrate_bps": "integer (effective Opus bitrate)",
+          "frame_ms": "integer (effective Opus frame size, one of 10, 20, 40, 60)",
+          "complexity": "integer (effective Opus complexity, 0..10)",
+          "vbr": "boolean",
+          "fec": "boolean",
+          "dtx": "boolean",
+          "max_playback_rate_hz": "integer (always 48000)"
+        },
+        "sources": "object (winning level per field: store|config|profile|default; keys bitrate_bps, frame_ms, complexity, vbr, fec, dtx)",
+        "library": "object (same shape as effective: the library's currently stored config, what the next encoder will actually use)",
+        "active_call": "boolean (the chat has a live call)",
+        "applies_on": "string (always \"next join\": settings apply to encoders created after the call, never mid-call)"
+      },
+      "service": "backend-go:quality"
     },
     "queue.vote": {
       "from": "daslui src/spotify.rs",
@@ -959,7 +989,8 @@
     "New actions are added here first, then in the backend package, then in the core handler.",
     "v0.3.0 (Phase 9): IPC-1 vc.now_playing UI fields, IPC-2 vc.progress, IPC-3 search Track fields, IPC-4 download.progress, IPC-5 lyrics fields, IPC-6 chat.settings, IPC-7 spotify.details/analyze. download.spotify_playlist gains file_paths (files mode). radio.status response corrected to the radio-js shape.",
     "v0.3.1 (Phase 9 gaps): search.inline request gains optional chat_id (np/s/l modes only — the core passes the chat the inline user is playing in; without it those modes return empty results); netease.lyrics response gains lrc_path (the .lrc file the service wrote under the download dir, empty string when the write fails); every download.* POST response gains run_id (12-hex progress-run id — the core reads it from the response for the IPC-4 snapshot. Live polling DURING the transfer is still not possible: the downloaders POST blocks until the transfer completes, so the run_id is only known after the POST returns.)",
-    "Phase 4 (2026-11-03, Worker C): retargeted to the unified backend — every action's service is backend-go:<package> (the 12-service HTTP mesh is gone); method is the UDS action name; protocol is UDS + JSON. Action set and request/response shapes unchanged (still 65 actions, 56 contract + 9 OD-3). chat.settings records the canonical values: play_mode everyone|admins (default everyone), autoplay_lang default \"\" (any language)."
+    "Phase 4 (2026-11-03, Worker C): retargeted to the unified backend — every action's service is backend-go:<package> (the 12-service HTTP mesh is gone); method is the UDS action name; protocol is UDS + JSON. Action set and request/response shapes unchanged (still 65 actions, 56 contract + 9 OD-3). chat.settings records the canonical values: play_mode everyone|admins (default everyone), autoplay_lang default \"\" (any language).",
+    "Opus quality surface (2026-11-05): 66 actions (56 contract + 9 OD-3 + quality.get). chat.settings gains the 6 per-chat quality overrides (quality_bitrate_bps, quality_frame_ms, quality_complexity, quality_vbr, quality_fec, quality_dtx; null = no override, fall through to parlay.toml [quality]); a JSON null set clears the override. quality.get returns the effective Opus config (store override > [quality] explicit keys > voice_profile preset > built-in default 192k/20ms), the winning level per field, the library's stored config, and applies_on \"next join\" — nothing about a running encoder changes mid-call."
   ],
   "title": "Parlay IPC contract",
   "transport": {

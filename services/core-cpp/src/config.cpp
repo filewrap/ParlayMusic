@@ -201,7 +201,9 @@ void applyToml(const toml::Document& doc, Config& c) {
                    {"resolve_ms", "join_ms", "ipc_cmd_ms", "download_ms",
                     "healthz_ms"});
     checkKnownKeys(doc, "quality",
-                   {"voice_profile", "source_ladder", "resampler_quality"});
+                   {"voice_profile", "source_ladder", "resampler_quality",
+                    "opus_bitrate_bps", "opus_frame_ms", "opus_complexity",
+                    "opus_vbr", "opus_fec", "opus_dtx"});
     checkKnownKeys(doc, "limits",
                    {"max_duration_minutes", "max_queue_size",
                     "prefetch_lead_time_sec", "url_cache_ttl_sec"});

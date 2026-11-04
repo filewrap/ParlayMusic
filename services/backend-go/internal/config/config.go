@@ -48,11 +48,128 @@ type TimeoutConfig struct {
 }
 
 // QualityConfig holds the voice profile, resolution ladder and
-// resampler choice.
+// resampler choice, plus the explicit Opus encoder keys. The
+// explicit keys are pointers: nil means "not set in the file"
+// and the value falls through to the voice_profile preset (for
+// the bitrate) or the built-in default. A set key always wins
+// over the preset. Env overrides exist only for voice_profile
+// / resampler_quality / source_ladder, not for these keys.
 type QualityConfig struct {
 	VoiceProfile     string   `toml:"voice_profile"`
 	SourceLadder     []string `toml:"source_ladder"`
 	ResamplerQuality string   `toml:"resampler_quality"`
+	// OpusBitrateBps is the explicit encoder bitrate in bits
+	// per second (192000 = 192 kbps). Nil = use the
+	// voice_profile preset.
+	OpusBitrateBps *int `toml:"opus_bitrate_bps"`
+	// OpusFrameMs is the explicit encoder frame size in ms
+	// (one of 10, 20, 40, 60). Nil = the built-in default
+	// (20 ms); the voice profile sets no frame size.
+	OpusFrameMs *int `toml:"opus_frame_ms"`
+	// OpusComplexity is the explicit Opus complexity (0-10).
+	// Nil = the built-in default (10).
+	OpusComplexity *int `toml:"opus_complexity"`
+	// OpusVBR / OpusFEC / OpusDTX are the explicit VBR, FEC
+	// and DTX switches. Nil = the built-in defaults (VBR on,
+	// FEC off, DTX off).
+	OpusVBR *bool `toml:"opus_vbr"`
+	OpusFEC *bool `toml:"opus_fec"`
+	OpusDTX *bool `toml:"opus_dtx"`
+}
+
+// Opus encoder bounds for the explicit [quality] keys. These
+// MUST equal voice.OpusMinBitrateBps / OpusMaxBitrateBps /
+// OpusMinComplexity / OpusMaxComplexity and the frame-size set
+// voice accepts (10, 20, 40, 60): this package must stay
+// cgo-free, so the bounds are duplicated here instead of
+// imported, and internal/quality's TestConfigBoundsAgree
+// fails the build if the two sets ever drift apart.
+const (
+	OpusMinBitrateBps = 6000
+	OpusMaxBitrateBps = 510000
+	OpusMinComplexity = 0
+	OpusMaxComplexity = 10
+)
+
+// Opus field names, shared by config.OpusSettings Sources and
+// the quality resolver's per-field source reporting.
+const (
+	OpusFieldBitrateBps = "bitrate_bps"
+	OpusFieldComplexity = "complexity"
+	OpusFieldVBR        = "vbr"
+	OpusFieldFEC        = "fec"
+	OpusFieldDTX        = "dtx"
+	OpusFieldFrameMs    = "frame_ms"
+)
+
+// OpusSettings is the resolved [quality] encoder config at the
+// file level: explicit keys win over the voice_profile preset,
+// which wins over the built-in default (192000 bps, 20 ms,
+// complexity 10, VBR on, FEC off, DTX off, 48000 Hz — the
+// same default as voice.DefaultOpusEncoderConfig). Sources
+// names, per field, which level set it ("config", "profile"
+// or "default"); the quality resolver overlays the per-chat
+// store override on top of this and reports "store" for the
+// fields it sets. MaxPlaybackRateHz has no explicit key and
+// is always 48000 (fullband).
+type OpusSettings struct {
+	BitrateBps        int
+	Complexity        int
+	VBR               bool
+	FEC               bool
+	DTX               bool
+	FrameMs           int
+	MaxPlaybackRateHz int
+	Sources           map[string]string
+}
+
+// OpusSettings resolves the file-level Opus encoder config:
+// explicit [quality] keys first, then the voice_profile
+// preset (bitrate only — the profile sets no other field),
+// then the built-in default.
+func (q QualityConfig) OpusSettings() OpusSettings {
+	s := OpusSettings{
+		BitrateBps:        q.OpusBitrateKbps() * 1000,
+		Complexity:        10,
+		VBR:               true,
+		FEC:               false,
+		DTX:               false,
+		FrameMs:           20,
+		MaxPlaybackRateHz: 48000,
+		Sources: map[string]string{
+			OpusFieldBitrateBps: "profile",
+			OpusFieldComplexity: "default",
+			OpusFieldVBR:        "default",
+			OpusFieldFEC:        "default",
+			OpusFieldDTX:        "default",
+			OpusFieldFrameMs:    "default",
+		},
+	}
+	if q.OpusBitrateBps != nil {
+		s.BitrateBps = *q.OpusBitrateBps
+		s.Sources[OpusFieldBitrateBps] = "config"
+	}
+	if q.OpusComplexity != nil {
+		s.Complexity = *q.OpusComplexity
+		s.Sources[OpusFieldComplexity] = "config"
+	}
+	if q.OpusVBR != nil {
+		s.VBR = *q.OpusVBR
+		s.Sources[OpusFieldVBR] = "config"
+	}
+	if q.OpusFEC != nil {
+		s.FEC = *q.OpusFEC
+		s.Sources[OpusFieldFEC] = "config"
+	}
+	if q.OpusDTX != nil {
+		s.DTX = *q.OpusDTX
+		s.Sources[OpusFieldDTX] = "config"
+	}
+	if q.OpusFrameMs != nil {
+		s.FrameMs = *q.OpusFrameMs
+		s.Sources[OpusFieldFrameMs] = "config"
+	}
+	return s
 }
 
 // OpusBitrateKbps returns the target Opus bitrate implied by the
@@ -331,6 +448,22 @@ func (c *Config) validate() error {
 	case "sinc_256", "sinc_128", "fast":
 	default:
 		return fail("quality.resampler_quality", "must be one of sinc_256, sinc_128, fast")
+	}
+	// Explicit Opus keys: same bounds as voice/opus.go (see
+	// the OpusMinBitrateBps comment — this package stays
+	// cgo-free, so the numbers are duplicated, not imported).
+	if v := c.Quality.OpusBitrateBps; v != nil && (*v < OpusMinBitrateBps || *v > OpusMaxBitrateBps) {
+		return fail("quality.opus_bitrate_bps", fmt.Sprintf("must be an integer in %d..%d, got %d", OpusMinBitrateBps, OpusMaxBitrateBps, *v))
+	}
+	if v := c.Quality.OpusComplexity; v != nil && (*v < OpusMinComplexity || *v > OpusMaxComplexity) {
+		return fail("quality.opus_complexity", fmt.Sprintf("must be an integer in %d..%d, got %d", OpusMinComplexity, OpusMaxComplexity, *v))
+	}
+	if v := c.Quality.OpusFrameMs; v != nil {
+		switch *v {
+		case 10, 20, 40, 60:
+		default:
+			return fail("quality.opus_frame_ms", fmt.Sprintf("must be one of 10, 20, 40, 60, got %d", *v))
+		}
 	}
 	if len(c.Quality.SourceLadder) == 0 {
 		return fail("quality.source_ladder", "must list at least one source")

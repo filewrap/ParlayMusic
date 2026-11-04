@@ -24,10 +24,14 @@ func saveOpusConfig(t *testing.T) (restore func()) {
 func TestOpusDefaults(t *testing.T) {
 	restore := saveOpusConfig(t)
 	defer restore()
-	// Apply the locked defaults, then read them back: the
+	// Apply the defaults, then read them back: the
 	// round-trip proves set_config/get_config agree, and the
-	// values are the locked profile (320k, complexity 10, VBR
-	// on, FEC/DTX off, 60 ms, 48 kHz fullband).
+	// values are the default profile (192k, complexity 10, VBR
+	// on, FEC/DTX off, 20 ms, 48 kHz fullband). The round-trip
+	// also proves the real library is linked: with the weak
+	// no-op stub (opus_stub.c, -tags ntgopus_stub) the readback
+	// is the stub's hardcoded 192000 bps / 60 ms and this
+	// fails on the frame size.
 	if err := SetOpusConfig(DefaultOpusEncoderConfig()); err != nil {
 		t.Fatalf("SetOpusConfig(defaults): %v", err)
 	}
@@ -48,7 +52,7 @@ func TestOpusSetBitrate(t *testing.T) {
 		t.Fatalf("SetOpusConfig(defaults): %v", err)
 	}
 	// The ladder step: only the bitrate changes, everything
-	// else stays at the locked defaults.
+	// else stays at the defaults (20 ms frames now).
 	if err := SetOpusBitrate(256000); err != nil {
 		t.Fatalf("SetOpusBitrate(256000): %v", err)
 	}
@@ -59,7 +63,7 @@ func TestOpusSetBitrate(t *testing.T) {
 	if got.BitrateBps != 256000 {
 		t.Errorf("bitrate = %d, want 256000", got.BitrateBps)
 	}
-	if got.Complexity != 10 || !got.VBREnabled || got.FECEnabled || got.DTXEnabled || got.FrameSizeMs != 60 || got.MaxPlaybackRateHz != 48000 {
+	if got.Complexity != 10 || !got.VBREnabled || got.FECEnabled || got.DTXEnabled || got.FrameSizeMs != 20 || got.MaxPlaybackRateHz != 48000 {
 		t.Errorf("other settings changed by set_bitrate: %+v", got)
 	}
 	// An out-of-range bitrate is rejected and leaves the stored
@@ -75,7 +79,9 @@ func TestOpusSetBitrate(t *testing.T) {
 func TestOpusSetConfig(t *testing.T) {
 	restore := saveOpusConfig(t)
 	defer restore()
-	// Full-config set: the standard_192k profile values.
+	// Full-config set: an explicit 192k / 60 ms config (60 ms
+	// stays a legal frame size even though the default is
+	// 20 ms now).
 	cfg := OpusEncoderConfig{BitrateBps: 192000, Complexity: 10, VBREnabled: true, FECEnabled: false, DTXEnabled: false, FrameSizeMs: 60, MaxPlaybackRateHz: 48000}
 	if err := SetOpusConfig(cfg); err != nil {
 		t.Fatalf("SetOpusConfig(192k): %v", err)

@@ -101,7 +101,8 @@ below: `/lyric`, `/language`, `/thumb`, `/reload`, `/rmsudo`,
 | Command | Args | Who | Implements |
 |---|---|---|---|
 | `/playmode` | `[admin\|everyone]` | admin | Store |
-| `/settings` | — | admin | inline settings panel (toggles + timer 2–7 min, group only) |
+| `/settings` | — | admin | inline settings panel (toggles + timer 2–7 min, group only); Quality section (bitrate / frame size) renders from `quality.get` and writes `quality_*` overrides via `chat.settings` |
+| `/quality` | — | admin | quality card: effective Opus values (bitrate / frame size / complexity / VBR / FEC / DTX) with source per field (store / config file / profile / default) + "applies on next join" note; group only; backend `quality.get` (core UI: routing-table C102, Contract) |
 | `/download-settings` | — | E | per-user download prefs (format / YouTube mode / path template); template set by free text afterwards (prefs stored, not yet sent to the backend — the `download.prefs` UDS action exists but the core does not call it yet) |
 | `/adminmode` | `[admin\|adminauth\|everyone]` | admin | Store |
 | `/cmddelete` | `[on\|off]` | admin | Store |

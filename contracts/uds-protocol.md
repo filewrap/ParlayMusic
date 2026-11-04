@@ -3,7 +3,7 @@
 Status: **Phase 2, implemented** (core side: `services/core-cpp/src/ipc.*`;
 test peer: `services/core-cpp/tests/stub_backend.cpp`).
 Replaces the HTTP wire protocol described in `contracts/ipc.json`
-(live contract since Phase 4 — the 65 actions and their payload shapes,
+(live contract since Phase 4 — the 66 actions and their payload shapes,
 retargeted to the unified backend; only the transport changes). `ipc.json` stays the
 authority for request/response field shapes; this document is the
 authority for how those shapes move over the wire.
@@ -156,7 +156,7 @@ keep working.
 
 | # | Action | Request (payload) | Response (data) | Deadline |
 |---|---|---|---|---|
-| 1 | `chat.settings` | `chat_id`; POST only: `key`, `value` | `chat_id`, `settings` (15 keys) | 10 s |
+| 1 | `chat.settings` | `chat_id`; POST only: `key`, `value` | `chat_id`, `settings` (21 keys) | 10 s |
 | 2 | `download.deezer` | `query`, `requested_by` | `file_path`, `track`, `run_id` | 30 s* |
 | 3 | `download.navidrome` | `url`, `requested_by` | `imported`, `track`, `run_id` | 30 s* |
 | 4 | `download.progress` | `run_id` | `run_id`, `percentage`, `done_bytes`, `total_bytes`, `speed_bytes_per_sec`, `eta_sec`, `elapsed_sec`, `phase`, `per_track`, `lossy_available`, `lossy_summary` | 10 s |
@@ -221,6 +221,7 @@ keep working.
 | 63 | `cache.clear` | `scope` (track\|all), `name` | `cleared`, `names` ([string]) | 10 s |
 | 64 | `download.prefs` | `user_id`; POST only: `format`, `use_youtube`, `path_template` | `user_id`, `format`, `use_youtube`, `path_template` | 10 s |
 | 65 | `vc.play_file` | `chat_id`, `file_path`, `file_id`, `title`, `kind`, `duration_sec`, `requested_by` | `now_playing` | 30 s |
+| 66 | `quality.get` | `chat_id` | `chat_id`, `effective`, `sources`, `library`, `active_call`, `applies_on` | 10 s |
 
 \* Download actions: the old HTTP call sites passed an explicit
 120 s timeout for `download.*` POSTs. That explicit value still
@@ -228,7 +229,7 @@ governs (the deadline table has no `download.*` entry, so the
 call-site parameter wins — see §8). The config rewrite should set
 a `download_ms` budget instead.
 
-Protocol-level action (NOT one of the 65): `ping`, empty payload,
+Protocol-level action (NOT one of the 66): `ping`, empty payload,
 answers `{service: "backend-go", …}` — the core's `healthz()`.
 
 ### §4.1 OD-3 actions (Phase 3, Wave 2)
@@ -433,7 +434,7 @@ of truth once the config rewrite (Worker C) populates it from
 | Class | Default |
 |---|---|
 | General (all actions not listed below) | 30,000 ms |
-| Read-style (fast reads): `vc.now_playing`, `vc.progress`, `vc.panel`, `vc.lyrics`, `radio.list`, `radio.status`, `download.progress`, `share.resolve`, `chat.settings`, `spotify.details`, `spotify.now_playing`, `spotify.watches`, `spotify.status`, `gui.now_playing`, `gui.queue` | 10,000 ms |
+| Read-style (fast reads): `vc.now_playing`, `vc.progress`, `vc.panel`, `vc.lyrics`, `radio.list`, `radio.status`, `download.progress`, `share.resolve`, `chat.settings`, `quality.get`, `spotify.details`, `spotify.now_playing`, `spotify.watches`, `spotify.status`, `gui.now_playing`, `gui.queue` | 10,000 ms |
 | `ping` (healthz) | 5,000 ms |
 
 On deadline expiry the core fails the call with

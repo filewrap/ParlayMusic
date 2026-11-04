@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1716,7 +1717,8 @@ inline const char* kDlSettingsTemplatePrompt =
 inline InlineKeyboard settingsIndexKeyboard() {
     using B = InlineButton;
     return {{B::callback("Pagination", cbSet("page")),
-             B::callback("Music Download", cbSet("musicdl"))}};
+             B::callback("Music Download", cbSet("musicdl")),
+             B::callback("Quality", cbSet("quality"))}};
 }
 inline const char* kSettingsPageScreen =
     "<h2>Auto delete old messages</h2>\n"
@@ -1742,6 +1744,132 @@ inline InlineKeyboard settingsToggleKeyboard(const std::string& key,
                          cbSet(key + ":" + (enabled ? "0" : "1"))),
              B::callback("Back", kCbSetMain)}};
 }
+
+// --- Opus quality (quality.get surface, 2026-11-05) -----------------------
+// Effective Opus encoder config for one chat, as quality.get reports
+// it: the effective values, the winning level per field, and the
+// library's stored config (what the next encoder will actually use).
+// Rendered as a rich message (§7.1): heading + field lines + the
+// next-join note. No emojis (§7.3). Every quality change applies on
+// the NEXT join — the library cannot reconfigure a running encoder,
+// so the card never promises a live change.
+struct QualityValues {
+    int bitrate_bps = 192000;
+    int frame_ms = 20;
+    int complexity = 10;
+    bool vbr = true;
+    bool fec = false;
+    bool dtx = false;
+    int max_playback_rate_hz = 48000;
+};
+struct QualityInfo {
+    QualityValues effective;
+    QualityValues library;
+    // Winning level per field ("store" | "config" | "profile" |
+    // "default"), keyed by the wire names (bitrate_bps, frame_ms,
+    // complexity, vbr, fec, dtx).
+    std::map<std::string, std::string> sources;
+    bool active_call = false;
+    std::string applies_on = "next join";
+};
+
+// Human label for a quality.get source level.
+inline std::string qualitySourceLabel(const std::string& source) {
+    if (source == "store") return "chat setting";
+    if (source == "config") return "config file";
+    if (source == "profile") return "voice profile";
+    if (source == "default") return "default";
+    return htmlEscape(source);
+}
+
+inline std::string qualityCardText(const QualityInfo& q) {
+    auto src = [&](const char* field) {
+        auto it = q.sources.find(field);
+        return qualitySourceLabel(it == q.sources.end() ? "default"
+                                                        : it->second);
+    };
+    auto on_off = [](bool v) { return v ? "on" : "off"; };
+    auto bitrate = [](int bps) {
+        if (bps % 1000 == 0) return std::to_string(bps / 1000) + " kbps";
+        return std::to_string(bps) + " bps";
+    };
+    std::string out = "<h2>Audio Quality</h2>\n\n";
+    out += "<b>Bitrate:</b> " + bitrate(q.effective.bitrate_bps) + " (" +
+           src("bitrate_bps") + ")\n";
+    out += "<b>Frame size:</b> " + std::to_string(q.effective.frame_ms) +
+           " ms (" + src("frame_ms") + ")\n";
+    out += "<b>Complexity:</b> " + std::to_string(q.effective.complexity) +
+           " (" + src("complexity") + ")\n";
+    out += "<b>VBR:</b> " + std::string(on_off(q.effective.vbr)) + " (" +
+           src("vbr") + ")\n";
+    out += "<b>FEC:</b> " + std::string(on_off(q.effective.fec)) + " (" +
+           src("fec") + ")\n";
+    out += "<b>DTX:</b> " + std::string(on_off(q.effective.dtx)) + " (" +
+           src("dtx") + ")\n";
+    // Library readback: the values the next encoder will actually use.
+    // In steady state they equal the effective values; when they differ
+    // (a change landed after the last join) say so, honestly.
+    bool lib_differs =
+        q.library.bitrate_bps != q.effective.bitrate_bps ||
+        q.library.frame_ms != q.effective.frame_ms ||
+        q.library.complexity != q.effective.complexity ||
+        q.library.vbr != q.effective.vbr ||
+        q.library.fec != q.effective.fec ||
+        q.library.dtx != q.effective.dtx;
+    if (lib_differs) {
+        out += "\n<i>Note: the encoder library currently holds " +
+               bitrate(q.library.bitrate_bps) + " / " +
+               std::to_string(q.library.frame_ms) +
+               " ms; the values above take effect on next join.</i>\n";
+    }
+    if (q.active_call) {
+        out += "\n<i>A call is live in this chat right now.</i>\n";
+    }
+    out += "\n<i>Changes apply on next join — a running call keeps its "
+           "current encoder settings.</i>";
+    return out;
+}
+
+inline std::string cbSetQualityBr(int kbps) {
+    return "pl:set:quality:br:" + std::to_string(kbps);
+}
+inline std::string cbSetQualityFr(int ms) {
+    return "pl:set:quality:fr:" + std::to_string(ms);
+}
+
+// Quality sub-screen keyboard (routing rows A97–A99): bitrate and
+// frame-size pickers with the current value marked, a reset that
+// clears the per-chat overrides, and Back to the settings panel.
+inline InlineKeyboard settingsQualityKeyboard(const QualityInfo& q) {
+    using B = InlineButton;
+    std::vector<B> bitrates;
+    for (int kbps : {128, 160, 192, 256, 320}) {
+        std::string label = std::to_string(kbps) + " kbps";
+        if (q.effective.bitrate_bps == kbps * 1000) label += " (current)";
+        bitrates.push_back(B::callback(label, cbSetQualityBr(kbps)));
+    }
+    std::vector<B> frames;
+    for (int ms : {10, 20, 40, 60}) {
+        std::string label = std::to_string(ms) + " ms";
+        if (q.effective.frame_ms == ms) label += " (current)";
+        frames.push_back(B::callback(label, cbSetQualityFr(ms)));
+    }
+    return {bitrates,
+            frames,
+            {B::callback("Reset to config file", cbSet("quality:reset"))},
+            {B::callback("Back", kCbSetMain)}};
+}
+
+// Back-only keyboard for the quality-load failure screen: the user
+// always has a way back to the settings panel (no dead ends, §7.5).
+inline InlineKeyboard qualityBackKeyboard() {
+    using B = InlineButton;
+    return {{B::callback("Back", kCbSetMain)}};
+}
+
+inline const char* kQualityLoadFailed =
+    "Could not load the audio quality settings — the backend is "
+    "unreachable. Nothing was changed.";
 
 // --- §10 admin/sudo panels ---------------------------------------------------
 // Permission denials (Yukki §3.9 wins, §10).

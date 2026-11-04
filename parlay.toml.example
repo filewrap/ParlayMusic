@@ -65,6 +65,19 @@ healthz_ms = 5000
 #   128 kbps, so 192k is the lowest new profile; ultra_320k becomes the
 #   default only after the Phase 6 live VPS bitrate test (OD-1) locks
 #   the verified ceiling.
+# opus_bitrate_bps / opus_frame_ms / opus_complexity / opus_vbr /
+# opus_fec / opus_dtx: explicit Opus encoder keys. A set key wins
+# over voice_profile (bitrate only — the profile sets no other
+# field); an unset key falls through to the profile, then the
+# built-in default (192000 bps, 20 ms, complexity 10, VBR on,
+# FEC off, DTX off, 48 kHz fullband). Ranges mirror the library:
+# bitrate 6000-510000, complexity 0-10, frame one of 10/20/40/60.
+# 20 ms is the default: it aligns 1:1 with the DSP's 960-sample
+# frames at 48 kHz, and 60 ms packets at 256/320 kbps (1920/2400
+# bytes) exceed a typical MTU. Opus quality saturates at 128-192
+# kbps stereo, so 192k is the default; 256/320 kbps stay
+# selectable. A per-chat Telegram override (settings panel /
+# /quality) wins over these file keys and applies on next join.
 # source_ladder: resolution order, Tier 1 lossless first, then Tier 2
 #   high-bitrate lossy, then Tier 3 adaptive/metadata. Known names:
 #   navidrome, soulseek, deezer, netease, jiosaavn, youtube, spotify,
@@ -74,6 +87,12 @@ healthz_ms = 5000
 #      PARLAY_RESAMPLER_QUALITY
 [quality]
 voice_profile = "standard_192k"
+opus_bitrate_bps = 192000
+opus_frame_ms = 20
+opus_complexity = 10
+opus_vbr = true
+opus_fec = false
+opus_dtx = false
 source_ladder = ["navidrome", "soulseek", "deezer", "netease", "jiosaavn", "youtube", "spotify", "tiktok", "radio"]
 resampler_quality = "sinc_256"
 

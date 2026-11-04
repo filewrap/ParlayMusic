@@ -183,11 +183,16 @@ type SkipCheckRecord struct {
 }
 
 // ChatSettings is the per-chat settings object of the chat.settings
-// action (contracts/ipc.json) — all 15 keys. Defaults are the
+// action (contracts/ipc.json) — all 21 keys: the 15 legacy keys
+// plus the 6 quality overrides below. Defaults are the
 // legacy values the core's Dispatcher::chatSettings reads when no
 // value is stored: admin_mode 0, play_mode "everyone", thumbnails
 // on, language "en", auto_delete_min 5, paginate_purge_old on,
-// chat_music_download on, everything else off/empty.
+// chat_music_download on, everything else off/empty. The quality
+// pointers are nil when unset: nil means "no per-chat override"
+// and the effective Opus config falls through to parlay.toml
+// [quality] (see internal/quality.Resolve). A set value wins
+// over the file for the next join in that chat.
 type ChatSettings struct {
 	AdminMode         int    `json:"admin_mode"`
 	PlayMode          string `json:"play_mode"`
@@ -204,9 +209,24 @@ type ChatSettings struct {
 	Language          string `json:"language"`
 	PaginatePurgeOld  bool   `json:"paginate_purge_old"`
 	ChatMusicDownload bool   `json:"chat_music_download"`
+	// QualityBitrateBps is the per-chat Opus bitrate override
+	// in bits per second (nil = unset). Validated 6000-510000
+	// on write (voice.OpusMinBitrateBps/OpusMaxBitrateBps).
+	QualityBitrateBps *int `json:"quality_bitrate_bps,omitempty"`
+	// QualityFrameMs is the per-chat Opus frame-size override
+	// in ms (nil = unset). Must be one of 10, 20, 40, 60.
+	QualityFrameMs *int `json:"quality_frame_ms,omitempty"`
+	// QualityComplexity is the per-chat Opus complexity
+	// override (nil = unset). Validated 0-10 on write.
+	QualityComplexity *int `json:"quality_complexity,omitempty"`
+	// QualityVBR / QualityFEC / QualityDTX are the per-chat
+	// VBR, FEC and DTX overrides (nil = unset).
+	QualityVBR *bool `json:"quality_vbr,omitempty"`
+	QualityFEC *bool `json:"quality_fec,omitempty"`
+	QualityDTX *bool `json:"quality_dtx,omitempty"`
 }
 
-// DefaultChatSettings returns the 15-key settings object for a chat
+// DefaultChatSettings returns the 21-key settings object for a chat
 // with no stored settings.
 func DefaultChatSettings() ChatSettings {
 	return ChatSettings{

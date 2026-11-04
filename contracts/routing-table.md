@@ -5,9 +5,8 @@ Sources (all read, not assumed): `services/core-cpp/src/ui_texts.hpp`
 (callback builders `cb*`, `kCb*` consts, every `*Keyboard` builder),
 `services/core-cpp/src/dispatcher.cpp` (`Dispatcher::handleCallback` +
 all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
-`handleInlineQuery`), `contracts/ipc.json` v0.3.1 (65 actions),
+`handleInlineQuery`), `contracts/ipc.json` v0.3.1 (66 actions),
 `UI_INVENTORY.md` / `phase9/` (inventory cross-check).
-
 ## How to read this table
 
 - One row per distinct input. **No row is blank**: a cell that has no
@@ -38,6 +37,15 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
     UI emits this callback (reachable only with hand-crafted
     `callback_data`). Listed so the cross-check is complete in both
     directions.
+  - `Contract` — the backend action and keys exist and are tested, and
+    the row specifies the core-side UI (button / command handler) that
+    must be built against them; the core has not implemented it yet.
+    Until it does, the callback/command answers through the router
+    default branch (alert `Unknown action.`) — handled, never silent,
+    never a crash, never a dead end. Implementing a `Contract` row is
+    core-side follow-up, not a backend gap, and does not change the
+    zero-unrouted / zero-unhandled counts: nothing in the shipped UI
+    emits these callbacks today.
 - Router default branch: `Dispatcher::handleCallback`
   (`services/core-cpp/src/dispatcher.cpp`, `handleCallback`) has an
   explicit default branch — empty data, data >64 bytes, a first segment
@@ -156,7 +164,11 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A92 | Download-settings sub-screens | Back | `pl:dlset:back` | `handleCallback` → `cbDlset` | none | silent ack + edit to `Select one of the settings below!` with `dlSettingsIndexKeyboard()` | Live |
 | A93 | Spotify companion card (backend-go:spotify — no in-core builder) | Dislike | `pl:spotify:dislike:<id>` | `handleCallback` → `cbSpotify` | `spotify.dislike` | toast `Disliked.`; backend error answers the error as an alert | Live |
 | A94 | Spotify companion cards (backend-go:spotify — no in-core builder) | Details / Analyze (companion surfaces) | `pl:spotify:details:<id>`, `pl:spotify:analyze:<id>` | `handleCallback` → `cbSpotify` | `spotify.details` (details) / `spotify.analyze` (analyze) | details: card edited in place with track, album, features (key/mode/tempo), disliked/ignored counts, genres, profanity, language, lyrics + `[Analyze text]` button; analyze: analysis card edited in place; any other verb → alert `This feature is not available yet.` | Live |
-| A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | alert `Unknown action.` (`kToastUnknownAction`); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
+| A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, A96–A99, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | alert `Unknown action.` (`kToastUnknownAction`); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
+| A96 | Settings panel, index row | Quality | `pl:set:quality` | `handleCallback` → `cbSet` | `quality.get` read | silent ack + edit to quality sub-screen (`qualityCardText` + `settingsQualityKeyboard()`) | Live |
+| A97 | Quality sub-screen | Bitrate: 128 / 160 / 192 / 256 / 320 kbps (current marked) | `pl:set:quality:br:<kbps>` (kbps 128, 160, 192, 256, 320) | `handleCallback` → `cbSet` | `chat.settings` write (`quality_bitrate_bps`) | toast `Settings updated!` + edit to quality sub-screen with updated bitrate; out-of-range kbps → alert `Unknown action.`; screen notes the change applies on next join | Live |
+| A98 | Quality sub-screen | Frame size: 10 / 20 / 40 / 60 ms (current marked) | `pl:set:quality:fr:<ms>` (ms 10, 20, 40, 60) | `handleCallback` → `cbSet` | `chat.settings` write (`quality_frame_ms`) | toast `Settings updated!` + edit to quality sub-screen with updated frame size; out-of-range ms → alert `Unknown action.`; screen notes the change applies on next join | Live |
+| A99 | Quality sub-screen | Reset to config file (clear overrides) | `pl:set:quality:reset` | `handleCallback` → `cbSet` | `chat.settings` write (quality_* keys set to null) | toast `Settings updated!` + edit to quality sub-screen showing file/profile/default values | Live |
 
 ## §B. Reply-keyboard buttons and non-callback buttons
 
@@ -303,6 +315,7 @@ from the core's local store / state only.
 | C99 | DM only | Pending share target | plain text `cancel` (while `sharetarget:<user>` is set) | `handleMessage` plain-text path (DM pending-state flow) | none | new message: `Sharing cancelled.`; any other text → `Your request was not handled` + the available-commands list (`kUnhandledText`) | Live |
 | C100 | DM only | Unhandled text | plain text (any non-command text, no pending state) | `handleMessage` plain-text path | none | new message: start card (`kStartPm` + `startPmKeyboard()`) | Live |
 | C101 | Group chat | Unhandled text | plain text (any non-command text, no pending state, not a digit, not `delete:`, not one of the four reply-keyboard labels in rows B1–B4) | `handleMessage` plain-text path | none | no reply — the text is silently dropped (intended: the bot does not answer arbitrary group chatter) | Live |
+| C102 | Group chat | /quality | `/quality` | `handleMessage` → `onQuality` (Any, Everyone) | `quality.get` read | new message: quality card (effective Opus values with source per field — store / config file / profile / default — plus an "applies on next join" note) with the bitrate / frame-size / reset buttons; DM → `These settings are available only in groups.` | Live |
 
 ## §D. Inline mode + deep links
 
@@ -444,14 +457,14 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
   only a line made of `|`, `-`, `:`, spaces as a separator, so rows
   containing `spotify----` are checked, not skipped):
   `python3 -c "import re,sys; sep=re.compile(r'^\|[\s\-|:]+\|$'); rows=[l for l in open('contracts/routing-table.md') if l.startswith('|') and not sep.match(l)]; bad=[l for l in rows if any(not c.strip() for c in l.strip().strip('|').split('|'))]; print(f'{len(rows)} rows, {len(bad)} blank cells'); sys.exit(1 if bad else 0)"`.
-  Result: **244 rows, 0 blank cells** (re-run after any edit).
-- **Counts (this file):** callbacks §A: 95 rows (A1–A95); reply-keyboard
+  Result: **249 rows, 0 blank cells** (re-run after any edit).
+- **Counts (this file):** callbacks §A: 99 rows (A1–A99: 99 live); reply-keyboard
   buttons §B.1: 4 rows; URL / switch-inline buttons §B.2: 11 rows;
-  commands §C: 101 rows (C1–C101: 86 live command groups covering 87
+  commands §C: 102 rows (C1–C102: 87 live command groups covering 88
   `add()` groups + 5 OD-3 commands + unknown-command + 70 aliases +
   40 channel commands + 7 plain-text rows); inline mode §D: 12 rows;
   OD-3 index §E: 11 entries (pointing at §A–§D rows, not new rows);
-  **total table rows: 95 + 4 + 11 + 101 + 12 = 223 rows; OD-3 rows
+  **total table rows: 99 + 4 + 11 + 102 + 12 = 228 rows; OD-3 rows
   among them: 10** (A63, A81, A94, C87–C91, D9, D10). The 11th OD-3
   item (E9, download prefs contract fields) shares the Live rows
   A87–A92 / C48 / C97 and is tracked as an index entry only.

@@ -102,7 +102,7 @@ new file mode 100644
 index 0000000..e3f75e5
 --- /dev/null
 +++ b/targets/c/ntgcalls_opus.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +// Parlay patch (OD-1): C API for the locked Opus encoder configuration.
 +//
 +// Hand-written sidecar to the generated ntgcalls.h -- intentionally NOT
@@ -110,20 +110,22 @@ index 0000000..e3f75e5
 +// Include after ntgcalls.h; links against the same libntgcalls.so.
 +//
 +// Effective encoder settings (defaults are the locked values):
-+//   bitrate_bps         320000 (ladder 320000 -> 256000 -> 192000; lock the
++//   bitrate_bps         192000 (ladder 192000 -> 160000 -> 128000; lock the
 +//                              verified ceiling in parlay.toml opus_bitrate_kbps)
 +//   complexity          10     (OPUS_SET_COMPLEXITY(10))
 +//   vbr_enabled         true   (OPUS_SET_VBR(1))
 +//   fec_enabled         false  (OPUS_SET_INBAND_FEC(0))
 +//   dtx_enabled         false
-+//   frame_size_ms       60     (ptime=60, unchanged from stock behaviour)
++//   frame_size_ms       20     (ptime=20; Xiph's recommended default --
++//                              60 ms at 256/320 kbps = 1920/2400-byte
++//                              packets, past MTU)
 +//   max_playback_rate_hz 48000 (fullband)
 +//
 +// Application is OPUS_APPLICATION_AUDIO, fixed (the lock has no VoIP mode).
 +// Signal is OPUS_AUTO, not OPUS_SIGNAL_MUSIC: WebRTC M152 exposes no
 +// OPUS_SET_SIGNAL path (AudioEncoderOpusConfig has no signal field and
 +// WebRtcOpus_EncoderCreate never calls it). With APPLICATION_AUDIO, libopus
-+// caps the voice estimate and at 192-320 kbps stereo selects CELT_ONLY /
++// caps the voice estimate and at 128-192 kbps stereo selects CELT_ONLY /
 +// fullband identically to SIGNAL_MUSIC; see phase5/worker-a-ntgcalls.md.
 +//
 +// Scope: settings are process-global and apply to Opus encoders created
@@ -198,7 +200,7 @@ index 0000000..e287330
 +//     OPUS_SET_VBR(1).
 +//   - OPUS_SET_INBAND_FEC(0): config.fec_enabled = false -> DisableFec ->
 +//     OPUS_SET_INBAND_FEC(0).
-+//   - Bitrate ladder 320000 -> 256000 -> 192000 bps: config.bitrate_bps,
++//   - Bitrate ladder 192000 -> 160000 -> 128000 bps: config.bitrate_bps,
 +//     settable at runtime (applies to encoders created after the call).
 +//
 +// Known deviation -- OPUS_SIGNAL_MUSIC: WebRTC M152's AudioEncoderOpusConfig
@@ -207,7 +209,7 @@ index 0000000..e287330
 +// explicitly; the encoder runs with libopus's default signal OPUS_AUTO.
 +// With OPUS_APPLICATION_AUDIO, libopus caps the voice estimate
 +// (voice_est <= 115, 48 with no tonality analysis) and at the locked
-+// 192-320 kbps stereo rates the mode decision lands on CELT_ONLY/fullband
++// 128-192 kbps stereo rates the mode decision lands on CELT_ONLY/fullband
 +// either way (music mode threshold 10 kbps stereo vs voice 44 kbps), so
 +// the audible difference vs OPUS_SIGNAL_MUSIC at these rates is nil.
 +// A literal OPUS_SET_SIGNAL(MUSIC) would require reimplementing the Opus
@@ -233,9 +235,9 @@ index 0000000..e287330
 +// (use RtpParameters max_bitrate_bps for live bitrate changes, or
 +// re-create the call). All fields are validated/clamped on set.
 +struct OpusEncoderSettings {
-+    // Target bitrate in bits per second. Locked ladder: 320000 -> 256000
-+    // -> 192000 (lock the verified ceiling in parlay.toml opus_bitrate_kbps).
-+    int32_t bitrate_bps = 320000;
++    // Target bitrate in bits per second. Locked ladder: 192000 -> 160000
++    // -> 128000 (lock the verified ceiling in parlay.toml opus_bitrate_kbps).
++    int32_t bitrate_bps = 192000;
 +    // Opus complexity 0-10. Locked at 10 (maximum quality).
 +    int32_t complexity = 10;
 +    // True = OPUS_SET_VBR(1); false = CBR.
@@ -244,9 +246,9 @@ index 0000000..e287330
 +    bool fec_enabled = false;
 +    // Opus DTX. Locked off: music must not gate.
 +    bool dtx_enabled = false;
-+    // Packet frame size in ms; one of 10/20/40/60. Keeps the existing
-+    // 60 ms packets (ptime=60) from OutgoingAudioChannel.
-+    int32_t frame_size_ms = 60;
++    // Packet frame size in ms; one of 10/20/40/60. 20 ms is Xiph's
++    // recommended default; 60 ms packets at 256/320 kbps exceed MTU.
++    int32_t frame_size_ms = 20;
 +    // Maximum playback rate in Hz; 48000 = fullband.
 +    int32_t max_playback_rate_hz = 48000;
 +};
@@ -352,7 +354,7 @@ index 0000000..01fb5af
 +    // AudioEncoderOpusConfig::IsOk / kOpusSupportedFrameLengths).
 +    if (out.frame_size_ms != 10 && out.frame_size_ms != 20 &&
 +        out.frame_size_ms != 40 && out.frame_size_ms != 60) {
-+        out.frame_size_ms = 60;
++        out.frame_size_ms = 20;
 +    }
 +    if (out.max_playback_rate_hz < 8000 ||
 +        out.max_playback_rate_hz > 48000) {

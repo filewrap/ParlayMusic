@@ -106,6 +106,21 @@ type Manager struct {
 	mu    sync.Mutex
 	calls map[int64]*Call
 
+	// preJoinHook, when set, runs before CreateCall on every
+	// Join (after the already-connected / already-in-progress
+	// checks, before any encoder is created). The backend
+	// installs the effective-Opus-config applier here
+	// (internal/quality, wired by main.go): store override for
+	// the joining chat > parlay.toml [quality] explicit keys >
+	// voice_profile preset > built-in default. The hook must
+	// run before CreateCall because the encoder reads the
+	// process-global settings at creation — a hook that ran
+	// after Connect would apply to the NEXT call, not this
+	// one. A hook error fails the join at stage "opus_config"
+	// (the call record lands in StateFailed like any other
+	// stage failure, so a retry re-runs the hook).
+	preJoinHook func(ctx context.Context, chatID int64) error
+
 	handlersMu               sync.RWMutex
 	streamEndHandlers        []StreamEndFunc
 	connectionChangeHandlers []ConnectionChangeFunc
@@ -131,6 +146,17 @@ func NewManager(client *Client, join JoinFunc) *Manager {
 		go m.dispatchConnectionChange(chatID, state, kind)
 	})
 	return m
+}
+
+// SetPreJoinHook installs fn, run before CreateCall on every
+// Join (see the preJoinHook field). A nil fn clears the hook.
+// It is called once at startup (main.go); calling it while
+// joins are running races the next Join, like any other
+// one-time wiring call.
+func (m *Manager) SetPreJoinHook(fn func(ctx context.Context, chatID int64) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.preJoinHook = fn
 }
 
 // OnStreamEnd registers a handler for ntgcalls stream-end events.
@@ -262,6 +288,7 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	}
 	call := &Call{ChatID: chatID, State: StateCreated}
 	m.calls[chatID] = call
+	hook := m.preJoinHook
 	m.mu.Unlock()
 
 	fail := func(stage string, err error) (int64, error) {
@@ -277,6 +304,16 @@ func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	}
 
 	log.Printf("voice: initiating join for chat %d", chatID)
+	// The pre-join hook applies the effective Opus config for
+	// this chat before any encoder is created (see the
+	// preJoinHook field): a hook error fails the join at stage
+	// "opus_config" instead of joining with unknown encoder
+	// settings.
+	if hook != nil {
+		if err := hook(ctx, chatID); err != nil {
+			return fail("opus_config", err)
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return fail("create_call", fmt.Errorf("context done before create_call: %w", err))
 	}

@@ -621,6 +621,69 @@ public:
             });
             return r;
         }
+        if (action == "quality.get") {
+            // Opus quality surface (2026-11-05): the effective config
+            // for the chat, resolved like the real backend at the
+            // store level only — a stored quality_* override wins
+            // (source "store"), anything unset falls through to the
+            // locked default (source "default"). The fake has no
+            // parlay.toml / profile level, so those two never win
+            // here; the library readback equals the effective config.
+            if (settings_fail) {
+                r.http_status = 503;
+                r.error_code = "engine_unavailable";
+                r.error_message = "fake: backend down";
+                return r;
+            }
+            const parlay::Json* cid = body.find("chat_id");
+            int64_t chat_id = cid ? cid->asInt() : 0;
+            auto it = settings_store.find(chat_id);
+            parlay::Json st = parlay::Json::parse(
+                it == settings_store.end() ? defaultSettingsJson()
+                                           : it->second);
+            parlay::Json eff = parlay::Json::objectOf({});
+            parlay::Json src = parlay::Json::objectOf({});
+            auto take_int = [&](const char* key, const char* field,
+                                int64_t def) {
+                const parlay::Json* v = st.find(key);
+                if (v != nullptr && !v->isNull()) {
+                    eff.set(field, *v);
+                    src.set(field, parlay::Json("store"));
+                } else {
+                    eff.set(field, parlay::Json(def));
+                    src.set(field, parlay::Json("default"));
+                }
+            };
+            auto take_bool = [&](const char* key, const char* field,
+                                 bool def) {
+                const parlay::Json* v = st.find(key);
+                if (v != nullptr && !v->isNull()) {
+                    eff.set(field, *v);
+                    src.set(field, parlay::Json("store"));
+                } else {
+                    eff.set(field, parlay::Json(def));
+                    src.set(field, parlay::Json("default"));
+                }
+            };
+            take_int("quality_bitrate_bps", "bitrate_bps", 192000);
+            take_int("quality_frame_ms", "frame_ms", 20);
+            take_int("quality_complexity", "complexity", 10);
+            take_bool("quality_vbr", "vbr", true);
+            take_bool("quality_fec", "fec", false);
+            take_bool("quality_dtx", "dtx", false);
+            eff.set("max_playback_rate_hz", parlay::Json(48000));
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::objectOf({
+                {"chat_id", parlay::Json(chat_id)},
+                {"effective", eff},
+                {"sources", src},
+                {"library", eff},
+                {"active_call", parlay::Json(false)},
+                {"applies_on", parlay::Json("next join")},
+            });
+            return r;
+        }
         r.http_status = 404;
         r.error_code = "not_found";
         r.error_message = "fake: no engine here";
@@ -2035,6 +2098,121 @@ int main() {
         CHECK(contains(rig.tg.edits.back().text,
                        "Download music via chat"),
               "set musicdl: screen renders");
+    }
+    {
+        // /quality + the quality sub-screen (Opus quality surface,
+        // routing rows A96–A99, C102). The FakeIpc resolves
+        // quality.get from the scripted settings store, so a set
+        // followed by a re-render proves the write landed.
+        Rig rig;
+        rig.ipc.seedSetting(-1001, "quality_bitrate_bps", "256000");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/quality"));
+        CHECK(!rig.tg.replies.empty() &&
+                  contains(rig.tg.replies[0], "Audio Quality") &&
+                  contains(rig.tg.replies[0], "256 kbps (chat setting)") &&
+                  contains(rig.tg.replies[0], "20 ms (default)") &&
+                  contains(rig.tg.replies[0], "next join"),
+              "quality: /quality renders the card with the store "
+              "bitrate + source per field + next-join note");
+        CHECK(!rig.tg.markups.empty() &&
+                  contains(rig.tg.markups[0], "pl:set:quality:br:256") &&
+                  contains(rig.tg.markups[0], "pl:set:quality:reset"),
+              "quality: /quality card carries the bitrate/reset buttons");
+        // DM refusal (C102).
+        Rig rig_dm;
+        parlay::TgMessage dm = makeMsg(111, 111, "/quality");
+        dm.chat.type = "private";
+        rig_dm.d.handleMessage(dm);
+        CHECK(!rig_dm.tg.replies.empty() &&
+                  contains(rig_dm.tg.replies.back(), "only in groups"),
+              "quality: /quality in DM refuses with the group-only text");
+        // Sub-screen via the settings panel button.
+        rig.d.handleCallback(makeCq("pl:set:quality", -1001, 111));
+        CHECK(!rig.tg.edits.empty() &&
+                  contains(rig.tg.edits.back().text, "Audio Quality") &&
+                  contains(rig.tg.edits.back().text, "256 kbps"),
+              "quality: pl:set:quality opens the sub-screen");
+        // Bitrate pick: posts quality_bitrate_bps=320000, confirms,
+        // and re-renders with the new effective value. (The set is
+        // found by scanning the posted bodies: the re-render's
+        // quality.get read overwrites last_post_body.)
+        rig.d.handleCallback(makeCq("pl:set:quality:br:320", -1001, 111));
+        {
+            bool posted = false;
+            for (size_t i = 0; i < rig.ipc.post_bodies.size(); ++i) {
+                parlay::Json b =
+                    parlay::Json::parse(rig.ipc.post_bodies[i]);
+                const parlay::Json* k = b.find("key");
+                const parlay::Json* v = b.find("value");
+                if (k && k->asString() == "quality_bitrate_bps" && v &&
+                    v->asInt() == 320000)
+                    posted = true;
+            }
+            CHECK(posted,
+                  "quality: br:320 posts quality_bitrate_bps=320000");
+        }
+        CHECK(!rig.tg.toasts.empty() &&
+                  contains(rig.tg.toasts.back().text, "updated") &&
+                  contains(rig.tg.edits.back().text,
+                           "320 kbps (chat setting)"),
+              "quality: br:320 confirms + re-renders at 320 kbps");
+        // Frame pick: posts quality_frame_ms=40.
+        rig.d.handleCallback(makeCq("pl:set:quality:fr:40", -1001, 111));
+        {
+            bool posted = false;
+            for (size_t i = 0; i < rig.ipc.post_bodies.size(); ++i) {
+                parlay::Json b =
+                    parlay::Json::parse(rig.ipc.post_bodies[i]);
+                const parlay::Json* k = b.find("key");
+                const parlay::Json* v = b.find("value");
+                if (k && k->asString() == "quality_frame_ms" && v &&
+                    v->asInt() == 40)
+                    posted = true;
+            }
+            CHECK(posted, "quality: fr:40 posts quality_frame_ms=40");
+        }
+        CHECK(contains(rig.tg.edits.back().text, "40 ms (chat setting)"),
+              "quality: fr:40 re-renders at 40 ms");
+        // Out-of-range values are Unknown action, never stored.
+        rig.d.handleCallback(makeCq("pl:set:quality:br:999", -1001, 111));
+        CHECK(!rig.tg.toasts.empty() &&
+                  rig.tg.toasts.back().text == "Unknown action.",
+              "quality: br:999 rejected with Unknown action");
+        rig.d.handleCallback(makeCq("pl:set:quality:fr:25", -1001, 111));
+        CHECK(!rig.tg.toasts.empty() &&
+                  rig.tg.toasts.back().text == "Unknown action.",
+              "quality: fr:25 rejected with Unknown action");
+        // Reset: clears all six overrides with JSON null; the card
+        // falls back to the defaults.
+        size_t posts_before = rig.ipc.post_bodies.size();
+        rig.d.handleCallback(makeCq("pl:set:quality:reset", -1001, 111));
+        int null_clears = 0;
+        for (size_t i = posts_before; i < rig.ipc.post_bodies.size(); ++i) {
+            parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[i]);
+            const parlay::Json* k = b.find("key");
+            const parlay::Json* v = b.find("value");
+            if (k && k->asString().rfind("quality_", 0) == 0 && v &&
+                v->isNull())
+                ++null_clears;
+        }
+        CHECK(null_clears == 6,
+              "quality: reset clears all six quality_* keys with null");
+        CHECK(contains(rig.tg.edits.back().text, "192 kbps (default)") &&
+                  contains(rig.tg.edits.back().text, "20 ms (default)"),
+              "quality: reset re-renders at the defaults");
+        // Backend down: /quality and the sub-screen fail honestly.
+        Rig rig_down;
+        rig_down.ipc.settings_fail = true;
+        rig_down.d.handleMessage(makeMsg(-1001, 111, "/quality"));
+        CHECK(!rig_down.tg.replies.empty() &&
+                  contains(rig_down.tg.replies.back(), "Could not load"),
+              "quality: /quality with the backend down fails honestly");
+        rig_down.d.handleCallback(makeCq("pl:set:quality", -1001, 111));
+        CHECK(!rig_down.tg.edits.empty() &&
+                  contains(rig_down.tg.edits.back().text,
+                           "Could not load"),
+              "quality: sub-screen with the backend down fails honestly "
+              "(Back button proven in ui_test)");
     }
 
     // --- Q7. Settings rewire (Phase 6): backend bbolt is the single

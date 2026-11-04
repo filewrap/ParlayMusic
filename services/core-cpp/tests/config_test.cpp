@@ -226,6 +226,28 @@ int main(int argc, char** argv) {
         unsetenv("PARLAY_VOICE_PROFILE");
     }
 
+    // --- D2. [quality] Opus explicit keys load (Go quality surface,
+    // 2026-11-05): the six new keys are allowlisted in the core, so
+    // a parlay.toml that sets them no longer fails CORE startup.
+    // The core does not consume the values (the Go backend owns the
+    // Opus config); the allowlist is the contract: unknown keys in
+    // [quality] are still rejected.
+    {
+        const std::string toml =
+            "[quality]\nvoice_profile = \"standard_192k\"\n"
+            "opus_bitrate_bps = 256000\nopus_frame_ms = 40\n"
+            "opus_complexity = 7\nopus_vbr = false\n"
+            "opus_fec = true\nopus_dtx = true\n";
+        parlay::Config c = parlay::Config::loadFromText(toml, "<test>");
+        CHECK(c.quality.voice_profile == "standard_192k",
+              "config: [quality] with the six Opus keys loads");
+        std::string what;
+        CHECK(throwsWith("[quality]\nopub_bitrate_bps = 192000\n",
+                         "unknown key", what),
+              "config: typo'd Opus key in [quality] still rejected: " +
+                  what);
+    }
+
     // --- E. legacy DURATION_LIMIT / QUEUE_LIMIT -----------------------
     {
         setenv("DURATION_LIMIT", "90", 1);

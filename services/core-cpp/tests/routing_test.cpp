@@ -319,6 +319,11 @@ public:
         if (action == "fx")
             return ok(parlay::Json::parse(
                 R"({"output_path":"/tmp/parlay-routing-test/fx-out.ogg"})"));
+        // quality.get (Opus quality surface, 2026-11-05): canned
+        // effective config at the locked defaults, library in sync.
+        if (action == "quality.get")
+            return ok(parlay::Json::parse(
+                R"({"chat_id":-1001234567890,"effective":{"bitrate_bps":192000,"frame_ms":20,"complexity":10,"vbr":true,"fec":false,"dtx":false,"max_playback_rate_hz":48000},"sources":{"bitrate_bps":"default","frame_ms":"default","complexity":"default","vbr":"default","fec":"default","dtx":"default"},"library":{"bitrate_bps":192000,"frame_ms":20,"complexity":10,"vbr":true,"fec":false,"dtx":false,"max_playback_rate_hz":48000},"active_call":false,"applies_on":"next join"})"));
         if (action == "download/spotify-playlist")
             return ok(parlay::Json::parse(
                 R"({"count":0,"file_path":"","file_paths":[],"run_id":"run123456"})"));
@@ -485,6 +490,7 @@ int main(int argc, char** argv) {
     harvestKb(dlSpotifyOptionsKeyboard(kRun), harvested);
     harvestKb(dlFxKeyboard(kRun), harvested);
     harvestKb(settingsKeyboard(ChatSettings{}), harvested);
+    harvestKb(settingsQualityKeyboard(QualityInfo{}), harvested);
     harvestKb(autoplayCardKeyboard(true), harvested);
     harvestKb(autoplayCardKeyboard(false), harvested);
     harvestKb(langPickerKeyboard("start"), harvested);
@@ -553,6 +559,12 @@ int main(int argc, char** argv) {
         {"pl:set:page:<0|1>", cbSet("page:1")},
         {"pl:set:musicdl", cbSet("musicdl")},
         {"pl:set:musicdl:<0|1>", cbSet("musicdl:0")},
+        {"pl:set:quality", cbSet("quality")},
+        {"pl:set:quality:br:<kbps>", cbSetQualityBr(192)},
+        {"pl:set:quality:br:<kbps>", cbSetQualityBr(320)},
+        {"pl:set:quality:fr:<ms>", cbSetQualityFr(20)},
+        {"pl:set:quality:fr:<ms>", cbSetQualityFr(60)},
+        {"pl:set:quality:reset", cbSet("quality:reset")},
         {"pl:lang:select", kCbLangSelect},
         {"pl:lang:select:<origin>", std::string(kCbLangSelect) + ":help"},
         {"pl:lang:select:<origin>",
@@ -869,8 +881,8 @@ int main(int argc, char** argv) {
             }
             at = close + 1;
         }
-        CHECK(commands.size() == 112,
-              "112 registered command names in source (got " +
+        CHECK(commands.size() == 113,
+              "113 registered command names in source (got " +
                   std::to_string(commands.size()) + ")");
         for (const auto& c : commands)
             CHECK(has_command(c), "table contains command: /" + c);
