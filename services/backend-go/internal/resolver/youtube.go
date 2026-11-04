@@ -4,8 +4,10 @@
 // HTTPS POST, no subprocess — ANDROID_VR player 0.61 s / ANDROID player
 // 0.81 s / WEB search 1.56 s, vs yt-dlp 5.7–6.7 s (7–10x faster).
 // WEB player is UNPLAYABLE (metadata only), so the player call always
-// uses ANDROID_VR (fallback ANDROID); search uses WEB with
-// params=CAASAhAB (video-only results).
+// uses ANDROID_VR (fallback ANDROID); search uses ANDROID first — WEB
+// gets WAF 403 on datacenter IPs (VPS 2026-11-04: WEB search 403,
+// resolves 6–13 s through the fallback chain) — with WEB second
+// (params=CAASAhAB, video-only results) and the daemon last.
 //
 // Stream URL = streamingData.adaptiveFormats itag 251 (Opus) first,
 // then 140 (AAC). Formats that carry only a signatureCipher (no direct
@@ -23,6 +25,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -159,14 +162,20 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 		return resolved, nil
 	}
 	if y.ytdlp != nil {
+		dstart := time.Now()
 		if dt, derr := y.resolveViaDaemon(ctx, tracks[0].ID); derr == nil && dt.StreamURL != "" {
+			log.Printf("youtube: resolve daemon ok in %s", time.Since(dstart))
 			return dt, nil
+		} else {
+			log.Printf("youtube: resolve daemon failed in %s: %v", time.Since(dstart), derr)
 		}
 	}
 	return tracks[0], nil
 }
 
-// Search runs an InnerTube search (WEB first, falling back to ANDROID, then daemon).
+// Search runs an InnerTube search (ANDROID first — WEB gets WAF 403 on
+// datacenter IPs — falling back to WEB, then daemon). Each stage logs
+// its duration so a slow resolve names the slow stage.
 func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) ([]Track, error) {
 	if limit <= 0 {
 		limit = 5
@@ -175,7 +184,28 @@ func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) (
 		return nil, engineUnavailable(SourceYouTube, "empty search query")
 	}
 
-	// 1. Try WEB search
+	// 1. Try ANDROID search (survives the WAF 403 that kills WEB on datacenter IPs)
+	androidPayload := map[string]any{
+		"context": map[string]any{"client": map[string]any{
+			"clientName": innerTubeAndroid, "clientVersion": innerTubeAndroidVer,
+		}},
+		"query": query,
+	}
+	var result map[string]any
+	start := time.Now()
+	if err := y.callInnerTube(ctx, "search", innerTubeAndroid, innerTubeAndroidVer, androidPayload, &result); err == nil {
+		var tracks []Track
+		parseVideoNodes(result, &tracks, limit)
+		if len(tracks) > 0 {
+			log.Printf("youtube: search ANDROID ok in %s (%d tracks)", time.Since(start), len(tracks))
+			return tracks, nil
+		}
+		log.Printf("youtube: search ANDROID ok in %s but 0 tracks", time.Since(start))
+	} else {
+		log.Printf("youtube: search ANDROID failed in %s: %v", time.Since(start), err)
+	}
+
+	// 2. Fallback to WEB search
 	webPayload := map[string]any{
 		"context": map[string]any{"client": map[string]any{
 			"clientName": innerTubeWeb, "clientVersion": innerTubeWebVer,
@@ -183,35 +213,28 @@ func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) (
 		"query":  query,
 		"params": "CAASAhAB",
 	}
-	var result map[string]any
+	result = nil
+	start = time.Now()
 	if err := y.callInnerTube(ctx, "search", innerTubeWeb, innerTubeWebVer, webPayload, &result); err == nil {
 		var tracks []Track
 		parseVideoNodes(result, &tracks, limit)
 		if len(tracks) > 0 {
+			log.Printf("youtube: search WEB ok in %s (%d tracks)", time.Since(start), len(tracks))
 			return tracks, nil
 		}
-	}
-
-	// 2. Fallback to ANDROID search (resilient against WAF 403 on WEB)
-	androidPayload := map[string]any{
-		"context": map[string]any{"client": map[string]any{
-			"clientName": innerTubeAndroid, "clientVersion": innerTubeAndroidVer,
-		}},
-		"query": query,
-	}
-	result = nil
-	if err := y.callInnerTube(ctx, "search", innerTubeAndroid, innerTubeAndroidVer, androidPayload, &result); err == nil {
-		var tracks []Track
-		parseVideoNodes(result, &tracks, limit)
-		if len(tracks) > 0 {
-			return tracks, nil
-		}
+		log.Printf("youtube: search WEB ok in %s but 0 tracks", time.Since(start))
+	} else {
+		log.Printf("youtube: search WEB failed in %s: %v", time.Since(start), err)
 	}
 
 	// 3. Fallback to yt-dlp daemon search
 	if y.ytdlp != nil {
+		start = time.Now()
 		if dt, derr := y.searchViaDaemon(ctx, query); derr == nil && dt.ID != "" {
+			log.Printf("youtube: search daemon ok in %s", time.Since(start))
 			return []Track{dt}, nil
+		} else {
+			log.Printf("youtube: search daemon failed in %s: %v", time.Since(start), derr)
 		}
 	}
 
@@ -235,20 +258,25 @@ func (y *YouTubeResolver) fetchVideo(ctx context.Context, videoID string) (Track
 			"videoId": videoID,
 		}
 		result = nil
+		start := time.Now()
 		if err := y.callInnerTube(ctx, "player", client.name, client.ver, payload, &result); err != nil {
+			log.Printf("youtube: player %s failed in %s: %v", client.name, time.Since(start), err)
 			lastErr = err
 			continue
 		}
 		if status, _ := dig(result, "playabilityStatus", "status").(string); status != "" && status != "OK" {
 			reason, _ := dig(result, "playabilityStatus", "reason").(string)
 			lastErr = engineUnavailable(SourceYouTube, "video %s not playable (status %s: %s)", videoID, status, reason)
+			log.Printf("youtube: player %s not playable in %s: %v", client.name, time.Since(start), lastErr)
 			continue
 		}
 		track, err := trackFromPlayer(result, videoID)
 		if err != nil {
+			log.Printf("youtube: player %s parse failed in %s: %v", client.name, time.Since(start), err)
 			lastErr = err
 			continue
 		}
+		log.Printf("youtube: player %s ok in %s", client.name, time.Since(start))
 		return track, nil
 	}
 	if lastErr == nil {
