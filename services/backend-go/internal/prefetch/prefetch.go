@@ -331,6 +331,17 @@ func (p *Prefetcher) run(chatID int64, s *PrebufferedStream) {
 		s.setErr(fmt.Errorf("prefetch buffer: %w", err))
 		return
 	}
+	// Download validation (queue-port Tier 2, item 15 — the
+	// in-memory twin of the voice openSource check): the
+	// buffered prefix must be non-empty media, not a JSON/HTML
+	// error body masquerading as a stream. A failed validation
+	// fails the prefetch, and the bind path falls back to the
+	// direct URL — it never hands the DSP an error document.
+	if err := validateMediaPrefix(prefix); err != nil {
+		_ = resp.Body.Close()
+		s.setErr(fmt.Errorf("prefetch buffer: %w", err))
+		return
+	}
 	// Success: the fresh track (with its fresh StreamURL) is the
 	// handle's track, and the body continues behind the prefix.
 	s.mu.Lock()
@@ -338,6 +349,25 @@ func (p *Prefetcher) run(chatID int64, s *PrebufferedStream) {
 	s.prefix = prefix
 	s.body = resp.Body
 	s.mu.Unlock()
+}
+
+// validateMediaPrefix rejects a buffered prefix that is not
+// media: empty (0 bytes), or opening with `{`, `<`, or `[` — a
+// JSON/HTML error body masquerading as a stream (NoxBeats'
+// YouTube::download check, queue-port Tier 2 item 15). No real
+// media format starts with those bytes (MP3 "ID3"/0xFF, FLAC
+// "fLaC", OGG "OggS", WebM 0x1A, MP4 box size + "ftyp", WAV
+// "RIFF"). The voice openSource path applies the same check to
+// the streaming body; this one covers the prefetch path.
+func validateMediaPrefix(prefix []byte) error {
+	if len(prefix) == 0 {
+		return fmt.Errorf("empty stream (0 bytes)")
+	}
+	switch prefix[0] {
+	case '{', '<', '[':
+		return fmt.Errorf("stream starts with %q — an error document, not media", string(prefix[0]))
+	}
+	return nil
 }
 
 func (s *PrebufferedStream) setErr(err error) {

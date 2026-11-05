@@ -258,6 +258,7 @@ func (h *Handlers) vcStop(ctx context.Context, req uds.Request) (any, error) {
 		return nil, mapRoomErr(err)
 	}
 	h.clearFeeding(chatID)
+	h.clearStuck(chatID)
 	h.prefetchCancel(chatID)
 	if _, ok := h.deps.Voice.Get(chatID); ok {
 		if verr := h.deps.Voice.Stop(chatID); verr != nil {

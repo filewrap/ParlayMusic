@@ -37,7 +37,12 @@
 //     block their caller: they capture the ended track id and
 //     dispatch the advance to a worker goroutine (blocking
 //     there while a skip waits in feed.Stop() for the pump to
-//     return would deadlock).
+//     return would deadlock). The video-chat-ended watcher
+//     (Manager.OnConnectionChange, queue-port Tier 2 item 18)
+//     clears the whole chat state when a live call ends — the
+//     queue does not survive a call ending — but only for a
+//     terminal transition of a call that was connected, so it
+//     never fights the join logic's own recovery.
 //   - One per-chat lock serialises every operation that changes
 //     the current track and binds voice for a chat, so a feed-end
 //     advance and a user skip can never interleave into a
@@ -92,6 +97,18 @@ type Handlers struct {
 	// advance a fresh track early.
 	watchdogMu     sync.Mutex
 	watchdogStreak map[int64]watchdogState
+
+	// stuckMu guards stuck: chatID -> the track id that just
+	// failed its bind budget in advancePlaybackMode (queue-port
+	// Tier 2, item 14). The room stands on that track with no
+	// feed behind it, and the watchdog's feeding check would
+	// otherwise never rescue it — the mark tells the watchdog
+	// the track is proven broken, so it advances on the next
+	// tick without waiting out the track's duration. The mark
+	// is cleared when the track advances, when the front track
+	// changes, or when the session ends.
+	stuckMu sync.Mutex
+	stuck   map[int64]string
 }
 
 // watchdogState is one chat's watchdog streak.
@@ -119,6 +136,7 @@ func New(d *app.Deps) *Handlers {
 		chatLocks:      map[int64]*sync.Mutex{},
 		feeding:        map[int64]string{},
 		watchdogStreak: map[int64]watchdogState{},
+		stuck:          map[int64]string{},
 	}
 	h.picker = newMixPicker(d.Registry)
 	d.Room.SetPicker(h.picker)
@@ -153,6 +171,9 @@ func Register(s *uds.Server, d *app.Deps) {
 	d.Voice.OnFeedEnd(h.onFeedEnd)
 	d.Voice.OnTransition(h.onTransition)
 	d.Voice.OnStreamEnd(h.onStreamEnd)
+	// The video-chat-ended watcher (queue-port Tier 2, item 18):
+	// when a live call ends, the whole chat state is cleared.
+	d.Voice.OnConnectionChange(h.onConnectionChange)
 	go h.watchdogLoop()
 
 	for action, fn := range map[string]uds.Handler{
@@ -423,6 +444,19 @@ func (h *Handlers) prefetchCancel(chatID int64) {
 // Manager.Play stops the old feed before starting the new one, so
 // a failed bind leaves no feed running, and a stale feeding id
 // would make a later feed-end look like the wrong track ended.
+//
+// Play-attempt retry (queue-port Tier 2, item 16): one bind
+// attempt is retried, in place, for Retryable-class errors only
+// (INTERDC_* → 2 s, short FLOOD_WAIT → the parsed wait, other
+// transient failures → 2 s), up to voice.MaxAttempts attempts
+// total, sleeping ctx-aware — a cancelled context ends the bind
+// with the last stage error. A Fatal or Unknown error returns
+// at once with no retry, and a call that dies mid-retry ends the
+// bind immediately (no sleep into a dead call). The retry is
+// inside the bind primitive, so every caller (vc.play's fresh
+// start, advances, resume, radio, autoplay-skip) gets it; the
+// advance path still classifies the final error (Fatal/Rotate
+// end the session, anything else advances past the track).
 func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Track) (bool, error) {
 	if !h.hasLiveCall(chatID) {
 		h.clearFeeding(chatID)
@@ -433,6 +467,43 @@ func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Trac
 		return false, fmt.Errorf("track %s has no playable stream URL", track.ID)
 	}
 	opts := h.dspOptions(chatID)
+	var lastErr error
+	for attempt := 1; attempt <= voice.MaxAttempts; attempt++ {
+		if attempt > 1 {
+			// The call may have died while the last attempt
+			// failed (a failed source swap marks it failed):
+			// do not sleep into a dead call.
+			if !h.hasLiveCall(chatID) {
+				h.clearFeeding(chatID)
+				return false, lastErr
+			}
+			if !sleepCtx(ctx, voice.RetryDelay(lastErr)) {
+				h.clearFeeding(chatID)
+				return false, lastErr
+			}
+		}
+		if err := h.tryBindOnce(ctx, chatID, track, opts); err == nil {
+			h.setFeeding(chatID, track.ID)
+			return true, nil
+		} else {
+			lastErr = err
+		}
+		if voice.Classify(lastErr) != voice.ClassRetryable {
+			break
+		}
+		log.Printf("handlers: bind chat %d track %s attempt %d failed (%v); retrying", chatID, track.ID, attempt, lastErr)
+	}
+	h.clearFeeding(chatID)
+	return false, lastErr
+}
+
+// tryBindOnce is one bind attempt: a ready prefetch handle first
+// (PlayStream), else the direct stream URL (Play). A failed
+// prefetch play falls back to the direct URL inside the same
+// attempt rather than failing the track — the prefetch is an
+// optimisation, never a gate. It returns nil when a feed is
+// running; the feeding record is the caller's job.
+func (h *Handlers) tryBindOnce(ctx context.Context, chatID int64, track model.Track, opts dsp.Options) error {
 	if h.prefetch != nil {
 		if stream, ok := h.prefetch.Take(chatID, track.ID); ok {
 			if err := h.deps.Voice.PlayStream(ctx, chatID, stream.Reader(), opts); err != nil {
@@ -441,17 +512,25 @@ func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Trac
 				_ = stream.Close()
 				log.Printf("handlers: prefetch play chat %d track %s failed (%v); falling back to direct URL", chatID, track.ID, err)
 			} else {
-				h.setFeeding(chatID, track.ID)
-				return true, nil
+				return nil
 			}
 		}
 	}
-	if err := h.deps.Voice.Play(ctx, chatID, track.StreamURL, opts); err != nil {
-		h.clearFeeding(chatID)
-		return false, err
+	return h.deps.Voice.Play(ctx, chatID, track.StreamURL, opts)
+}
+
+// sleepCtx sleeps d, or returns false early when ctx is done. A
+// zero or negative d returns true at once.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
 	}
-	h.setFeeding(chatID, track.ID)
-	return true, nil
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 // applyMuteIfNeeded re-applies the room's mute flag to a freshly
@@ -510,10 +589,12 @@ func (h *Handlers) resumeFeed(ctx context.Context, chatID int64) error {
 // maxBindAttempts is the bind budget per advance call: a track
 // that fails to bind is popped and the next one tried, at most
 // this many binds (Parvati's 3-attempt rule, queue-port Tier 1
-// item 16). When the budget is spent the room stands on the
-// broken track with a VoiceError behind it, and the watchdog
-// advances past it on its next cycle — the queue drains one
-// broken track per watchdog tick instead of wedging.
+// item 16). The budget is checked when a bind FAILS, not at the
+// top of the loop, so the room never parks on a track that was
+// never tried: when the budget is spent the room stands on the
+// track whose bind just failed, marked stuck for the watchdog
+// (item 14), which advances past it on its next tick — the queue
+// drains one broken track per watchdog tick instead of wedging.
 const maxBindAttempts = 3
 
 // advancePlayback runs one room Advance and drives voice + events
@@ -525,8 +606,12 @@ const maxBindAttempts = 3
 // announced as playing. A bind failure advances past the broken
 // track (bounded by maxBindAttempts); when the voice call itself
 // is gone the session ends instead (queue-port Tier 1, item 5:
-// a failure always moves the queue or ends the session). The
-// returned snapshot is the room after the advance.
+// a failure always moves the queue or ends the session). A
+// Fatal-class bind error (GROUPCALL_INVALID, RTMP, call gone)
+// ends the session at once, and a Rotate-class one evicts the
+// assistant first (queue-port Tier 2, item 16) — neither drains
+// the queue through a call that cannot play. The returned
+// snapshot is the room after the advance.
 func (h *Handlers) advancePlayback(ctx context.Context, chatID int64, endedID string, fromSkip bool) (room.AdvanceOutcome, model.NowPlaying, error) {
 	return h.advancePlaybackMode(ctx, chatID, endedID, fromSkip, true)
 }
@@ -560,13 +645,43 @@ func (h *Handlers) advancePlaybackMode(ctx context.Context, chatID int64, endedI
 				h.maybePrefetch(chatID, snap)
 				return out, snap, nil
 			}
-			if binds >= maxBindAttempts {
-				h.events.VoiceError(chatID, "stream_error", "voice bind failed repeatedly; track left standing for the watchdog")
-				snap, _ := h.rooms.Snapshot(chatID)
-				return out, snap, errEngineUnavailable("voice bind failed")
-			}
 			binds++
 			if berr := h.bindAfterAdvance(ctx, chatID, *out.Track); berr != nil {
+				// Classified end-of-the-line first: a
+				// Fatal bind error (GROUPCALL_INVALID,
+				// RTMP, the call itself gone) and a
+				// Rotate one (the assistant is dead or
+				// flooded) end the session instead of
+				// draining the queue through a call that
+				// cannot play (item 16). bindTrack
+				// already retried the Retryable classes
+				// in place, so a Retryable error here
+				// means its retries are spent — it
+				// advances past the track like Unknown.
+				switch voice.Classify(berr) {
+				case voice.ClassFatal:
+					h.endSession(chatID, out)
+					snap, _ := h.rooms.Snapshot(chatID)
+					return out, snap, berr
+				case voice.ClassRotate:
+					evicted := h.deps.Voice.EvictCurrentAssistant(berr.Error())
+					log.Printf("handlers: advance chat %d bind failed with rotate-class error (%v); evicted assistant %q, ending session", chatID, berr, evicted)
+					h.endSession(chatID, out)
+					snap, _ := h.rooms.Snapshot(chatID)
+					return out, snap, berr
+				}
+				if binds >= maxBindAttempts {
+					// Budget spent: park on this track
+					// — it WAS tried (the budget is
+					// checked on failure, never before
+					// a first attempt) — and mark it
+					// stuck so the watchdog rescues it
+					// on its next tick (item 14).
+					h.markStuck(chatID, out.Track.ID)
+					h.events.VoiceError(chatID, "stream_error", "voice bind failed repeatedly; track left standing for the watchdog")
+					snap, _ := h.rooms.Snapshot(chatID)
+					return out, snap, errEngineUnavailable("voice bind failed")
+				}
 				if !h.hasLiveCall(chatID) {
 					// The call is gone: end the session
 					// (item 5) instead of draining the
@@ -643,6 +758,7 @@ func (h *Handlers) endSession(chatID int64, out room.AdvanceOutcome) {
 	}
 	h.events.QueueEmpty(chatID)
 	h.clearFeeding(chatID)
+	h.clearStuck(chatID)
 	h.prefetchCancel(chatID)
 	if _, err := h.rooms.Stop(chatID); err != nil {
 		log.Printf("handlers: end session chat %d room stop: %v", chatID, err)
@@ -726,6 +842,64 @@ func (h *Handlers) onStreamEnd(chatID int64, streamType voice.StreamType, device
 	go h.advanceFromTrigger(chatID, endedID)
 }
 
+// onConnectionChange is the video-chat-ended watcher
+// (Manager.OnConnectionChange, queue-port Tier 2 item 18): when
+// the voice chat ends, the whole chat state is cleared — the
+// queue does not survive a call ending (TgMusicBot's watcher;
+// NoxBeats' on_chat_closed → stop). It NEVER blocks the ntgcalls
+// callback thread: it checks the call record synchronously and
+// dispatches the teardown to a worker goroutine.
+//
+// It acts ONLY on a terminal transition of a call that WAS
+// connected. The Manager marks exactly those
+// FailedStage "connection" (dispatchConnectionChange only marks
+// a record that was StateConnected); a terminal event from a
+// join attempt lands as stage "connect"/"join"/"create_call",
+// and a stale event for a record a fresh join already replaced
+// shows a live state — both are ignored, so the watcher never
+// fights the join logic's own recovery (a failed join that
+// Manager.Join is about to retry must not wipe the room).
+// Transient/connecting states and presentation-kind changes are
+// ignored: a presentation ending is not the call ending.
+func (h *Handlers) onConnectionChange(chatID int64, state voice.ConnectionState, kind voice.ConnectionKind) {
+	if kind != voice.ConnectionKindNormal {
+		return
+	}
+	switch state {
+	case voice.ConnectionFailed, voice.ConnectionTimeout, voice.ConnectionClosed:
+	default:
+		return
+	}
+	call, ok := h.deps.Voice.Get(chatID)
+	if !ok || call.State != voice.StateFailed || call.FailedStage != "connection" {
+		return // join noise, a stale event, or already rejoined
+	}
+	go h.endSessionFromCallEnd(chatID)
+}
+
+// endSessionFromCallEnd clears the whole chat state after the
+// voice call ended: room stopped (queue included), feeding
+// record cleared, pending prefetch dropped, call left
+// best-effort — the endSession path, with the current track as
+// the ended track. The call record is re-checked under the
+// per-chat lock: a fresh join may have landed between the event
+// and this worker, and then there is nothing to clear.
+func (h *Handlers) endSessionFromCallEnd(chatID int64) {
+	h.chatLock(chatID).Lock()
+	defer h.chatLock(chatID).Unlock()
+	call, ok := h.deps.Voice.Get(chatID)
+	if !ok || call.State != voice.StateFailed || call.FailedStage != "connection" {
+		return
+	}
+	var ended *model.Track
+	if current, ok := h.rooms.Current(chatID); ok {
+		t := current
+		ended = &t
+	}
+	log.Printf("handlers: voice call ended chat %d; clearing room state", chatID)
+	h.endSession(chatID, room.AdvanceOutcome{EndedTrack: ended})
+}
+
 // watchdogInterval is the queue watchdog tick (Parvati's 4 s
 // monitor, queue-port Tier 1 item 2). watchdogEndStreak is how
 // many consecutive ticks a track must be past its duration
@@ -752,10 +926,32 @@ func (h *Handlers) watchdogLoop() {
 // engine); the feed record must exist for the track (a track with
 // no feed — a replied file, an unreachable radio — is not the
 // watchdog's job). Paused rooms and duration-less tracks never
-// advance.
+// advance. EXCEPTION (queue-port Tier 2, item 14): a track
+// marked stuck — it already failed its bind budget, so there is
+// no feed by definition and no point waiting out its duration —
+// advances on the next tick, with no streak and no duration
+// check. The binds already proved it broken.
 func (h *Handlers) watchdogTick() {
 	for _, snap := range h.rooms.PlayingSnapshots() {
-		if snap.Track == nil || snap.Track.DurationSec <= 0 || snap.IsPaused {
+		trackID := ""
+		if snap.Track != nil {
+			trackID = snap.Track.ID
+		}
+		// A stale stuck mark (the front track changed since
+		// the mark was set) is dropped before anything
+		// consults it, so it can never advance a fresh track.
+		h.clearStuckIfNot(snap.ChatID, trackID)
+		if snap.Track == nil || snap.IsPaused {
+			h.watchdogReset(snap.ChatID)
+			continue
+		}
+		if h.isStuck(snap.ChatID, snap.Track.ID) {
+			h.clearStuck(snap.ChatID)
+			log.Printf("handlers: watchdog chat %d track %s stuck after failed binds; advancing", snap.ChatID, snap.Track.ID)
+			go h.advanceFromTrigger(snap.ChatID, snap.Track.ID)
+			continue
+		}
+		if snap.Track.DurationSec <= 0 {
 			h.watchdogReset(snap.ChatID)
 			continue
 		}
@@ -790,6 +986,44 @@ func (h *Handlers) watchdogReset(chatID int64) {
 	h.watchdogMu.Lock()
 	defer h.watchdogMu.Unlock()
 	delete(h.watchdogStreak, chatID)
+}
+
+// markStuck records that chatID's front track (trackID) failed its
+// bind budget in advancePlaybackMode and the room stands on it
+// with no feed. The watchdog rescues it on its next tick
+// (item 14). The mark is deliberately NOT cleared by
+// watchdogReset: the streak resets whenever the track is not yet
+// past its duration, but the stuck mark must survive until the
+// track advances or changes.
+func (h *Handlers) markStuck(chatID int64, trackID string) {
+	h.stuckMu.Lock()
+	defer h.stuckMu.Unlock()
+	h.stuck[chatID] = trackID
+}
+
+// isStuck reports whether chatID is marked stuck on trackID.
+func (h *Handlers) isStuck(chatID int64, trackID string) bool {
+	h.stuckMu.Lock()
+	defer h.stuckMu.Unlock()
+	return h.stuck[chatID] == trackID
+}
+
+// clearStuck drops chatID's stuck mark, if any.
+func (h *Handlers) clearStuck(chatID int64) {
+	h.stuckMu.Lock()
+	defer h.stuckMu.Unlock()
+	delete(h.stuck, chatID)
+}
+
+// clearStuckIfNot drops chatID's stuck mark when it names a
+// different track than trackID — the front track changed, so the
+// mark is stale and must never advance the fresh track.
+func (h *Handlers) clearStuckIfNot(chatID int64, trackID string) {
+	h.stuckMu.Lock()
+	defer h.stuckMu.Unlock()
+	if id, ok := h.stuck[chatID]; ok && id != trackID {
+		delete(h.stuck, chatID)
+	}
 }
 
 // onTransition is the DSP gapless-promotion callback
