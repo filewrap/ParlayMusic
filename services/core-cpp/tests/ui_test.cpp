@@ -568,10 +568,10 @@ int main() {
     // --- Package 3: queue blockquote, search page footer, copy
     // button + collection / retry keyboards -------------------------
     {
-        CardTrack now{"Now Song", "https://x/now", "3:00", "Alice", "tok0"};
+        CardTrack now{"Now Song", "https://x/now", "3:00", "Alice", "tok0", ""};
         std::vector<CardTrack> up = {
-            {"One", "https://x/1", "2:00", "Bob", "tok1"},
-            {"Two", "https://x/2", "4:00", "Carol", "tok2"},
+            {"One", "https://x/1", "2:00", "Bob", "tok1", ""},
+            {"Two", "https://x/2", "4:00", "Carol", "tok2", ""},
         };
         std::string q = queueText(now, up, 2);
         CHECK(contains(q, "<blockquote expandable>") &&

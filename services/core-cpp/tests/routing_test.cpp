@@ -472,16 +472,16 @@ int main(int argc, char** argv) {
               harvested);
     harvestKb(playerKeyboard(kChat, true, false, 3, "", false, 0, 0),
               harvested);
-    harvestKb(queuedKeyboard(kToken), harvested);
-    harvestKb(queuedKeyboard(""), harvested);
+    harvestKb(queuedKeyboard(kChat, kToken), harvested);
+    harvestKb(queuedKeyboard(kChat, ""), harvested);
     harvestKb(stopConfirmKeyboard(kChat, true), harvested);
     harvestKb(stopConfirmKeyboard(kChat, false), harvested);
     harvestKb(restartConfirmKeyboard(kChat), harvested);
     harvestKb(menuPanelKeyboard(kChat), harvested);
     {
         std::vector<CardTrack> shown = {
-            {"Song One", "https://x/1", "3:24", "Alice", kToken},
-            {"Song Two", "https://x/2", "2:00", "Bob", "0123456789"},
+            {"Song One", "https://x/1", "3:24", "Alice", kToken, ""},
+            {"Song Two", "https://x/2", "2:00", "Bob", "0123456789", ""},
         };
         harvestKb(queueKeyboard(kChat, shown, true, 5), harvested);
     }
@@ -557,6 +557,7 @@ int main(int argc, char** argv) {
         {"pl:player:refresh:<chat_id>", cbPlayer("refresh", kChat)},
         {"pl:player:thumb:<chat_id>", cbPlayer("thumb", kChat)},
         {"pl:player:playnow:<token>", cbPlayerToken("playnow", kToken)},
+        {"pl:play:force:<chat_id>:<token>", cbPlayForce(kChat, kToken)},
         {"pl:player:addlist:<token>", cbPlayerToken("addlist", kToken)},
         {"pl:player:confirm:resume:<chat_id>",
          "pl:player:confirm:resume:" + std::to_string(kChat)},
