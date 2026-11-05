@@ -689,13 +689,8 @@ inline const char* kHelpUnknownCmd =
 inline const char* kHelpBackToast = "Returning to main menu...";
 inline const char* kHelpUnknownCategory = "Unknown help category.";
 
-// Unknown command / unhandled text (rustify §7.1, §3). {list} is the
+// Unhandled text (rustify §7.1, §3). {list} is the
 // command list for the caller's access level.
-inline const char* kUnknownCommand =
-    "<b>Command <code>{command}</code> not found.</b>\n"
-    "\n"
-    "<b>Commands available to you:</b>\n"
-    "{list}";
 inline const char* kUnhandledText =
     "<b>Your request was not handled</b>\n"
     "\n"

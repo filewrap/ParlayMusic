@@ -328,15 +328,26 @@ public:
 
     // Handle one callback_query update (Phase 9, UI_INVENTORY.md §1):
     // the "pl:<domain>:<verb>[:<arg>…]" namespace only. Unknown
-    // callbacks get a polite alert, never a crash. Wrong-user taps get
-    // the "You aren't allowed" toast (admin-or-requester gate per row),
-    // except the remix /menu panel rule where other users are silently
-    // ignored.
+    // callbacks (empty / over-64-byte / non-pl: data, unknown domain)
+    // get a silent ack — empty text, query still answered — by direct
+    // user order 2026-11-05, overriding the locked §7.5 "never
+    // silent" rule for this point only (see phase10/PHASE10.md). A
+    // known domain keeps its own honest alerts for a malformed verb
+    // or bad arguments. Wrong-user taps get the "You aren't allowed"
+    // toast (admin-or-requester gate per row), except the remix /menu
+    // panel rule where other users are silently ignored.
     void handleCallback(const TgCallbackQuery& cq);
     // Handle one my_chat_member update (bot status change): the
     // demotion goodbye (§2) — the bot sends the notice and leaves when
     // it loses admin rights in a group.
     void handleMyChatMember(const TgChatMemberUpdate& upd);
+    // Handle one chat_member update for a non-bot member whose
+    // transition touches administrator/creator status (remix
+    // chat_member_updated): re-fetch the chat admin list so the admin
+    // cache (10 min TTL) does not serve a stale list after a
+    // promotion/demotion. Returns true when the cache was refreshed;
+    // ordinary member joins/leaves return false and refresh nothing.
+    bool handleAdminTransition(const TgChatMemberUpdate& upd);
     // Handle one inline_query update (Phase 9 gaps, §13): the core
     // calls search.inline (vc-ts /v1/inline) and renders the
     // InlineQueryResult objects itself — vc-ts returns Tracks only.
@@ -870,6 +881,9 @@ private:
     void onAuth(const CommandContext& ctx);
     void onAuthlist(const CommandContext& ctx);
     void onAdmincache(const CommandContext& ctx);
+    void onRmcache(const CommandContext& ctx);
+    void onScan(const CommandContext& ctx);
+    void onShareScan(const CommandContext& ctx);
     void onBlacklist(const CommandContext& ctx);
     void onBlacklisted(const CommandContext& ctx);
     void onAddSudo(const CommandContext& ctx);
