@@ -499,6 +499,14 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onLogger(c); });
     add({"restart"}, Scope::Any, Perm::Sudo,
         [this](const CommandContext& c) { onRestart(c); });
+    // Library / cache tools (Package 1, §9-E5/E6/E7): sudo-only admin
+    // commands that post the existing backend actions.
+    add({"rmcache"}, Scope::Any, Perm::Sudo,
+        [this](const CommandContext& c) { onRmcache(c); });
+    add({"scan"}, Scope::Any, Perm::Sudo,
+        [this](const CommandContext& c) { onScan(c); });
+    add({"sharescan"}, Scope::Any, Perm::Sudo,
+        [this](const CommandContext& c) { onShareScan(c); });
     // RTMP.
     add({"setrtmp"}, Scope::Private, Perm::Everyone,
         [this](const CommandContext& c) { onSetRtmp(c); });
@@ -956,10 +964,12 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         if (r.perm == Perm::Sudo && !isSudo(msg.from.id)) return;
         if (r.perm == Perm::Owner && !isOwner(msg.from.id)) return;
         // Blacklisted users are refused on Everyone commands (except
-        // /start and /listsudo).
+        // /start and /listsudo). The owner is exempt: a blacklisted
+        // owner still runs Everyone commands (telegram-music-bot-rust
+        // ADMIN_ID ban checks return false for the owner).
         if (r.perm == Perm::Everyone && ctx.command != "start" &&
             ctx.command != "listsudo" && ctx.command != "sudolist" &&
-            isBlUser(msg.from.id))
+            !isOwner(msg.from.id) && isBlUser(msg.from.id))
             return;
         // Blacklisted chat: leave.
         if (isBlChat(msg.chat.id)) {
@@ -1004,12 +1014,10 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         }
         return;  // first match wins
     }
-    // Unknown command: the §3 reply (never silent, never a crash).
+    // Unknown command: the refined §3 reply (row C92) — the command
+    // doesn't exist, use /help. Never silent, never a crash.
     replyHtml(ctx, ui_texts::fmt(ui_texts::kUnknownCommand,
-                                 {{"command", "/" + ctx.command},
-                                  {"list", availableCommandsList(
-                                               isSudo(msg.from.id),
-                                               isOwner(msg.from.id))}}));
+                                 {{"command", "/" + ctx.command}}));
 }
 
 // --- permissions -----------------------------------------------------------
@@ -5641,6 +5649,100 @@ void Dispatcher::onAdmincache(const CommandContext& ctx) {
     reply(ctx, ui_texts::kReloadShortOk);
 }
 
+void Dispatcher::onRmcache(const CommandContext& ctx) {
+    // /rmcache (Music163bot-Go adminOnly /rmcache): clear the
+    // backend's per-track cache via cache.clear (Phase 3, §9-E7). No
+    // name clears the whole cache (scope "all"); a name clears one
+    // entry (scope "track"). A backend refusal is answered with the
+    // backend's exact error, never a fake success.
+    Json body = Json::objectOf({});
+    if (!trim(ctx.args).empty()) {
+        body.set("scope", Json("track"));
+        body.set("name", Json(trim(ctx.args)));
+    }
+    IpcResult r = ipc_.post("cache.clear", body, 30);
+    if (!r.ok) {
+        reply(ctx, r.error_message);
+        return;
+    }
+    bool cleared = false;
+    if (const Json* c = r.data.find("cleared")) cleared = c->asBool();
+    if (!cleared) {
+        reply(ctx, "Cache is already empty.");
+        return;
+    }
+    std::string out = "Cache cleared.";
+    if (const Json* names = r.data.find("names")) {
+        if (names->isArray() && names->size() > 0)
+            out += " " + std::to_string(names->size()) +
+                   " entries removed.";
+    }
+    reply(ctx, out);
+}
+
+void Dispatcher::onScan(const CommandContext& ctx) {
+    // /scan (music-bot-navidrome cmd_scan): trigger a Navidrome
+    // library rescan via library.scan (Phase 3, §9-E5). The scan
+    // itself is async on the Navidrome side; the backend answers
+    // {triggered, error?, tracks_found?}. A not-configured backend
+    // answers honestly with the locked not-configured text, and any
+    // other refusal is answered with the backend's exact error —
+    // never a fake "triggered".
+    IpcResult r = ipc_.post("library.scan", Json::objectOf({}), 30);
+    if (!r.ok) {
+        reply(ctx, r.error_message);
+        return;
+    }
+    bool triggered = false;
+    if (const Json* t = r.data.find("triggered")) triggered = t->asBool();
+    if (!triggered) {
+        std::string err;
+        if (const Json* e = r.data.find("error")) err = e->asString();
+        if (err == "not configured") {
+            reply(ctx, "Library scan not configured "
+                       "(NAVIDROME_USER/NAVIDROME_PASS not set).");
+            return;
+        }
+        if (!err.empty()) {
+            reply(ctx, "Library scan failed: " + err + ".");
+            return;
+        }
+        reply(ctx, "Library scan not triggered.");
+        return;
+    }
+    std::string out = "Library scan triggered.";
+    if (const Json* n = r.data.find("tracks_found"))
+        out += " " + std::to_string(n->asInt()) + " tracks found.";
+    reply(ctx, out);
+}
+
+void Dispatcher::onShareScan(const CommandContext& ctx) {
+    // /sharescan (music-bot-navidrome cmd_share_scan): trigger (or
+    // schedule) an slskd share rescan via library.sharescan (Phase 3,
+    // §9-E6). The backend answers {triggered, scheduled_in_min?}: a
+    // 409 from slskd (scan already running) comes back as
+    // triggered:false with no minute estimate, which is reported
+    // honestly instead of inventing one.
+    IpcResult r =
+        ipc_.post("library.sharescan", Json::objectOf({}), 30);
+    if (!r.ok) {
+        reply(ctx, r.error_message);
+        return;
+    }
+    bool triggered = false;
+    if (const Json* t = r.data.find("triggered")) triggered = t->asBool();
+    if (!triggered) {
+        const Json* m = r.data.find("scheduled_in_min");
+        if (m && !m->isNull())
+            reply(ctx, "slskd share scan scheduled in ~" +
+                           std::to_string(m->asInt()) + "m.");
+        else
+            reply(ctx, "slskd share scan already in progress.");
+        return;
+    }
+    reply(ctx, "slskd share scan triggered.");
+}
+
 void Dispatcher::onBlacklist(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
@@ -6584,18 +6686,27 @@ void Dispatcher::onStreamStatus(const CommandContext& ctx) {
 // --- Phase 9: callback router (UI_INVENTORY.md §1) -------------------------
 // One namespace, colon-separated, 64-byte hard limit:
 //   pl:<domain>:<verb>[:<arg>…]
-// Unknown callbacks get a polite alert, never a crash. Player/queue
+// Unknown callbacks get the hand toast, never a crash. Player/queue
 // buttons are admin-or-requester gated (§28.2): sudo, chat admin, auth
 // user, or admin_mode==2. Search buttons are requester-only. The remix
 // /menu panel is the exception: other users' taps are silently ignored.
 void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
+    // Unknown callbacks are answered with the hand toast by direct
+    // user order (2026-11-05, see phase10/PHASE10.md): the query is
+    // still answered, with the text "🖐️" and alert off, so the
+    // spinner ends. This covers only the router-level unknowns
+    // below (empty / over-64-byte / non-pl: data, unknown domain).
+    // A known domain keeps its own honest alerts for a malformed
+    // verb or bad arguments (e.g. unknown help topic, out-of-range
+    // quality value), and a handler that throws still answers with
+    // the "not available yet" alert.
     if (cq.data.empty() || cq.data.size() > 64) {
-        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        answerCb(cq, "🖐️", false);
         return;
     }
     std::vector<std::string> parts = splitCb(cq.data);
     if (parts.size() < 2 || parts[0] != "pl") {
-        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        answerCb(cq, "🖐️", false);
         return;
     }
     // A button press proves the user is looking at this chat — same
@@ -6623,7 +6734,7 @@ void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
         else if (domain == "dlset") cbDlset(cq, parts);
         else if (domain == "spotify") cbSpotify(cq, parts);
         else
-            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            answerCb(cq, "🖐️", false);  // unknown domain: hand toast (see above)
     } catch (const std::exception& e) {
         std::cerr << "[cb] handler for " << cq.data
                   << " threw: " << e.what() << "\n";
@@ -6644,6 +6755,23 @@ void Dispatcher::handleMyChatMember(const TgChatMemberUpdate& upd) {
     ctx.command = "start";
     replyHtml(ctx, ui_texts::kDemoted);
     tg_.leaveChat(upd.chat_id);
+}
+
+bool Dispatcher::handleAdminTransition(const TgChatMemberUpdate& upd) {
+    // Non-bot member transition touching administrator/creator status
+    // (remix chat_member_updated): a promotion, demotion, or removal
+    // of an admin makes the cached admin list stale, so re-fetch it
+    // now (cachedAdmins with reload re-reads getChatAdministrators
+    // and cacheSets the fresh list) instead of waiting out the 10
+    // min TTL. Ordinary member joins/leaves touch no admin status
+    // and refresh nothing.
+    bool touches_admin = upd.old_status == "administrator" ||
+                         upd.old_status == "creator" ||
+                         upd.new_status == "administrator" ||
+                         upd.new_status == "creator";
+    if (!touches_admin) return false;
+    cachedAdmins(upd.chat_id, true);
+    return true;
 }
 
 // --- inline queries (§13, Phase 9 gaps) ------------------------------------

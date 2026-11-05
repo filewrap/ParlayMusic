@@ -357,6 +357,12 @@ public:
     // below): download.cancel / library.delete success payloads.
     mutable std::string download_cancel_response;
     mutable std::string library_delete_response;
+    // Scripted Package 1 answers (empty = fall through to the 404
+    // below): library.scan / library.sharescan / cache.clear success
+    // payloads.
+    mutable std::string library_scan_response;
+    mutable std::string library_sharescan_response;
+    mutable std::string cache_clear_response;
     mutable std::string last_post_body;
     // Every POST body, in order (last_post_body keeps the latest).
     mutable std::vector<std::string> post_bodies;
@@ -477,6 +483,27 @@ public:
             r.ok = true;
             r.http_status = 200;
             r.data = parlay::Json::parse(library_delete_response);
+            return r;
+        }
+        if (action == "library.scan" &&
+            !library_scan_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(library_scan_response);
+            return r;
+        }
+        if (action == "library.sharescan" &&
+            !library_sharescan_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(library_sharescan_response);
+            return r;
+        }
+        if (action == "cache.clear" &&
+            !cache_clear_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(cache_clear_response);
             return r;
         }
         if (action == "fx" && !fx_response.empty()) {
@@ -1590,28 +1617,34 @@ int main() {
         Rig rig;
         rig.d.handleCallback(makeCq("pl:unknown:thing"));
         CHECK(rig.tg.toasts.size() == 1 &&
-                  rig.tg.toasts[0].alert &&
-                  contains(rig.tg.toasts[0].text, "Unknown"),
-              "callback: unknown domain gets a polite alert, no crash");
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: unknown domain gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq(""));
-        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
-              "callback: empty data gets an alert, no crash");
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: empty data gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq("pl:player:pause:" +
                                     std::string(70, '9')));
-        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
-              "callback: over-64-byte data gets an alert, no crash");
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: over-64-byte data gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq("not-a-callback"));
-        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
-              "callback: non-pl data gets an alert, no crash");
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: non-pl data gets the hand toast, no crash");
     }
     {
         Rig rig;
@@ -3656,7 +3689,241 @@ int main() {
               "cbSpotify dislike: still routed to spotify.dislike");
     }
 
-    std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+    // --- Package 1 (S0–S5): silent denials + sudo gaps ---------------
+    // S0 (per user ruling 2026-11-05, superseding the silent drop):
+    // unknown commands answer the refined kUnknownCommand card — the
+    // command doesn't exist, use /help. No IPC post.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/nosuchcommand"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "doesn't exist") &&
+                  contains(rig.tg.replies[0], "/help") &&
+                  rig.ipc.posts.empty(),
+              "pkg1 unknown command: refined reply, no post");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/mix"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "doesn't exist") &&
+                  contains(rig.tg.replies[0], "/help"),
+              "pkg1 unknown command /mix: refined reply");
+    }
+    // S1: /rmcache — sudo-only gate, cache.clear post, cleared
+    // result, honest refusal when the backend refuses.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 112, "/rmcache"));
+        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
+              "pkg1 rmcache: non-sudo is denied silently, no post");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.cache_clear_response =
+            R"({"cleared": true, "names": ["Song A", "Song B"]})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/rmcache"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 rmcache: cache.clear issued to the backend");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Cache cleared.") &&
+                  contains(rig.tg.replies[0], "2 entries removed."),
+              "pkg1 rmcache: cleared result with entry count");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.cache_clear_response =
+            R"({"cleared": true, "names": ["Song A"]})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/rmcache Song A"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 rmcache named: cache.clear issued");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("scope") &&
+                      b.find("scope")->asString() == "track" &&
+                      b.find("name") &&
+                      b.find("name")->asString() == "Song A",
+                  "pkg1 rmcache named: scope track + name carried");
+        }
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/rmcache"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 rmcache, backend refuses: cache.clear issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "fake: no engine here") &&
+                  !contains(rig.tg.replies[0], "Cache cleared"),
+              "pkg1 rmcache, backend refuses: honest error, no fake "
+              "success");
+    }
+    // S2: /scan — sudo-only gate, library.scan post, trigger result,
+    // honest not-configured text, honest refusal.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 112, "/scan"));
+        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
+              "pkg1 scan: non-sudo is denied silently, no post");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_scan_response =
+            R"({"triggered": true, "tracks_found": 5})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/scan"));
+        CHECK(has_post(rig, "library.scan"),
+              "pkg1 scan: library.scan issued to the backend");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Library scan triggered.") &&
+                  contains(rig.tg.replies[0], "5 tracks found."),
+              "pkg1 scan: trigger result with track count");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_scan_response =
+            R"({"triggered": false, "error": "not configured"})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/scan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "not configured") &&
+                  !contains(rig.tg.replies[0], "Library scan triggered."),
+              "pkg1 scan, not configured: honest text, no fake success");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/scan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "fake: no engine here") &&
+                  !contains(rig.tg.replies[0], "Library scan triggered."),
+              "pkg1 scan, backend refuses: honest error, no fake success");
+    }
+    // S3: /sharescan — sudo-only gate, library.sharescan post,
+    // triggered / already-running / scheduled results, honest refusal.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 112, "/sharescan"));
+        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
+              "pkg1 sharescan: non-sudo is denied silently, no post");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_sharescan_response = R"({"triggered": true})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(has_post(rig, "library.sharescan"),
+              "pkg1 sharescan: library.sharescan issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "slskd share scan triggered."),
+              "pkg1 sharescan: triggered result");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_sharescan_response = R"({"triggered": false})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "already in progress") &&
+                  !contains(rig.tg.replies[0], "triggered."),
+              "pkg1 sharescan, already running: honest text, no fake "
+              "success");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_sharescan_response =
+            R"({"triggered": false, "scheduled_in_min": 7})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "scheduled in ~7m."),
+              "pkg1 sharescan, scheduled: scheduled result with minutes");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "fake: no engine here") &&
+                  !contains(rig.tg.replies[0], "triggered."),
+              "pkg1 sharescan, backend refuses: honest error, no fake "
+              "success");
+    }
+    // S4: admin-list refresh on admin transitions (remix
+    // chat_member_updated), observed through /settings admin-gating:
+    // a promotion re-fetches the list so the new admin passes the
+    // gate at once; an ordinary member join refreshes nothing, so
+    // the newcomer is still denied; a demotion re-fetches, so the
+    // demoted admin is denied again. (User ids 5222/5333 are fresh:
+    // an earlier test blacklists 222 in the shared file store.)
+    {
+        Rig rig;
+        rig.tg.admins = {111};
+        rig.d.handleMessage(makeMsg(-100777, 5222, "/settings"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Access Denied"),
+              "pkg1 admin transition: non-admin is denied before "
+              "promotion (cache seeded {111})");
+        rig.tg.admins = {111, 5222};
+        CHECK(rig.d.handleAdminTransition(
+                  parlay::TgChatMemberUpdate{-100777, 5222, "member",
+                                             "administrator"}),
+              "pkg1 admin transition: promotion refreshes");
+        rig.d.handleMessage(makeMsg(-100777, 5222, "/settings"));
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[1], "Chat Settings"),
+              "pkg1 admin transition: promoted admin opens settings "
+              "without waiting for the TTL");
+        rig.tg.admins = {111, 5222, 5333};
+        CHECK(!rig.d.handleAdminTransition(
+                  parlay::TgChatMemberUpdate{-100777, 5333, "left",
+                                             "member"}),
+              "pkg1 admin transition: member join does not refresh");
+        rig.d.handleMessage(makeMsg(-100777, 5333, "/settings"));
+        CHECK(rig.tg.replies.size() == 3 &&
+                  contains(rig.tg.replies[2], "Access Denied"),
+              "pkg1 admin transition: member join leaves the cache "
+              "unchanged, newcomer still denied");
+        rig.tg.admins = {111};
+        CHECK(rig.d.handleAdminTransition(
+                  parlay::TgChatMemberUpdate{-100777, 5222, "administrator",
+                                             "member"}),
+              "pkg1 admin transition: demotion refreshes");
+        rig.d.handleMessage(makeMsg(-100777, 5222, "/settings"));
+        CHECK(rig.tg.replies.size() == 4 &&
+                  contains(rig.tg.replies[3], "Access Denied"),
+              "pkg1 admin transition: demoted admin is denied again");
+    }
+    // S5: the owner is exempt from the blacklist-user refusal on
+    // Everyone commands; a blacklisted non-owner is still refused
+    // silently, and a non-blacklisted non-owner still runs them.
+    {
+        Rig rig;
+        rig.store.sadd("bl_users", "999");
+        rig.store.sadd("bl_users", "111");
+        rig.d.handleMessage(makeMsg(-1001, 999, "/id"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "This chat has ID"),
+              "pkg1 blacklist: blacklisted owner still runs /id");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("bl_users", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/id"));
+        CHECK(rig.tg.replies.empty(),
+              "pkg1 blacklist: blacklisted non-owner still refused "
+              "silently");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 113, "/id"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "This chat has ID"),
+              "pkg1 blacklist: non-blacklisted non-owner still runs /id");
+    }
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
     if (failures == 0) {

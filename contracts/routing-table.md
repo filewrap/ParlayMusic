@@ -41,28 +41,30 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
     the row specifies the core-side UI (button / command handler) that
     must be built against them; the core has not implemented it yet.
     Until it does, the callback/command answers through the router
-    default branch (alert `Unknown action.`) — handled, never silent,
-    never a crash, never a dead end. Implementing a `Contract` row is
-    core-side follow-up, not a backend gap, and does not change the
-    zero-unrouted / zero-unhandled counts: nothing in the shipped UI
+    default branch (hand toast `🖐️`, alert off — query still answered) —
+    handled, never a crash, never a dead end. Implementing a `Contract`
+    row is core-side follow-up, not a backend gap, and does not change
+    the zero-unrouted / zero-unhandled counts: nothing in the shipped UI
     emits these callbacks today.
 - Router default branch: `Dispatcher::handleCallback`
   (`services/core-cpp/src/dispatcher.cpp`, `handleCallback`) has an
   explicit default branch — empty data, data >64 bytes, a first segment
-  other than `pl`, an unknown domain, and any unknown verb inside a
-  known domain all answer the callback query with the alert
-  `Unknown action.` (`kToastUnknownAction`), never silence, never a
-  crash, never an un-answered query. Handler exceptions are caught and
-  answered with the alert `This feature is not available yet.`
-  (`kToastFeatureUnavailable`). Verified by `tests/routing_test.cpp`
-  (§H). No code change was needed for this item: the branch already
-  existed.
+  other than `pl`, and an unknown domain all answer the callback query
+  with the toast `🖐️` (alert off; the query is still answered), by
+  direct user order 2026-11-05 (see phase10/PHASE10.md). An unknown
+  verb inside a known domain is
+  answered by that domain's handler with the alert `Unknown action.`
+  (`kToastUnknownAction`) or the handler's own honest toast. Handler
+  exceptions are caught and answered with the alert `This feature is
+  not available yet.` (`kToastFeatureUnavailable`). Verified by
+  `tests/routing_test.cpp` (§H). No code change was needed for this
+  item: the branch already existed.
 - Cross-check result (§F): every `pl:` callback emitted by a builder in
   `ui_texts.hpp` has a handler in `handleCallback`, and every handler
   branch has a builder — except the `No button` rows listed in §F, which
   are handler-only by design or by omission (recorded, not silently
   dropped). Every reply-keyboard button is listed in §B. Every
-  registered command (112 names in 87 groups + 70 aliases + 40
+  registered command (116 names in 91 groups + 70 aliases + 40
   channel commands) is listed in §C. Every inline-mode entry is listed
   in §D.
 
@@ -164,7 +166,7 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A92 | Download-settings sub-screens | Back | `pl:dlset:back` | `handleCallback` → `cbDlset` | none | silent ack + edit to `Select one of the settings below!` with `dlSettingsIndexKeyboard()` | Live |
 | A93 | Spotify companion card (backend-go:spotify — no in-core builder) | Dislike | `pl:spotify:dislike:<id>` | `handleCallback` → `cbSpotify` | `spotify.dislike` | toast `Disliked.`; backend error answers the error as an alert | Live |
 | A94 | Spotify companion cards (backend-go:spotify — no in-core builder) | Details / Analyze (companion surfaces) | `pl:spotify:details:<id>`, `pl:spotify:analyze:<id>` | `handleCallback` → `cbSpotify` | `spotify.details` (details) / `spotify.analyze` (analyze) | details: card edited in place with track, album, features (key/mode/tempo), disliked/ignored counts, genres, profanity, language, lyrics + `[Analyze text]` button; analyze: analysis card edited in place; any other verb → alert `This feature is not available yet.` | Live |
-| A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, A96–A99, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | alert `Unknown action.` (`kToastUnknownAction`); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
+| A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, A96–A99, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | toast `🖐️` (alert off; the query is still answered) — direct user order 2026-11-05 (see phase10/PHASE10.md); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
 | A96 | Settings panel, index row | Quality | `pl:set:quality` | `handleCallback` → `cbSet` | `quality.get` read | silent ack + edit to quality sub-screen (`qualityCardText` + `settingsQualityKeyboard()`) | Live |
 | A97 | Quality sub-screen | Bitrate: 128 / 160 / 192 / 256 / 320 kbps (current marked) | `pl:set:quality:br:<kbps>` (kbps 128, 160, 192, 256, 320) | `handleCallback` → `cbSet` | `chat.settings` write (`quality_bitrate_bps`) | toast `Settings updated!` + edit to quality sub-screen with updated bitrate; out-of-range kbps → alert `Unknown action.`; screen notes the change applies on next join | Live |
 | A98 | Quality sub-screen | Frame size: 10 / 20 / 40 / 60 ms (current marked) | `pl:set:quality:fr:<ms>` (ms 10, 20, 40, 60) | `handleCallback` → `cbSet` | `chat.settings` write (`quality_frame_ms`) | toast `Settings updated!` + edit to quality sub-screen with updated frame size; out-of-range ms → alert `Unknown action.`; screen notes the change applies on next join | Live |
@@ -206,8 +208,11 @@ therefore `handleMessage`'s plain-text path, not `handleCallback`.
 Scope / permission are from `Dispatcher::registerCommands`
 (`services/core-cpp/src/dispatcher.cpp`): `Scope` Group / Private / Any,
 `Perm` Everyone / Sudo / Owner. Gates that fail do so silently (NoxBeats
-dispatch rule) except where the row says otherwise. Unknown commands are
-never silent: the §C90 row answers with the unknown-command card.
+dispatch rule) except where the row says otherwise. The Everyone-command
+blacklist refusal does not apply to the owner: a blacklisted owner still
+runs Everyone commands (row C65). Unknown commands are never silent:
+the §C92 row answers with the refined unknown-command card (the
+command doesn't exist, use /help).
 `Backend action` names the contract action from `contracts/ipc.json`
 where the handler calls the backend; `none` means the handler answers
 from the core's local store / state only.
@@ -277,9 +282,9 @@ from the core's local store / state only.
 | C61 | Group chat | /join | `/join` | `handleMessage` → `onJoin` (Group, Everyone) | `vc.join` (via `joinVoice`, duplex JoinRequest handshake) | new message: `Joined the voice chat.`; already joined → `Already in the voice chat.`; failure → `Could not join the voice chat: <reason>` | Live |
 | C62 | Group chat | /auth, /unauth | `/auth [user]`, `/unauth [user]` | `handleMessage` → `onAuth` (Group, Everyone) | none (local auth store) | new message: `Added {user}.\nNow {count}/{limit} authorized users.` / `Removed {user} from the authorized users list.`; already authorized → already notice; at the limit (25) → limit notice; not authorized (unauth) → not-authorized notice; no user → usage | Live |
 | C63 | Group chat | /authlist | `/authlist` | `handleMessage` → `onAuthlist` (Group, Everyone) | none (local auth store) | new message: authorized-users list (`authlistText` + `authlistKeyboard()` with ⨯ revoke buttons); empty → `There are no authorized users in this chat.` | Live |
-| C64 | Group chat | /admincache, /reload | `/admincache`, `/reload` | `handleMessage` → `onAdmincache` (Group, Everyone) | none (admin cache in local store) | new message: `Administrator cache reloaded successfully.`; within cooldown → `Please wait <mm:ss> before using this command again.` | Live |
-| C65 | Any chat | /blacklist, /unblacklist, /whitelist | `/blacklist <user\|chat>`, `/unblacklist <user\|chat>`, `/whitelist <user\|chat>` | `handleMessage` → `onBlacklist` (Any, Sudo; silent denial otherwise) | none (local blocklists) | new message: `User blocked: <id>` / `Chat blocked: <id>` / `Removed <id>` / `Already blacklisted.` / `Not blacklisted.`; unresolvable target → `Cannot resolve that user/chat.`; invalid id → `Invalid id.` | Live |
-| C66 | Any chat | /blacklisted | `/blacklisted` | `handleMessage` → `onBlacklisted` (Any, Sudo; silent denial otherwise) | none (local blocklists) | new message: blacklisted users/chats list | Live |
+| C64 | Group chat | /admincache, /reload | `/admincache`, `/reload` | `handleMessage` → `onAdmincache` (Group, Everyone) | none (admin cache in local store) | new message: `Administrator cache reloaded successfully.`; within cooldown → `Please wait <mm:ss> before using this command again.`; admin-list refresh: a non-bot member gaining or losing administrator/creator status in a chat re-fetches the admin list immediately (`updateChatMember` → `handleAdminTransition`), so the cache does not wait out its 10 min TTL; ordinary member joins do not refresh | Live |
+| C65 | Any chat | /blacklist, /unblacklist, /whitelist | `/blacklist <user\|chat>`, `/unblacklist <user\|chat>`, `/whitelist <user\|chat>` | `handleMessage` → `onBlacklist` (Any, Sudo; silent denial otherwise) | none (local blocklists) | new message: `User blocked: <id>` / `Chat blocked: <id>` / `Removed <id>` / `Already blacklisted.` / `Not blacklisted.`; unresolvable target → `Cannot resolve that user/chat.`; invalid id → `Invalid id.`; owner exemption: the owner is never refused on Everyone commands by the blacklist gate, even when listed in `bl_users` | Live |
+| C66 | Any chat | /blacklisted | `/blacklisted` | `handleMessage` → `onBlacklisted` (Any, Sudo; silent denial otherwise) | none (local blocklists) | new message: blacklisted users/chats list; owner exemption: the owner is never refused on Everyone commands by the blacklist gate, even when listed in `bl_users` (see row C65) | Live |
 | C67 | Any chat | /addsudo, /delsudo, /rmsudo | `/addsudo <user>`, `/delsudo <user>`, `/rmsudo <user>` | `handleMessage` → `onAddSudo` (Any, Owner; silent denial otherwise) | none (sudo set in local store) | new message: `Added sudo user <id>.` / `Removed sudo user <id>.`; already sudo → already notice; not sudo → not-sudo notice; owner removal attempt → `Nice try! You can't remove the owner — they're untouchable.`; no user → `Reply to a user or give a user id/@username.` | Live |
 | C68 | Any chat | /listsudo, /sudolist | `/listsudo`, `/sudolist` | `handleMessage` → `onListSudo` (Any, Everyone) | none (sudo set in local store) | new message: sudoers list (`kSudoHeader`); none extra → `No additional sudoers found.` | Live |
 | C69 | Any chat | /ac, /activevc | `/ac`, `/activevc` | `handleMessage` → `onActiveVc` (Any, Sudo; silent denial otherwise) | `vc.now_playing` (read, per active chat) | new message: active-streams list (`kActiveStreamsHeader` + per-chat lines) or `Looks like there aren't any active streams on the bot.` | Live |
@@ -300,12 +305,12 @@ from the core's local store / state only.
 | C84 | Group chat | /stream | `/stream <query>` | `handleMessage` → `onStream` (Group, Everyone) | `download.youtube` (resolve to file, then RTMP push) | new message: RTMP stream-started card; no RTMP set → `No RTMP destination set.`; already running → already-running notice; no file → `Downloader returned no file for that query.`; start failure → start-failed notice; no argument → usage | Live |
 | C85 | Group chat | /streamstop | `/streamstop` | `handleMessage` → `onStreamStop` (Group, Everyone) | none | new message: RTMP stopped card; nothing running → `No RTMP stream is running.` | Live |
 | C86 | Group chat | /streamstatus | `/streamstatus` | `handleMessage` → `onStreamStatus` (Group, Everyone) | none | new message: RTMP status card; none active → `No RTMP stream is active.` | Live |
-| C87 | Any chat | /mix | `/mix` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /mix not found.` + the command list for the caller's level) | Phase 3 |
-| C88 | Any chat | /recognize | `/recognize` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /recognize not found.` + the command list for the caller's level) | Phase 3 |
-| C89 | Any chat | /scan | `/scan` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /scan not found.` + the command list for the caller's level) | Phase 3 |
-| C90 | Any chat | /sharescan | `/sharescan` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /sharescan not found.` + the command list for the caller's level) | Phase 3 |
-| C91 | Any chat | /rmcache | `/rmcache` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /rmcache not found.` + the command list for the caller's level) | Phase 3 |
-| C92 | Any chat | Unknown command | `/<anything-not-registered>` | `handleMessage` command loop, no route matched | none | new message: unknown-command card (`kUnknownCommand`: `Command /<name> not found.` + the command list for the caller's level) — never silent, never a crash | Live |
+| C87 | Any chat | /mix | `/mix` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /mix doesn't exist. Use /help to see the commands available to you.`) | Phase 3 |
+| C88 | Any chat | /recognize | `/recognize` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /recognize doesn't exist. Use /help to see the commands available to you.`) | Phase 3 |
+| C89 | Any chat | /scan | `/scan` | `handleMessage` → `onScan` (Any, Sudo; silent denial otherwise) | `library.scan` | new message: `Library scan triggered.` (+ `N tracks found.` when the backend reports a count); not configured → `Library scan not configured (NAVIDROME_USER/NAVIDROME_PASS not set).`; backend refusal → the backend's exact error, never a fake success | Live |
+| C90 | Any chat | /sharescan | `/sharescan` | `handleMessage` → `onShareScan` (Any, Sudo; silent denial otherwise) | `library.sharescan` | new message: `slskd share scan triggered.`; already running → `slskd share scan already in progress.`; scheduled → `slskd share scan scheduled in ~Nm.`; backend refusal → the backend's exact error, never a fake success | Live |
+| C91 | Any chat | /rmcache | `/rmcache [name]` | `handleMessage` → `onRmcache` (Any, Sudo; silent denial otherwise) | `cache.clear` | new message: `Cache cleared.` (+ `N entries removed.` when the backend reports names); nothing cached → `Cache is already empty.`; a name clears one entry (scope `track`), no name clears the whole cache (scope `all`); backend refusal → the backend's exact error, never a fake success | Live |
+| C92 | Any chat | Unknown command | `/<anything-not-registered>` | `handleMessage` command loop, no route matched | none | new message: refined unknown-command card (`kUnknownCommand`: `Command /<name> doesn't exist.` + `Use /help to see the commands available to you.`) — never silent, never a crash | Live |
 | C93 | Any chat | Aliases (70) | `/p`, `/fplay`, `/forceplay`, `/fvplay`, `/vfplay`, `/q`, `/aplay`, `/setloop`, `/setspeed`, `/speedup`, `/position`, `/addauth`, `/delauth`, `/removeauth`, `/sudoers`, `/listsudo`, `/sudoadd`, `/addsudoer`, `/delsudoer`, `/sudodel`, `/remsudo`, `/sudorem`, `/dropsudo`, `/unsudo`, `/blockuser`, `/blacklistuser`, `/blackuser`, `/bluser`, `/blockchat`, `/blacklistchat`, `/blackchat`, `/blchat`, `/unblockuser`, `/unblacklistuser`, `/unbluser`, `/whitelistuser`, `/unblockchat`, `/unblacklistchat`, `/unblackchat`, `/whitechat`, `/unblchat`, `/blocked`, `/gcast`, `/bcast`, `/active`, `/activevoice`, `/log`, `/bash`, `/shell`, `/nothumbs`, `/commanddelete`, `/bassboost`, `/listplaylist`, `/myplaylist`, `/playlists`, `/mylist`, `/delplaylist`, `/removeplaylist`, `/pplaylist`, `/plplay`, `/playmylist`, `/saveplaylist`, `/addsong`, `/maint`, `/spt`, `/assistant`, `/userbotjoin`, `/assistantjoin`, `/setcplay`, `/rtmp` | `handleMessage` → alias resolution (`aliases_`) → the target command's row (C1–C86) | same as the target command | same rendered update as the target command | Live |
 | C94 | Group chat (linked channel) | Channel commands (40) | `/cplay`, `/vcplay`, `/cvplay`, `/cfplay`, `/fcplay`, `/cforceplay`, `/cplayforce`, `/fvcplay`, `/fvplay`, `/vcplayforce`, `/cpause`, `/cresume`, `/cmute`, `/cunmute`, `/cskip`, `/caskip`, `/cstop`, `/cend`, `/cqueue`, `/cclear`, `/cremove`, `/cmove`, `/crestore`, `/cpos`, `/cposition`, `/cseek`, `/cseekback`, `/cjump`, `/cbass`, `/cbassboost`, `/cspeed`, `/csetspeed`, `/cspeedup`, `/creplay`, `/cloop`, `/csetloop`, `/cshuffle`, `/cplayer`, `/cjoin`, `/creload` | `handleMessage` → channel-command resolution (`channel_cmds_`) → the base command's handler, run against the linked channel | same as the base command | same rendered update as the base command, in the linked channel's voice chat | Live |
 | C95 | Any chat | Reply a number (search pick) | plain text `<number>` (bare digits, active search session) | `handleMessage` plain-text path → `playSearchPick` | `vc.play` (via `/play` on the picked track) | the search message is deleted and the now-playing card is sent as a new message; no active session or out of range → the text is ignored (falls through to the unhandled-text path) | Live |
@@ -355,9 +360,9 @@ the row's Status to `Live`.
 | E2 | `library.delete` | A81, A82, C96 | Live: backend action `library.delete` registered since Phase 3; the core posts it from `cbDel` (Q4 wiring) — `yes` deletes the record and the file and answers `Deleted.` |
 | E3 | `/mix` | C87 | Register the command + new backend action (mix generation); today it answers the unknown-command card |
 | E4 | `/recognize` | C88 | Register the command + new backend action (audio recognition); today it answers the unknown-command card |
-| E5 | `/scan` | C89 | Register the command + new backend action (library scan); today it answers the unknown-command card |
-| E6 | `/sharescan` | C90 | Register the command + new backend action (share scan); today it answers the unknown-command card |
-| E7 | `/rmcache` | C91 | Register the command + new backend action (cache clear); today it answers the unknown-command card |
+| E5 | `/scan` | C89 | Live: backend action `library.scan` registered since Phase 3; the core posts it from `onScan` — trigger answers `Library scan triggered.` (+ track count), not-configured answers the locked not-configured text, refusals answer the backend's exact error |
+| E6 | `/sharescan` | C90 | Live: backend action `library.sharescan` registered since Phase 3; the core posts it from `onShareScan` — trigger answers `slskd share scan triggered.`, already-running answers `slskd share scan already in progress.`, refusals answer the backend's exact error |
+| E7 | `/rmcache` | C91 | Live: backend action `cache.clear` registered since Phase 3; the core posts it from `onRmcache` — cleared answers `Cache cleared.` (+ entry count), nothing cached answers `Cache is already empty.`, refusals answer the backend's exact error |
 | E8 | Spotify companion surfaces (`/details`, `/analyze`) | A94 | Live since Phase 3 Wave 2: details via `spotify.details`, analyze via `spotify.analyze`; `pl:spotify:dislike` (row A93) was already Live via `spotify.dislike` |
 | E9 | Download prefs contract fields | A87–A92, C48, C97 | Carry the per-user download prefs (format, use-YouTube, path template) into the backend contract (`chat.settings` / download prefs fields); today they live only in the core's local store |
 | E10 | Inline `Song not cached` article | D9 | Backend returns a cached-file marker on `search.inline` tracks (or a `file_id`); the core then answers the `Song not cached` article when no cached file exists |
@@ -401,10 +406,11 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
   directly (§H).
 - **Reply keyboards.** One persistent keyboard (`persistentKeyboard()`),
   4 buttons, rows B1–B4. No other reply keyboard exists in the core.
-- **Commands.** 87 `add()` groups / 112 names / 70 aliases / 40 channel
-  commands in `registerCommands`; rows C1–C86 cover all 87 groups
+- **Commands.** 91 `add()` groups / 116 names / 70 aliases / 40 channel
+  commands in `registerCommands`; rows C1–C86 cover 88 groups
   (`/nothumb` and `/thumbnail` are two groups sharing one handler and
-  one row, C57); rows C93–C94 cover all aliases and channel commands.
+  one row, C57); rows C89–C91 cover the 3 Package 1 groups (`/scan`,
+  `/sharescan`, `/rmcache`); rows C93–C94 cover all aliases and channel commands.
   The routing test re-derives these counts from `dispatcher.cpp` (§H).
 
 ## §G. Known §7.5 gaps (recorded, not hidden)
@@ -435,7 +441,9 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
      presence.
   3. It dispatches unknown callbacks (`pl:bogus:…`, non-`pl:` data,
      empty data, 65-byte data) and asserts each is answered with the
-     `Unknown action.` alert — the default branch.
+     `🖐️` toast (alert off) — the default branch, by direct user order
+     2026-11-05; an unknown verb inside a known domain still answers
+     the `Unknown action.` alert.
   4. It enumerates `persistentKeyboard()` and asserts every button
      label is routed in a DM (start card reply) and runs its claimed
      action in a group (gap G1 fixed: Music → start card, Global
@@ -460,12 +468,12 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
   Result: **249 rows, 0 blank cells** (re-run after any edit).
 - **Counts (this file):** callbacks §A: 99 rows (A1–A99: 99 live); reply-keyboard
   buttons §B.1: 4 rows; URL / switch-inline buttons §B.2: 11 rows;
-  commands §C: 102 rows (C1–C102: 87 live command groups covering 88
-  `add()` groups + 5 OD-3 commands + unknown-command + 70 aliases +
+  commands §C: 102 rows (C1–C102: 90 live command groups covering 91
+  `add()` groups + 2 OD-3 commands + unknown-command + 70 aliases +
   40 channel commands + 7 plain-text rows); inline mode §D: 12 rows;
   OD-3 index §E: 11 entries (pointing at §A–§D rows, not new rows);
   **total table rows: 99 + 4 + 11 + 102 + 12 = 228 rows; OD-3 rows
-  among them: 10** (A63, A81, A94, C87–C91, D9, D10). The 11th OD-3
+  among them: 7** (A63, A81, A94, C87, C88, D9, D10). The 11th OD-3
   item (E9, download prefs contract fields) shares the Live rows
   A87–A92 / C48 / C97 and is tracked as an index entry only.
 - **Full-suite result after this work:** see the Phase 2 report

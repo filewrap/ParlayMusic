@@ -689,13 +689,16 @@ inline const char* kHelpUnknownCmd =
 inline const char* kHelpBackToast = "Returning to main menu...";
 inline const char* kHelpUnknownCategory = "Unknown help category.";
 
-// Unknown command / unhandled text (rustify §7.1, §3). {list} is the
-// command list for the caller's access level.
+// Unknown command (routing row C92): refined short reply — the
+// command doesn't exist, use /help. No command list: the old card's
+// {list} part is dropped; the call site passes only {command}.
 inline const char* kUnknownCommand =
-    "<b>Command <code>{command}</code> not found.</b>\n"
+    "<b>Command <code>{command}</code> doesn't exist.</b>\n"
     "\n"
-    "<b>Commands available to you:</b>\n"
-    "{list}";
+    "Use /help to see the commands available to you.";
+
+// Unhandled text (rustify §7.1, §3). {list} is the
+// command list for the caller's access level.
 inline const char* kUnhandledText =
     "<b>Your request was not handled</b>\n"
     "\n"

@@ -470,14 +470,18 @@ bool dispatchTdUpdate(const parlay::Json& upd, parlay::TdLibClient& bot,
         return true;
     }
     if (t == "updateChatMember") {
-        // Only the bot's own status change has a dispatcher entry.
+        // The bot's own status change goes to the demotion goodbye;
+        // a non-bot member gaining or losing administrator/creator
+        // status refreshes the dispatcher's admin cache (remix
+        // chat_member_updated, via handleAdminTransition); ordinary
+        // member joins/leaves are not forwarded — the admin list
+        // cannot have changed.
         const parlay::Json* nm = upd.find("new_chat_member");
         const parlay::Json* member_id =
             nm ? nm->find("member_id") : nullptr;
         const parlay::Json* uid =
             member_id ? member_id->find("user_id") : nullptr;
         int64_t user_id = uid ? uid->asInt() : 0;
-        if (user_id != bot_id) return true;
         parlay::TgChatMemberUpdate mu;
         const parlay::Json* chat_id = upd.find("chat_id");
         mu.chat_id = chat_id ? chat_id->asInt() : 0;
@@ -485,7 +489,14 @@ bool dispatchTdUpdate(const parlay::Json& upd, parlay::TdLibClient& bot,
         const parlay::Json* om = upd.find("old_chat_member");
         mu.old_status = tdMemberStatus(om ? om->find("status") : nullptr);
         mu.new_status = tdMemberStatus(nm ? nm->find("status") : nullptr);
-        dispatcher.handleMyChatMember(mu);
+        if (user_id == bot_id) {
+            dispatcher.handleMyChatMember(mu);
+        } else if (mu.old_status == "administrator" ||
+                   mu.old_status == "creator" ||
+                   mu.new_status == "administrator" ||
+                   mu.new_status == "creator") {
+            dispatcher.handleAdminTransition(mu);
+        }
         return true;
     }
     if (t == "updateNewInlineQuery") {
