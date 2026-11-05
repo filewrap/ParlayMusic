@@ -4,18 +4,25 @@ Package 1 (2026-11-05): silent denials + sudo gaps.
 
 ## Deviation from the locked doc (direct user order)
 
-2026-11-05: unknown commands/callbacks are silent by direct user order,
-overriding locked §7.5/C92 'never silent' for this point only.
+2026-11-05 (supersedes the silent-drop ruling from earlier the same
+day): unknown commands answer, and unknown callbacks answer with the
+hand toast — by direct user order, overriding locked §7.5/C92 'never
+silent' only in the sense that the unknown-command card is now a
+short refined reply instead of the old card with a command list, and
+the unknown-callback answer is the single hand emoji instead of the
+'Unknown action.' alert.
 
-- Unknown commands (`/<anything-not-registered>`, routing row C92) are
-  silently dropped in `Dispatcher::handleMessage`: no reply, no error,
-  no crash. The `kUnknownCommand` card const was removed with the only
-  code path that used it.
-- Unknown callbacks (routing row A95) are silently acked in
-  `Dispatcher::handleCallback`: empty data, data over 64 bytes, a first
-  segment other than `pl`, and an unknown domain answer the callback
-  query with empty text (alert off) — the query is still answered, the
-  user sees nothing. A known domain keeps its own honest alerts for an
+- Unknown commands (`/<anything-not-registered>`, routing row C92)
+  answer in `Dispatcher::handleMessage` with the refined
+  `kUnknownCommand` card: `Command /<name> doesn't exist. Use /help
+  to see the commands available to you.` — no command list, no
+  emojis. The `kUnknownCommand` const was restored with this new
+  short text (the earlier silent-drop change had removed it).
+- Unknown callbacks (routing row A95) are answered in
+  `Dispatcher::handleCallback` with the toast `🖐️` (alert off) —
+  the query is still answered, the spinner ends. This covers empty
+  data, data over 64 bytes, a first segment other than `pl`, and an
+  unknown domain. A known domain keeps its own honest alerts for an
   unknown verb or bad arguments, and a handler that throws still
   answers with the "not available yet" alert.
 

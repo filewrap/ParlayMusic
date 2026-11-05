@@ -1617,34 +1617,34 @@ int main() {
         Rig rig;
         rig.d.handleCallback(makeCq("pl:unknown:thing"));
         CHECK(rig.tg.toasts.size() == 1 &&
-                  rig.tg.toasts[0].text.empty() &&
+                  rig.tg.toasts[0].text == "🖐️" &&
                   !rig.tg.toasts[0].alert,
-              "callback: unknown domain gets a silent ack, no crash");
+              "callback: unknown domain gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq(""));
         CHECK(rig.tg.toasts.size() == 1 &&
-                  rig.tg.toasts[0].text.empty() &&
+                  rig.tg.toasts[0].text == "🖐️" &&
                   !rig.tg.toasts[0].alert,
-              "callback: empty data gets a silent ack, no crash");
+              "callback: empty data gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq("pl:player:pause:" +
                                     std::string(70, '9')));
         CHECK(rig.tg.toasts.size() == 1 &&
-                  rig.tg.toasts[0].text.empty() &&
+                  rig.tg.toasts[0].text == "🖐️" &&
                   !rig.tg.toasts[0].alert,
-              "callback: over-64-byte data gets a silent ack, no crash");
+              "callback: over-64-byte data gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq("not-a-callback"));
         CHECK(rig.tg.toasts.size() == 1 &&
-                  rig.tg.toasts[0].text.empty() &&
+                  rig.tg.toasts[0].text == "🖐️" &&
                   !rig.tg.toasts[0].alert,
-              "callback: non-pl data gets a silent ack, no crash");
+              "callback: non-pl data gets the hand toast, no crash");
     }
     {
         Rig rig;
@@ -3690,20 +3690,25 @@ int main() {
     }
 
     // --- Package 1 (S0–S5): silent denials + sudo gaps ---------------
-    // S0: unknown commands are silently dropped (direct user order
-    // 2026-11-05, overriding §7.5/C92 "never silent" for this point
-    // only): no reply, no IPC post.
+    // S0 (per user ruling 2026-11-05, superseding the silent drop):
+    // unknown commands answer the refined kUnknownCommand card — the
+    // command doesn't exist, use /help. No IPC post.
     {
         Rig rig;
         rig.d.handleMessage(makeMsg(-1001, 111, "/nosuchcommand"));
-        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
-              "pkg1 unknown command: silently dropped, no reply, no post");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "doesn't exist") &&
+                  contains(rig.tg.replies[0], "/help") &&
+                  rig.ipc.posts.empty(),
+              "pkg1 unknown command: refined reply, no post");
     }
     {
         Rig rig;
         rig.d.handleMessage(makeMsg(-1001, 111, "/mix"));
-        CHECK(rig.tg.replies.empty(),
-              "pkg1 unknown command /mix: silently dropped, no reply");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "doesn't exist") &&
+                  contains(rig.tg.replies[0], "/help"),
+              "pkg1 unknown command /mix: refined reply");
     }
     // S1: /rmcache — sudo-only gate, cache.clear post, cleared
     // result, honest refusal when the backend refuses.

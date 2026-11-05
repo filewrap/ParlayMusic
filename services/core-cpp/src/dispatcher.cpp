@@ -1014,11 +1014,10 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         }
         return;  // first match wins
     }
-    // Unknown command: silent drop by direct user order (2026-11-05),
-    // overriding the locked §7.5/C92 "never silent" rule for this
-    // point only (see phase10/PHASE10.md). No reply, no error, no
-    // crash — the message is simply not answered.
-    return;
+    // Unknown command: the refined §3 reply (row C92) — the command
+    // doesn't exist, use /help. Never silent, never a crash.
+    replyHtml(ctx, ui_texts::fmt(ui_texts::kUnknownCommand,
+                                 {{"command", "/" + ctx.command}}));
 }
 
 // --- permissions -----------------------------------------------------------
@@ -6687,28 +6686,27 @@ void Dispatcher::onStreamStatus(const CommandContext& ctx) {
 // --- Phase 9: callback router (UI_INVENTORY.md §1) -------------------------
 // One namespace, colon-separated, 64-byte hard limit:
 //   pl:<domain>:<verb>[:<arg>…]
-// Unknown callbacks get a polite alert, never a crash. Player/queue
+// Unknown callbacks get the hand toast, never a crash. Player/queue
 // buttons are admin-or-requester gated (§28.2): sudo, chat admin, auth
 // user, or admin_mode==2. Search buttons are requester-only. The remix
 // /menu panel is the exception: other users' taps are silently ignored.
 void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
-    // Unknown callbacks are silently acked by direct user order
-    // (2026-11-05), overriding the locked §7.5/C92 "never silent"
-    // rule for this point only (see phase10/PHASE10.md): the query is
-    // still answered, with empty text, so the user sees nothing and
-    // the spinner ends. This covers only the router-level unknowns
+    // Unknown callbacks are answered with the hand toast by direct
+    // user order (2026-11-05, see phase10/PHASE10.md): the query is
+    // still answered, with the text "🖐️" and alert off, so the
+    // spinner ends. This covers only the router-level unknowns
     // below (empty / over-64-byte / non-pl: data, unknown domain).
     // A known domain keeps its own honest alerts for a malformed
     // verb or bad arguments (e.g. unknown help topic, out-of-range
     // quality value), and a handler that throws still answers with
     // the "not available yet" alert.
     if (cq.data.empty() || cq.data.size() > 64) {
-        answerCb(cq, "");
+        answerCb(cq, "🖐️", false);
         return;
     }
     std::vector<std::string> parts = splitCb(cq.data);
     if (parts.size() < 2 || parts[0] != "pl") {
-        answerCb(cq, "");
+        answerCb(cq, "🖐️", false);
         return;
     }
     // A button press proves the user is looking at this chat — same
@@ -6736,7 +6734,7 @@ void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
         else if (domain == "dlset") cbDlset(cq, parts);
         else if (domain == "spotify") cbSpotify(cq, parts);
         else
-            answerCb(cq, "");  // unknown domain: silent ack (see above)
+            answerCb(cq, "🖐️", false);  // unknown domain: hand toast (see above)
     } catch (const std::exception& e) {
         std::cerr << "[cb] handler for " << cq.data
                   << " threw: " << e.what() << "\n";

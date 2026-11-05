@@ -22,11 +22,10 @@
 //         (supervisor restart) — it is length- and table-checked
 //         only, NEVER dispatched.
 //  3. The default branch answers every router-level unknown callback
-//     (unknown domain, non-pl: data, empty data, >64 bytes) with a
-//     silent ack — empty text, query still answered — by direct user
-//     order 2026-11-05, overriding the locked §7.5 "never silent"
-//     rule for this point only (see phase10/PHASE10.md). A known
-//     domain keeps its own honest alerts for an unknown verb or bad
+//     (unknown domain, non-pl: data, empty data, >64 bytes) with the
+//     hand toast "🖐️" (alert off, query still answered) — by direct
+//     user order 2026-11-05 (see phase10/PHASE10.md). A known domain
+//     keeps its own honest alerts for an unknown verb or bad
 //     arguments, and a handler that throws is answered with "This
 //     feature is not available yet.". Never a crash, never an
 //     un-answered query.
@@ -729,11 +728,10 @@ int main(int argc, char** argv) {
     }
 
     // --- E. Default branch: router-level unknown callbacks are
-    // silently acked (direct user order 2026-11-05, overriding §7.5
-    // "never silent" for this point only) — the query is still
-    // answered, with empty text. A known domain keeps its own honest
-    // alert for an unknown verb (pl:player:unknownverb still answers
-    // "Unknown action."). Includes the 64-byte boundary.
+    // answered with the hand toast "🖐️" (alert off, direct user order
+    // 2026-11-05) — the query is still answered. A known domain keeps
+    // its own honest alert for an unknown verb (pl:player:unknownverb
+    // still answers "Unknown action."). Includes the 64-byte boundary.
     {
         std::error_code ec2;
         std::filesystem::remove_all("/tmp/parlay-routing-test", ec2);
@@ -748,9 +746,9 @@ int main(int argc, char** argv) {
             rig.d.handleCallback(makeCq(data));
             CHECK(rig.tg.toasts.size() > before,
                   "unknown callback answered: " + why);
-            CHECK(rig.tg.toasts.back().text.empty() &&
+            CHECK(rig.tg.toasts.back().text == "🖐️" &&
                       !rig.tg.toasts.back().alert,
-                  "unknown callback silently acked: " + why);
+                  "unknown callback hand toast: " + why);
         }
         // Unknown verb inside a known domain keeps its alert.
         {
@@ -783,7 +781,7 @@ int main(int argc, char** argv) {
                   "spotify analyze routed: analysis rendered in place");
         }
         // Exactly 64 bytes is accepted by the guard (routed, not
-        // rejected); 65 bytes is rejected with the same alert.
+        // rejected); 65 bytes is rejected with the hand toast.
         std::string sixty_four = "pl:set:info:" + std::string(52, 'x');
         CHECK(sixty_four.size() == 64, "64-byte probe is 64 bytes");
         {
@@ -798,9 +796,9 @@ int main(int argc, char** argv) {
             size_t before = rig.tg.toasts.size();
             rig.d.handleCallback(makeCq(sixty_five));
             CHECK(rig.tg.toasts.size() > before &&
-                      rig.tg.toasts.back().text.empty() &&
+                      rig.tg.toasts.back().text == "🖐️" &&
                       !rig.tg.toasts.back().alert,
-                  "65-byte callback rejected with a silent ack.");
+                  "65-byte callback rejected with the hand toast.");
         }
     }
 

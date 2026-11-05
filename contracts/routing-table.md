@@ -41,7 +41,7 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
     the row specifies the core-side UI (button / command handler) that
     must be built against them; the core has not implemented it yet.
     Until it does, the callback/command answers through the router
-    default branch (silent ack — empty text, query still answered) —
+    default branch (hand toast `🖐️`, alert off — query still answered) —
     handled, never a crash, never a dead end. Implementing a `Contract`
     row is core-side follow-up, not a backend gap, and does not change
     the zero-unrouted / zero-unhandled counts: nothing in the shipped UI
@@ -50,10 +50,9 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
   (`services/core-cpp/src/dispatcher.cpp`, `handleCallback`) has an
   explicit default branch — empty data, data >64 bytes, a first segment
   other than `pl`, and an unknown domain all answer the callback query
-  with a silent ack (empty text; the query is still answered, the user
-  sees nothing), by direct user order 2026-11-05 overriding the locked
-  §7.5 "never silent" rule for this point only (see
-  phase10/PHASE10.md). An unknown verb inside a known domain is
+  with the toast `🖐️` (alert off; the query is still answered), by
+  direct user order 2026-11-05 (see phase10/PHASE10.md). An unknown
+  verb inside a known domain is
   answered by that domain's handler with the alert `Unknown action.`
   (`kToastUnknownAction`) or the handler's own honest toast. Handler
   exceptions are caught and answered with the alert `This feature is
@@ -167,7 +166,7 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A92 | Download-settings sub-screens | Back | `pl:dlset:back` | `handleCallback` → `cbDlset` | none | silent ack + edit to `Select one of the settings below!` with `dlSettingsIndexKeyboard()` | Live |
 | A93 | Spotify companion card (backend-go:spotify — no in-core builder) | Dislike | `pl:spotify:dislike:<id>` | `handleCallback` → `cbSpotify` | `spotify.dislike` | toast `Disliked.`; backend error answers the error as an alert | Live |
 | A94 | Spotify companion cards (backend-go:spotify — no in-core builder) | Details / Analyze (companion surfaces) | `pl:spotify:details:<id>`, `pl:spotify:analyze:<id>` | `handleCallback` → `cbSpotify` | `spotify.details` (details) / `spotify.analyze` (analyze) | details: card edited in place with track, album, features (key/mode/tempo), disliked/ignored counts, genres, profanity, language, lyrics + `[Analyze text]` button; analyze: analysis card edited in place; any other verb → alert `This feature is not available yet.` | Live |
-| A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, A96–A99, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | silent ack (empty toast text, alert off; the query is still answered, the user sees nothing) — direct user order 2026-11-05, overriding locked §7.5 "never silent" for this point only (see phase10/PHASE10.md); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
+| A95 | Any message with an inline keyboard | Any button whose `callback_data` is not in rows A1–A94, A96–A99, any data not starting with `pl:`, empty data, or data over 64 bytes | `pl:<unknown-domain>:…` / non-`pl:` data / empty / >64 bytes | `handleCallback` default branch (explicit `else`) | none | toast `🖐️` (alert off; the query is still answered) — direct user order 2026-11-05 (see phase10/PHASE10.md); a handler that throws is answered with the alert `This feature is not available yet.` (`kToastFeatureUnavailable`) | Live |
 | A96 | Settings panel, index row | Quality | `pl:set:quality` | `handleCallback` → `cbSet` | `quality.get` read | silent ack + edit to quality sub-screen (`qualityCardText` + `settingsQualityKeyboard()`) | Live |
 | A97 | Quality sub-screen | Bitrate: 128 / 160 / 192 / 256 / 320 kbps (current marked) | `pl:set:quality:br:<kbps>` (kbps 128, 160, 192, 256, 320) | `handleCallback` → `cbSet` | `chat.settings` write (`quality_bitrate_bps`) | toast `Settings updated!` + edit to quality sub-screen with updated bitrate; out-of-range kbps → alert `Unknown action.`; screen notes the change applies on next join | Live |
 | A98 | Quality sub-screen | Frame size: 10 / 20 / 40 / 60 ms (current marked) | `pl:set:quality:fr:<ms>` (ms 10, 20, 40, 60) | `handleCallback` → `cbSet` | `chat.settings` write (`quality_frame_ms`) | toast `Settings updated!` + edit to quality sub-screen with updated frame size; out-of-range ms → alert `Unknown action.`; screen notes the change applies on next join | Live |
@@ -211,9 +210,9 @@ Scope / permission are from `Dispatcher::registerCommands`
 `Perm` Everyone / Sudo / Owner. Gates that fail do so silently (NoxBeats
 dispatch rule) except where the row says otherwise. The Everyone-command
 blacklist refusal does not apply to the owner: a blacklisted owner still
-runs Everyone commands (row C65). Unknown commands are silently dropped
-(direct user order 2026-11-05, overriding §7.5/C92 "never silent" for
-this point only; see row C92 and phase10/PHASE10.md).
+runs Everyone commands (row C65). Unknown commands are never silent:
+the §C92 row answers with the refined unknown-command card (the
+command doesn't exist, use /help).
 `Backend action` names the contract action from `contracts/ipc.json`
 where the handler calls the backend; `none` means the handler answers
 from the core's local store / state only.
@@ -306,12 +305,12 @@ from the core's local store / state only.
 | C84 | Group chat | /stream | `/stream <query>` | `handleMessage` → `onStream` (Group, Everyone) | `download.youtube` (resolve to file, then RTMP push) | new message: RTMP stream-started card; no RTMP set → `No RTMP destination set.`; already running → already-running notice; no file → `Downloader returned no file for that query.`; start failure → start-failed notice; no argument → usage | Live |
 | C85 | Group chat | /streamstop | `/streamstop` | `handleMessage` → `onStreamStop` (Group, Everyone) | none | new message: RTMP stopped card; nothing running → `No RTMP stream is running.` | Live |
 | C86 | Group chat | /streamstatus | `/streamstatus` | `handleMessage` → `onStreamStatus` (Group, Everyone) | none | new message: RTMP status card; none active → `No RTMP stream is active.` | Live |
-| C87 | Any chat | /mix | `/mix` | none — not registered in `registerCommands` | none — no backend action exists | no reply — the unregistered command is silently dropped (direct user order 2026-11-05; see row C92) | Phase 3 |
-| C88 | Any chat | /recognize | `/recognize` | none — not registered in `registerCommands` | none — no backend action exists | no reply — the unregistered command is silently dropped (direct user order 2026-11-05; see row C92) | Phase 3 |
+| C87 | Any chat | /mix | `/mix` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /mix doesn't exist. Use /help to see the commands available to you.`) | Phase 3 |
+| C88 | Any chat | /recognize | `/recognize` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /recognize doesn't exist. Use /help to see the commands available to you.`) | Phase 3 |
 | C89 | Any chat | /scan | `/scan` | `handleMessage` → `onScan` (Any, Sudo; silent denial otherwise) | `library.scan` | new message: `Library scan triggered.` (+ `N tracks found.` when the backend reports a count); not configured → `Library scan not configured (NAVIDROME_USER/NAVIDROME_PASS not set).`; backend refusal → the backend's exact error, never a fake success | Live |
 | C90 | Any chat | /sharescan | `/sharescan` | `handleMessage` → `onShareScan` (Any, Sudo; silent denial otherwise) | `library.sharescan` | new message: `slskd share scan triggered.`; already running → `slskd share scan already in progress.`; scheduled → `slskd share scan scheduled in ~Nm.`; backend refusal → the backend's exact error, never a fake success | Live |
 | C91 | Any chat | /rmcache | `/rmcache [name]` | `handleMessage` → `onRmcache` (Any, Sudo; silent denial otherwise) | `cache.clear` | new message: `Cache cleared.` (+ `N entries removed.` when the backend reports names); nothing cached → `Cache is already empty.`; a name clears one entry (scope `track`), no name clears the whole cache (scope `all`); backend refusal → the backend's exact error, never a fake success | Live |
-| C92 | Any chat | Unknown command | `/<anything-not-registered>` | `handleMessage` command loop, no route matched | none | no reply — the unknown command is silently dropped (direct user order 2026-11-05, overriding locked §7.5 "never silent" for this point only; see phase10/PHASE10.md), never a crash | Live |
+| C92 | Any chat | Unknown command | `/<anything-not-registered>` | `handleMessage` command loop, no route matched | none | new message: refined unknown-command card (`kUnknownCommand`: `Command /<name> doesn't exist.` + `Use /help to see the commands available to you.`) — never silent, never a crash | Live |
 | C93 | Any chat | Aliases (70) | `/p`, `/fplay`, `/forceplay`, `/fvplay`, `/vfplay`, `/q`, `/aplay`, `/setloop`, `/setspeed`, `/speedup`, `/position`, `/addauth`, `/delauth`, `/removeauth`, `/sudoers`, `/listsudo`, `/sudoadd`, `/addsudoer`, `/delsudoer`, `/sudodel`, `/remsudo`, `/sudorem`, `/dropsudo`, `/unsudo`, `/blockuser`, `/blacklistuser`, `/blackuser`, `/bluser`, `/blockchat`, `/blacklistchat`, `/blackchat`, `/blchat`, `/unblockuser`, `/unblacklistuser`, `/unbluser`, `/whitelistuser`, `/unblockchat`, `/unblacklistchat`, `/unblackchat`, `/whitechat`, `/unblchat`, `/blocked`, `/gcast`, `/bcast`, `/active`, `/activevoice`, `/log`, `/bash`, `/shell`, `/nothumbs`, `/commanddelete`, `/bassboost`, `/listplaylist`, `/myplaylist`, `/playlists`, `/mylist`, `/delplaylist`, `/removeplaylist`, `/pplaylist`, `/plplay`, `/playmylist`, `/saveplaylist`, `/addsong`, `/maint`, `/spt`, `/assistant`, `/userbotjoin`, `/assistantjoin`, `/setcplay`, `/rtmp` | `handleMessage` → alias resolution (`aliases_`) → the target command's row (C1–C86) | same as the target command | same rendered update as the target command | Live |
 | C94 | Group chat (linked channel) | Channel commands (40) | `/cplay`, `/vcplay`, `/cvplay`, `/cfplay`, `/fcplay`, `/cforceplay`, `/cplayforce`, `/fvcplay`, `/fvplay`, `/vcplayforce`, `/cpause`, `/cresume`, `/cmute`, `/cunmute`, `/cskip`, `/caskip`, `/cstop`, `/cend`, `/cqueue`, `/cclear`, `/cremove`, `/cmove`, `/crestore`, `/cpos`, `/cposition`, `/cseek`, `/cseekback`, `/cjump`, `/cbass`, `/cbassboost`, `/cspeed`, `/csetspeed`, `/cspeedup`, `/creplay`, `/cloop`, `/csetloop`, `/cshuffle`, `/cplayer`, `/cjoin`, `/creload` | `handleMessage` → channel-command resolution (`channel_cmds_`) → the base command's handler, run against the linked channel | same as the base command | same rendered update as the base command, in the linked channel's voice chat | Live |
 | C95 | Any chat | Reply a number (search pick) | plain text `<number>` (bare digits, active search session) | `handleMessage` plain-text path → `playSearchPick` | `vc.play` (via `/play` on the picked track) | the search message is deleted and the now-playing card is sent as a new message; no active session or out of range → the text is ignored (falls through to the unhandled-text path) | Live |
@@ -359,8 +358,8 @@ the row's Status to `Live`.
 |---|---|---|---|
 | E1 | `download.cancel` | A63 | Live: backend action `download.cancel` registered since Phase 3; the core posts it from `cbDl` (Q4 wiring) — cancel answers `Download cancelled.` and retires the progress message |
 | E2 | `library.delete` | A81, A82, C96 | Live: backend action `library.delete` registered since Phase 3; the core posts it from `cbDel` (Q4 wiring) — `yes` deletes the record and the file and answers `Deleted.` |
-| E3 | `/mix` | C87 | Register the command + new backend action (mix generation); today it is silently dropped (no reply) |
-| E4 | `/recognize` | C88 | Register the command + new backend action (audio recognition); today it is silently dropped (no reply) |
+| E3 | `/mix` | C87 | Register the command + new backend action (mix generation); today it answers the unknown-command card |
+| E4 | `/recognize` | C88 | Register the command + new backend action (audio recognition); today it answers the unknown-command card |
 | E5 | `/scan` | C89 | Live: backend action `library.scan` registered since Phase 3; the core posts it from `onScan` — trigger answers `Library scan triggered.` (+ track count), not-configured answers the locked not-configured text, refusals answer the backend's exact error |
 | E6 | `/sharescan` | C90 | Live: backend action `library.sharescan` registered since Phase 3; the core posts it from `onShareScan` — trigger answers `slskd share scan triggered.`, already-running answers `slskd share scan already in progress.`, refusals answer the backend's exact error |
 | E7 | `/rmcache` | C91 | Live: backend action `cache.clear` registered since Phase 3; the core posts it from `onRmcache` — cleared answers `Cache cleared.` (+ entry count), nothing cached answers `Cache is already empty.`, refusals answer the backend's exact error |
@@ -441,10 +440,10 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
      process by design) and asserts only for length + table
      presence.
   3. It dispatches unknown callbacks (`pl:bogus:…`, non-`pl:` data,
-     empty data, 65-byte data) and asserts each is answered with a
-     silent ack (empty toast text, alert off) — the default branch,
-     by direct user order 2026-11-05; an unknown verb inside a known
-     domain still answers the `Unknown action.` alert.
+     empty data, 65-byte data) and asserts each is answered with the
+     `🖐️` toast (alert off) — the default branch, by direct user order
+     2026-11-05; an unknown verb inside a known domain still answers
+     the `Unknown action.` alert.
   4. It enumerates `persistentKeyboard()` and asserts every button
      label is routed in a DM (start card reply) and runs its claimed
      action in a group (gap G1 fixed: Music → start card, Global
