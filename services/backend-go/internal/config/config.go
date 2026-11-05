@@ -75,6 +75,14 @@ type QualityConfig struct {
 	OpusVBR *bool `toml:"opus_vbr"`
 	OpusFEC *bool `toml:"opus_fec"`
 	OpusDTX *bool `toml:"opus_dtx"`
+	// DSPEnabled is the explicit Opus DSP switch. Nil = on
+	// (the default). false means: apply NO custom Opus config
+	// at all — the encoder runs the patched library's stock
+	// defaults (see voice.StockOpusEncoderConfig) and every
+	// other quality setting (bitrate, frame, complexity,
+	// VBR/FEC/DTX, voice profile) is ignored while off. The
+	// per-chat quality_dsp_enabled override wins over this.
+	DSPEnabled *bool `toml:"dsp_enabled"`
 }
 
 // Opus encoder bounds for the explicit [quality] keys. These
@@ -100,6 +108,9 @@ const (
 	OpusFieldFEC        = "fec"
 	OpusFieldDTX        = "dtx"
 	OpusFieldFrameMs    = "frame_ms"
+	// OpusFieldDSPEnabled names the Opus DSP switch in
+	// OpusSettings.Sources and quality.get's sources object.
+	OpusFieldDSPEnabled = "dsp_enabled"
 )
 
 // OpusSettings is the resolved [quality] encoder config at the
@@ -111,7 +122,10 @@ const (
 // or "default"); the quality resolver overlays the per-chat
 // store override on top of this and reports "store" for the
 // fields it sets. MaxPlaybackRateHz has no explicit key and
-// is always 48000 (fullband).
+// is always 48000 (fullband). DSPEnabled is the file-level
+// Opus DSP switch (default on); when it is false the quality
+// resolver ignores every other field and reports the stock
+// library defaults instead (see quality.Effective).
 type OpusSettings struct {
 	BitrateBps        int
 	Complexity        int
@@ -120,6 +134,7 @@ type OpusSettings struct {
 	DTX               bool
 	FrameMs           int
 	MaxPlaybackRateHz int
+	DSPEnabled        bool
 	Sources           map[string]string
 }
 
@@ -136,6 +151,7 @@ func (q QualityConfig) OpusSettings() OpusSettings {
 		DTX:               false,
 		FrameMs:           20,
 		MaxPlaybackRateHz: 48000,
+		DSPEnabled:        true,
 		Sources: map[string]string{
 			OpusFieldBitrateBps: "profile",
 			OpusFieldComplexity: "default",
@@ -143,6 +159,7 @@ func (q QualityConfig) OpusSettings() OpusSettings {
 			OpusFieldFEC:        "default",
 			OpusFieldDTX:        "default",
 			OpusFieldFrameMs:    "default",
+			OpusFieldDSPEnabled: "default",
 		},
 	}
 	if q.OpusBitrateBps != nil {
@@ -168,6 +185,10 @@ func (q QualityConfig) OpusSettings() OpusSettings {
 	if q.OpusFrameMs != nil {
 		s.FrameMs = *q.OpusFrameMs
 		s.Sources[OpusFieldFrameMs] = "config"
+	}
+	if q.DSPEnabled != nil {
+		s.DSPEnabled = *q.DSPEnabled
+		s.Sources[OpusFieldDSPEnabled] = "config"
 	}
 	return s
 }

@@ -1955,9 +1955,15 @@ struct QualityInfo {
     QualityValues effective;
     QualityValues library;
     // Winning level per field ("store" | "config" | "profile" |
-    // "default"), keyed by the wire names (bitrate_bps, frame_ms,
-    // complexity, vbr, fec, dtx).
+    // "default" — or "stock" for every numeric field while the
+    // DSP is off, meaning no quality setting is in force),
+    // keyed by the wire names (bitrate_bps, frame_ms,
+    // complexity, vbr, fec, dtx, dsp_enabled).
     std::map<std::string, std::string> sources;
+    // Opus DSP state for this chat (quality.get "dsp_enabled"):
+    // false means the encoder runs the patched library's stock
+    // defaults and every other quality setting is ignored.
+    bool dsp_enabled = true;
     bool active_call = false;
     std::string applies_on = "next join";
 };
@@ -1968,6 +1974,7 @@ inline std::string qualitySourceLabel(const std::string& source) {
     if (source == "config") return "config file";
     if (source == "profile") return "voice profile";
     if (source == "default") return "default";
+    if (source == "stock") return "stock encoder";
     return htmlEscape(source);
 }
 
@@ -1983,6 +1990,19 @@ inline std::string qualityCardText(const QualityInfo& q) {
         return std::to_string(bps) + " bps";
     };
     std::string out = "<h2>Audio Quality</h2>\n\n";
+    // DSP state first: it decides whether any of the values
+    // below are Parlay settings at all. "Off" means stock
+    // encoder behavior — no custom Opus config is applied and
+    // the bitrate / frame / profile settings are ignored until
+    // it is turned back on (applies on next join, like every
+    // other quality setting).
+    if (q.dsp_enabled) {
+        out += "<b>DSP:</b> on\n";
+    } else {
+        out += "<b>DSP:</b> off — stock encoder: no custom Opus config "
+               "is applied, and the settings below are ignored until "
+               "it is turned back on.\n";
+    }
     out += "<b>Bitrate:</b> " + bitrate(q.effective.bitrate_bps) + " (" +
            src("bitrate_bps") + ")\n";
     out += "<b>Frame size:</b> " + std::to_string(q.effective.frame_ms) +
@@ -2025,12 +2045,43 @@ inline std::string cbSetQualityBr(int kbps) {
 inline std::string cbSetQualityFr(int ms) {
     return "pl:set:quality:fr:" + std::to_string(ms);
 }
+// Preset pick: sets the voice-profile bitrate as a per-chat
+// override (ultra_320k 320000, high_256k 256000,
+// standard_192k 192000) and re-enables the DSP if it was off.
+inline std::string cbSetQualityPreset(const std::string& name) {
+    return "pl:set:quality:preset:" + name;
+}
+// DSP toggle: sets quality_dsp_enabled (1 = on, 0 = off).
+inline std::string cbSetQualityDsp(bool enabled) {
+    return std::string("pl:set:quality:dsp:") + (enabled ? "1" : "0");
+}
 
-// Quality sub-screen keyboard (routing rows A97–A99): bitrate and
-// frame-size pickers with the current value marked, a reset that
-// clears the per-chat overrides, and Back to the settings panel.
+// Quality menu keyboard (routing rows A97–A99, A102–A103):
+// voice-profile preset picks, bitrate and frame-size pickers
+// with the current value marked, the DSP on/off toggle, a
+// reset that clears the per-chat overrides, and Back to the
+// settings panel. Shared by the /quality menu and the
+// /settings quality sub-screen, so a tap re-renders the same
+// screen from either entry point.
 inline InlineKeyboard settingsQualityKeyboard(const QualityInfo& q) {
     using B = InlineButton;
+    struct QualityPreset {
+        const char* name;
+        int kbps;
+        const char* label;
+    };
+    static const QualityPreset kQualityPresets[] = {
+        {"ultra_320k", 320, "Ultra 320 kbps"},
+        {"high_256k", 256, "High 256 kbps"},
+        {"standard_192k", 192, "Standard 192 kbps"},
+    };
+    std::vector<B> presets;
+    for (const QualityPreset& p : kQualityPresets) {
+        std::string text = p.label;
+        if (q.dsp_enabled && q.effective.bitrate_bps == p.kbps * 1000)
+            text += " (current)";
+        presets.push_back(B::callback(text, cbSetQualityPreset(p.name)));
+    }
     std::vector<B> bitrates;
     for (int kbps : {128, 160, 192, 256, 320}) {
         std::string label = std::to_string(kbps) + " kbps";
@@ -2043,8 +2094,12 @@ inline InlineKeyboard settingsQualityKeyboard(const QualityInfo& q) {
         if (q.effective.frame_ms == ms) label += " (current)";
         frames.push_back(B::callback(label, cbSetQualityFr(ms)));
     }
-    return {bitrates,
+    return {presets,
+            bitrates,
             frames,
+            {B::callback(q.dsp_enabled ? "DSP: On — tap to turn off"
+                                       : "DSP: Off — tap to turn on",
+                         cbSetQualityDsp(!q.dsp_enabled))},
             {B::callback("Reset to config file", cbSet("quality:reset"))},
             {B::callback("Back", kCbSetMain)}};
 }
@@ -2059,6 +2114,25 @@ inline InlineKeyboard qualityBackKeyboard() {
 inline const char* kQualityLoadFailed =
     "Could not load the audio quality settings — the backend is "
     "unreachable. Nothing was changed.";
+
+// /quality off: "off" means stock encoder behavior — no custom
+// Opus config is applied and every other quality setting is
+// ignored until it is turned back on. Applies on next join;
+// a running call keeps its current encoder settings.
+inline const char* kQualityDspOff =
+    "Opus DSP off — the encoder now runs stock (no custom Opus "
+    "config applied; bitrate / frame / profile settings are "
+    "ignored until it is turned back on). Applies on next join — "
+    "a running call keeps its current encoder settings.";
+inline const char* kQualityDspOn =
+    "Opus DSP on — the chat's quality settings apply again on "
+    "next join. A running call keeps its current encoder "
+    "settings.";
+inline const char* kQualityUsage =
+    "Usage: /quality — show the audio quality menu.\n"
+    "/quality off — turn the Opus DSP off (stock encoder, no "
+    "custom Opus config).\n"
+    "/quality on — turn the Opus DSP back on.";
 
 // --- §10 admin/sudo panels ---------------------------------------------------
 // Permission denials (Yukki §3.9 wins, §10).

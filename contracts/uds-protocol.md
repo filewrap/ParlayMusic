@@ -156,7 +156,7 @@ keep working.
 
 | # | Action | Request (payload) | Response (data) | Deadline |
 |---|---|---|---|---|
-| 1 | `chat.settings` | `chat_id`; POST only: `key`, `value` | `chat_id`, `settings` (21 keys) | 10 s |
+| 1 | `chat.settings` | `chat_id`; POST only: `key`, `value` | `chat_id`, `settings` (22 keys) | 10 s |
 | 2 | `download.deezer` | `query`, `requested_by` | `file_path`, `track`, `run_id` | 30 s* |
 | 3 | `download.navidrome` | `url`, `requested_by` | `imported`, `track`, `run_id` | 30 s* |
 | 4 | `download.progress` | `run_id` | `run_id`, `percentage`, `done_bytes`, `total_bytes`, `speed_bytes_per_sec`, `eta_sec`, `elapsed_sec`, `phase`, `per_track`, `lossy_available`, `lossy_summary` | 10 s |

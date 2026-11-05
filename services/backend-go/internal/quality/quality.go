@@ -29,6 +29,18 @@
 // no store override) and again before EVERY join via the
 // voice Manager's pre-join hook, so a per-chat override lands
 // on that chat's next call without a restart.
+//
+// The Opus DSP switch (quality_dsp_enabled per chat,
+// [quality] dsp_enabled in the file, default on) sits above
+// the precedence: when it is off, Effective ignores every
+// quality setting and returns the patched library's stock
+// defaults (voice.StockOpusEncoderConfig) with the numeric
+// sources reported as "stock" — the encoder then runs exactly
+// as a fresh patched library would, with no Parlay-applied
+// Opus config in force. Apply restores those stock defaults
+// (rather than skipping the set) so a previous chat's applied
+// config cannot leak into a DSP-off chat's call through the
+// process-global stored config.
 package quality
 
 import (
@@ -80,4 +92,44 @@ func Resolve(cfg *config.Config, st model.ChatSettings) (voice.OpusEncoderConfig
 		sources[config.OpusFieldFrameMs] = "store"
 	}
 	return eff, sources
+}
+
+// DSPEnabled resolves the Opus DSP switch for one chat's
+// settings: the per-chat quality_dsp_enabled override wins
+// over parlay.toml [quality] dsp_enabled, which wins over
+// the default (on). It also returns the winning level
+// ("store", "config" or "default") for the sources object.
+func DSPEnabled(cfg *config.Config, st model.ChatSettings) (bool, string) {
+	file := cfg.Quality.OpusSettings()
+	if st.QualityDSPEnabled != nil {
+		return *st.QualityDSPEnabled, "store"
+	}
+	return file.DSPEnabled, file.Sources[config.OpusFieldDSPEnabled]
+}
+
+// Effective returns the Opus config that will actually be in
+// force for one chat: Resolve's config while the DSP is on;
+// the patched library's stock defaults while it is off, with
+// every numeric source reported as "stock" (no quality
+// setting is in force then, so claiming a store/config/
+// profile source would lie). The third return is the DSP
+// state itself; sources always carries the dsp_enabled level
+// (store | config | default). It performs no I/O and never
+// calls the library: the caller applies the result with
+// Apply, or renders it with quality.get.
+func Effective(cfg *config.Config, st model.ChatSettings) (voice.OpusEncoderConfig, map[string]string, bool) {
+	eff, sources := Resolve(cfg, st)
+	enabled, dspSource := DSPEnabled(cfg, st)
+	sources[config.OpusFieldDSPEnabled] = dspSource
+	if !enabled {
+		eff = voice.StockOpusEncoderConfig()
+		for _, f := range []string{
+			config.OpusFieldBitrateBps, config.OpusFieldFrameMs,
+			config.OpusFieldComplexity, config.OpusFieldVBR,
+			config.OpusFieldFEC, config.OpusFieldDTX,
+		} {
+			sources[f] = "stock"
+		}
+	}
+	return eff, sources, enabled
 }

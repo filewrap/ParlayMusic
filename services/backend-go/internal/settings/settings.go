@@ -1,12 +1,12 @@
 // Package settings implements the chat.settings UDS action
-// (phase3/actions-inventory.md §8.1): per-chat settings, all 21 keys
+// (phase3/actions-inventory.md §8.1): per-chat settings, all 22 keys
 // from contracts/ipc.json. The backend owns them in Phase 3 (no
 // engine ever implemented this action; the old implementation was
 // core-local). Values persist in the store settings bucket, key
-// chat:<chat_id>, one JSON object with all 21 keys. Fresh start
+// chat:<chat_id>, one JSON object with all 22 keys. Fresh start
 // (OD-2): every chat starts at the defaults below.
 //
-// The 21 keys (ipc.json types; the inventory's §8.1 table agrees
+// The 22 keys (ipc.json types; the inventory's §8.1 table agrees
 // except where noted):
 //
 //	admin_mode int 0-2 (0), play_mode string everyone|admins,
@@ -16,13 +16,15 @@
 //	auto_delete_min int 2-7 (5), language string "en",
 //	paginate_purge_old bool, chat_music_download bool.
 //
-// Plus the 6 quality overrides (nil = no per-chat override;
+// Plus the 7 quality overrides (nil = no per-chat override;
 // the effective Opus config falls through to parlay.toml
 // [quality] — see internal/quality.Resolve):
 //
 //	quality_bitrate_bps int|null, quality_frame_ms int|null,
 //	quality_complexity int|null, quality_vbr bool|null,
-//	quality_fec bool|null, quality_dtx bool|null.
+//	quality_fec bool|null, quality_dtx bool|null,
+//	quality_dsp_enabled bool|null (false = Opus DSP off:
+//	stock encoder, no custom Opus config applied).
 //
 // clean_mode / clean_delay_min are ONE field read through two
 // names: clean_mode is whether auto-clean is on, clean_delay_min
@@ -32,7 +34,7 @@
 //
 // GET/POST over UDS: the envelope carries no method, so a payload
 // with key+value is a set, a payload with key only (or neither) is
-// a get. GET with no key returns all 21; GET with a key returns
+// a get. GET with no key returns all 22; GET with a key returns
 // that key only (still under "settings"). A JSON null value on a
 // quality key CLEARS the per-chat override (falls back to the
 // file/profile/default); null on any other key is a GET, as
@@ -83,6 +85,7 @@ var knownKeys = []string{
 	"chat_music_download",
 	"quality_bitrate_bps", "quality_frame_ms", "quality_complexity",
 	"quality_vbr", "quality_fec", "quality_dtx",
+	"quality_dsp_enabled",
 }
 
 // qualityKeys are the per-chat Opus override keys: a nil value
@@ -90,6 +93,7 @@ var knownKeys = []string{
 var qualityKeys = []string{
 	"quality_bitrate_bps", "quality_frame_ms", "quality_complexity",
 	"quality_vbr", "quality_fec", "quality_dtx",
+	"quality_dsp_enabled",
 }
 
 func isQualityKey(k string) bool {
@@ -126,7 +130,7 @@ func ptrBool(p *bool) any {
 	return *p
 }
 
-// settingsMap renders the 21-key object for the wire. clean_mode is
+// settingsMap renders the 22-key object for the wire. clean_mode is
 // a bool on the wire (ipc.json); clean_delay_min carries the minutes.
 // The quality keys render null when unset (no per-chat override).
 func settingsMap(st model.ChatSettings) map[string]any {
@@ -152,10 +156,11 @@ func settingsMap(st model.ChatSettings) map[string]any {
 		"quality_vbr":         ptrBool(st.QualityVBR),
 		"quality_fec":         ptrBool(st.QualityFEC),
 		"quality_dtx":         ptrBool(st.QualityDTX),
+		"quality_dsp_enabled": ptrBool(st.QualityDSPEnabled),
 	}
 }
 
-// defaults returns the 21-key defaults for a fresh chat.
+// defaults returns the 22-key defaults for a fresh chat.
 func defaults() model.ChatSettings {
 	st := model.DefaultChatSettings()
 	st.AutoplayLang = "" // inventory §8.1 / U3: "" (any language)
@@ -370,6 +375,12 @@ func setKey(st *model.ChatSettings, key string, raw json.RawMessage) error {
 			return err
 		}
 		st.QualityDTX = &b
+	case "quality_dsp_enabled":
+		b, err := parseBool(raw)
+		if err != nil {
+			return err
+		}
+		st.QualityDSPEnabled = &b
 	default:
 		return fmt.Errorf("unknown settings key %q (known: %s)", key, strings.Join(knownKeys, ", "))
 	}
@@ -393,6 +404,8 @@ func clearQualityKey(st *model.ChatSettings, key string) {
 		st.QualityFEC = nil
 	case "quality_dtx":
 		st.QualityDTX = nil
+	case "quality_dsp_enabled":
+		st.QualityDSPEnabled = nil
 	}
 }
 
