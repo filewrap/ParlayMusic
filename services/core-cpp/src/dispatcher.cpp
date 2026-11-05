@@ -20,6 +20,7 @@
 #include <sstream>
 
 #include "scram.hpp"  // base64Encode (TDLib `bytes` fields are base64)
+#include "rich_message.hpp"  // Rich Messages engine (TDLib only)
 #include "telemetry.hpp"
 
 namespace parlay {
@@ -1029,9 +1030,12 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         return;  // first match wins
     }
     // Unknown command: the refined §3 reply (row C92) — the command
-    // doesn't exist, use /help. Never silent, never a crash.
+    // doesn't exist, use /help. Never silent, never a crash. The
+    // typed command is user input: escape it so a '<' in it cannot
+    // become a tag the Rich validator rejects.
     replyHtml(ctx, ui_texts::fmt(ui_texts::kUnknownCommand,
-                                 {{"command", "/" + ctx.command}}));
+                                 {{"command", ui_texts::htmlEscape(
+                                                 "/" + ctx.command)}}));
 }
 
 // --- permissions -----------------------------------------------------------
@@ -1456,11 +1460,31 @@ int64_t Dispatcher::vcTarget(const CommandContext& ctx) const {
 }
 
 // --- replies / IPC helpers -------------------------------------------------
+// Rich Message send over the TDLib bot session. The default
+// TelegramSender implementation reports "not supported" so other
+// implementations keep compiling; TdLibTelegramSender (below)
+// implements it for real. Kept on the interface so the dispatcher
+// can send built RichMessages through tg_ without downcasting.
+int64_t TelegramSender::sendRichMessage(int64_t chat_id,
+                                        const rich::RichMessage& msg,
+                                        const Json& reply_markup,
+                                        int64_t reply_to,
+                                        std::string* error_out) {
+    (void)chat_id;
+    (void)msg;
+    (void)reply_markup;
+    (void)reply_to;
+    if (error_out)
+        *error_out = "rich messages are not supported by this sender";
+    return -1;
+}
+
 int64_t Dispatcher::reply(const CommandContext& ctx, const std::string& text) {
+    std::string err;
     int64_t id = tg_.sendMessageId(ctx.message.chat.id, text,
-                                   ctx.message.message_id);
+                                   ctx.message.message_id, &err);
     if (id < 0) {
-        std::cerr << "[tg] sendMessage failed\n";
+        reportOwnerError("reply (plain text)", ctx.message.chat.id, err);
         return -1;
     }
     int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
@@ -1472,13 +1496,15 @@ void Dispatcher::replyError(const CommandContext& ctx, const IpcResult& r) {
     reply(ctx, "Service error (" + r.error_code + "): " + r.error_message);
 }
 
-// --- Phase 9 reply helpers (HTML + keyboards) ------------------------------
+// --- Phase 9 reply helpers (Rich Messages + keyboards) ------------------
 int64_t Dispatcher::replyHtml(const CommandContext& ctx,
                               const std::string& text) {
+    std::string err;
     int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text,
-                                     InlineKeyboard{}, ctx.message.message_id);
+                                     InlineKeyboard{}, ctx.message.message_id,
+                                     &err);
     if (id < 0) {
-        std::cerr << "[tg] sendMessageHtml failed\n";
+        reportOwnerError("replyHtml", ctx.message.chat.id, err);
         return -1;
     }
     int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
@@ -1488,11 +1514,12 @@ int64_t Dispatcher::replyHtml(const CommandContext& ctx,
 
 int64_t Dispatcher::replyKb(const CommandContext& ctx, const std::string& text,
                             const InlineKeyboard& kb) {
+    std::string err;
     int64_t id = tg_.sendMessageHtml(ctx.message.chat.id, text,
                                      kb,
-                                     ctx.message.message_id);
+                                     ctx.message.message_id, &err);
     if (id < 0) {
-        std::cerr << "[tg] sendMessageHtml (kb) failed\n";
+        reportOwnerError("replyKb", ctx.message.chat.id, err);
         return -1;
     }
     int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
@@ -1503,13 +1530,14 @@ int64_t Dispatcher::replyKb(const CommandContext& ctx, const std::string& text,
 int64_t Dispatcher::replyReplyKb(const CommandContext& ctx,
                                  const std::string& text,
                                  const ReplyKeyboard& kb, bool remove_kb) {
+    std::string err;
     int64_t id = remove_kb
                      ? tg_.sendMessageRemoveKb(ctx.message.chat.id, text,
-                                               ctx.message.message_id)
+                                               ctx.message.message_id, &err)
                      : tg_.sendMessageReplyKb(ctx.message.chat.id, text, kb,
-                                              ctx.message.message_id);
+                                              ctx.message.message_id, &err);
     if (id < 0) {
-        std::cerr << "[tg] sendMessageHtml (reply kb) failed\n";
+        reportOwnerError("replyReplyKb", ctx.message.chat.id, err);
         return -1;
     }
     int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
@@ -1521,14 +1549,39 @@ int64_t Dispatcher::replyPhoto(const CommandContext& ctx,
                                const std::string& photo,
                                const std::string& caption,
                                const InlineKeyboard& kb) {
-    int64_t id = tg_.sendPhoto(ctx.message.chat.id, photo, caption, kb);
+    std::string err;
+    int64_t id = tg_.sendPhoto(ctx.message.chat.id, photo, caption, kb,
+                               &err);
     if (id < 0) {
-        std::cerr << "[tg] sendPhoto failed\n";
+        reportOwnerError("replyPhoto", ctx.message.chat.id, err);
         return -1;
     }
     int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
     if (mins > 0) scheduleDelete(ctx.message.chat.id, id, mins);
     return id;
+}
+
+// Every engine/send failure is reported to the owner: one Rich
+// Message DM (works from any chat, including groups) plus the same
+// line on stderr. The notifying_owner_ guard makes a failure to
+// notify log-only — it can never trigger another notification.
+void Dispatcher::reportOwnerError(const std::string& action, int64_t chat_id,
+                                  const std::string& error) {
+    std::string detail = error.empty() ? "(no error detail)" : error;
+    std::cerr << "[tg] " << action << " failed in chat " << chat_id << ": "
+              << detail << "\n";
+    if (cfg_.owner_id == 0 || notifying_owner_) return;
+    notifying_owner_ = true;
+    std::string text = ui_texts::fmt(
+        ui_texts::kOwnerErrorReport,
+        {{"action", ui_texts::htmlEscape(action)},
+         {"chat", std::to_string(chat_id)},
+         {"error", ui_texts::htmlEscape(detail)}});
+    std::string err;
+    tg_.sendMessageHtml(cfg_.owner_id, text, InlineKeyboard{}, 0, &err);
+    if (!err.empty())
+        std::cerr << "[tg] owner error report failed: " << err << "\n";
+    notifying_owner_ = false;
 }
 
 bool Dispatcher::answerCb(const TgCallbackQuery& cq, const std::string& text,
@@ -1708,16 +1761,68 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     fake.message.chat.id = chat_id;
     int64_t id = -1;
     bool is_photo = false;
-    if (!thumb.empty()) {
-        id = tg_.sendPhoto(chat_id, thumb, text, kb);
+    std::string last_err;
+    if (!thumb.empty() && rich::isUsableInputFile(thumb)) {
+        // Rich card with the thumbnail as a photo block: a real
+        // Rich Message (photo + heading + track lines), not a
+        // classic photo caption — captions cannot carry <h2>. The
+        // keyboard stays a reply_markup, so button routing is
+        // unchanged. A rich card is edited via editMessageText, so
+        // it records as a text card (is_photo=false).
+        rich::RichMessage card = rich::RichMessage::fromBlocks();
+        std::string err;
+        std::string title_raw =
+            track->find("title") ? track->find("title")->asString() : "?";
+        title_raw = ui_texts::truncUtf8(title_raw, 25);
+        Json title_rt = ct.url.empty()
+                            ? rich::rtPlain(title_raw)
+                            : rich::rtUrl(rich::rtPlain(title_raw), ct.url);
+        bool built = card.photoBlock(thumb, rich::rtPlain(""), Json(),
+                                     false, &err);
+        if (built && !state_line.empty())
+            built = card.paragraph(rich::rtPlain(state_line), &err);
+        if (built)
+            built = card.heading(2, rich::rtPlain("Now Playing"), &err);
+        if (built)
+            built = card.paragraph(
+                rich::rtTexts({rich::rtBold(rich::rtPlain("▫ Track: ")),
+                               title_rt}),
+                &err);
+        if (built)
+            built = card.paragraph(
+                rich::rtTexts(
+                    {rich::rtBold(rich::rtPlain("▫ Duration: ")),
+                     rich::rtPlain(ct.duration)}),
+                &err);
+        if (built)
+            built = card.paragraph(
+                rich::rtTexts(
+                    {rich::rtBold(rich::rtPlain("▫ Requested by: ")),
+                     rich::rtPlain(requester)}),
+                &err);
+        if (built) {
+            id = tg_.sendRichMessage(
+                chat_id, card, TdLibTelegramSender::inlineMarkup(kb), 0,
+                &err);
+        }
+        if (id < 0) last_err = err;
+    }
+    if (id < 0 && !thumb.empty()) {
+        std::string err;
+        id = tg_.sendPhoto(chat_id, thumb, text, kb, &err);
         if (id > 0) is_photo = true;
+        if (id < 0) last_err = err;
     }
     if (id < 0) {
         // No thumbnail (track or configured default), thumbnails off,
-        // or sendPhoto failed: text card.
-        id = tg_.sendMessageHtml(chat_id, text, kb, 0);
+        // or the photo paths failed: text card (Rich Message).
+        std::string err;
+        id = tg_.sendMessageHtml(chat_id, text, kb, 0, &err);
+        if (id < 0) last_err = err;
     }
     if (id > 0) recordCard(chat_id, id, is_photo);
+    if (id < 0)
+        reportOwnerError("sendNowPlayingCard", chat_id, last_err);
     return id;
 }
 
@@ -2711,7 +2816,7 @@ void Dispatcher::onHelp(const CommandContext& ctx) {
             return;
         }
         replyHtml(ctx, ui_texts::fmt(ui_texts::kHelpUnknownCmd,
-                                     {{"cmd", arg}}));
+                                     {{"cmd", ui_texts::htmlEscape(arg)}}));
         return;
     }
     replyKb(ctx, ui_texts::kHelpMenu, ui_texts::helpMenuKeyboard());
@@ -9397,19 +9502,33 @@ int64_t TdLibTelegramSender::sendMessageId(int64_t chat_id,
                            error_out);
 }
 
+int64_t TdLibTelegramSender::sendRichMessage(int64_t chat_id,
+                                             const rich::RichMessage& msg,
+                                             const Json& reply_markup,
+                                             int64_t reply_to,
+                                             std::string* error_out) {
+    std::string err;
+    Json content = msg.buildContent(&err);
+    if (content.isNull()) {
+        if (error_out) *error_out = err;
+        return -1;
+    }
+    return sendWithContent(chat_id, content, reply_markup, reply_to,
+                           error_out);
+}
+
 int64_t TdLibTelegramSender::sendMessageHtml(int64_t chat_id,
                                              const std::string& text,
                                              const InlineKeyboard& kb,
                                              int64_t reply_to,
                                              std::string* error_out) {
-    std::string err;
-    Json content = inputMessageText(text, "HTML", err);
-    if (content.isNull()) {
-        if (error_out) *error_out = err;
-        return -1;
-    }
-    return sendWithContent(chat_id, content, inlineMarkup(kb), reply_to,
-                           error_out);
+    // Rich Message, not classic HTML: the text is validated against
+    // the Rich HTML tag list by the engine and sent as
+    // inputMessageRichMessage. That is what makes <h1>/<h2> (and
+    // the rest of the Rich HTML vocabulary) sendable — the classic
+    // parseTextEntities path rejected them with 400.
+    return sendRichMessage(chat_id, rich::RichMessage::fromHtml(text),
+                           inlineMarkup(kb), reply_to, error_out);
 }
 
 int64_t TdLibTelegramSender::sendMessageReplyKb(int64_t chat_id,
@@ -9417,31 +9536,20 @@ int64_t TdLibTelegramSender::sendMessageReplyKb(int64_t chat_id,
                                                 const ReplyKeyboard& kb,
                                                 int64_t reply_to,
                                                 std::string* error_out) {
-    std::string err;
-    Json content = inputMessageText(text, "HTML", err);
-    if (content.isNull()) {
-        if (error_out) *error_out = err;
-        return -1;
-    }
-    return sendWithContent(chat_id, content, replyMarkup(kb), reply_to,
-                           error_out);
+    return sendRichMessage(chat_id, rich::RichMessage::fromHtml(text),
+                           replyMarkup(kb), reply_to, error_out);
 }
 
 int64_t TdLibTelegramSender::sendMessageRemoveKb(int64_t chat_id,
                                                  const std::string& text,
                                                  int64_t reply_to,
                                                  std::string* error_out) {
-    std::string err;
-    Json content = inputMessageText(text, "HTML", err);
-    if (content.isNull()) {
-        if (error_out) *error_out = err;
-        return -1;
-    }
     Json markup = Json::objectOf({
         {"@type", Json("replyMarkupRemoveKeyboard")},
         {"is_personal", Json(true)},
     });
-    return sendWithContent(chat_id, content, markup, reply_to, error_out);
+    return sendRichMessage(chat_id, rich::RichMessage::fromHtml(text),
+                           markup, reply_to, error_out);
 }
 
 int64_t TdLibTelegramSender::sendPhoto(int64_t chat_id,
@@ -9452,30 +9560,36 @@ int64_t TdLibTelegramSender::sendPhoto(int64_t chat_id,
     std::string err;
     Json ft = formattedText(caption, "HTML", err);
     if (ft.isNull()) {
+        // Captions are classic formattedText, not Rich Messages:
+        // <h1>..<h6> are rejected. Downgrade headings to bold and
+        // retry once so a rich-built caption still sends with its
+        // photo instead of failing. Any other parse failure is
+        // reported as-is.
+        std::string downgraded =
+            rich::downgradeHeadingsForClassic(caption);
+        if (downgraded != caption) {
+            std::cerr << "[tg] sendPhoto: caption has headings; "
+                         "retrying with headings downgraded to bold\n";
+            err.clear();
+            ft = formattedText(downgraded, "HTML", err);
+        }
+        if (ft.isNull()) {
+            if (error_out) *error_out = err;
+            return -1;
+        }
+    }
+    // inputMessagePhoto.photo is an inputPhoto object (td_api.tl),
+    // not a bare InputFile: rich::inputPhotoJson builds the exact
+    // shape, and refuses http(s) URLs upfront (they are not valid
+    // inputFiles — the caller falls back to a text card).
+    Json photo_obj = rich::inputPhotoJson(photo, &err);
+    if (photo_obj.isNull()) {
         if (error_out) *error_out = err;
         return -1;
     }
-    // A remote HTTP(S) URL is NOT a valid inputFileRemote id: TDLib
-    // answers with its exact error, and the caller (sendNowPlayingCard)
-    // falls back to a text card. A local path becomes inputFileLocal;
-    // anything else is treated as a TDLib remote file id.
-    Json file;
-    std::error_code ec;
-    if (!photo.empty() && photo[0] == '/' &&
-        std::filesystem::exists(photo, ec)) {
-        file = Json::objectOf({
-            {"@type", Json("inputFileLocal")},
-            {"path", Json(photo)},
-        });
-    } else {
-        file = Json::objectOf({
-            {"@type", Json("inputFileRemote")},
-            {"id", Json(photo)},
-        });
-    }
     Json content = Json::objectOf({
         {"@type", Json("inputMessagePhoto")},
-        {"photo", file},
+        {"photo", photo_obj},
         {"caption", ft},
     });
     return sendWithContent(chat_id, content, inlineMarkup(kb), 0, error_out);
@@ -9487,7 +9601,8 @@ bool TdLibTelegramSender::editMessageText(int64_t chat_id,
                                           const InlineKeyboard& kb,
                                           std::string* error_out) {
     std::string err;
-    Json content = inputMessageText(text, "HTML", err);
+    Json content =
+        rich::RichMessage::fromHtml(text).buildContent(&err);
     if (content.isNull()) {
         if (error_out) *error_out = err;
         return false;
@@ -9519,8 +9634,21 @@ bool TdLibTelegramSender::editMessageCaption(int64_t chat_id,
     std::string err;
     Json ft = formattedText(caption, "HTML", err);
     if (ft.isNull()) {
-        if (error_out) *error_out = err;
-        return false;
+        // Same heading downgrade as sendPhoto: captions are classic
+        // formattedText, so a rich-built caption retries bold.
+        std::string downgraded =
+            rich::downgradeHeadingsForClassic(caption);
+        if (downgraded != caption) {
+            std::cerr << "[tg] editMessageCaption: caption has "
+                         "headings; retrying with headings downgraded "
+                         "to bold\n";
+            err.clear();
+            ft = formattedText(downgraded, "HTML", err);
+        }
+        if (ft.isNull()) {
+            if (error_out) *error_out = err;
+            return false;
+        }
     }
     Json req = Json::objectOf({
         {"@type", Json("editMessageCaption")},

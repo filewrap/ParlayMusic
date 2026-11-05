@@ -49,7 +49,7 @@ PARLAY_ALLOW_CHATS, PARLAY_BLOCK_CHATS,
 ASSISTANT_IDS, NTGCALLS_LIB, VOICE_RTP_SINK, TD_API_ID, TD_API_HASH,
 TD_SESSION_DIR, TDJSON_LIB, TD_PHONE, TD_CODE, TD_PASSWORD, TD_EMAIL,
 TD_EMAIL_CODE, TD_FIRST_NAME, TD_LAST_NAME, TD_QR,
-PARLAY_DATA_DIR, PARLAY_LOG_FILE, TELEGRAM_API_BASE,
+PARLAY_DATA_DIR, PARLAY_LOG_FILE,
 DURATION_LIMIT, QUEUE_LIMIT, SUPPORT_CHAT
 ```
 
@@ -67,12 +67,6 @@ supervisor-restart signal.
 
 ## Implemented (real)
 
-- **Telegram Bot API client** (`src/telegram_api.*`) — HTTPS long-poll
-  `getUpdates` (30 s, exponential back-off 1 s → 30 s), `sendMessage`
-  (returns message id), `getChatMember`, `getChatAdministrators`,
-  `getMe`, `deleteMessage`, `leaveChat`, `forwardMessage`, `copyMessage`,
-  `exportChatInviteLink`. Plain-text replies on purpose (track titles
-  must never break formatting). Base URL from `TELEGRAM_API_BASE`.
 - **HTTP API** (`src/http_server.*`, `src/core_api.*`, Phase 6 A2) — the
   core's GUI-facing surface on `PORT` (default 8080), std-only POSIX
   sockets on its own thread so the Telegram long-poll loop is never
