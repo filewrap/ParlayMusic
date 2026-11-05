@@ -55,7 +55,37 @@ if [ -d "$ROOT/services/core-cpp" ]; then
     cp --remove-destination "$CORE_BIN" "$ROOT/bin/parlay-core"
 fi
 
-# --- 5. TypeScript Mini App bundle (services/miniapp/dist) --------------------
+# --- 5. bgutil POT sidecar (build/bgutil-ytdlp-pot-provider) ---------------
+# Build-time dependency, NOT vendored: the bgutil-ytdlp-pot-provider
+# server mints YouTube proof-of-origin tokens (BotGuard JS in Node
+# -> GenerateIT -> WebPoMinter.mintAsWebsafeString) that the Go
+# backend attaches to InnerTube player calls and the yt-dlp daemon
+# fallback. Pinned at tag 2.0.2; the clone lives under build/ (see
+# .gitignore **/build/) and is never committed. Delete
+# build/bgutil-ytdlp-pot-provider to re-fetch from scratch.
+# Node >= 22 is REQUIRED: without it the sidecar cannot be built,
+# and the build fails loudly here rather than silently leaving the
+# backend tokenless on the VPS.
+POT_DIR="$ROOT/build/bgutil-ytdlp-pot-provider"
+POT_TAG="2.0.2"
+POT_REPO="https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
+command -v node >/dev/null 2>&1 || fail "node (>= 22) not found — required to build the bgutil POT sidecar (node build/main.js, 127.0.0.1:4416). Install Node 22+ and re-run ./build.sh."
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+[ "$NODE_MAJOR" -ge 22 ] 2>/dev/null || fail "node $NODE_MAJOR found, but the bgutil POT sidecar needs Node >= 22 (have: $(node --version 2>/dev/null || echo unknown)). Upgrade Node and re-run ./build.sh."
+if [ ! -d "$POT_DIR/server" ]; then
+    say "Fetching bgutil POT provider $POT_TAG (build-time dependency, not vendored)…"
+    command -v git >/dev/null 2>&1 || fail "git not found — needed to fetch the bgutil POT sidecar"
+    mkdir -p "$ROOT/build"
+    git clone --single-branch --branch "$POT_TAG" "$POT_REPO" "$POT_DIR" \
+        || fail "failed to clone bgutil POT provider $POT_TAG from $POT_REPO"
+fi
+if [ ! -f "$POT_DIR/server/build/main.js" ]; then
+    say "Building bgutil POT provider server (npm ci && npx tsc)…"
+    ( cd "$POT_DIR/server" && npm ci && npx tsc ) \
+        || fail "bgutil POT provider build failed (npm ci / npx tsc in $POT_DIR/server)"
+fi
+
+# --- 6. TypeScript Mini App bundle (services/miniapp/dist) --------------------
 if [ -d "$ROOT/services/miniapp" ] && command -v node >/dev/null 2>&1; then
     if [ ! -f "$ROOT/services/miniapp/dist/app.js" ]; then
         say "Building Mini App bundle (services/miniapp)…"

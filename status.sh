@@ -2,6 +2,8 @@
 # Parlay — status table without starting anything.
 #   backend: PID alive? + UDS socket file present?
 #   core:    PID alive? + GET /healthz on :8080
+#   pot:     PID alive? + GET /ping on :4416 (optional; the backend
+#            degrades to tokenless resolves when it is down).
 #   slskd:   PID alive? + any HTTP response on :5030 (optional; shows
 #            SKIPPED when it is not enabled).
 # Exits 0 only when every required process (backend, core) is UP.
@@ -12,6 +14,7 @@ cd "$ROOT"
 
 BACKEND_SOCK="$ROOT/data/parlay-backend.sock"
 CORE_PORT="${PORT:-8080}"
+POT_PORT=4416
 SLSKD_PORT=5030
 
 pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
@@ -57,6 +60,19 @@ if pid_alive "$pid"; then
 else
     ALL_UP=0
     printf '%-12s %-6s %-8s %s\n' "core" "$CORE_PORT" "DOWN" "not running (no live PID)"
+fi
+
+# --- pot (optional; backend degrades to tokenless resolves when down) ---
+pid="$(cat "$ROOT/run/pot.pid" 2>/dev/null || true)"
+if pid_alive "$pid"; then
+    hc="$(health_code "$POT_PORT" "/ping" 0)"
+    case "$hc" in
+        UP*) status="UP" ;;
+        *)   status="DOWN" ;;
+    esac
+    printf '%-12s %-6s %-8s %s\n' "pot" "$POT_PORT" "$status" "pid $pid, $hc"
+else
+    printf '%-12s %-6s %-8s %s\n' "pot" "$POT_PORT" "DOWN" "not running (backend resolves without PO tokens)"
 fi
 
 # --- slskd (optional) ---

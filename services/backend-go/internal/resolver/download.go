@@ -155,6 +155,13 @@ func downloadHTTPWithHeaders(ctx context.Context, track Track, destDir, name, ur
 // download path for YouTube, Spotify (via the YouTube ladder) and
 // the TikTok fallback — one daemon call, zero per-call forks.
 func downloadViaDaemon(ctx context.Context, client *YtDlpClient, track Track, destDir string, onProgress ProgressFunc) (DownloadResult, error) {
+	return downloadViaDaemonWithPoToken(ctx, client, track, destDir, onProgress, "")
+}
+
+// downloadViaDaemonWithPoToken is downloadViaDaemon with an
+// optional yt-dlp PO token ("web.player+<token>"); "" means a
+// plain tokenless download.
+func downloadViaDaemonWithPoToken(ctx context.Context, client *YtDlpClient, track Track, destDir string, onProgress ProgressFunc, poToken string) (DownloadResult, error) {
 	runID := NewRunID()
 	if client == nil {
 		return DownloadResult{}, engineUnavailable(SourceYouTube, "yt-dlp daemon is not configured")
@@ -169,7 +176,7 @@ func downloadViaDaemon(ctx context.Context, client *YtDlpClient, track Track, de
 	if url == "" {
 		url = "https://www.youtube.com/watch?v=" + track.ID
 	}
-	path, err := client.Download(ctx, url, destDir)
+	path, err := client.DownloadWithPoToken(ctx, url, destDir, poToken)
 	if err != nil {
 		return DownloadResult{}, err
 	}

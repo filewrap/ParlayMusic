@@ -3,8 +3,11 @@
 // Resolve order (probe 2026-11-05, same video dQw4w9WgXcQ, bytes
 // verified on both the VPS and the sandbox):
 //  1. Native InnerTube ANDROID_VR player — 199 ms VPS / 615 ms
-//     sandbox. Works on both IPs, no cookies, no PO token, no
-//     subprocess. ANDROID is the player fallback (0.81 s).
+//     sandbox. Works on both IPs, no cookies. A web-minted PO token
+//     from the bgutil sidecar (internal/pot) rides on the player
+//     call as serviceIntegrityDimensions.poToken; when the sidecar
+//     is down the call proceeds tokenless, exactly as before.
+//     ANDROID is the player fallback (0.81 s).
 //  2. NubCoders /info — signed MP4, ~2.4–9.8 s. Server-side
 //     bot-bypass; no cookies/PO token.
 //  3. Warm yt-dlp daemon — cookieless-first (cookies only for
@@ -40,6 +43,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"parlay/backend-go/internal/pot"
 )
 
 // InnerTube client identities. WEB is for search (its client version
@@ -72,13 +77,20 @@ var (
 // free-text search via native InnerTube.
 type YouTubeResolver struct {
 	ytdlp *YtDlpClient
+	// pot mints web PO tokens from the bgutil sidecar (internal/pot).
+	// The token rides on every player call as
+	// serviceIntegrityDimensions.poToken and on the yt-dlp daemon
+	// fallback as params.po_token ("web.player+<token>"). A dead
+	// sidecar degrades to the old tokenless behavior — Token just
+	// returns "" — so this field is never nil-checked at use sites.
+	pot *pot.Client
 }
 
 // NewYouTubeResolver builds a YouTube resolver. ytdlp may be nil —
 // the daemon fallback is then unavailable and ciphered formats fail
 // honestly instead of silently.
 func NewYouTubeResolver(ytdlp *YtDlpClient) *YouTubeResolver {
-	return &YouTubeResolver{ytdlp: ytdlp}
+	return &YouTubeResolver{ytdlp: ytdlp, pot: pot.NewClient()}
 }
 
 // Source implements Resolver.
@@ -141,7 +153,8 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 	if vid := ExtractYouTubeID(q); vid != "" {
 		// Primary: native InnerTube ANDROID_VR player (probe
 		// 2026-11-05: 199 ms VPS / 615 ms sandbox, works on both
-		// IPs, no cookies, no PO token, no subprocess).
+		// IPs, no cookies, no subprocess) with a web-minted PO
+		// token attached when the sidecar is up.
 		track, err := y.fetchVideo(ctx, vid)
 		if err == nil {
 			return track, nil
@@ -268,46 +281,95 @@ func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) (
 
 // fetchVideo resolves one video id via the ANDROID_VR player call
 // (ANDROID fallback), returning title, duration and the best
-// adaptive audio stream URL (itag 251 Opus, else 140 AAC).
+// adaptive audio stream URL (itag 251 Opus, else 140 AAC). A
+// web-minted PO token (internal/pot, bound to the video id) rides
+// on every player call as serviceIntegrityDimensions.poToken. A
+// 403 / LOGIN_REQUIRED — the signature of a stale or rejected
+// token — refreshes the token once (bypass_cache) and retries that
+// same client once; anything else fails over to the next client.
 func (y *YouTubeResolver) fetchVideo(ctx context.Context, videoID string) (Track, error) {
-	var result map[string]any
 	var lastErr error
 	for _, client := range []struct{ name, ver string }{
 		{innerTubeAndroidVR, innerTubeAndroidVRVer},
 		{innerTubeAndroid, innerTubeAndroidVer},
 	} {
-		payload := map[string]any{
-			"context": map[string]any{"client": map[string]any{
-				"clientName": client.name, "clientVersion": client.ver,
-			}},
-			"videoId": videoID,
+		track, err := y.fetchVideoWithClient(ctx, videoID, client.name, client.ver, false)
+		if err == nil {
+			return track, nil
 		}
-		result = nil
-		start := time.Now()
-		if err := y.callInnerTube(ctx, "player", client.name, client.ver, payload, &result); err != nil {
-			log.Printf("youtube: player %s failed in %s: %v", client.name, time.Since(start), err)
-			lastErr = err
-			continue
+		lastErr = err
+		if isPoTokenFailure(err) {
+			log.Printf("youtube: player %s PO-token failure, refreshing token and retrying once", client.name)
+			track, err2 := y.fetchVideoWithClient(ctx, videoID, client.name, client.ver, true)
+			if err2 == nil {
+				return track, nil
+			}
+			lastErr = err2
 		}
-		if status, _ := dig(result, "playabilityStatus", "status").(string); status != "" && status != "OK" {
-			reason, _ := dig(result, "playabilityStatus", "reason").(string)
-			lastErr = engineUnavailable(SourceYouTube, "video %s not playable (status %s: %s)", videoID, status, reason)
-			log.Printf("youtube: player %s not playable in %s: %v", client.name, time.Since(start), lastErr)
-			continue
-		}
-		track, err := trackFromPlayer(result, videoID)
-		if err != nil {
-			log.Printf("youtube: player %s parse failed in %s: %v", client.name, time.Since(start), err)
-			lastErr = err
-			continue
-		}
-		log.Printf("youtube: player %s ok in %s", client.name, time.Since(start))
-		return track, nil
 	}
 	if lastErr == nil {
 		lastErr = engineUnavailable(SourceYouTube, "video %s: no playable response", videoID)
 	}
 	return Track{}, lastErr
+}
+
+// isPoTokenFailure reports whether an InnerTube player failure
+// looks like a rejected/stale PO token: an HTTP 403 from the
+// player endpoint, or a LOGIN_REQUIRED playability status (the
+// VPS symptom: ANDROID answers LOGIN_REQUIRED on every video).
+func isPoTokenFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "HTTP 403") || strings.Contains(msg, "LOGIN_REQUIRED")
+}
+
+// fetchVideoWithClient runs one player call for one client. When
+// refresh is true the PO token is force-refreshed (bypass_cache)
+// first. A failed token fetch just means no token is attached —
+// the call proceeds tokenless, exactly as before the sidecar
+// existed. The token VALUE is never logged, only whether one was
+// attached and which client it rode on.
+func (y *YouTubeResolver) fetchVideoWithClient(ctx context.Context, videoID, clientName, clientVersion string, refresh bool) (Track, error) {
+	var token string
+	var err error
+	if refresh {
+		token, err = y.pot.Refresh(ctx, videoID)
+	} else {
+		token, err = y.pot.Token(ctx, videoID)
+	}
+	if err != nil {
+		token = ""
+	}
+	payload := map[string]any{
+		"context": map[string]any{"client": map[string]any{
+			"clientName": clientName, "clientVersion": clientVersion,
+		}},
+		"videoId": videoID,
+	}
+	if token != "" {
+		payload["serviceIntegrityDimensions"] = map[string]any{"poToken": token}
+	}
+	var result map[string]any
+	start := time.Now()
+	if err := y.callInnerTube(ctx, "player", clientName, clientVersion, payload, &result); err != nil {
+		log.Printf("youtube: player %s failed in %s: %v", clientName, time.Since(start), err)
+		return Track{}, err
+	}
+	if status, _ := dig(result, "playabilityStatus", "status").(string); status != "" && status != "OK" {
+		reason, _ := dig(result, "playabilityStatus", "reason").(string)
+		err := engineUnavailable(SourceYouTube, "video %s not playable (status %s: %s)", videoID, status, reason)
+		log.Printf("youtube: player %s not playable in %s: %v", clientName, time.Since(start), err)
+		return Track{}, err
+	}
+	track, err := trackFromPlayer(result, videoID)
+	if err != nil {
+		log.Printf("youtube: player %s parse failed in %s: %v", clientName, time.Since(start), err)
+		return Track{}, err
+	}
+	log.Printf("youtube: player %s ok in %s (po_token attached=%v)", clientName, time.Since(start), token != "")
+	return track, nil
 }
 
 // fetchPlaylist resolves a playlist (browse VL+id) or a mix
@@ -373,9 +435,17 @@ func (y *YouTubeResolver) fetchPlaylist(ctx context.Context, playlistID string, 
 
 // resolveViaDaemon is the warm yt-dlp fallback: one JSON-RPC extract
 // over the persistent daemon (no fork). Used only when the native
-// player call cannot produce a playable track.
+// player call cannot produce a playable track. The video's PO token
+// rides along as params.po_token ("web.player+<token>") so the
+// daemon's web client can present it on its own player request; a
+// missing sidecar just means a tokenless extract, as before.
 func (y *YouTubeResolver) resolveViaDaemon(ctx context.Context, videoID string) (Track, error) {
-	info, err := y.ytdlp.Extract(ctx, "https://www.youtube.com/watch?v="+videoID)
+	token, _ := y.pot.Token(ctx, videoID)
+	poToken := ""
+	if token != "" {
+		poToken = pot.FormatPlayer(token)
+	}
+	info, err := y.ytdlp.ExtractWithPoToken(ctx, "https://www.youtube.com/watch?v="+videoID, poToken)
 	if err != nil {
 		return Track{}, err
 	}
@@ -384,7 +454,9 @@ func (y *YouTubeResolver) resolveViaDaemon(ctx context.Context, videoID string) 
 
 // searchViaDaemon is the warm yt-dlp fallback for search: runs
 // ytsearch1:<query> over the persistent daemon. Used when InnerTube
-// search fails or is throttled.
+// search fails or is throttled. No PO token rides here: a player
+// token is bound to a video id and there is no video id yet at
+// search time.
 func (y *YouTubeResolver) searchViaDaemon(ctx context.Context, query string) (Track, error) {
 	if y.ytdlp == nil {
 		return Track{}, engineUnavailable(SourceYouTube, "yt-dlp daemon is not configured")
@@ -403,12 +475,20 @@ func (y *YouTubeResolver) searchViaDaemon(ctx context.Context, query string) (Tr
 }
 
 // Download downloads a YouTube track via the warm daemon (bestaudio,
-// extracted to mp3) into destDir.
+// extracted to mp3) into destDir. The video's PO token rides along
+// as params.po_token when the track id is a YouTube video id; a
+// missing sidecar just means a tokenless download, as before.
 func (y *YouTubeResolver) Download(ctx context.Context, track Track, destDir string, onProgress ProgressFunc) (DownloadResult, error) {
 	if y.ytdlp == nil {
 		return DownloadResult{}, engineUnavailable(SourceYouTube, "yt-dlp daemon is not configured; cannot download YouTube track %s", track.ID)
 	}
-	return downloadViaDaemon(ctx, y.ytdlp, track, destDir, onProgress)
+	var poToken string
+	if bareVideoIDRe.MatchString(track.ID) {
+		if token, err := y.pot.Token(ctx, track.ID); err == nil && token != "" {
+			poToken = pot.FormatPlayer(token)
+		}
+	}
+	return downloadViaDaemonWithPoToken(ctx, y.ytdlp, track, destDir, onProgress, poToken)
 }
 
 // callInnerTube POSTs one InnerTube call (YukkiMusic-Go callInnerTube,
