@@ -35,15 +35,30 @@ func Register(s *uds.Server, d *app.Deps) {
 }
 
 // Snapshot builds a NowPlaying view from a persisted room state and
-// its waiting queue. Exported so the radio package can render the
-// same shape for its now_playing superset field.
+// its full ordered list (index 0 is the playing track when the room
+// is Playing, else the next-up track). Exported so the radio package
+// can render the same shape for its now_playing superset field.
+// The wire Queue is the waiting list only, renumbered from 0.
 func Snapshot(room model.RoomState, queue []model.QueueItem) model.NowPlaying {
 	if queue == nil {
 		queue = []model.QueueItem{}
 	}
+	waiting := queue
+	var track *model.Track
+	var streamURL string
+	if room.Playing && len(queue) > 0 {
+		t := queue[0].Track
+		track = &t
+		streamURL = t.StreamURL
+		waiting = make([]model.QueueItem, len(queue)-1)
+		for i, item := range queue[1:] {
+			item.Position = i
+			waiting[i] = item
+		}
+	}
 	np := model.NowPlaying{
 		ChatID:          room.ChatID,
-		Track:           room.Current,
+		Track:           track,
 		Engine:          "backend-go",
 		Loop:            room.Loop,
 		LoopCount:       room.Loop,
@@ -51,13 +66,13 @@ func Snapshot(room model.RoomState, queue []model.QueueItem) model.NowPlaying {
 		IsPaused:        room.Paused,
 		IsMuted:         room.Muted,
 		PositionSec:     room.PositionSec,
-		Queue:           queue,
+		Queue:           waiting,
 		Shuffle:         room.Shuffle,
 		Autoplay:        room.Autoplay,
 		AutoplayEnabled: room.Autoplay,
 		Volume:          room.Volume,
 		Speed:           room.Speed,
-		StreamURL:       room.StreamURL,
+		StreamURL:       streamURL,
 	}
 	return np
 }

@@ -258,6 +258,7 @@ func (h *Handlers) vcStop(ctx context.Context, req uds.Request) (any, error) {
 		return nil, mapRoomErr(err)
 	}
 	h.clearFeeding(chatID)
+	h.clearStuck(chatID)
 	h.prefetchCancel(chatID)
 	if _, ok := h.deps.Voice.Get(chatID); ok {
 		if verr := h.deps.Voice.Stop(chatID); verr != nil {
@@ -390,6 +391,41 @@ func (h *Handlers) vcQueue(ctx context.Context, req uds.Request) (any, error) {
 	}
 }
 
+// vcPlayNext moves an already-queued track to the front of the
+// waiting list (queue-port Tier 3, item 23 — the "Play Now" button
+// on a queued card): with the one-list model that is list index 1
+// while a track is playing, so the normal advance path picks it up
+// next. No track is resolved or added and nothing is interrupted;
+// the track must already be waiting in this chat's queue.
+// Response is the now_playing snapshot plus moved (false when the
+// track was already next or already playing) and the track id.
+func (h *Handlers) vcPlayNext(ctx context.Context, req uds.Request) (any, error) {
+	var p struct {
+		ChatID  int64  `json:"chat_id"`
+		TrackID string `json:"track_id"`
+	}
+	if err := decodePayload(req, &p); err != nil {
+		return nil, err
+	}
+	chatID, err := chatIDOf(req, p.ChatID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(p.TrackID) == "" {
+		return nil, errBadRequest("track_id is required")
+	}
+	h.chatLock(chatID).Lock()
+	defer h.chatLock(chatID).Unlock()
+	snap, moved, err := h.rooms.MoveToNext(chatID, p.TrackID)
+	if err != nil {
+		return nil, mapRoomErr(err)
+	}
+	resp := nowPlayingResp(snap)
+	resp["moved"] = moved
+	resp["track_id"] = p.TrackID
+	return resp, nil
+}
+
 // --- vc.loop / vc.shuffle / vc.autoplay / vc.autoplay_skip / vc.volume ---
 
 // vcLoop sets the remaining replays of the current track (0-10).
@@ -488,15 +524,28 @@ func (h *Handlers) vcAutoplaySkip(ctx context.Context, req uds.Request) (any, er
 		h.events.VoiceError(chatID, "join_failed", err.Error())
 		return nil, errEngineUnavailable("voice join failed: %v", err)
 	}
-	pick, _, err := h.rooms.AutoplaySkip(ctx, chatID)
+	pick, last, err := h.rooms.AutoplaySkip(ctx, chatID)
 	if err != nil {
 		return nil, mapRoomErr(err)
 	}
 	if _, berr := h.bindTrack(ctx, chatID, pick); berr != nil {
-		// The pick stands as current (the room transition is
-		// irreversible — the previous track is already replaced);
-		// the failure is surfaced, not hidden.
+		// Roll back (queue-port Tier 1, item 3): the pick
+		// never got a feed, so it must not stand as the
+		// active track. Put the replaced track back at the
+		// front and re-bind it; when that succeeds the room
+		// is playing the previous track again and the pick
+		// failure is still surfaced. When the re-bind fails
+		// too, drop to queued-only rather than standing on
+		// a track with no feed behind it.
 		h.events.VoiceError(chatID, "stream_error", berr.Error())
+		if _, rerr := h.rooms.ReplaceFront(chatID, last); rerr == nil {
+			if _, rberr := h.bindTrack(ctx, chatID, last); rberr == nil {
+				h.applyMuteIfNeeded(chatID)
+				h.events.TrackStarted(chatID, last)
+				return nil, errEngineUnavailable("voice bind failed for autoplay pick: %v", berr)
+			}
+		}
+		_, _ = h.rooms.ClearCurrent(chatID)
 		return nil, errEngineUnavailable("voice bind failed: %v", berr)
 	}
 	h.applyMuteIfNeeded(chatID)
@@ -537,10 +586,17 @@ func (h *Handlers) vcVolume(ctx context.Context, req uds.Request) (any, error) {
 // sets track.ThumbnailPath to the local path, so the core can send it
 // as inputFileLocal. It never fails the request: on any error it logs
 // and leaves ThumbnailPath empty, and the core falls back to a text
-// card with no owner error DM.
+// card with no owner error DM. The thumbnail URL itself is
+// normalized to the jpg variant first (queue-port Tier 4, item 28):
+// the cached file and the snapshot's thumbnail URL both carry
+// hqdefault.jpg, so the item-27 hyperlink fallback gets the
+// variant Telegram reliably fetches.
 func (h *Handlers) ensureThumb(ctx context.Context, track *model.Track) {
 	if track == nil || track.ThumbnailPath != "" || track.Thumbnail == "" {
 		return
+	}
+	if norm := thumbs.NormalizeURL(track.Thumbnail); norm != track.Thumbnail {
+		track.Thumbnail = norm
 	}
 	p, err := thumbs.Ensure(ctx, h.deps.Config.Backend.DataDir, track.Thumbnail)
 	if err != nil {
@@ -548,6 +604,42 @@ func (h *Handlers) ensureThumb(ctx context.Context, track *model.Track) {
 		return
 	}
 	track.ThumbnailPath = p
+}
+
+// vcCard records the now-playing card's Telegram message id on the
+// track (queue-port Tier 6, item 32 — NoxBeats Track::message_id).
+// The core posts it after sending a fresh card or re-rendering the
+// recorded card onto a new front track; the room persists it with
+// the queue in bbolt, so the id survives a core restart and
+// vc.now_playing surfaces it on the track (the core's card
+// refresh prefers it, with recordCard as fallback). Unknown track
+// id or an empty room maps to bad_request / not_found via
+// mapRoomErr; the core treats a failure as a log line, never as a
+// card failure.
+func (h *Handlers) vcCard(ctx context.Context, req uds.Request) (any, error) {
+	var p struct {
+		ChatID    int64  `json:"chat_id"`
+		TrackID   string `json:"track_id"`
+		MessageID int64  `json:"message_id"`
+	}
+	if err := decodePayload(req, &p); err != nil {
+		return nil, err
+	}
+	chatID, err := chatIDOf(req, p.ChatID)
+	if err != nil {
+		return nil, err
+	}
+	if p.TrackID == "" {
+		return nil, errBadRequest("track_id is required")
+	}
+	if p.MessageID <= 0 {
+		return nil, errBadRequest("message_id must be > 0")
+	}
+	snap, err := h.rooms.SetCardMessageID(chatID, p.TrackID, p.MessageID)
+	if err != nil {
+		return nil, mapRoomErr(err)
+	}
+	return nowPlayingResp(snap), nil
 }
 
 // vcNowPlaying returns the room snapshot. No room, or a room with

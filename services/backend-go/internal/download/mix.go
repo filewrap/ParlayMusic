@@ -80,7 +80,7 @@ func (s *Service) handleMix(ctx context.Context, req uds.Request) (any, error) {
 			}
 		}
 		// Autoplay history is excluded too: the room state carries
-		// it (model.RoomState.AutoplayHistory, capped at 50), and
+		// it (model.RoomState.AutoplayHistory, capped at 100), and
 		// the room Manager persists it synchronously on every
 		// transition, so the store read is current.
 		if st, found, err := s.deps.Store.GetRoom(body.ChatID); err == nil && found {
@@ -113,10 +113,21 @@ func (s *Service) roomCurrentTrack(chatID int64) (*model.Track, error) {
 	if err != nil {
 		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room read failed: %v", err))
 	}
-	if !found || st.Current == nil {
+	// The active track is the front of the stored list, and only
+	// when the room is Playing — a queued-only room has no
+	// current track to mix from.
+	if !found || !st.Playing {
 		return nil, nil
 	}
-	return st.Current, nil
+	queue, err := s.deps.Store.GetQueue(chatID)
+	if err != nil {
+		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("queue read failed: %v", err))
+	}
+	if len(queue) == 0 {
+		return nil, nil
+	}
+	track := queue[0].Track
+	return &track, nil
 }
 
 // fetchMix fetches the YouTube RD-mix flat playlist for videoID via

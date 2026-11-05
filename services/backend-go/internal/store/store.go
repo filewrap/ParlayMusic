@@ -176,9 +176,11 @@ func posKey(pos int) []byte {
 	return b[:]
 }
 
-// PutQueue stores the whole waiting queue for a chat (replacing
-// whatever was there). Positions are renumbered 0..n-1 in slice
-// order.
+// PutQueue stores the whole ordered list for a chat (replacing
+// whatever was there). Index 0 is the playing track when the room
+// is Playing, else the next-up track (queue-port Tier 1, item 10:
+// one list, not a waiting-only queue). Positions are renumbered
+// 0..n-1 in slice order.
 func (s *Store) PutQueue(chatID int64, items []model.QueueItem) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		qb, err := queueBucket(tx, chatID)
@@ -204,7 +206,8 @@ func (s *Store) PutQueue(chatID int64, items []model.QueueItem) error {
 	})
 }
 
-// GetQueue returns the waiting queue for a chat in play order.
+// GetQueue returns the whole ordered list for a chat in play
+// order (index 0 is the playing track when the room is Playing).
 func (s *Store) GetQueue(chatID int64) ([]model.QueueItem, error) {
 	var items []model.QueueItem
 	err := s.db.View(func(tx *bbolt.Tx) error {

@@ -134,7 +134,7 @@ uses 1,000,000+). The core runs the handler on a worker thread, so
 a slow TDLib `joinVideoChat` never stalls the reader or other
 in-flight responses. See §6.
 
-## §4. Action table — all 65 contract actions
+## §4. Action table — all 68 contract actions
 
 Payload/response shapes are exactly `contracts/ipc.json`
 `actions/<name>` (request / response objects, `Track` /
@@ -222,6 +222,9 @@ keep working.
 | 64 | `download.prefs` | `user_id`; POST only: `format`, `use_youtube`, `path_template` | `user_id`, `format`, `use_youtube`, `path_template` | 10 s |
 | 65 | `vc.play_file` | `chat_id`, `file_path`, `file_id`, `title`, `kind`, `duration_sec`, `requested_by` | `now_playing` | 30 s |
 | 66 | `quality.get` | `chat_id` | `chat_id`, `effective`, `sources`, `library`, `active_call`, `applies_on` | 10 s |
+| 67 | `vc.play_next` | `chat_id`, `track_id` | `now_playing`, `moved`, `track_id` | 30 s |
+| 68 | `download.cancel_chat` | `chat_id` | `cancelled`, `chat_id`, `run_ids` | 10 s |
+| 69 | `vc.card` | `chat_id`, `track_id`, `message_id` | `now_playing` | 30 s |
 
 \* Download actions: the old HTTP call sites passed an explicit
 120 s timeout for `download.*` POSTs. That explicit value still
@@ -229,7 +232,7 @@ governs (the deadline table has no `download.*` entry, so the
 call-site parameter wins — see §8). The config rewrite should set
 a `download_ms` budget instead.
 
-Protocol-level action (NOT one of the 66): `ping`, empty payload,
+Protocol-level action (NOT one of the 68): `ping`, empty payload,
 answers `{service: "backend-go", …}` — the core's `healthz()`.
 
 ### §4.1 OD-3 actions (Phase 3, Wave 2)
@@ -271,7 +274,7 @@ YouTube seeds have mixes: a non-YouTube seed → `502
 engine_unavailable` ("Failed to get mix: Please try again later.").
 The mix is the YouTube `RD<id>` flat playlist via the warm yt-dlp
 daemon, up to 10 tracks, excluding the seed, the room queue, and
-the autoplay history (`RoomState.AutoplayHistory`, capped at 50).
+the autoplay history (`RoomState.AutoplayHistory`, capped at 100).
 Response `{tracks: [Track], source_track: Track}`; zero tracks
 after filtering → `200 {tracks: []}`.
 
@@ -364,6 +367,52 @@ implementation is `internal/handlers` (record-only per inventory
 §3.3 — no feed bound in Phase 3, the Phase 5 DSP decodes the local
 path). The action is registered exactly once, by
 `handlers.Register`.
+
+### §4.2 Queue-port Tier 3 actions (2026-11-05)
+
+**`vc.play_next`** — the "Play Now" button on a queued card.
+Request `{chat_id, track_id}`. Moves an already-queued track to
+the front of the waiting list (list index 1 while a track is
+playing, index 0 while idle), so the normal advance path picks it
+up next — "play next", not an interrupt. No track is resolved or
+added and nothing is interrupted. Response `{now_playing, moved,
+track_id}`: `moved` is false when the track was already next or
+already playing (a no-op, not an error). Unknown track id in the
+queue → `bad_request`; empty room → `not_found` ("nothing playing
+in this chat").
+
+**`download.cancel_chat`** — the per-chat download-cancel flag.
+Request `{chat_id}`. Cancels every live download run for the chat
+via the runs' contexts (the provider loop checks the context
+between chunks/tracks; the partial files are deleted by the jobs'
+failure paths). Response `{cancelled, chat_id, run_ids}`:
+`cancelled` is true when at least one run was live. No live run
+is 200 with `cancelled: false` (the core's "Nothing to cancel —
+already finished." path). The per-chat form exists because the
+core cannot know a run's backend id mid-download — the id is only
+revealed in the POST response, after the download — so the
+per-run `download.cancel` cannot be the button's mechanism.
+Runs record their requesting chat from the POST body's `chat_id`
+(the core sends it on `download.*` POSTs).
+
+### §4.3 Queue-port Tier 6 action (2026-11-05)
+
+**`vc.card`** — the core reports a now-playing card's Telegram
+message id back to the backend (queue-port Tier 6, item 32 —
+NoxBeats `Track::message_id`). Request `{chat_id, track_id,
+message_id}`. The room stores the id on the matching track and
+persists it with the queue in bbolt, so the id survives a core
+restart and `vc.now_playing` surfaces it as
+`track.card_message_id`; the core's card refresh prefers that
+field, with its local `recordCard` entry as fallback. The core
+posts it after sending a fresh card (`sendNowPlayingCard`) and
+after re-rendering the recorded card onto a new front track
+(`editNowPlayingCard`, `refreshCard`), so the stored id always
+belongs to the track the card currently shows. Response
+`{now_playing}`. Unknown track id in the queue → `bad_request`;
+empty room → `not_found`. The call is fire-and-forget from the
+core: a failure is a stderr line, never a card failure and never
+an owner error DM.
 
 ## §5. Backend-initiated events
 

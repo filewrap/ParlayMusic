@@ -145,16 +145,23 @@ func (s *Service) handleInline(ctx context.Context, req uds.Request) (any, error
 }
 
 // currentTrack returns the room's current track for a chat, or nil
-// when nothing is playing (no chat_id, no room, no current track).
+// when nothing is playing (no chat_id, no room, no active track).
 func (s *Service) currentTrack(chatID int64) *model.Track {
 	if chatID == 0 || s.deps == nil || s.deps.Store == nil {
 		return nil
 	}
 	room, found, err := s.deps.Store.GetRoom(chatID)
-	if err != nil || !found || room.Current == nil {
+	// The active track is the front of the stored list, and only
+	// when the room is Playing — a queued-only room has no
+	// current track.
+	if err != nil || !found || !room.Playing {
 		return nil
 	}
-	track := *room.Current
+	queue, err := s.deps.Store.GetQueue(chatID)
+	if err != nil || len(queue) == 0 {
+		return nil
+	}
+	track := queue[0].Track
 	return &track
 }
 

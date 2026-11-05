@@ -243,6 +243,7 @@ std::string IpcClient::canonicalAction(const std::string& action) {
         {"stop", "vc.stop"},         {"seek", "vc.seek"},
         {"queue", "vc.queue"},       {"loop", "vc.loop"},
         {"shuffle", "vc.shuffle"},   {"autoplay", "vc.autoplay"},
+        {"play_next", "vc.play_next"},
         {"autoplay-skip", "vc.autoplay_skip"},
         {"radio", "vc.radio"},       {"join", "vc.join"},
         {"mute", "vc.mute"},         {"volume", "vc.volume"},

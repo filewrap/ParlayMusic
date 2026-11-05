@@ -5,11 +5,19 @@
 // photo (inputFileLocal / inputFileRemote) — an https URL is not a
 // valid inputFile, and the rich engine refuses it honestly. The
 // backend therefore caches each thumbnail under
-// <dataDir>/thumbs/<sha1(url)>.<ext> on first use and hands the core
-// the local path (model.Track.ThumbnailPath). A failed download is
-// never fatal: Ensure returns "" and the caller falls back to a text
-// card, with no owner error DM — a missing thumbnail must not page
-// the owner when the card itself still renders.
+// <dataDir>/thumbs/<sha1(lowercased url)>.<ext> on first use and
+// hands the core the local path (model.Track.ThumbnailPath). A
+// failed download is never fatal: Ensure returns "" and the caller
+// falls back to a text card, with no owner error DM — a missing
+// thumbnail must not page the owner when the card itself still
+// renders.
+//
+// Cache semantics (queue-port Tier 4, item 26 — Parvati
+// artwork.rs, idea ported, not the code): hash-named cache file,
+// cache hit returns immediately, HTTP GET with a 15 s timeout and
+// a 6 MB cap, at most 5 redirects, content-type must be an image,
+// atomic write via a .tmp rename, any failure returns "" and the
+// caller falls back to a text card.
 package thumbs
 
 import (
@@ -27,16 +35,51 @@ import (
 	"time"
 )
 
-// maxThumbBytes caps a single thumbnail download (thumbnails are
-// small; anything bigger is not a thumbnail).
-const maxThumbBytes = 2 << 20 // 2 MiB
+// maxThumbBytes caps a single thumbnail download (Parvati's 6 MB
+// cap, item 26; thumbnails are small, anything bigger is not a
+// thumbnail).
+const maxThumbBytes = 6 << 20 // 6 MiB
+
+// thumbTimeout bounds one thumbnail fetch (Parvati's 15 s,
+// item 26).
+const thumbTimeout = 15 * time.Second
+
+// maxThumbRedirects caps the redirect chain (Parvati: at most 5).
+const maxThumbRedirects = 5
+
+// NormalizeURL forces the jpg thumbnail variant (queue-port Tier 4,
+// item 28 — NoxBeats yt.cpp:68): yt-dlp often reports .webp and
+// Telegram only reliably fetches the jpg variant. Only
+// i.ytimg.com/vi/<id>/<variant> URLs are rewritten, to
+// https://i.ytimg.com/vi/<id>/hqdefault.jpg — the variant that
+// always exists for a video, unlike maxresdefault. Every other URL
+// is returned unchanged, so non-YouTube thumbnails (which may
+// genuinely be .webp with no jpg twin) are never mangled.
+// Normalization is idempotent.
+func NormalizeURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host != "i.ytimg.com" {
+		return rawURL
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "vi" || parts[1] == "" {
+		return rawURL
+	}
+	u.Path = "/vi/" + parts[1] + "/hqdefault.jpg"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
 
 // Ensure returns the local path of a cached copy of the thumbnail at
 // rawURL, downloading it into <dataDir>/thumbs on first use. It
 // returns "" when there is no URL or the download fails. A rawURL
-// that is already a local path is returned unchanged.
+// that is already a local path is returned unchanged. The URL is
+// normalized (NormalizeURL) before caching, so the .webp and .jpg
+// reports of one thumbnail share one cache file.
 func Ensure(ctx context.Context, dataDir, rawURL string) (string, error) {
-	rawURL = strings.TrimSpace(rawURL)
+	rawURL = NormalizeURL(rawURL)
 	if rawURL == "" {
 		return "", nil
 	}
@@ -49,7 +92,11 @@ func Ensure(ctx context.Context, dataDir, rawURL string) (string, error) {
 		return "", err
 	}
 	ext := thumbExt(rawURL)
-	sum := sha1.Sum([]byte(rawURL))
+	// Parvati hashes the lowercased URL (FNV-1a there; sha1 here —
+	// the hash function is cosmetic, the case-insensitivity is the
+	// semantic): the same thumbnail under different URL casings is
+	// one cache file.
+	sum := sha1.Sum([]byte(strings.ToLower(rawURL)))
 	name := hex.EncodeToString(sum[:]) + ext
 	path := filepath.Join(dir, name)
 	if st, err := os.Stat(path); err == nil && st.Size() > 0 {
@@ -60,7 +107,15 @@ func Ensure(ctx context.Context, dataDir, rawURL string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "Parlay/1.0 (thumbnail fetch)")
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout: thumbTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxThumbRedirects {
+				return fmt.Errorf("thumbnail %s: too many redirects", rawURL)
+			}
+			return nil
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

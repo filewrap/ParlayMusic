@@ -166,6 +166,15 @@ inline std::string cbPlayerToken(const std::string& verb,
                                  const std::string& token) {
     return "pl:player:" + verb + ":" + token;
 }
+// Play Now force button (queue-port Tier 3, item 23):
+// "pl:play:force:<chat>:<token>" — the token is trackToken(id), so
+// the payload stays under the 64-byte limit for any track id
+// (14 + ≤14 + 1 + ≤20 = ≤49 bytes). The core resolves the token to
+// the full track id before calling vc.play_next.
+inline std::string cbPlayForce(int64_t chat_id,
+                               const std::string& token) {
+    return "pl:play:force:" + std::to_string(chat_id) + ":" + token;
+}
 inline std::string cbQueueMore(int64_t chat_id) {
     return "pl:queue:more:" + std::to_string(chat_id);
 }
@@ -907,6 +916,13 @@ struct CardTrack {
     std::string duration;   // human duration ("3:24", "∞")
     std::string requester;  // display name of the requester, escaped
     std::string token;      // queue token (trackToken)
+    // Thumbnail URL (jpg-normalized by the backend's ensureThumb /
+    // thumbs.NormalizeURL), for the thumbnail-as-hyperlink fallback
+    // (queue-port Tier 4, item 27): when no local photo exists for
+    // the text card, the title links here instead of `url`, so
+    // Telegram renders the image preview. Empty when the track has
+    // no thumbnail.
+    std::string thumb_url;
 };
 
 inline std::string trackLink(const CardTrack& t) {
@@ -967,6 +983,40 @@ inline std::string queuedText(int index, const CardTrack& t) {
                 {"by", t.requester}});
 }
 
+// Playlist remainder cap (queue-port Tier 3, item 24): the
+// expandable blockquote listing stays well inside the 32768-char
+// rich limit; the tail names how many more were queued.
+inline constexpr size_t kPlaylistRemainderCap = 3500;
+
+// Playlist remainder (NoxBeats playlist_to_queue / TgMusicBot
+// handleMultipleTracks): the queued tracks after the first, in a
+// separate expandable blockquote, with totals. `lines` are
+// pre-rendered, already HTML-escaped "N. title — duration" rows;
+// `total_added` is how many tracks were queued in total (the list
+// may be capped), `total_tracks` the playlist size.
+inline std::string playlistRemainderText(
+    const std::vector<std::string>& lines, int total_added,
+    int total_tracks) {
+    std::string body;
+    int shown = 0;
+    for (const auto& line : lines) {
+        if (body.size() + line.size() + 1 > kPlaylistRemainderCap)
+            break;
+        if (!body.empty()) body += "\n";
+        body += line;
+        ++shown;
+    }
+    std::string out = "<b>Queued from your playlist:</b> " +
+                      std::to_string(total_added) + " of " +
+                      std::to_string(total_tracks) + " tracks\n";
+    out += "<blockquote expandable>" + body;
+    if (shown < total_added)
+        out += "\n… and " + std::to_string(total_added - shown) +
+               " more";
+    out += "</blockquote>";
+    return out;
+}
+
 // Merged 6-row control keyboard (Tina seek row + Yukki pause toggle +
 // Parvati autoplay row, §4). Row 1 is the no-op progress button (only
 // when NOT queued — the caller omits it for queued cards). The pause
@@ -1020,9 +1070,14 @@ inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
 }
 
 // Queued card keyboard: Play Now (NoxBeats/TgMusicBot play_now, §4).
-inline InlineKeyboard queuedKeyboard(const std::string& token) {
+// The button is pl:play:force:<chat>:<token> (queue-port Tier 3,
+// item 23): it moves the queued track to the front of the waiting
+// list instead of interrupting the current track.
+inline InlineKeyboard queuedKeyboard(int64_t chat_id,
+                                     const std::string& token) {
     if (token.empty()) return {};
-    return {{InlineButton::callback("Play Now", cbPlayerToken("playnow", token))}};
+    return {{InlineButton::callback("Play Now",
+                                    cbPlayForce(chat_id, token))}};
 }
 
 // Callback toasts + edited cards (Parvati wins, corrected English, §4).
@@ -1035,6 +1090,10 @@ inline std::string toastResumed(int64_t pos_sec) {
 inline const char* kToastReplayedBy = "Track replayed by {user}.";
 inline const char* kToastSkipped = "Track skipped.";
 inline const char* kToastSkippedBy = "Skipped by {user}";
+// Play Now toasts (queue-port Tier 3, item 23): the move outcome.
+inline const char* kToastPlayNext = "Will play next.";
+inline const char* kToastAlreadyNext = "Already up next.";
+inline const char* kToastAlreadyPlaying = "Already playing.";
 inline const char* kToastStopped = "Playback stopped.";
 inline const char* kToastMuted = "Muted.";
 inline const char* kToastUnmuted = "Unmuted.";

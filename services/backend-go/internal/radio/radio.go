@@ -18,13 +18,13 @@ package radio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	"parlay/backend-go/internal/app"
 	"parlay/backend-go/internal/dsp"
-	"parlay/backend-go/internal/gui"
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
 	"parlay/backend-go/internal/room"
@@ -128,32 +128,23 @@ func (s *Service) Start(ctx context.Context, chatID int64, stationRef string) (*
 	}
 	probe := s.probe(ctx, station.StreamURL)
 	track := radioTrack(station, 0)
+	if s.rooms == nil {
+		return nil, uds.NewHandlerError(uds.ErrInternal, "room manager not configured")
+	}
 	now := time.Now()
 	reachable := probe.Reachable
-	if err := s.store.PutRadio(model.RadioState{
+	radioState := model.RadioState{
 		ChatID: chatID, Station: station.ID, StreamURL: station.StreamURL,
 		Reachable: &reachable, NowPlaying: &track, UpdatedAt: now.Unix(),
-	}); err != nil {
-		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("radio store failed: %v", err))
 	}
-	room, found, err := s.store.GetRoom(chatID)
+	// The room mutation goes through the Manager (never a direct
+	// store write, which would leave the Manager's in-memory room
+	// stale): the radio track becomes the front track and the
+	// radio state is recorded, both in the room and in the
+	// store's radio bucket.
+	snap, err := s.rooms.StartRadio(chatID, radioState, track, 0)
 	if err != nil {
-		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room lookup failed: %v", err))
-	}
-	if !found {
-		room = model.DefaultRoomState(chatID)
-	}
-	room.Current = &track
-	room.StreamURL = station.StreamURL
-	room.PositionSec = 0
-	room.Paused = false
-	room.UpdatedAt = now.Unix()
-	if err := s.store.PutRoom(room); err != nil {
-		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room store failed: %v", err))
-	}
-	queue, err := s.store.GetQueue(chatID)
-	if err != nil {
-		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("queue lookup failed: %v", err))
+		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room start failed: %v", err))
 	}
 	handoff := s.voiceHandoff(ctx, chatID, station.StreamURL)
 	s.mu.Lock()
@@ -165,7 +156,7 @@ func (s *Service) Start(ctx context.Context, chatID int64, stationRef string) (*
 		Probe: probe.Probe, Format: probe.Format,
 		FallbackPlaylist: station.Playlist,
 		VCHandoff:        handoff,
-		NowPlaying:       gui.Snapshot(room, queue),
+		NowPlaying:       snap,
 	}, nil
 }
 
@@ -204,18 +195,23 @@ func (s *Service) Stop(ctx context.Context, chatID int64) (bool, error) {
 		return false, uds.NewHandlerError(uds.ErrNotFound, "no radio is playing in this chat")
 	}
 	vcCleared := false
-	room, found, err := s.store.GetRoom(chatID)
-	if err != nil {
-		return false, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room lookup failed: %v", err))
+	if s.rooms == nil {
+		return false, uds.NewHandlerError(uds.ErrInternal, "room manager not configured")
 	}
-	if found && room.Current != nil && room.Current.Source == "radio" {
-		room.Current = nil
-		room.StreamURL = ""
-		room.PositionSec = 0
-		room.UpdatedAt = time.Now().Unix()
-		if err := s.store.PutRoom(room); err != nil {
-			return false, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room store failed: %v", err))
+	// The room mutation goes through the Manager: the radio track
+	// is dropped from the front only when it is still the active
+	// track — a normal music track that replaced it is NOT
+	// stopped. StopRadio deletes the radio bucket itself; a room
+	// with no radio state is "not the active track", not an error.
+	wasRadio, _, err := s.rooms.StopRadio(chatID)
+	if err != nil {
+		if errors.Is(err, room.ErrNothingPlaying) {
+			wasRadio = false
+		} else {
+			return false, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("room stop failed: %v", err))
 		}
+	}
+	if wasRadio {
 		if s.voice != nil {
 			// Leave the call only if the call was radio-only:
 			// the room had no other track playing. Stop reports
@@ -225,9 +221,6 @@ func (s *Service) Stop(ctx context.Context, chatID int64) (bool, error) {
 				vcCleared = true
 			}
 		}
-	}
-	if err := s.store.DeleteRadio(chatID); err != nil {
-		return false, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("radio store failed: %v", err))
 	}
 	s.mu.Lock()
 	delete(s.handoffs, chatID)
@@ -354,8 +347,14 @@ func (s *Service) handleStatus(ctx context.Context, req uds.Request) (any, error
 		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("queue lookup failed: %v", err))
 	}
 	autoplay := false
+	queueLength := len(queue)
 	if room, found, err := s.store.GetRoom(chatID); err == nil && found {
 		autoplay = room.Autoplay
+		// The stored list includes the playing track at index 0;
+		// the reported queue length counts waiting tracks only.
+		if room.Playing && queueLength > 0 {
+			queueLength--
+		}
 	}
 	s.mu.Lock()
 	handoff := s.handoffs[chatID]
@@ -379,6 +378,6 @@ func (s *Service) handleStatus(ctx context.Context, req uds.Request) (any, error
 		// Superset fields (inventory §7.4): listeners are always
 		// 0 — no listener accounting exists.
 		"listeners": 0, "total_listeners": 0, "loop_type": "none",
-		"autoplay_enabled": autoplay, "queue_length": len(queue),
+		"autoplay_enabled": autoplay, "queue_length": queueLength,
 	}, nil
 }
