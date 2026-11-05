@@ -326,6 +326,8 @@ void Dispatcher::registerCommands() {
     // Playback / queue (NoxBeats cmd/play.cpp, playback.cpp, queue_ops.cpp).
     add({"play", "playforce", "vplay", "vplayforce"}, Scope::Group,
         Perm::Everyone, [this](const CommandContext& c) { onPlay(c); });
+    add({"mix"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onMix(c); });
     add({"playplaylist"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onPlayPlaylist(c); });
     add({"skip", "next"}, Scope::Group, Perm::Everyone,
@@ -364,12 +366,16 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onBass(c); });
     add({"mute", "unmute"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onMute(c); });
+    add({"volume"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onVolume(c); });
     add({"replay"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onReplay(c); });
     add({"player"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onPlayer(c); });
     add({"lyrics", "lyric"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onLyrics(c); });
+    add({"recognize"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onRecognize(c); });
     // Search / download / radio / share / engine.
     add({"search"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onSearch(c); });
@@ -544,7 +550,13 @@ void Dispatcher::registerCommands() {
         {"assistant", "userbot"}, {"userbotjoin", "userbot"},
         {"assistantjoin", "userbot"},
         {"setcplay", "channelplay"}, {"rtmp", "setrtmp"},
+        // s-aliases (TgMusicBot load.go: s + name for every command
+        // in SupportsSilence): the same handler, with only the
+        // success message suppressed (see silent_aliases_).
+        {"splay", "play"}, {"sskip", "skip"}, {"sstop", "stop"},
+        {"spause", "pause"}, {"sresume", "resume"},
     };
+    silent_aliases_ = {"splay", "sskip", "sstop", "spause", "sresume"};
     // c-commands (NoxBeats channel_commands()): name -> (base, is_play).
     channel_cmds_ = {
         {"cplay", {"play", true}}, {"vcplay", {"vplay", true}},
@@ -938,6 +950,8 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         ctx.via_channel = true;
     } else if (auto al = aliases_.find(cmd); al != aliases_.end()) {
         ctx.command = al->second;
+        // s-alias: same handler, success message suppressed.
+        ctx.silent_success = silent_aliases_.count(cmd) > 0;
     }
 
     if (!chatAllowed(msg.chat.id)) {
@@ -1676,7 +1690,8 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     std::string text = ui_texts::nowPlayingText(ct);
     if (!state_line.empty()) text = state_line + "\n\n" + text;
     InlineKeyboard kb = ui_texts::playerKeyboard(
-        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
+        settingsFor(chat_id).thumbnails);
     std::string thumb =
         track->find("thumbnail") ? track->find("thumbnail")->asString() : "";
     CommandContext fake;
@@ -2389,7 +2404,8 @@ void Dispatcher::refreshCardText(int64_t chat_id, int64_t message_id,
     if (loop == 0) loop = chatRtIntField(chat_id, "loop", 0);
     std::string text = ui_texts::nowPlayingText(ct);
     InlineKeyboard kb = ui_texts::playerKeyboard(
-        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
+        settingsFor(chat_id).thumbnails);
     std::string err;
     if (is_photo)
         tg_.editMessageCaption(chat_id, message_id, text, kb, &err);
@@ -2882,13 +2898,18 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                         ? lt->find("thumbnail")->asString()
                         : "";
                 InlineKeyboard kb = ui_texts::queuedKeyboard(ct.token);
-                if (!thumb.empty() && thumbnailsOn(chat)) {
-                    if (replyPhoto(ctx, thumb, text, kb) > 0) {
-                        deleteCommandMessage(ctx);
-                        return;
+                // s-alias: the queueing itself still happens (the
+                // backend accepted it); only the success card is
+                // suppressed. Errors above stay visible.
+                if (!ctx.silent_success) {
+                    if (!thumb.empty() && thumbnailsOn(chat)) {
+                        if (replyPhoto(ctx, thumb, text, kb) > 0) {
+                            deleteCommandMessage(ctx);
+                            return;
+                        }
                     }
+                    replyKb(ctx, text, kb);
                 }
-                replyKb(ctx, text, kb);
                 deleteCommandMessage(ctx);
                 return;
             }
@@ -2896,14 +2917,16 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
         // Queue list unavailable: the current track is still what
         // is playing, so show its card (the queued track is visible
         // in /queue). Never claim the queued track is playing.
-        sendNowPlayingCard(chat, now, "Now playing");
+        if (!ctx.silent_success)
+            sendNowPlayingCard(chat, now, "Now playing");
         deleteCommandMessage(ctx);
         return;
     }
     std::string state_line = "Now playing";
     if (chatRtIntField(chat, "muted", 0))
         state_line += "\n(muted — use /unmute)";
-    sendNowPlayingCard(chat, now, state_line);
+    if (!ctx.silent_success)
+        sendNowPlayingCard(chat, now, state_line);
     deleteCommandMessage(ctx);
 }
 
@@ -2973,10 +2996,12 @@ void Dispatcher::onPause(const CommandContext& ctx) {
     std::string state_line = ui_texts::kCtlPaused;
     // The backend owns the call and the audio: its pause is the
     // pause. No core-side voice step remains.
-    if (state.find("track"))
-        sendNowPlayingCard(vcTarget(ctx), state, state_line);
-    else
-        replyHtml(ctx, state_line);
+    if (!ctx.silent_success) {
+        if (state.find("track"))
+            sendNowPlayingCard(vcTarget(ctx), state, state_line);
+        else
+            replyHtml(ctx, state_line);
+    }
 }
 
 void Dispatcher::onResume(const CommandContext& ctx) {
@@ -2995,10 +3020,12 @@ void Dispatcher::onResume(const CommandContext& ctx) {
     Json state = np ? *np : r.data;
     std::string state_line = ui_texts::kCtlResumed;
     // Mirror of onPause: the backend's resume is the resume.
-    if (state.find("track"))
-        sendNowPlayingCard(vcTarget(ctx), state, state_line);
-    else
-        replyHtml(ctx, state_line);
+    if (!ctx.silent_success) {
+        if (state.find("track"))
+            sendNowPlayingCard(vcTarget(ctx), state, state_line);
+        else
+            replyHtml(ctx, state_line);
+    }
 }
 
 void Dispatcher::onSkip(const CommandContext& ctx) {
@@ -3019,11 +3046,13 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
         // The backend moved to a new track and owns its audio: render
         // the new card. A backend failure would already have been
         // reported above via replyError.
-        sendNowPlayingCard(vcTarget(ctx), *np, ui_texts::kCtlSkipped);
+        if (!ctx.silent_success)
+            sendNowPlayingCard(vcTarget(ctx), *np, ui_texts::kCtlSkipped);
     } else {
         // Queue empty: the backend stopped, so the call is inactive.
         setCallActive(vcTarget(ctx), false);
-        reply(ctx, "Skipped — the queue is now empty.");
+        if (!ctx.silent_success)
+            reply(ctx, "Skipped — the queue is now empty.");
     }
 }
 
@@ -3071,12 +3100,254 @@ void Dispatcher::onStop(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    if (was_active)
-        replyHtml(ctx, ui_texts::fmt(ui_texts::kStoppedCard,
-                                     {{"user", ui_texts::htmlEscape(
-                                                   userLabel(ctx))}}));
-    else
-        replyHtml(ctx, ui_texts::kCtlNotStreaming);
+    if (!ctx.silent_success) {
+        if (was_active)
+            replyHtml(ctx, ui_texts::fmt(ui_texts::kStoppedCard,
+                                         {{"user", ui_texts::htmlEscape(
+                                                       userLabel(ctx))}}));
+        else
+            replyHtml(ctx, ui_texts::kCtlNotStreaming);
+    }
+}
+
+// --- /volume shared step ----------------------------------------------------
+// The panel Vol-/Vol+ buttons and the /volume text command share this
+// step: the backend room owns the live volume, the core keeps only
+// the last applied value (runtime hash) so the +/- buttons can step
+// from it; the vc.volume call is the authority.
+bool Dispatcher::applyVolume(const CommandContext& ctx, int64_t chat_id,
+                             int target, std::string& toast_out) {
+    int v = target;
+    if (v < 0) v = 0;
+    if (v > 200) v = 200;
+    IpcResult r = vcCall(ctx, "volume",
+                         Json::objectOf({
+                             {"chat_id", Json(chat_id)},
+                             {"volume", Json(static_cast<int64_t>(v))},
+                         }));
+    if (!r.ok) {
+        toast_out = r.error_message;
+        return false;
+    }
+    setChatRtField(chat_id, "volume", std::to_string(v));
+    toast_out = ui_texts::toastVolumeSet(v);
+    return true;
+}
+
+// --- /volume <0-200> (remix controls.ts, anonx-cpp handle_volume) ---------
+// Text form of the /menu Vol-/Vol+ buttons: same vc.volume path, same
+// 0-200 range, same "Volume set to N." reply. Usage, non-numeric and
+// out-of-range inputs are refused honestly before any backend call;
+// with nothing in the call the answer is "Not in call."
+void Dispatcher::onVolume(const CommandContext& ctx) {
+    if (!isGroup(ctx)) {
+        reply(ctx, "Music only plays in groups (supergroups).");
+        return;
+    }
+    if (!canManageVc(ctx)) return;
+    std::string arg = trim(ctx.args);
+    if (arg.empty()) {
+        reply(ctx, ui_texts::kVolumeUsage);
+        return;
+    }
+    // Strict integer: an optional '-' followed by digits only (stoi
+    // would silently accept "80x" and "+80").
+    std::string digits = arg;
+    bool negative = false;
+    if (!digits.empty() && digits[0] == '-') {
+        negative = true;
+        digits = digits.substr(1);
+    }
+    long value = 0;
+    bool numeric = !digits.empty() && isDigits(digits);
+    if (numeric) {
+        try {
+            value = std::stol(digits);
+        } catch (...) {
+            numeric = false;
+        }
+    }
+    if (!numeric) {
+        reply(ctx, ui_texts::kVolumeNotNumeric);
+        return;
+    }
+    if (negative) value = -value;
+    if (value < 0 || value > 200) {
+        reply(ctx, ui_texts::kVolumeOutOfRange);
+        return;
+    }
+    if (!callActive(vcTarget(ctx))) {
+        reply(ctx, "Not in call.");
+        return;
+    }
+    std::string toast;
+    if (!applyVolume(ctx, vcTarget(ctx), static_cast<int>(value), toast)) {
+        reply(ctx, toast);
+        return;
+    }
+    reply(ctx, toast);
+}
+
+// --- /mix [song or URL] (TgMusicBot mix.go, §9-E3) ------------------------
+// Posts mix.generate with the query, or with an empty query to seed
+// from the current song. The backend returns a track list; the core
+// enqueues it (vc.queue add per track) and renders the result
+// through the existing queued card path (the first mix track's
+// queued card, with the Play Now button). The fetching message is
+// edited in place with the outcome, so the chat sees one message.
+void Dispatcher::onMix(const CommandContext& ctx) {
+    if (!isGroup(ctx)) {
+        reply(ctx, "Music only plays in groups (supergroups).");
+        return;
+    }
+    if (!playAllowed(ctx, false)) return;
+    int64_t chat = vcTarget(ctx);
+    std::string query = trim(ctx.args);
+    // Bare /mix seeds from the current track (the backend rule);
+    // with nothing playing there is no seed, so answer the usage
+    // card instead of posting a mix the backend must refuse.
+    if (query.empty() && !callActive(chat)) {
+        replyHtml(ctx, ui_texts::kMixUsage);
+        return;
+    }
+    int64_t fetching = reply(ctx, ui_texts::kMixFetching);
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"query", Json(query)},
+        {"requested_by", Json(ctx.message.from.id)},
+    });
+    IpcResult r = vcCall(ctx, "mix.generate", body);
+    // Edit the fetching message with the outcome; a failed edit
+    // falls back to a fresh reply so the outcome is never lost.
+    auto finish = [&](const std::string& text, const InlineKeyboard& kb) {
+        std::string err;
+        if (fetching > 0 &&
+            tg_.editMessageText(chat, fetching, text, kb, &err))
+            return;
+        replyKb(ctx, text, kb);
+    };
+    if (!r.ok) {
+        finish("Service error (" + r.error_code + "): " + r.error_message,
+               InlineKeyboard{});
+        return;
+    }
+    const Json* tracks = r.data.find("tracks");
+    if (!tracks || tracks->size() == 0) {
+        finish(ui_texts::kMixAlreadyQueued, InlineKeyboard{});
+        return;
+    }
+    int added = 0;
+    std::string add_error;
+    for (const auto& t : tracks->asArray()) {
+        Json add = Json::objectOf({
+            {"chat_id", Json(chat)},
+            {"action", Json("add")},
+            {"track", t},
+            {"requested_by", Json(ctx.message.from.id)},
+        });
+        IpcResult ar = vcCall(ctx, "queue", add);
+        if (!ar.ok) {
+            add_error = "Service error (" + ar.error_code + "): " +
+                        ar.error_message;
+            break;
+        }
+        ++added;
+    }
+    if (added == 0) {
+        finish(add_error, InlineKeyboard{});
+        return;
+    }
+    if (!add_error.empty()) {
+        // Partial enqueue: say exactly how many landed before the
+        // refusal, never a blanket success.
+        finish("Added " + std::to_string(added) + " of " +
+                   std::to_string(tracks->size()) +
+                   " mix tracks, then failed: " + add_error,
+               InlineKeyboard{});
+        return;
+    }
+    // Queued card path: the first mix track's queued card. Its
+    // display position comes from the queue list (the tail's
+    // position, like finishPlay); when the list is unavailable the
+    // honest fallback is a plain count, never a guessed position.
+    const Json& first = tracks->asArray()[0];
+    ui_texts::CardTrack ct = cardTrack(first, ctx.message.from.id);
+    Json qbody = Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"action", Json("list")},
+    });
+    IpcResult qr = vcCall(ctx, "queue", qbody);
+    const Json* items = qr.ok ? qr.data.find("queue") : nullptr;
+    if (items && items->size() > 0) {
+        int pos = static_cast<int>(items->size()) - added + 1;
+        finish(ui_texts::queuedText(pos, ct),
+               ui_texts::queuedKeyboard(ct.token));
+    } else {
+        finish("Added " + std::to_string(added) +
+                   " mix tracks to the queue.",
+               InlineKeyboard{});
+    }
+    deleteCommandMessage(ctx);
+}
+
+// --- /recognize (Music163bot-Go /recognize, §9-E4) ------------------------
+// Replies to an audio or voice message: the core downloads it via
+// the TDLib bot session (the same flow as vc.play_file) and posts
+// audio.recognize with the local path. The reply names the
+// identified track, or says honestly that nothing was recognized.
+// When the backend has no provider token it answers
+// engine_unavailable "Music recognition is not configured": that
+// surfaces as the feature-unavailable reply, never a fabricated
+// identification.
+void Dispatcher::onRecognize(const CommandContext& ctx) {
+    if (!ctx.message.has_reply_media ||
+        (ctx.message.reply_media_kind != "audio" &&
+         ctx.message.reply_media_kind != "voice")) {
+        reply(ctx, ui_texts::kRecognizeUsage);
+        return;
+    }
+    std::string saved, err;
+    if (!tg_.downloadFile(ctx.message.reply_media_file_id,
+                          cfg_.data_dir + "/recognize", saved, err)) {
+        reply(ctx, "Could not fetch the replied file: " + err);
+        return;
+    }
+    Json body = Json::objectOf({
+        {"file_path", Json(saved)},
+        {"file_id", Json(ctx.message.reply_media_file_id)},
+    });
+    IpcResult r = vcCall(ctx, "audio.recognize", body);
+    if (!r.ok) {
+        if (r.error_code == "engine_unavailable" &&
+            r.error_message.find("not configured") != std::string::npos) {
+            reply(ctx, ui_texts::kRecognizeNotConfigured);
+            return;
+        }
+        replyError(ctx, r);
+        return;
+    }
+    const Json* rec = r.data.find("recognized");
+    if (!rec || !rec->asBool()) {
+        reply(ctx, ui_texts::kRecognizeNotFound);
+        return;
+    }
+    std::string name =
+        r.data.find("name") ? r.data.find("name")->asString() : "";
+    std::string artists =
+        r.data.find("artists") ? r.data.find("artists")->asString() : "";
+    std::string album =
+        r.data.find("album") ? r.data.find("album")->asString() : "";
+    if (name.empty()) {
+        const Json* track = r.data.find("track");
+        if (track) {
+            name = track->find("title") ? track->find("title")->asString()
+                                        : "";
+            artists = track->find("artist")
+                          ? track->find("artist")->asString()
+                          : "";
+        }
+    }
+    replyHtml(ctx, ui_texts::recognizeText(name, artists, album));
 }
 
 void Dispatcher::onQueue(const CommandContext& ctx) {
@@ -7189,19 +7460,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         // from it; the vc.volume call is the authority.
         int v = static_cast<int>(chatRtIntField(chat_id, "volume", 100));
         v += verb == "volinc" ? 10 : -10;
-        if (v < 0) v = 0;
-        if (v > 200) v = 200;
-        IpcResult r = vcCall(ctx, "volume",
-                             Json::objectOf({
-                                 {"chat_id", Json(chat_id)},
-                                 {"volume", Json(static_cast<int64_t>(v))},
-                             }));
-        if (!r.ok) {
-            error = r.error_message;
-            return false;
-        }
-        setChatRtField(chat_id, "volume", std::to_string(v));
-        error = ui_texts::toastVolumeSet(v);
+        if (!applyVolume(ctx, chat_id, v, error)) return false;
         return true;
     }
     if (verb == "refresh") {

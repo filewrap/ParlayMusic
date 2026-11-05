@@ -510,6 +510,16 @@ int main(int argc, char** argv) {
     harvestKb(deleteConfirmKeyboard("track123"), harvested);
     harvestKb(bcastKeyboard(), harvested);
 
+    // --- A35: the thumbnails toggle is emitted by a builder now
+    // (Package 2: playerKeyboard's Thumbnails row), not just handled.
+    {
+        bool thumb_emitted = false;
+        for (const auto& cb : harvested)
+            if (cb.rfind("pl:player:thumb:", 0) == 0) thumb_emitted = true;
+        CHECK(thumb_emitted,
+              "playerKeyboard emits pl:player:thumb (row A35)");
+    }
+
     // --- B. Templates: one per distinct callback shape in the table.
     // Concrete examples are built by calling the real builders, so a
     // builder that stops emitting the table's shape fails here.
@@ -881,8 +891,8 @@ int main(int argc, char** argv) {
             }
             at = close + 1;
         }
-        CHECK(commands.size() == 113,
-              "113 registered command names in source (got " +
+        CHECK(commands.size() == 116,
+              "116 registered command names in source (got " +
                   std::to_string(commands.size()) + ")");
         for (const auto& c : commands)
             CHECK(has_command(c), "table contains command: /" + c);
@@ -901,8 +911,8 @@ int main(int argc, char** argv) {
                 p = b + 1;
             }
         }
-        CHECK(aliases.size() == 70,
-              "70 aliases in source (got " +
+        CHECK(aliases.size() == 75,
+              "75 aliases in source (got " +
                   std::to_string(aliases.size()) + ")");
         for (const auto& c : aliases)
             CHECK(has_command(c), "table contains alias: /" + c);
@@ -933,6 +943,52 @@ int main(int argc, char** argv) {
                   std::to_string(channel.size()) + ")");
         for (const auto& c : channel)
             CHECK(has_command(c), "table contains channel command: /" + c);
+    }
+
+    // --- G2. Package 2 routes (C87, C88, C103–C108): the new
+    // commands are registered on the right handlers, the s-aliases
+    // map to their bases, and the silent-success flag is set from
+    // the alias table — so each row is routed, not just listed.
+    {
+        size_t reg2 = dispatcher_src.find(
+            "void Dispatcher::registerCommands()");
+        size_t end2 = dispatcher_src.find(
+            "bool Dispatcher::forwardShareMedia", reg2);
+        std::string body2 = dispatcher_src.substr(
+            reg2, end2 == std::string::npos ? std::string::npos
+                                            : end2 - reg2);
+        auto has_reg = [&](const std::string& needle) {
+            return body2.find(needle) != std::string::npos;
+        };
+        CHECK(has_reg("add({\"mix\"}") && has_reg("onMix(c)"),
+              "C87 routed: /mix registered on onMix");
+        CHECK(has_reg("add({\"volume\"}") && has_reg("onVolume(c)"),
+              "C103 routed: /volume registered on onVolume");
+        CHECK(has_reg("add({\"recognize\"}") &&
+                  has_reg("onRecognize(c)"),
+              "C88 routed: /recognize registered on onRecognize");
+        CHECK(has_reg("{\"splay\", \"play\"}") &&
+                  has_reg("{\"sskip\", \"skip\"}") &&
+                  has_reg("{\"sstop\", \"stop\"}") &&
+                  has_reg("{\"spause\", \"pause\"}") &&
+                  has_reg("{\"sresume\", \"resume\"}"),
+              "C104-C108 routed: s-aliases map to their base commands");
+        CHECK(dispatcher_src.find("silent_aliases_ = {\"splay\", "
+                                  "\"sskip\", \"sstop\", \"spause\", "
+                                  "\"sresume\"}") != std::string::npos,
+              "s-aliases: silent_aliases_ lists the five s-forms");
+        CHECK(dispatcher_src.find("ctx.silent_success = "
+                                  "silent_aliases_.count(cmd) > 0;") !=
+                  std::string::npos,
+              "s-aliases: alias resolution sets silent_success");
+        CHECK(contains(table, "onMix` (Group, Everyone)"),
+              "table routes C87 to onMix");
+        CHECK(contains(table, "onVolume` (Group, Everyone)"),
+              "table routes C103 to onVolume");
+        CHECK(contains(table, "onRecognize` (Any, Everyone)"),
+              "table routes C88 to onRecognize");
+        CHECK(contains(table, "silent_aliases_"),
+              "table routes C104-C108 through silent_aliases_");
     }
 
     std::cout << "routing_test: " << templates.size() << " templates, "

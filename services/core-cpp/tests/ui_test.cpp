@@ -158,11 +158,11 @@ int main() {
     CHECK(cbSearchPick(10, 123456789012LL, "a1b2c3d4e5").size() <= 64,
           "callback_data: search pick fits 64 bytes");
 
-    // --- player keyboard: merged 5-row layout ---------------------------
+    // --- player keyboard: merged 6-row layout ---------------------------
     {
         InlineKeyboard kb = playerKeyboard(-1001, false, true, 2, "tok123",
                                            true, 90, 200);
-        CHECK(kb.size() == 5, "playerKeyboard: 5 rows with progress");
+        CHECK(kb.size() == 6, "playerKeyboard: 6 rows with progress");
         CHECK(kb[0].size() == 1 && kb[0][0].callback_data == "pl:player:progress:-1001",
               "playerKeyboard: row 1 is the progress no-op button");
         CHECK(contains(kb[0][0].text, "1:30"),
@@ -179,18 +179,41 @@ int main() {
         CHECK(kb[3].size() == 1 &&
                   contains(kb[3][0].text, "Autoplay: Enabled"),
               "playerKeyboard: row 4 is the autoplay toggle");
-        CHECK(kb[4].size() == 2 &&
-                  kb[4][1].callback_data == "pl:player:addlist:tok123",
-              "playerKeyboard: row 5 has Close + Add to Playlist");
+        CHECK(kb[4].size() == 1 &&
+                  contains(kb[4][0].text, "Thumbnails: Enabled") &&
+                  kb[4][0].callback_data == "pl:player:thumb:-1001",
+              "playerKeyboard: row 5 is the thumbnails toggle, on");
+        CHECK(kb[5].size() == 2 &&
+                  kb[5][1].callback_data == "pl:player:addlist:tok123",
+              "playerKeyboard: row 6 has Close + Add to Playlist");
     }
     {
         InlineKeyboard kb = playerKeyboard(-1001, true, false, 0, "", false, 0, 0);
-        CHECK(kb.size() == 4, "playerKeyboard: 4 rows without progress");
+        CHECK(kb.size() == 5, "playerKeyboard: 5 rows without progress");
         CHECK(kb[0][0].text == "Resume" &&
                   kb[0][0].callback_data == "pl:player:resume:-1001",
               "playerKeyboard: paused state shows the resume button");
-        CHECK(kb[3].size() == 1 && kb[3][0].text == "Close",
+        CHECK(kb[3].size() == 1 &&
+                  contains(kb[3][0].text, "Thumbnails: Enabled"),
+              "playerKeyboard: thumbnails toggle on by default");
+        CHECK(kb[4].size() == 1 && kb[4][0].text == "Close",
               "playerKeyboard: no Add to Playlist without a token");
+    }
+    {
+        // Thumbnails toggle shows the current state, like the
+        // autoplay row (Package 2, row A35).
+        InlineKeyboard kb = playerKeyboard(-1001, false, true, 0, "", true,
+                                           0, 0, false);
+        CHECK(kb.size() == 6 &&
+                  kb[4].size() == 1 &&
+                  contains(kb[4][0].text, "Thumbnails: Disabled") &&
+                  kb[4][0].callback_data == "pl:player:thumb:-1001",
+              "playerKeyboard: thumbnails toggle shows Disabled when off");
+        InlineKeyboard kb_on = playerKeyboard(-1001, false, true, 0, "",
+                                              true, 0, 0, true);
+        CHECK(kb_on[4].size() == 1 &&
+                  contains(kb_on[4][0].text, "Thumbnails: Enabled"),
+              "playerKeyboard: thumbnails toggle shows Enabled when on");
     }
 
     // --- menu panel keyboard ---------------------------------------------

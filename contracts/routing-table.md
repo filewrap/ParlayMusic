@@ -104,9 +104,9 @@ all 18 `cb*` sub-handlers, `registerCommands`, `handleMessage`,
 | A32 | /menu panel | Vol - | `pl:player:voldec:<chat_id>` | `handleCallback` → `cbPlayer` → `playerAction` | `vc.volume` −10 (0–200) | toast `Volume set to N.` + panel refresh | Live |
 | A33 | /menu panel | Vol + | `pl:player:volinc:<chat_id>` | `handleCallback` → `cbPlayer` → `playerAction` | `vc.volume` +10 (0–200) | toast `Volume set to N.` + panel refresh | Live |
 | A34 | /menu panel | Refresh | `pl:player:refresh:<chat_id>` | `handleCallback` → `cbPlayer` → `playerAction` | `vc.now_playing` (read) | toast `Updated.` + panel refresh; nothing playing → alert `Nothing playing right now.` | Live |
-| A35 | n/a — no button emits it | n/a | `pl:player:thumb:<chat_id>` | `handleCallback` → `cbPlayer` → `playerAction` | none (core chat field `thumb`) | toast `Thumbnails enabled.` or `Thumbnails disabled.` + card refresh | No button |
+| A35 | Now-playing card | Thumbnails: Enabled / Disabled | `pl:player:thumb:<chat_id>` | `handleCallback` → `cbPlayer` → `playerAction` | none (core chat field `thumbnails`) | toast `Thumbnails enabled.` or `Thumbnails disabled.` + card refresh | Live |
 | A36 | Queued card | Play Now | `pl:player:playnow:<token>` | `handleCallback` → `cbPlayer` | `vc.stop` then `vc.play` (interrupt) | toast `Track skipped.` + card refresh; expired token → alert `This button has expired.`; empty track → alert `Invalid request.` | Live |
-| A37 | Now-playing card, row 5 | Add to Playlist | `pl:player:addlist:<token>` | `handleCallback` → `cbPlayer` | none (local playlist store) | toast `Added to your playlist.`; already present → toast `Already in your playlist.`; full → alert `Your playlist is full.`; expired token → alert `This button has expired.` | Live |
+| A37 | Now-playing card, row 6 | Add to Playlist | `pl:player:addlist:<token>` | `handleCallback` → `cbPlayer` | none (local playlist store) | toast `Added to your playlist.`; already present → toast `Already in your playlist.`; full → alert `Your playlist is full.`; expired token → alert `This button has expired.` | Live |
 | A38 | Stop-confirm card (paused) | Resume | `pl:player:confirm:resume:<chat_id>` | `handleCallback` → `cbPlayer` | `vc.resume` | toast `Resumed at 0:00.` + card refresh; failure answers the error as an alert | Live |
 | A39 | Stop-confirm card (muted) | Unmute | `pl:player:confirm:unmute:<chat_id>` | `handleCallback` → `cbPlayer` | `vc.mute` muted=false | toast `Unmuted.` + card refresh; failure answers the error as an alert | Live |
 | A40 | Stop-confirm card | Stop | `pl:player:confirm:stop:<chat_id>` | `handleCallback` → `cbPlayer` | `vc.stop` | toast `Playback stopped.` + edit to stopped card (`kStoppedCard`, no keyboard); failure answers the error as an alert | Live |
@@ -300,13 +300,13 @@ from the core's local store / state only.
 | C84 | Group chat | /stream | `/stream <query>` | `handleMessage` → `onStream` (Group, Everyone) | `download.youtube` (resolve to file, then RTMP push) | new message: RTMP stream-started card; no RTMP set → `No RTMP destination set.`; already running → already-running notice; no file → `Downloader returned no file for that query.`; start failure → start-failed notice; no argument → usage | Live |
 | C85 | Group chat | /streamstop | `/streamstop` | `handleMessage` → `onStreamStop` (Group, Everyone) | none | new message: RTMP stopped card; nothing running → `No RTMP stream is running.` | Live |
 | C86 | Group chat | /streamstatus | `/streamstatus` | `handleMessage` → `onStreamStatus` (Group, Everyone) | none | new message: RTMP status card; none active → `No RTMP stream is active.` | Live |
-| C87 | Any chat | /mix | `/mix` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /mix not found.` + the command list for the caller's level) | Phase 3 |
-| C88 | Any chat | /recognize | `/recognize` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /recognize not found.` + the command list for the caller's level) | Phase 3 |
+| C87 | Group chat | /mix | `/mix [song or URL]` | `handleMessage` → `onMix` (Group, Everyone) | `mix.generate`; `vc.queue` add per mix track; `vc.queue` list (queued-card position) | new message: `Fetching mix tracks...`, edited in place with the outcome — the first mix track's queued card (`queuedText` + `queuedKeyboard()` Play Now button) when tracks were enqueued; `All mix tracks are already in the queue or playing.` when the mix is empty; no query and nothing playing → usage card (`kMixUsage`); backend refusal answers the exact error, never a fake mix | Live |
+| C88 | Any chat | /recognize | `/recognize` | `handleMessage` → `onRecognize` (Any, Everyone) | `audio.recognize` (replied file downloaded via the TDLib bot session, then the local path + `file_id`) | new message: `Recognized:` card (track name, artist, album) on a match; `Could not recognize this track.` when the provider finds no match; `Music recognition is not configured.` when the backend has no provider token; no replied audio/voice message → usage `Reply to an audio or voice message to recognize it.`; download/backend failure answers the exact error | Live |
 | C89 | Any chat | /scan | `/scan` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /scan not found.` + the command list for the caller's level) | Phase 3 |
 | C90 | Any chat | /sharescan | `/sharescan` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /sharescan not found.` + the command list for the caller's level) | Phase 3 |
 | C91 | Any chat | /rmcache | `/rmcache` | none — not registered in `registerCommands` | none — no backend action exists | new message: unknown-command card (`kUnknownCommand`: `Command /rmcache not found.` + the command list for the caller's level) | Phase 3 |
 | C92 | Any chat | Unknown command | `/<anything-not-registered>` | `handleMessage` command loop, no route matched | none | new message: unknown-command card (`kUnknownCommand`: `Command /<name> not found.` + the command list for the caller's level) — never silent, never a crash | Live |
-| C93 | Any chat | Aliases (70) | `/p`, `/fplay`, `/forceplay`, `/fvplay`, `/vfplay`, `/q`, `/aplay`, `/setloop`, `/setspeed`, `/speedup`, `/position`, `/addauth`, `/delauth`, `/removeauth`, `/sudoers`, `/listsudo`, `/sudoadd`, `/addsudoer`, `/delsudoer`, `/sudodel`, `/remsudo`, `/sudorem`, `/dropsudo`, `/unsudo`, `/blockuser`, `/blacklistuser`, `/blackuser`, `/bluser`, `/blockchat`, `/blacklistchat`, `/blackchat`, `/blchat`, `/unblockuser`, `/unblacklistuser`, `/unbluser`, `/whitelistuser`, `/unblockchat`, `/unblacklistchat`, `/unblackchat`, `/whitechat`, `/unblchat`, `/blocked`, `/gcast`, `/bcast`, `/active`, `/activevoice`, `/log`, `/bash`, `/shell`, `/nothumbs`, `/commanddelete`, `/bassboost`, `/listplaylist`, `/myplaylist`, `/playlists`, `/mylist`, `/delplaylist`, `/removeplaylist`, `/pplaylist`, `/plplay`, `/playmylist`, `/saveplaylist`, `/addsong`, `/maint`, `/spt`, `/assistant`, `/userbotjoin`, `/assistantjoin`, `/setcplay`, `/rtmp` | `handleMessage` → alias resolution (`aliases_`) → the target command's row (C1–C86) | same as the target command | same rendered update as the target command | Live |
+| C93 | Any chat | Aliases (75) | `/p`, `/fplay`, `/forceplay`, `/fvplay`, `/vfplay`, `/q`, `/aplay`, `/setloop`, `/setspeed`, `/speedup`, `/position`, `/addauth`, `/delauth`, `/removeauth`, `/sudoers`, `/listsudo`, `/sudoadd`, `/addsudoer`, `/delsudoer`, `/sudodel`, `/remsudo`, `/sudorem`, `/dropsudo`, `/unsudo`, `/blockuser`, `/blacklistuser`, `/blackuser`, `/bluser`, `/blockchat`, `/blacklistchat`, `/blackchat`, `/blchat`, `/unblockuser`, `/unblacklistuser`, `/unbluser`, `/whitelistuser`, `/unblockchat`, `/unblacklistchat`, `/unblackchat`, `/whitechat`, `/unblchat`, `/blocked`, `/gcast`, `/bcast`, `/active`, `/activevoice`, `/log`, `/bash`, `/shell`, `/nothumbs`, `/commanddelete`, `/bassboost`, `/listplaylist`, `/myplaylist`, `/playlists`, `/mylist`, `/delplaylist`, `/removeplaylist`, `/pplaylist`, `/plplay`, `/playmylist`, `/saveplaylist`, `/addsong`, `/maint`, `/spt`, `/assistant`, `/userbotjoin`, `/assistantjoin`, `/setcplay`, `/rtmp`, `/splay`, `/sskip`, `/sstop`, `/spause`, `/sresume` | `handleMessage` → alias resolution (`aliases_`) → the target command's row (C1–C86) | same as the target command | same rendered update as the target command; the five s-forms (`/splay`, `/sskip`, `/sstop`, `/spause`, `/sresume`) suppress only the success message — progress, denials and errors stay visible (rows C104–C108) | Live |
 | C94 | Group chat (linked channel) | Channel commands (40) | `/cplay`, `/vcplay`, `/cvplay`, `/cfplay`, `/fcplay`, `/cforceplay`, `/cplayforce`, `/fvcplay`, `/fvplay`, `/vcplayforce`, `/cpause`, `/cresume`, `/cmute`, `/cunmute`, `/cskip`, `/caskip`, `/cstop`, `/cend`, `/cqueue`, `/cclear`, `/cremove`, `/cmove`, `/crestore`, `/cpos`, `/cposition`, `/cseek`, `/cseekback`, `/cjump`, `/cbass`, `/cbassboost`, `/cspeed`, `/csetspeed`, `/cspeedup`, `/creplay`, `/cloop`, `/csetloop`, `/cshuffle`, `/cplayer`, `/cjoin`, `/creload` | `handleMessage` → channel-command resolution (`channel_cmds_`) → the base command's handler, run against the linked channel | same as the base command | same rendered update as the base command, in the linked channel's voice chat | Live |
 | C95 | Any chat | Reply a number (search pick) | plain text `<number>` (bare digits, active search session) | `handleMessage` plain-text path → `playSearchPick` | `vc.play` (via `/play` on the picked track) | the search message is deleted and the now-playing card is sent as a new message; no active session or out of range → the text is ignored (falls through to the unhandled-text path) | Live |
 | C96 | Any chat | Delete trigger | plain text `delete:<path>` | `handleMessage` plain-text path | none | new message: delete-confirm card (`Delete <label>?` + `deleteConfirmKeyboard()`, rows A81–A82); `..` in path → `Invalid path.`; top-level path → `Cannot delete top-level directories.`; empty path → ignored | Live |
@@ -316,6 +316,12 @@ from the core's local store / state only.
 | C100 | DM only | Unhandled text | plain text (any non-command text, no pending state) | `handleMessage` plain-text path | none | new message: start card (`kStartPm` + `startPmKeyboard()`) | Live |
 | C101 | Group chat | Unhandled text | plain text (any non-command text, no pending state, not a digit, not `delete:`, not one of the four reply-keyboard labels in rows B1–B4) | `handleMessage` plain-text path | none | no reply — the text is silently dropped (intended: the bot does not answer arbitrary group chatter) | Live |
 | C102 | Group chat | /quality | `/quality` | `handleMessage` → `onQuality` (Any, Everyone) | `quality.get` read | new message: quality card (effective Opus values with source per field — store / config file / profile / default — plus an "applies on next join" note) with the bitrate / frame-size / reset buttons; DM → `These settings are available only in groups.` | Live |
+| C103 | Group chat | /volume | `/volume <0-200>` | `handleMessage` → `onVolume` (Group, Everyone) | `vc.volume` (same path as the /menu Vol-/Vol+ buttons, rows A32–A33) | new message: `Volume set to N.`; no argument → usage `Usage: /volume <0-200>`; non-numeric → `Volume must be a number between 0 and 200.`; out of range → `Volume must be between 0 and 200.`; nothing playing → `Not in call.`; backend refusal answers the backend error | Live |
+| C104 | Group chat | /splay | `/splay [song/link]` | `handleMessage` → alias resolution (`aliases_`, `silent_aliases_`) → `onPlay` (Group, Everyone) | same as /play (row C1) | the base command runs exactly as /play, except the success card is suppressed; usage, denials, progress and backend errors stay visible | Live |
+| C105 | Group chat | /sskip | `/sskip` | `handleMessage` → alias resolution (`aliases_`, `silent_aliases_`) → `onSkip` (Group, Everyone) | same as /skip (row C3) | the base command runs exactly as /skip, except the success card is suppressed; usage, denials, progress and backend errors stay visible | Live |
+| C106 | Group chat | /sstop | `/sstop` | `handleMessage` → alias resolution (`aliases_`, `silent_aliases_`) → `onStop` (Group, Everyone) | same as /stop (row C7) | the base command runs exactly as /stop, except the success reply is suppressed; usage, denials, progress and backend errors stay visible | Live |
+| C107 | Group chat | /spause | `/spause` | `handleMessage` → alias resolution (`aliases_`, `silent_aliases_`) → `onPause` (Group, Everyone) | same as /pause (row C5) | the base command runs exactly as /pause, except the success card is suppressed; usage, denials, progress and backend errors stay visible | Live |
+| C108 | Group chat | /sresume | `/sresume` | `handleMessage` → alias resolution (`aliases_`, `silent_aliases_`) → `onResume` (Group, Everyone) | same as /resume (row C6) | the base command runs exactly as /resume, except the success card is suppressed; usage, denials, progress and backend errors stay visible | Live |
 
 ## §D. Inline mode + deep links
 
@@ -353,8 +359,8 @@ the row's Status to `Live`.
 |---|---|---|---|
 | E1 | `download.cancel` | A63 | Live: backend action `download.cancel` registered since Phase 3; the core posts it from `cbDl` (Q4 wiring) — cancel answers `Download cancelled.` and retires the progress message |
 | E2 | `library.delete` | A81, A82, C96 | Live: backend action `library.delete` registered since Phase 3; the core posts it from `cbDel` (Q4 wiring) — `yes` deletes the record and the file and answers `Deleted.` |
-| E3 | `/mix` | C87 | Register the command + new backend action (mix generation); today it answers the unknown-command card |
-| E4 | `/recognize` | C88 | Register the command + new backend action (audio recognition); today it answers the unknown-command card |
+| E3 | `/mix` | C87 | Live: backend action `mix.generate` registered since Phase 3; the core posts it from `onMix` (Package 2) — the mix tracks are enqueued (`vc.queue` add per track) and the first mix track's queued card is rendered; bare `/mix` with nothing playing answers the usage card |
+| E4 | `/recognize` | C88 | Live: backend action `audio.recognize` registered since Phase 3; the core posts it from `onRecognize` (Package 2) — the replied audio/voice file is downloaded via the TDLib bot session and the local path posted; an unconfigured provider answers `Music recognition is not configured.` |
 | E5 | `/scan` | C89 | Register the command + new backend action (library scan); today it answers the unknown-command card |
 | E6 | `/sharescan` | C90 | Register the command + new backend action (share scan); today it answers the unknown-command card |
 | E7 | `/rmcache` | C91 | Register the command + new backend action (cache clear); today it answers the unknown-command card |
@@ -389,10 +395,11 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
   Handler-only callbacks (a branch exists, no button emits it):
   `pl:help:owner` / `pl:help:radio` / `pl:help:search` (rows A14–A16 —
   topics exist in `helpTopicText` but have no menu button),
-  `pl:player:thumb` (row A35 — `playerAction` handles `thumb`, no
-  button emits it), `pl:share:cancel` (row A78 — the share prompt's
-  Cancel button is `pl:close`, row A19), `pl:lang:<non-en>` (row A62 —
-  the picker offers English alone). These are recorded, not dropped.
+  `pl:share:cancel` (row A78 — the share prompt's Cancel button is
+  `pl:close`, row A19), `pl:lang:<non-en>` (row A62 — the picker
+  offers English alone). These are recorded, not dropped.
+  (`pl:player:thumb`, row A35, used to be in this list; the
+  now-playing card's Thumbnails row emits it since Package 2.)
 - **Buttons built outside the core.** Two callback families are emitted
   by other services, not by `ui_texts.hpp`: `pl:vote:approve/decline`
   (rows A75–A76, backend-go:vote voting card) and `pl:spotify:dislike`
@@ -457,15 +464,17 @@ call site in every `*Keyboard` builder, and every domain/verb branch in
   only a line made of `|`, `-`, `:`, spaces as a separator, so rows
   containing `spotify----` are checked, not skipped):
   `python3 -c "import re,sys; sep=re.compile(r'^\|[\s\-|:]+\|$'); rows=[l for l in open('contracts/routing-table.md') if l.startswith('|') and not sep.match(l)]; bad=[l for l in rows if any(not c.strip() for c in l.strip().strip('|').split('|'))]; print(f'{len(rows)} rows, {len(bad)} blank cells'); sys.exit(1 if bad else 0)"`.
-  Result: **249 rows, 0 blank cells** (re-run after any edit).
+  Result: **255 rows, 0 blank cells** (re-run after any edit).
 - **Counts (this file):** callbacks §A: 99 rows (A1–A99: 99 live); reply-keyboard
   buttons §B.1: 4 rows; URL / switch-inline buttons §B.2: 11 rows;
-  commands §C: 102 rows (C1–C102: 87 live command groups covering 88
-  `add()` groups + 5 OD-3 commands + unknown-command + 70 aliases +
-  40 channel commands + 7 plain-text rows); inline mode §D: 12 rows;
+  commands §C: 108 rows (C1–C108: 90 live command rows covering 91
+  `add()` groups + 3 OD-3 commands + unknown-command + 75 aliases +
+  40 channel commands + 7 plain-text rows + 5 s-alias rows); inline mode §D: 12 rows;
   OD-3 index §E: 11 entries (pointing at §A–§D rows, not new rows);
-  **total table rows: 99 + 4 + 11 + 102 + 12 = 228 rows; OD-3 rows
-  among them: 10** (A63, A81, A94, C87–C91, D9, D10). The 11th OD-3
+  **total table rows: 99 + 4 + 11 + 108 + 12 = 234 rows; OD-3 rows
+  among them: 10** (A63, A81, A94, C87–C91, D9, D10). C87 and C88 are
+  Live since Package 2; the remaining Phase 3-status rows are
+  C89–C91. The 11th OD-3
   item (E9, download prefs contract fields) shares the Live rows
   A87–A92 / C48 / C97 and is tracked as an index entry only.
 - **Full-suite result after this work:** see the Phase 2 report
