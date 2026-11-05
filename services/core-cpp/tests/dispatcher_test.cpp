@@ -342,6 +342,18 @@ public:
     mutable std::string skip_response;
     mutable std::string pause_response;
     mutable std::string resume_response;
+    // Scripted Package 2 answers (empty = fall through to the 404
+    // below, per the FakeIpc contract above): mix.generate /
+    // audio.recognize success payloads and failure messages, and a
+    // vc.volume failure message. mix_error / recognize_error are
+    // reported as bad_request / engine_unavailable respectively (the
+    // codes the real backend uses for a refused mix and an
+    // unconfigured recognition provider).
+    mutable std::string mix_response;
+    mutable std::string mix_error;
+    mutable std::string recognize_response;
+    mutable std::string recognize_error;
+    mutable std::string volume_error;
     // Scripted Phase 9-gaps answers (empty = fall through to the 404
     // below, per the FakeIpc contract above): search.inline tracks,
     // vc.lyrics text, NetEase search/lyrics, download POSTs, and the
@@ -537,6 +549,52 @@ public:
             r.http_status = 200;
             r.data = parlay::Json::parse(skip_response);
             return r;
+        }
+        if (action == "stop") {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
+        if (action == "volume") {
+            if (!volume_error.empty()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = volume_error;
+                return r;
+            }
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
+        if (action == "mix.generate") {
+            if (!mix_error.empty()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = mix_error;
+                return r;
+            }
+            if (!mix_response.empty()) {
+                r.ok = true;
+                r.http_status = 200;
+                r.data = parlay::Json::parse(mix_response);
+                return r;
+            }
+        }
+        if (action == "audio.recognize") {
+            if (!recognize_error.empty()) {
+                r.http_status = 502;
+                r.error_code = "engine_unavailable";
+                r.error_message = recognize_error;
+                return r;
+            }
+            if (!recognize_response.empty()) {
+                r.ok = true;
+                r.http_status = 200;
+                r.data = parlay::Json::parse(recognize_response);
+                return r;
+            }
         }
         // Queue actions (Phase 9 §K): list returns the scripted
         // waiting queue when set, else an empty queue; clear/add/
@@ -3923,6 +3981,327 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "This chat has ID"),
               "pkg1 blacklist: non-blacklisted non-owner still runs /id");
+
+    // --- P2. /mix, /volume, /recognize, s-aliases (Package 2) -------------
+    const std::string mix_tracks =
+        R"({"tracks":[{"id":"yt:mix1","title":"Mix Song One","artist":"Mix Artist","source":"youtube","url":"https://www.youtube.com/watch?v=mix1","duration_sec":200,"duration_str":"3:20"},{"id":"yt:mix2","title":"Mix Song Two","artist":"Mix Artist","source":"youtube","url":"https://www.youtube.com/watch?v=mix2","duration_sec":180,"duration_str":"3:00"}],"source_track":{"id":"yt:seed","title":"Seed Song","source":"youtube"}})";
+    {
+        // Bare /mix with nothing playing: usage, no backend call.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1301, 111, "/mix"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage:") &&
+                  contains(rig.tg.replies[0], "/mix [song or URL]"),
+              "mix no-query: usage card, no mix.generate post");
+        CHECK(!has_post(rig, "mix.generate"),
+              "mix no-query: no mix.generate posted");
+    }
+    {
+        // /mix with a query: mix.generate posted, tracks enqueued
+        // (vc.queue add per track), first track's queued card
+        // rendered by editing the fetching message in place.
+        Rig rig;
+        rig.ipc.mix_response = mix_tracks;
+        rig.ipc.queue_list_response = R"({"queue":[{},{}]})";
+        rig.d.handleMessage(makeMsg(-1302, 111, "/mix Seed Song"));
+        CHECK(has_post(rig, "mix.generate"),
+              "mix query: mix.generate issued to the backend");
+        {
+            parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[0]);
+            CHECK(b.find("query") &&
+                      b.find("query")->asString() == "Seed Song",
+                  "mix query: mix.generate carries the query");
+        }
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Fetching mix tracks...",
+              "mix query: fetching reply sent");
+        int queue_posts = 0;
+        for (const auto& p : rig.ipc.posts)
+            if (p.find("|queue") != std::string::npos) ++queue_posts;
+        CHECK(queue_posts == 3,
+              "mix query: two vc.queue adds + one list");
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Added to Queue:") &&
+                  contains(rig.tg.edits[0].text, "#1") &&
+                  contains(rig.tg.edits[0].text, "Mix Song One"),
+              "mix query: first mix track queued card edited in place");
+    }
+    {
+        // Bare /mix while a track is playing: seeds from the current
+        // song (empty query posted).
+        Rig rig;
+        rig.ipc.mix_response = mix_tracks;
+        rig.ipc.queue_list_response = R"({"queue":[{},{}]})";
+        rig.store.set("call:-1303", "1");
+        rig.d.handleMessage(makeMsg(-1303, 111, "/mix"));
+        CHECK(has_post(rig, "mix.generate"),
+              "mix bare while playing: mix.generate issued");
+        {
+            parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[0]);
+            CHECK(b.find("query") && b.find("query")->asString().empty(),
+                  "mix bare while playing: empty query seeds from current");
+        }
+    }
+    {
+        // Backend refuses the mix: the exact error, edited in place.
+        Rig rig;
+        rig.ipc.mix_error = "Seed is not a YouTube track.";
+        rig.d.handleMessage(makeMsg(-1304, 111, "/mix Seed Song"));
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Service error") &&
+                  contains(rig.tg.edits[0].text,
+                           "Seed is not a YouTube track."),
+              "mix failure: exact backend error edited in place");
+    }
+    {
+        // Empty mix: every track already queued or playing.
+        Rig rig;
+        rig.ipc.mix_response =
+            R"({"tracks":[],"source_track":{"id":"yt:seed","title":"Seed Song","source":"youtube"}})";
+        rig.d.handleMessage(makeMsg(-1305, 111, "/mix Seed Song"));
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text,
+                           "already in the queue or playing"),
+              "mix empty: already-queued text edited in place");
+        CHECK(!has_post(rig, "queue"),
+              "mix empty: nothing enqueued");
+    }
+    {
+        // /volume: usage, non-numeric, out of range, nothing
+        // playing, success, boundaries, backend refusal.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1310, 111, "/volume"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /volume"),
+              "volume usage: no argument answers the usage line");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1311, 111, "/volume loud"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "must be a number"),
+              "volume non-numeric: refused honestly");
+        CHECK(!has_post(rig, "volume"),
+              "volume non-numeric: no vc.volume posted");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1312, 111, "/volume 201"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "must be between 0 and 200"),
+              "volume out-of-range: 201 refused");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1313, 111, "/volume -5"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0],
+                           "must be between 0 and 200"),
+              "volume out-of-range: -5 refused");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1314, 111, "/volume 80"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Not in call.",
+              "volume nothing-playing: Not in call.");
+        CHECK(!has_post(rig, "volume"),
+              "volume nothing-playing: no vc.volume posted");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1315", "1");
+        rig.d.handleMessage(makeMsg(-1315, 111, "/volume 80"));
+        CHECK(has_post(rig, "volume"),
+              "volume success: vc.volume issued to the backend");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("volume") && b.find("volume")->asInt() == 80,
+                  "volume success: vc.volume carries 80");
+        }
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Volume set to 80.",
+              "volume success: Volume set to 80.");
+        auto f = rig.store.hgetall("chatrt:-1315");
+        CHECK(f["volume"] == "80",
+              "volume success: applied value kept for the +/- buttons");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1316", "1");
+        rig.d.handleMessage(makeMsg(-1316, 111, "/volume 0"));
+        rig.d.handleMessage(makeMsg(-1316, 111, "/volume 200"));
+        CHECK(rig.tg.replies.size() == 2 &&
+                  rig.tg.replies[0] == "Volume set to 0." &&
+                  rig.tg.replies[1] == "Volume set to 200.",
+              "volume boundaries: 0 and 200 both accepted");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1317", "1");
+        rig.ipc.volume_error = "engine down";
+        rig.d.handleMessage(makeMsg(-1317, 111, "/volume 80"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "engine down"),
+              "volume backend refusal: exact error reported");
+        auto f = rig.store.hgetall("chatrt:-1317");
+        CHECK(f.count("volume") == 0,
+              "volume backend refusal: no value recorded");
+    }
+    {
+        // /splay: same play, success card suppressed, call still
+        // marked active; usage and backend errors stay visible.
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.d.handleMessage(makeMsg(-1321, 111, "/splay Test Song"));
+        CHECK(has_post(rig, "play"),
+              "splay: vc.play issued to the backend");
+        CHECK(rig.tg.replies.empty(),
+              "splay: success card suppressed");
+        auto c = rig.store.get("call:-1321");
+        CHECK(c && *c == "1", "splay: call marked active");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1322, 111, "/splay Test Song"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Service error"),
+              "splay error: backend refusal stays visible");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1323, 111, "/splay"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Whoops! Nothing to play."),
+              "splay usage: no-query usage stays visible");
+    }
+    {
+        // Plain /pause still renders its card: suppression is
+        // per-invocation, not a mode.
+        Rig rig;
+        rig.store.set("call:-1324", "1");
+        rig.ipc.pause_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
+        rig.d.handleMessage(makeMsg(-1324, 111, "/pause"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Paused"),
+              "pause control: plain /pause renders its card");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1325", "1");
+        rig.ipc.skip_response = skip_np;
+        rig.d.handleMessage(makeMsg(-1325, 111, "/sskip"));
+        CHECK(has_post(rig, "skip"), "sskip: vc.skip issued");
+        CHECK(rig.tg.replies.empty(),
+              "sskip: success card suppressed");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1326", "1");
+        rig.d.handleMessage(makeMsg(-1326, 111, "/sstop"));
+        CHECK(has_post(rig, "stop"), "sstop: vc.stop issued");
+        CHECK(rig.tg.replies.empty(),
+              "sstop: success reply suppressed");
+        auto c = rig.store.get("call:-1326");
+        CHECK(!c || *c != "1", "sstop: call marked inactive");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1327", "1");
+        rig.ipc.pause_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
+        rig.d.handleMessage(makeMsg(-1327, 111, "/spause"));
+        CHECK(has_post(rig, "pause"), "spause: vc.pause issued");
+        CHECK(rig.tg.replies.empty(),
+              "spause: success card suppressed");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1328", "1");
+        rig.ipc.resume_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":false}})";
+        rig.d.handleMessage(makeMsg(-1328, 111, "/sresume"));
+        CHECK(has_post(rig, "resume"), "sresume: vc.resume issued");
+        CHECK(rig.tg.replies.empty(),
+              "sresume: success card suppressed");
+    }
+    {
+        // /recognize: usage without a replied audio/voice message.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1331, 111, "/recognize"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /recognize"),
+              "recognize no-reply: usage");
+        CHECK(!has_post(rig, "audio.recognize"),
+              "recognize no-reply: no audio.recognize posted");
+    }
+    {
+        Rig rig;
+        parlay::TgMessage m = makeMsg(-1332, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "PHOTO1";
+        m.reply_media_kind = "photo";
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /recognize"),
+              "recognize non-audio reply: usage");
+    }
+    {
+        // Recognized: the identified track is named.
+        Rig rig;
+        rig.ipc.recognize_response =
+            R"({"recognized":true,"name":"Song Title","artists":"Some Artist","album":"Some Album","source":"audd"})";
+        parlay::TgMessage m = makeMsg(-1333, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "VOICE1";
+        m.reply_media_kind = "voice";
+        rig.d.handleMessage(m);
+        CHECK(has_post(rig, "audio.recognize"),
+              "recognize match: audio.recognize issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Recognized:") &&
+                  contains(rig.tg.replies[0], "Song Title") &&
+                  contains(rig.tg.replies[0], "Some Artist"),
+              "recognize match: identified track named");
+    }
+    {
+        // Unconfigured provider: honest feature-unavailable reply,
+        // never a fabricated identification, no setup text leaked.
+        Rig rig;
+        rig.ipc.recognize_error =
+            "Music recognition is not configured: set AUDD_API_TOKEN "
+            "(from dashboard.audd.io) in the environment";
+        parlay::TgMessage m = makeMsg(-1334, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "AUDIO1";
+        m.reply_media_kind = "audio";
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] ==
+                      "Music recognition is not configured.",
+              "recognize unconfigured: honest unavailable reply");
+    }
+    {
+        // Provider finds no match: honest not-recognized reply.
+        Rig rig;
+        rig.ipc.recognize_response = R"({"recognized":false})";
+        parlay::TgMessage m = makeMsg(-1335, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "VOICE1";
+        m.reply_media_kind = "voice";
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "Could not recognize this track."),
+              "recognize no-match: honest not-recognized reply");
     }
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");

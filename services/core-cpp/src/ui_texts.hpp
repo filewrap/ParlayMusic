@@ -957,17 +957,21 @@ inline std::string queuedText(int index, const CardTrack& t) {
                 {"by", t.requester}});
 }
 
-// Merged 5-row control keyboard (Tina seek row + Yukki pause toggle +
+// Merged 6-row control keyboard (Tina seek row + Yukki pause toggle +
 // Parvati autoplay row, §4). Row 1 is the no-op progress button (only
 // when NOT queued — the caller omits it for queued cards). The pause
-// button reads Pause while playing, Resume while paused. Row 5 is Close +
-// Add-to-Playlist (TgMusicBot). The loop state is shown on the replay
-// button label when looping ("Loop ×n").
+// button reads Pause while playing, Resume while paused. The autoplay
+// and thumbnails rows show the current per-chat setting, like the
+// autoplay row; the thumbnails row emits the already-routed
+// pl:player:thumb callback. Row 6 is Close + Add-to-Playlist
+// (TgMusicBot). The loop state is shown on the replay button label
+// when looping ("Loop ×n").
 inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
                                      bool autoplay_on, int loop_count,
                                      const std::string& token,
                                      bool include_progress,
-                                     int64_t pos_sec, int64_t dur_sec) {
+                                     int64_t pos_sec, int64_t dur_sec,
+                                     bool thumbnails_on = true) {
     using B = InlineButton;
     InlineKeyboard kb;
     if (include_progress) {
@@ -992,6 +996,10 @@ inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
     kb.push_back({B::callback(
         std::string("Autoplay: ") + (autoplay_on ? "Enabled" : "Disabled"),
         cbPlayer("autoplay", chat_id))});
+    kb.push_back({B::callback(
+        std::string("Thumbnails: ") +
+            (thumbnails_on ? "Enabled" : "Disabled"),
+        cbPlayer("thumb", chat_id))});
     std::vector<B> row5;
     row5.push_back(B::callback("Close", kCbClose));
     if (!token.empty())
@@ -1143,6 +1151,17 @@ inline const char* kToastPanelUpdated = "Updated.";
 inline std::string toastVolumeSet(int amount) {
     return "Volume set to " + std::to_string(amount) + ".";
 }
+
+// /volume (remix controls.ts, anonx-cpp handle_volume): usage with
+// no argument, the non-numeric reply, and the out-of-range reply.
+// The range is 0-200, the same range the /menu Vol-/Vol+ buttons
+// step through.
+inline const char* kVolumeUsage =
+    "Usage: /volume <0-200>\nPass a number between 0 and 200.";
+inline const char* kVolumeNotNumeric =
+    "Volume must be a number between 0 and 200.";
+inline const char* kVolumeOutOfRange =
+    "Volume must be between 0 and 200.";
 
 // /now (remix §2.2, §4).
 inline std::string nowText(const std::string& title,
@@ -1377,6 +1396,39 @@ inline const char* kNoSongQuery =
 inline std::string playTooLongText(int minutes) {
     return fmt("Sorry, song exceeds max duration of {n} minutes.",
                {{"n", std::to_string(minutes)}});
+}
+
+// /mix lifecycle (TgMusicBot mix.go): usage when there is no query
+// and nothing playing to seed from; the fetching line while the
+// backend builds the mix; the already-queued line when every mix
+// track is already in the queue or playing.
+inline const char* kMixUsage =
+    "<b>Usage:</b>\n/mix [song or URL]\n\nOr run /mix while a song is "
+    "currently playing to create a mix based on it.";
+inline const char* kMixFetching = "Fetching mix tracks...";
+inline const char* kMixAlreadyQueued =
+    "All mix tracks are already in the queue or playing.";
+
+// /recognize (Music163bot-Go /recognize): usage when the command does
+// not reply to an audio or voice message; the not-configured line
+// when the backend has no recognition provider token (the backend
+// answers engine_unavailable "Music recognition is not configured");
+// the not-found line when the provider finds no match.
+inline const char* kRecognizeUsage =
+    "Reply to an audio or voice message to recognize it. "
+    "Usage: /recognize";
+inline const char* kRecognizeNotConfigured =
+    "Music recognition is not configured.";
+inline const char* kRecognizeNotFound = "Could not recognize this track.";
+inline std::string recognizeText(const std::string& name,
+                                 const std::string& artists,
+                                 const std::string& album) {
+    std::string out = "<b>Recognized:</b> " + htmlEscape(name);
+    if (!artists.empty())
+        out += "\n<b>Artist:</b> " + htmlEscape(artists);
+    if (!album.empty())
+        out += "\n<b>Album:</b> " + htmlEscape(album);
+    return out;
 }
 
 // --- §8 download progress ---------------------------------------------------

@@ -309,6 +309,12 @@ struct CommandContext {
     std::string command;  // lowercased, without leading '/' or @bot suffix
     std::string args;     // raw argument text after the command
     bool via_channel = false;  // c-command: run against the linked channel
+    // s-alias invocation (TgMusicBot SupportsSilence: /splay, /sskip,
+    // /sstop, /spause, /sresume): the base handler runs exactly as
+    // for the plain command, except its SUCCESS message is
+    // suppressed. Usage replies, denials, progress and backend
+    // errors stay visible — silence covers only the success outcome.
+    bool silent_success = false;
     // Phase 1 telemetry: steady-clock microseconds when
     // Dispatcher::handleMessage received this command (0 = unknown,
     // e.g. a context built outside handleMessage). t_dispatch_to_ipc
@@ -747,6 +753,13 @@ private:
     bool playerAction(int64_t chat_id, const std::string& verb,
                       int64_t user_id, const TgCallbackQuery* cq,
                       std::string& error);
+    // Shared vc.volume step (the /menu Vol-/Vol+ panel buttons and
+    // the /volume text command): clamps the target to 0-200, posts
+    // vc.volume, records the applied value in the runtime hash, and
+    // returns the success toast in toast_out. False + the backend's
+    // error message in toast_out when the backend refuses.
+    bool applyVolume(const CommandContext& ctx, int64_t chat_id,
+                     int target, std::string& toast_out);
     // Re-render the now-playing card in place on the callback's
     // message (after a player action). No-op when there is no card.
     void refreshCard(const TgCallbackQuery& cq, int64_t chat_id);
@@ -786,6 +799,9 @@ private:
     void onStart(const CommandContext& ctx);
     void onHelp(const CommandContext& ctx);
     void onPlay(const CommandContext& ctx);
+    void onMix(const CommandContext& ctx);
+    void onVolume(const CommandContext& ctx);
+    void onRecognize(const CommandContext& ctx);
     void onPause(const CommandContext& ctx);
     void onResume(const CommandContext& ctx);
     void onSkip(const CommandContext& ctx);
@@ -921,6 +937,9 @@ private:
 
     std::vector<Route> routes_;
     std::map<std::string, std::string> aliases_;
+    // s-aliases (TgMusicBot SupportsSilence): the alias names whose
+    // invocations set CommandContext::silent_success.
+    std::set<std::string> silent_aliases_;
     std::map<std::string, std::pair<std::string, bool>> channel_cmds_;
 
     // Settings cache (Q7): one snapshot per chat, fetched from the
