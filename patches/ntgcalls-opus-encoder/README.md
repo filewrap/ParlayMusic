@@ -70,13 +70,15 @@ push. What DOES survive:
 - This patch file + README + `scripts/rebuild-ntgcalls.sh` (all
   committed in the outer repo).
 - `scripts/package-release.sh`, which ships the rebuilt
-  `libntgcalls.so` (98,123,704 bytes, size-pinned) in the release
+  `libntgcalls.so` (98,092,096 bytes, size-pinned) in the release
   tarball under `lib/`.
 
 What does NOT survive a fresh clone and must be rebuilt on the
 build machine: the `.so` itself (`refs/ntgcalls/shared-output/lib/
 libntgcalls.so`, 98 MB — never committed to git), the `build-c/`
-directory, and the apt package `libpulse-dev` (see below). The
+directory, the vendored clang toolchain (`deps/clang/`, also
+gitignored — the rebuild script re-downloads it), and the apt
+packages `libasound2-dev` + `libpulse-dev` (see below). The
 release tarball is the distribution path for the `.so`.
 
 ## Rebuild
@@ -86,11 +88,12 @@ scripts/rebuild-ntgcalls.sh            # full rebuild from the patch
 ```
 
 Prerequisites (build machine): `cmake`, `make`, a C++20
-toolchain, and the PulseAudio dev headers — the build fails at
-~78% on `pulse/pulseaudio.h` without them:
+toolchain, and the ALSA + PulseAudio dev headers — the build fails
+at ~74% on `alsa/asoundlib.h` and at ~78% on
+`pulse/pulseaudio.h` without them:
 
 ```sh
-apt-get install -y libpulse-dev
+apt-get install -y libasound2-dev libpulse-dev
 ```
 
 (On Ubuntu 24.04 this may require downgrading `libpulse0` to the
@@ -99,7 +102,7 @@ change. A VM replacement wipes apt-installed packages, so
 re-install on every fresh build host.)
 
 Expected result: `refs/ntgcalls/shared-output/lib/libntgcalls.so`,
-98,123,704 bytes (size varies slightly per toolchain — the
+98,092,096 bytes (size varies slightly per toolchain — the
 packaging size pin in `scripts/package-release.sh` must be updated
 if a rebuild changes it), exporting `ntg_opus_set_config`,
 `ntg_opus_get_config`, `ntg_opus_set_bitrate` (verify with

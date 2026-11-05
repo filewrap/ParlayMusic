@@ -15,11 +15,12 @@
 # refs/ntgcalls/shared-output/lib/libntgcalls.so — the exact path
 # the Go cgo link uses.
 #
-# Prerequisites: cmake, make, C++20 toolchain, libpulse-dev
-# (the build fails at ~78% on pulse/pulseaudio.h without it:
-#   apt-get install -y libpulse-dev
-# On Ubuntu 24.04 that may require downgrading libpulse0 to the
-# exact version libpulse-dev depends on; same SONAME, no ABI change.)
+# Prerequisites: cmake, make, a C++20 toolchain, and the ALSA +
+# PulseAudio dev headers (the build fails at ~74% on
+# alsa/asoundlib.h and at ~78% on pulse/pulseaudio.h without them:
+#   apt-get install -y libasound2-dev libpulse-dev
+# On Ubuntu 24.04 libpulse-dev may require downgrading libpulse0 to
+# the exact version it depends on; same SONAME, no ABI change.)
 #
 # Usage: scripts/rebuild-ntgcalls.sh [--clean]
 #   --clean: remove the existing build dir first (full rebuild;
@@ -28,7 +29,7 @@
 #            after headers are installed).
 #
 # Expected result: refs/ntgcalls/shared-output/lib/libntgcalls.so
-# (~98,123,704 bytes for this toolchain; the packaging size pin in
+# (~98,092,096 bytes for this toolchain; the packaging size pin in
 # scripts/package-release.sh must be updated if a rebuild changes
 # it), exporting the 3 ntg_opus_* symbols. The script verifies that
 # and fails loudly otherwise.
@@ -48,12 +49,20 @@ command -v cmake >/dev/null 2>&1 || { echo "ERROR: cmake not found" >&2; exit 1;
 if [ ! -d "$NTG_DIR/.git" ]; then
     echo "==> cloning ntgcalls $BASE_REV (refs/ is gitignored; fresh clone has no checkout)"
     mkdir -p "$ROOT/refs"
-    git clone "$UPSTREAM" "$NTG_DIR"
+    # --recurse-submodules: deps/oboe and deps/pybind11 are submodules
+    # that configure REQUIRES (cmake/ThirdPartyNotices.cmake reads
+    # their LICENSE files). A plain clone leaves them empty and the
+    # configure fails with "file failed to open for reading:
+    # deps/oboe/LICENSE" (2026-11-05).
+    git clone --recurse-submodules "$UPSTREAM" "$NTG_DIR"
 fi
 
 cd "$NTG_DIR"
 git fetch --quiet origin || true
 git checkout --quiet "$BASE_REV"
+# An EXISTING checkout can also have empty submodule dirs (wiped or
+# partial clone); make sure they are populated for configure.
+git submodule update --init --recursive
 # The patch must apply cleanly to the pristine base. Detect "already
 # applied" from the TREE (reverse-apply check), not from an existing
 # .so: after `git checkout -- .` the tree is pristine but a stale
@@ -93,6 +102,28 @@ elif [ -f build-c/CMakeCache.txt ]; then
     fi
 fi
 
+# Vendored clang: deps/clang/ is gitignored, so a wiped build host
+# has no toolchain at all. FindClang.cmake re-downloads it, but in a
+# SILENT execute_process with no RESULT_CHECK — a transient network
+# failure is swallowed and the configure then dies at project() with
+# the confusing "CMAKE_C_COMPILER: .../deps/clang/bin/clang is not a
+# full path to an existing compiler tool" (2026-11-05). When
+# update.py is present, run it here with visible output. When it is
+# missing entirely (fresh clone), FindClang's GitFile fetches it
+# during configure (20 retries) — let that path do its job.
+if [ ! -x "$NTG_DIR/deps/clang/bin/clang" ] && [ -f "$NTG_DIR/deps/clang/update.py" ]; then
+    command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found (needed to download the vendored clang toolchain)" >&2; exit 1; }
+    echo "==> vendored clang missing (deps/clang is gitignored); downloading via deps/clang/update.py"
+    python3 "$NTG_DIR/deps/clang/update.py" --output-dir "$NTG_DIR/deps/clang"
+fi
+
+# Dev headers: a wiped build host lacks them and the build dies
+# mid-compile at ~74% (alsa/asoundlib.h) / ~78% (pulse/pulseaudio.h);
+# fail early with the exact fix instead (2026-11-05).
+for header in /usr/include/alsa/asoundlib.h /usr/include/pulse/pulseaudio.h; do
+    [ -f "$header" ] || { echo "ERROR: $header not found; install with: apt-get install -y libasound2-dev libpulse-dev" >&2; exit 1; }
+done
+
 echo "==> configure"
 # The toolchain file is REQUIRED, not optional: GetProperty (used by
 # every cmake/Find*.cmake) is defined in cmake/PlatformUtils.cmake,
@@ -101,7 +132,7 @@ echo "==> configure"
 # 'GetProperty'". It worked in the sandbox only because build-c/
 # already had the toolchain file cached from the first configure.
 cmake -S . -B build-c -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=OFF -DUSE_LIBCXX=ON -DBINDING=c -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain.cmake
-echo "==> build (incremental; ~4 min first time after libpulse-dev install)"
+echo "==> build (incremental; ~4 min first time after the dev headers are installed)"
 cmake --build build-c --target ntgcalls -j2
 
 SO="shared-output/lib/libntgcalls.so"
