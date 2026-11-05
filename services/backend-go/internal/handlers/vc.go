@@ -488,15 +488,28 @@ func (h *Handlers) vcAutoplaySkip(ctx context.Context, req uds.Request) (any, er
 		h.events.VoiceError(chatID, "join_failed", err.Error())
 		return nil, errEngineUnavailable("voice join failed: %v", err)
 	}
-	pick, _, err := h.rooms.AutoplaySkip(ctx, chatID)
+	pick, last, err := h.rooms.AutoplaySkip(ctx, chatID)
 	if err != nil {
 		return nil, mapRoomErr(err)
 	}
 	if _, berr := h.bindTrack(ctx, chatID, pick); berr != nil {
-		// The pick stands as current (the room transition is
-		// irreversible — the previous track is already replaced);
-		// the failure is surfaced, not hidden.
+		// Roll back (queue-port Tier 1, item 3): the pick
+		// never got a feed, so it must not stand as the
+		// active track. Put the replaced track back at the
+		// front and re-bind it; when that succeeds the room
+		// is playing the previous track again and the pick
+		// failure is still surfaced. When the re-bind fails
+		// too, drop to queued-only rather than standing on
+		// a track with no feed behind it.
 		h.events.VoiceError(chatID, "stream_error", berr.Error())
+		if _, rerr := h.rooms.ReplaceFront(chatID, last); rerr == nil {
+			if _, rberr := h.bindTrack(ctx, chatID, last); rberr == nil {
+				h.applyMuteIfNeeded(chatID)
+				h.events.TrackStarted(chatID, last)
+				return nil, errEngineUnavailable("voice bind failed for autoplay pick: %v", berr)
+			}
+		}
+		_, _ = h.rooms.ClearCurrent(chatID)
 		return nil, errEngineUnavailable("voice bind failed: %v", berr)
 	}
 	h.applyMuteIfNeeded(chatID)

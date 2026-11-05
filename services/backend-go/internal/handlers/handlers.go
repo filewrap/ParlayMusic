@@ -17,16 +17,25 @@
 //     untouched. Background advances (feed-end) never join.
 //   - vc.play binds the feed BEFORE firing TrackStarted, so a
 //     failed bind rolls the room back to idle with no event fired.
-//     Advances fire their events right after the room transition
-//     (the transition is irreversible — the queue pop is consumed)
-//     and then bind; a bind failure there surfaces as VoiceError
-//     plus the action error, with the room standing advanced.
-//   - Track advance is event-driven only: the voice feed's EOF
-//     (Manager.OnFeedEnd) or its gapless slot promotion
-//     (Manager.OnTransition) advances the room. There is NO polling
-//     ticker and NO watcher. OnFeedEnd/OnTransition never block the
-//     pump goroutine: they capture the ended/transitioned track id
-//     and dispatch the advance to a worker goroutine (blocking
+//     Advances bind BEFORE firing their events too (the
+//     transition is irreversible — the queue pop is consumed) and
+//     a bind failure advances past the broken track, bounded to
+//     three binds per call; when the voice call itself is gone
+//     the session ends instead. A track is never reported as
+//     playing with no feed behind it.
+//   - Track advance has three triggers, all funnelling through
+//     the one advancePlayback path with the ended-track id as
+//     the dedup key, so a double fire is a no-op (queue-port
+//     Tier 1): the voice feed's EOF (Manager.OnFeedEnd), the
+//     ntgcalls stream-end for audio streams
+//     (Manager.OnStreamEnd), and the 4-second wall-clock
+//     watchdog (a track past its duration for three consecutive
+//     ticks advances — the rescue when both event sources fail).
+//     The DSP gapless slot promotion (Manager.OnTransition)
+//     advances without a rebind, because the audio is already
+//     flowing. OnFeedEnd/OnTransition/OnStreamEnd/watchdog never
+//     block their caller: they capture the ended track id and
+//     dispatch the advance to a worker goroutine (blocking
 //     there while a skip waits in feed.Stop() for the pump to
 //     return would deadlock).
 //   - One per-chat lock serialises every operation that changes
@@ -75,6 +84,20 @@ type Handlers struct {
 
 	feedMu  sync.Mutex
 	feeding map[int64]string // chatID -> track id currently being fed to voice
+
+	// watchdogMu guards watchdogStreak: chatID -> the last track
+	// id the watchdog saw past its duration, and how many
+	// consecutive 4-second ticks it has been past it. A track
+	// change resets the streak, so a stale entry can never
+	// advance a fresh track early.
+	watchdogMu     sync.Mutex
+	watchdogStreak map[int64]watchdogState
+}
+
+// watchdogState is one chat's watchdog streak.
+type watchdogState struct {
+	trackID string
+	streak  int
 }
 
 // New builds the Handlers for deps: it takes the room manager and
@@ -89,12 +112,13 @@ type Handlers struct {
 // configured); vc.lyrics answers engine_unavailable in that case.
 func New(d *app.Deps) *Handlers {
 	h := &Handlers{
-		deps:      d,
-		rooms:     d.Room,
-		events:    events.New(d.Server),
-		lyrics:    d.Lyrics,
-		chatLocks: map[int64]*sync.Mutex{},
-		feeding:   map[int64]string{},
+		deps:           d,
+		rooms:          d.Room,
+		events:         events.New(d.Server),
+		lyrics:         d.Lyrics,
+		chatLocks:      map[int64]*sync.Mutex{},
+		feeding:        map[int64]string{},
+		watchdogStreak: map[int64]watchdogState{},
 	}
 	h.picker = newMixPicker(d.Registry)
 	d.Room.SetPicker(h.picker)
@@ -116,23 +140,20 @@ func New(d *app.Deps) *Handlers {
 }
 
 // Register wires the vc.* actions onto the server and installs the
-// voice callbacks (feed-end advance, stream-end logging). It is the
-// contract-shaped entry point: func Register(s *uds.Server, d
-// *app.Deps).
+// voice callbacks (feed-end advance, stream-end advance, gapless
+// promotion) and the queue watchdog. It is the contract-shaped
+// entry point: func Register(s *uds.Server, d *app.Deps).
 func Register(s *uds.Server, d *app.Deps) {
 	h := New(d)
-	// Voice callbacks: the feed-end advance and the gapless slot
-	// promotion are the ONLY track advance triggers (no polling,
-	// no watcher).
+	// Voice callbacks: the feed-end advance, the ntgcalls
+	// stream-end advance (audio streams only), and the gapless
+	// slot promotion are the event-driven advance triggers, and
+	// the watchdog loop is the rescue when both event sources
+	// fail (queue-port Tier 1, items 1-2).
 	d.Voice.OnFeedEnd(h.onFeedEnd)
 	d.Voice.OnTransition(h.onTransition)
-	d.Voice.OnStreamEnd(func(chatID int64, streamType voice.StreamType, device voice.StreamDevice) {
-		// The ntgcalls stream-end is not an advance trigger (the
-		// external source never ends by itself; the feeder's EOF
-		// is the boundary signal). Log it; take no playback
-		// action, so a stream-end can never double-advance.
-		log.Printf("handlers: stream end chat %d type %d device %d", chatID, streamType, device)
-	})
+	d.Voice.OnStreamEnd(h.onStreamEnd)
+	go h.watchdogLoop()
 
 	for action, fn := range map[string]uds.Handler{
 		"vc.play":          h.vcPlay,
@@ -278,6 +299,16 @@ func (h *Handlers) clearFeeding(chatID int64) {
 
 // --- voice orchestration ---------------------------------------------
 
+// hasLiveCall reports whether chatID has a connected voice call.
+// A call record in any other state (joining, failed, left) is not
+// a live call: binding a feed to it would fail in startStream,
+// so callers treat it as "no call" and end the session instead of
+// draining the queue into a dead call.
+func (h *Handlers) hasLiveCall(chatID int64) bool {
+	call, ok := h.deps.Voice.Get(chatID)
+	return ok && call.State == voice.StateConnected
+}
+
 // ensureCall joins the voice call for chatID when no connected call
 // exists, and is a no-op when one does. A failure returns the exact
 // stage error and never reports success.
@@ -383,19 +414,19 @@ func (h *Handlers) prefetchCancel(chatID int64) {
 // prefetch falls back to the direct stream URL, never delaying the
 // bind. The room's DSP parameters (speed, bass, volume, FX
 // preset) are read once per bind and applied from the first frame.
-// When no call record exists at all the bind is skipped and (false,
-// nil) is returned: the room is the source of truth and the audio
-// simply is not flowing. When a call record exists, the bind is
-// attempted and its error returned. The bool reports whether a
-// feed is now running. In both non-running cases the feeding
-// record is cleared: Manager.Play stops the old feed before
-// starting the new one, so a failed bind leaves no feed running,
-// and a stale feeding id would make a later feed-end look like
-// the wrong track ended.
+// When no call record exists at all the bind FAILS LOUDLY: a
+// track must never be reported as playing with no feed behind it
+// (the ghost — queue-port Tier 1, item 6). Callers advance past
+// the track or end the session on this error, never claim
+// success. The bool reports whether a feed is now running. In
+// both non-running cases the feeding record is cleared:
+// Manager.Play stops the old feed before starting the new one, so
+// a failed bind leaves no feed running, and a stale feeding id
+// would make a later feed-end look like the wrong track ended.
 func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Track) (bool, error) {
-	if _, ok := h.deps.Voice.Get(chatID); !ok {
+	if !h.hasLiveCall(chatID) {
 		h.clearFeeding(chatID)
-		return false, nil
+		return false, fmt.Errorf("no active voice call in this chat")
 	}
 	if track.StreamURL == "" {
 		h.clearFeeding(chatID)
@@ -476,15 +507,26 @@ func (h *Handlers) resumeFeed(ctx context.Context, chatID int64) error {
 	return nil
 }
 
+// maxBindAttempts is the bind budget per advance call: a track
+// that fails to bind is popped and the next one tried, at most
+// this many binds (Parvati's 3-attempt rule, queue-port Tier 1
+// item 16). When the budget is spent the room stands on the
+// broken track with a VoiceError behind it, and the watchdog
+// advances past it on its next cycle — the queue drains one
+// broken track per watchdog tick instead of wedging.
+const maxBindAttempts = 3
+
 // advancePlayback runs one room Advance and drives voice + events
 // from the outcome. It is the single advance path for vc.skip,
-// vc.autoplay_skip's aftermath, and the feed-end callback, so the
-// §4.5 events fire exactly once per transition. Events fire right
-// after the room transition (the transition is irreversible — the
-// queue pop is consumed); the voice bind follows, and a bind
-// failure surfaces as VoiceError plus the returned error, with
-// the room standing advanced. The returned snapshot is the room
-// after the advance.
+// vc.autoplay_skip's aftermath, the feed-end callback, the
+// stream-end callback, and the watchdog, so the §4.5 events fire
+// exactly once per transition. Events fire only after the voice
+// bind succeeds — a track that never got a feed is never
+// announced as playing. A bind failure advances past the broken
+// track (bounded by maxBindAttempts); when the voice call itself
+// is gone the session ends instead (queue-port Tier 1, item 5:
+// a failure always moves the queue or ends the session). The
+// returned snapshot is the room after the advance.
 func (h *Handlers) advancePlayback(ctx context.Context, chatID int64, endedID string, fromSkip bool) (room.AdvanceOutcome, model.NowPlaying, error) {
 	return h.advancePlaybackMode(ctx, chatID, endedID, fromSkip, true)
 }
@@ -502,64 +544,114 @@ func (h *Handlers) advancePlaybackMode(ctx context.Context, chatID int64, endedI
 	if err != nil {
 		return out, model.NowPlaying{}, mapRoomErr(err)
 	}
-	switch out.Kind {
-	case room.AdvanceNoOp:
-		// Nothing advanced: no events, no voice action.
-	case room.AdvanceReplayed:
-		// A loop replay fires TrackStarted only — never
-		// TrackAdvanced (§4.5).
-		h.events.TrackStarted(chatID, *out.Track)
-		if rebind {
-			if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
+	binds := 0
+	for {
+		switch out.Kind {
+		case room.AdvanceNoOp:
+			// Nothing advanced: no events, no voice action.
+			snap, _ := h.rooms.Snapshot(chatID)
+			return out, snap, nil
+		case room.AdvanceReplayed, room.AdvanceNext, room.AdvanceAutoplay:
+			if !rebind {
+				// Gapless path: the DSP is already playing
+				// the promoted track; events only.
+				h.fireAdvanceEvents(chatID, out)
 				snap, _ := h.rooms.Snapshot(chatID)
-				return out, snap, err
+				h.maybePrefetch(chatID, snap)
+				return out, snap, nil
 			}
+			if binds >= maxBindAttempts {
+				h.events.VoiceError(chatID, "stream_error", "voice bind failed repeatedly; track left standing for the watchdog")
+				snap, _ := h.rooms.Snapshot(chatID)
+				return out, snap, errEngineUnavailable("voice bind failed")
+			}
+			binds++
+			if berr := h.bindAfterAdvance(ctx, chatID, *out.Track); berr != nil {
+				if !h.hasLiveCall(chatID) {
+					// The call is gone: end the session
+					// (item 5) instead of draining the
+					// queue into a dead call.
+					h.endSession(chatID, out)
+					snap, _ := h.rooms.Snapshot(chatID)
+					return out, snap, berr
+				}
+				// Advance past the broken track and try the
+				// next one. The pop is consumed; the broken
+				// track never fired TrackStarted.
+				log.Printf("handlers: advance chat %d track %s failed to bind (%v); advancing past it", chatID, out.Track.ID, berr)
+				out, err = h.rooms.Advance(ctx, chatID, out.Track.ID, false)
+				if err != nil {
+					return out, model.NowPlaying{}, mapRoomErr(err)
+				}
+				continue
+			}
+			h.fireAdvanceEvents(chatID, out)
+			snap, _ := h.rooms.Snapshot(chatID)
+			h.maybePrefetch(chatID, snap)
+			return out, snap, nil
+		case room.AdvanceIdle:
+			h.fireIdleEvents(chatID, out)
+			snap, _ := h.rooms.Snapshot(chatID)
+			h.prefetchCancel(chatID)
+			return out, snap, nil
 		}
+	}
+}
+
+// fireAdvanceEvents fires the §4.5 events for a track that just
+// started playing. A loop replay fires TrackStarted only — never
+// TrackAdvanced.
+func (h *Handlers) fireAdvanceEvents(chatID int64, out room.AdvanceOutcome) {
+	switch out.Kind {
+	case room.AdvanceReplayed:
+		h.events.TrackStarted(chatID, *out.Track)
 	case room.AdvanceNext:
 		h.events.TrackAdvanced(chatID, *out.Track, out.PreviousTrackID)
 		h.events.TrackStarted(chatID, *out.Track)
-		if rebind {
-			if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
-				snap, _ := h.rooms.Snapshot(chatID)
-				return out, snap, err
-			}
-		}
 	case room.AdvanceAutoplay:
 		h.events.TrackStarted(chatID, *out.Track)
-		if rebind {
-			if err := h.bindAfterAdvance(ctx, chatID, *out.Track); err != nil {
-				snap, _ := h.rooms.Snapshot(chatID)
-				return out, snap, err
-			}
-		}
-	case room.AdvanceIdle:
-		if out.EndedTrack != nil {
-			h.events.TrackEnded(chatID, *out.EndedTrack, out.Reason)
-		}
-		h.events.QueueEmpty(chatID)
-		// The room went idle: leave the call (vc-rust rule —
-		// VOICE.stop on Idle). Best effort; the room is idle
-		// either way. The feeding record is cleared whether or
-		// not a call record exists: an idle room has no feed.
-		h.clearFeeding(chatID)
-		if _, ok := h.deps.Voice.Get(chatID); ok {
-			if err := h.deps.Voice.Stop(chatID); err != nil {
-				log.Printf("handlers: leave idle call chat %d: %v", chatID, err)
-			}
+	}
+}
+
+// fireIdleEvents fires the §4.5 events for a room that went idle
+// and leaves the voice call (vc-rust rule — VOICE.stop on Idle).
+// Best effort; the room is idle either way. The feeding record is
+// cleared whether or not a call record exists: an idle room has
+// no feed.
+func (h *Handlers) fireIdleEvents(chatID int64, out room.AdvanceOutcome) {
+	if out.EndedTrack != nil {
+		h.events.TrackEnded(chatID, *out.EndedTrack, out.Reason)
+	}
+	h.events.QueueEmpty(chatID)
+	h.clearFeeding(chatID)
+	if _, ok := h.deps.Voice.Get(chatID); ok {
+		if err := h.deps.Voice.Stop(chatID); err != nil {
+			log.Printf("handlers: leave idle call chat %d: %v", chatID, err)
 		}
 	}
-	snap, _ := h.rooms.Snapshot(chatID)
-	// Lookahead: a track just started, so the next one is
-	// prefetched in the background (the loop replay when Loop >
-	// 0, else N+1 — see maybePrefetch); an idle room drops any
-	// pending prefetch.
-	switch out.Kind {
-	case room.AdvanceNext, room.AdvanceAutoplay, room.AdvanceReplayed:
-		h.maybePrefetch(chatID, snap)
-	case room.AdvanceIdle:
-		h.prefetchCancel(chatID)
+}
+
+// endSession ends the playback session for a chat whose voice call
+// is gone: the room is stopped outright (queue included), the
+// feeding record is cleared, any pending prefetch is dropped, and
+// the call is left best-effort. A failure always moves the queue
+// or ends the session — it never leaves a track standing with no
+// call behind it (queue-port Tier 1, item 5).
+func (h *Handlers) endSession(chatID int64, out room.AdvanceOutcome) {
+	if out.EndedTrack != nil {
+		h.events.TrackEnded(chatID, *out.EndedTrack, "call_ended")
 	}
-	return out, snap, nil
+	h.events.QueueEmpty(chatID)
+	h.clearFeeding(chatID)
+	h.prefetchCancel(chatID)
+	if _, err := h.rooms.Stop(chatID); err != nil {
+		log.Printf("handlers: end session chat %d room stop: %v", chatID, err)
+	}
+	if _, ok := h.deps.Voice.Get(chatID); ok {
+		if err := h.deps.Voice.Stop(chatID); err != nil {
+			log.Printf("handlers: end session chat %d leave call: %v", chatID, err)
+		}
+	}
 }
 
 // bindAfterAdvance binds the feed for a track an advance just
@@ -601,6 +693,103 @@ func (h *Handlers) advanceFromFeedEnd(chatID int64, endedID string, feedErr erro
 	// transition (or NoOp, when the user already skipped or
 	// stopped) is the outcome.
 	_, _, _ = h.advancePlayback(ctx, chatID, endedID, false)
+}
+
+// advanceFromTrigger runs one background advance for a trigger
+// that already captured its ended track id (stream-end,
+// watchdog). The per-chat lock serialises it against skips and
+// other triggers; the ended-id dedup in room.Advance makes a
+// stale or duplicate fire a no-op.
+func (h *Handlers) advanceFromTrigger(chatID int64, endedID string) {
+	h.chatLock(chatID).Lock()
+	defer h.chatLock(chatID).Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _, _ = h.advancePlayback(ctx, chatID, endedID, false)
+}
+
+// onStreamEnd is the ntgcalls stream-end callback
+// (Manager.OnStreamEnd) — a real advance trigger (queue-port
+// Tier 1, item 1). Video-stream ends never advance the audio
+// queue (item 9); an audio-stream end advances the room exactly
+// like a feed EOF, with the ended-track id as the dedup key, so a
+// stream-end that races a feed-end (or a skip) is a no-op. It
+// NEVER blocks the ntgcalls callback thread.
+func (h *Handlers) onStreamEnd(chatID int64, streamType voice.StreamType, device voice.StreamDevice) {
+	if streamType != voice.StreamTypeAudio {
+		return
+	}
+	endedID, ok := h.getFeeding(chatID)
+	if !ok {
+		return // no feed was playing; spurious end
+	}
+	go h.advanceFromTrigger(chatID, endedID)
+}
+
+// watchdogInterval is the queue watchdog tick (Parvati's 4 s
+// monitor, queue-port Tier 1 item 2). watchdogEndStreak is how
+// many consecutive ticks a track must be past its duration
+// before the watchdog advances (12 s of overshoot).
+const (
+	watchdogInterval  = 4 * time.Second
+	watchdogEndStreak = 3
+)
+
+// watchdogLoop runs the queue watchdog for the backend's
+// lifetime: every tick it checks every room with an active track
+// whose wall-clock position has passed the track's duration.
+func (h *Handlers) watchdogLoop() {
+	t := time.NewTicker(watchdogInterval)
+	defer t.Stop()
+	for range t.C {
+		h.watchdogTick()
+	}
+}
+
+// watchdogTick advances rooms whose active track is past its
+// duration for watchdogEndStreak consecutive ticks. The position
+// is the room's wall-clock clock (never polled from the voice
+// engine); the feed record must exist for the track (a track with
+// no feed — a replied file, an unreachable radio — is not the
+// watchdog's job). Paused rooms and duration-less tracks never
+// advance.
+func (h *Handlers) watchdogTick() {
+	for _, snap := range h.rooms.PlayingSnapshots() {
+		if snap.Track == nil || snap.Track.DurationSec <= 0 || snap.IsPaused {
+			h.watchdogReset(snap.ChatID)
+			continue
+		}
+		feeding, ok := h.getFeeding(snap.ChatID)
+		if !ok || feeding != snap.Track.ID {
+			h.watchdogReset(snap.ChatID)
+			continue
+		}
+		if snap.PositionSec < snap.Track.DurationSec {
+			h.watchdogReset(snap.ChatID)
+			continue
+		}
+		h.watchdogMu.Lock()
+		st := h.watchdogStreak[snap.ChatID]
+		if st.trackID != snap.Track.ID {
+			st = watchdogState{trackID: snap.Track.ID}
+		}
+		st.streak++
+		h.watchdogStreak[snap.ChatID] = st
+		streak := st.streak
+		h.watchdogMu.Unlock()
+		if streak >= watchdogEndStreak {
+			h.watchdogReset(snap.ChatID)
+			log.Printf("handlers: watchdog chat %d track %s past duration for %d ticks; advancing", snap.ChatID, snap.Track.ID, streak)
+			go h.advanceFromTrigger(snap.ChatID, snap.Track.ID)
+		}
+	}
+}
+
+// watchdogReset clears a chat's watchdog streak.
+func (h *Handlers) watchdogReset(chatID int64) {
+	h.watchdogMu.Lock()
+	defer h.watchdogMu.Unlock()
+	delete(h.watchdogStreak, chatID)
 }
 
 // onTransition is the DSP gapless-promotion callback
