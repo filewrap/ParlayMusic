@@ -149,5 +149,15 @@ echo "==> verify: $SO ($(stat -c%s "$SO") bytes)"
 [ "$(nm -D "$SO" | grep -c " T ntg_opus_get_config")" -gt 0 ] || { echo "ERROR: ntg_opus_get_config not exported" >&2; exit 1; }
 [ "$(nm -D "$SO" | grep -c " T ntg_opus_set_bitrate")" -gt 0 ] || { echo "ERROR: ntg_opus_set_bitrate not exported" >&2; exit 1; }
 nm -D "$SO" | grep "ntg_opus"
+# Runtime copy in lib/: start.sh puts $ROOT/lib FIRST on
+# LD_LIBRARY_PATH, which outranks the backend binary's RUNPATH (the
+# refs/ntgcalls dir). A stale STOCK 3.0.5 copy in lib/ therefore
+# shadows the patched build and crashes the backend at the first
+# ntg_opus_* call with "undefined symbol: ntg_opus_set_config"
+# (2026-11-05). Keep the runtime copy in sync with the build.
+if [ -d "$ROOT/lib" ] && [ -f "$ROOT/lib/libntgcalls.so" ] && ! cmp -s "$NTG_DIR/$SO" "$ROOT/lib/libntgcalls.so"; then
+    echo "==> syncing patched .so to $ROOT/lib/libntgcalls.so (a stale copy there would shadow the build)"
+    cp --remove-destination "$NTG_DIR/$SO" "$ROOT/lib/libntgcalls.so"
+fi
 echo "OK: patched libntgcalls.so rebuilt at $NTG_DIR/$SO"
 echo "NOTE: if the size changed, update the NTG size pin in scripts/package-release.sh"
