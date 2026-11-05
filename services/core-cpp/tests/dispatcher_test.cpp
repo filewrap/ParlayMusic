@@ -93,6 +93,10 @@ public:
         std::string text, kind;  // kind: text | caption | markup
     };
     std::vector<EditCall> edits;
+    // Serialised keyboard of each editMessageText / editMessageCaption
+    // call, in order (Package 3: the retry button on an edited card
+    // is only visible through the markup).
+    std::vector<std::string> edit_markups;
     struct ToastCall {
         std::string id, text;
         bool alert;
@@ -120,6 +124,7 @@ public:
             for (const auto& b : row) {
                 out += b.text + "=";
                 if (!b.callback_data.empty()) out += b.callback_data;
+                else if (!b.copy_text.empty()) out += b.copy_text;
                 else if (!b.url.empty()) out += b.url;
                 else if (b.has_switch) out += b.switch_inline_query;
                 out += "|";
@@ -195,18 +200,18 @@ public:
                          const std::string& text,
                          const parlay::InlineKeyboard& kb,
                          std::string* error_out = nullptr) override {
-        (void)kb;
         (void)error_out;
         edits.push_back({chat_id, message_id, text, "text"});
+        edit_markups.push_back(serialiseKb(kb));
         return true;
     }
     bool editMessageCaption(int64_t chat_id, int64_t message_id,
                             const std::string& caption,
                             const parlay::InlineKeyboard& kb,
                             std::string* error_out = nullptr) override {
-        (void)kb;
         (void)error_out;
         edits.push_back({chat_id, message_id, caption, "caption"});
+        edit_markups.push_back(serialiseKb(kb));
         return true;
     }
     bool editMessageReplyMarkup(int64_t chat_id, int64_t message_id,
@@ -360,10 +365,19 @@ public:
     // radio status GET. last_post_body records the most recent POST
     // body so tests can assert the chat_id the core passed.
     mutable std::string inline_response;
+    // Scripted /search answer (Package 3, R4): when set, the search
+    // POST succeeds with this JSON ({"results":[...]}).
+    mutable std::string search_response;
     mutable std::string lyrics_response;
     mutable std::string netease_search_response;
     mutable std::string netease_lyrics_response;
     mutable std::string download_response;
+    // Scripted download failure (Package 3, R6): when set, every
+    // download/* POST fails with this message instead of succeeding.
+    mutable std::string download_error;
+    // Scripted spotify.collection answer (Package 3, R5): when set,
+    // the collection metadata call succeeds with this JSON.
+    mutable std::string spotify_collection_response;
     mutable std::string radio_status_response;
     // Scripted Phase 4 (Q4) answers (empty = fall through to the 404
     // below): download.cancel / library.delete success payloads.
@@ -436,6 +450,12 @@ public:
             r.data = parlay::Json::parse(inline_response);
             return r;
         }
+        if (action == "search" && !search_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(search_response);
+            return r;
+        }
         if (action == "lyrics" && !lyrics_response.empty()) {
             r.ok = true;
             r.http_status = 200;
@@ -457,10 +477,25 @@ public:
             return r;
         }
         if (action.rfind("download/", 0) == 0 &&
+            !download_error.empty()) {
+            r.ok = false;
+            r.http_status = 400;
+            r.error_code = "download_failed";
+            r.error_message = download_error;
+            return r;
+        }
+        if (action.rfind("download/", 0) == 0 &&
             !download_response.empty()) {
             r.ok = true;
             r.http_status = 200;
             r.data = parlay::Json::parse(download_response);
+            return r;
+        }
+        if (action == "spotify.collection" &&
+            !spotify_collection_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(spotify_collection_response);
             return r;
         }
         if (action == "loop") {
@@ -3760,14 +3795,6 @@ int main() {
                   rig.ipc.posts.empty(),
               "pkg1 unknown command: refined reply, no post");
     }
-    {
-        Rig rig;
-        rig.d.handleMessage(makeMsg(-1001, 111, "/mix"));
-        CHECK(rig.tg.replies.size() == 1 &&
-                  contains(rig.tg.replies[0], "doesn't exist") &&
-                  contains(rig.tg.replies[0], "/help"),
-              "pkg1 unknown command /mix: refined reply");
-    }
     // S1: /rmcache — sudo-only gate, cache.clear post, cleared
     // result, honest refusal when the backend refuses.
     {
@@ -3958,10 +3985,14 @@ int main() {
     // S5: the owner is exempt from the blacklist-user refusal on
     // Everyone commands; a blacklisted non-owner is still refused
     // silently, and a non-blacklisted non-owner still runs them.
+    // The blacklisted non-owner is 4444, a fresh id: 111 is the
+    // workhorse user for later package tests and must not be
+    // blacklisted in the shared file store (merge fix: it was 111,
+    // which silently refused every later Everyone command from 111
+    // and segfaulted the /mix tests on an empty post_bodies[0]).
     {
         Rig rig;
         rig.store.sadd("bl_users", "999");
-        rig.store.sadd("bl_users", "111");
         rig.d.handleMessage(makeMsg(-1001, 999, "/id"));
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "This chat has ID"),
@@ -3969,8 +4000,8 @@ int main() {
     }
     {
         Rig rig;
-        rig.store.sadd("bl_users", "111");
-        rig.d.handleMessage(makeMsg(-1001, 111, "/id"));
+        rig.store.sadd("bl_users", "4444");
+        rig.d.handleMessage(makeMsg(-1001, 4444, "/id"));
         CHECK(rig.tg.replies.empty(),
               "pkg1 blacklist: blacklisted non-owner still refused "
               "silently");
@@ -3981,6 +4012,7 @@ int main() {
         CHECK(rig.tg.replies.size() == 1 &&
                   contains(rig.tg.replies[0], "This chat has ID"),
               "pkg1 blacklist: non-blacklisted non-owner still runs /id");
+    }
 
     // --- P2. /mix, /volume, /recognize, s-aliases (Package 2) -------------
     const std::string mix_tracks =
@@ -4006,7 +4038,9 @@ int main() {
         rig.d.handleMessage(makeMsg(-1302, 111, "/mix Seed Song"));
         CHECK(has_post(rig, "mix.generate"),
               "mix query: mix.generate issued to the backend");
-        {
+        CHECK(!rig.ipc.post_bodies.empty(),
+              "mix query: a post body was recorded");
+        if (!rig.ipc.post_bodies.empty()) {
             parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[0]);
             CHECK(b.find("query") &&
                       b.find("query")->asString() == "Seed Song",
@@ -4036,7 +4070,9 @@ int main() {
         rig.d.handleMessage(makeMsg(-1303, 111, "/mix"));
         CHECK(has_post(rig, "mix.generate"),
               "mix bare while playing: mix.generate issued");
-        {
+        CHECK(!rig.ipc.post_bodies.empty(),
+              "mix bare while playing: a post body was recorded");
+        if (!rig.ipc.post_bodies.empty()) {
             parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[0]);
             CHECK(b.find("query") && b.find("query")->asString().empty(),
                   "mix bare while playing: empty query seeds from current");
@@ -4303,6 +4339,246 @@ int main() {
                            "Could not recognize this track."),
               "recognize no-match: honest not-recognized reply");
     }
+
+    // --- Package 3, R2: configured default-thumbnail fallback -----
+    // Exercised through /play -> finishPlay -> sendNowPlayingCard.
+    {
+        auto npNoThumb = std::string(
+            R"({"now_playing":{"track":{"id":"t1","title":"No Thumb Song","artist":"A","duration_sec":200},"position_sec":0,"paused":false}})");
+        {
+            Rig rig;
+            rig.cfg.default_thumbnail =
+                "https://example.invalid/default.jpg";
+            rig.ipc.play_response = npNoThumb;
+            rig.d.handleMessage(makeMsg(-1101, 111, "/play No Thumb Song"));
+            CHECK(rig.tg.photos.size() == 1 &&
+                      rig.tg.photos[0] ==
+                          "https://example.invalid/default.jpg",
+                  "R2: default thumbnail used when the track has none");
+        }
+        {
+            Rig rig;
+            rig.ipc.play_response = npNoThumb;
+            rig.d.handleMessage(makeMsg(-1102, 111, "/play No Thumb Song"));
+            CHECK(rig.tg.photos.empty(),
+                  "R2: text card when neither track nor default "
+                  "thumbnail exists");
+        }
+        {
+            Rig rig;
+            rig.cfg.default_thumbnail =
+                "https://example.invalid/default.jpg";
+            rig.ipc.seedSetting(-1103, "thumbnails", "false");
+            rig.ipc.play_response = npNoThumb;
+            rig.d.handleMessage(makeMsg(-1103, 111, "/play No Thumb Song"));
+            CHECK(rig.tg.photos.empty(),
+                  "R2: thumbnails-off still forces a text card");
+        }
+        {
+            Rig rig;
+            rig.cfg.default_thumbnail =
+                "https://example.invalid/default.jpg";
+            rig.ipc.play_response =
+                R"({"now_playing":{"track":{"id":"t1","title":"Thumb Song","artist":"A","duration_sec":200,"thumbnail":"https://example.invalid/track.jpg"},"position_sec":0,"paused":false}})";
+            rig.d.handleMessage(makeMsg(-1104, 111, "/play Thumb Song"));
+            CHECK(rig.tg.photos.size() == 1 &&
+                      rig.tg.photos[0] ==
+                          "https://example.invalid/track.jpg",
+                  "R2: track thumbnail takes precedence over the "
+                  "default");
+        }
+    }
+
+    // --- Package 3, R4: italic page footer on search pages ---------
+    // Exercised through /search -> searchResultsText, then the page
+    // callback -> the same text edited in place.
+    {
+        auto searchJson = [](int n) {
+            std::string arr = "{\"results\":[";
+            for (int i = 0; i < n; ++i) {
+                if (i) arr += ",";
+                arr += "{\"id\":\"t" + std::to_string(i) +
+                       "\",\"title\":\"Song " + std::to_string(i) +
+                       "\",\"url\":\"https://example.invalid/" +
+                       std::to_string(i) + "\",\"artist\":\"A\"}";
+            }
+            arr += "]}";
+            return arr;
+        };
+        {
+            Rig rig;
+            rig.ipc.search_response = searchJson(25);
+            rig.d.handleMessage(makeMsg(-1001, 111, "/search q"));
+            CHECK(rig.tg.replies.size() == 1 &&
+                      contains(rig.tg.replies[0], "<i>Page 1 of 3</i>"),
+                  "R4: search page 1 carries the italic Page 1 of 3 "
+                  "footer");
+            rig.d.handleCallback(makeCq(
+                "pl:search:page:111:2:" +
+                    parlay::ui_texts::queryHash("q"),
+                -1001, 111, 1));
+            CHECK(!rig.tg.edits.empty() &&
+                      contains(rig.tg.edits[0].text, "<i>Page 2 of 3</i>"),
+                  "R4: search page 2 carries the italic Page 2 of 3 "
+                  "footer");
+            rig.d.handleCallback(makeCq(
+                "pl:search:page:111:3:" +
+                    parlay::ui_texts::queryHash("q"),
+                -1001, 111, 1));
+            CHECK(rig.tg.edits.size() >= 2 &&
+                      contains(rig.tg.edits[1].text, "<i>Page 3 of 3</i>"),
+                  "R4: last search page carries the italic Page 3 of "
+                  "3 footer");
+        }
+        {
+            Rig rig;
+            rig.ipc.search_response = searchJson(3);
+            rig.d.handleMessage(makeMsg(-1001, 111, "/search q"));
+            CHECK(rig.tg.replies.size() == 1 &&
+                      !contains(rig.tg.replies[0], "Page "),
+                  "R4: single-page search carries no page footer");
+        }
+    }
+
+    // --- Package 3, R5: collection photo card + Download N songs ---
+    {
+        std::filesystem::create_directories("/tmp/parlay-dispatcher-test");
+        {
+            std::ofstream a("/tmp/parlay-dispatcher-test/coll-a.mp3");
+            std::ofstream b("/tmp/parlay-dispatcher-test/coll-b.mp3");
+        }
+        Rig rig;
+        rig.store.set("dlpick:run123456",
+                      "https://open.spotify.com/playlist/xyz\n-1001");
+        rig.ipc.spotify_collection_response =
+            R"({"kind":"playlist","name":"Chill Mix","total":2,"tracks":[{"title":"A","artist":"X","thumbnail":"https://example.invalid/cover.jpg"},{"title":"B","artist":"Y","thumbnail":"https://example.invalid/cover2.jpg"}],"truncated":false})";
+        rig.d.handleCallback(makeCq("pl:dl:1by1:run123456"));
+        CHECK(rig.tg.photos.size() == 1 &&
+                  rig.tg.photos[0] == "https://example.invalid/cover.jpg",
+              "R5: collection card sent as a photo with the cover");
+        bool card_ok = false;
+        for (const auto& r : rig.tg.replies)
+            if (contains(r, "Chill Mix") && contains(r, "2 songs"))
+                card_ok = true;
+        CHECK(card_ok && !rig.tg.markups.empty() &&
+                  contains(rig.tg.markups.back(), "pl:dl:go:run123456"),
+              "R5: collection card caption + Download N songs button");
+        rig.ipc.download_response =
+            R"({"count":2,"file_paths":["/tmp/parlay-dispatcher-test/coll-a.mp3","/tmp/parlay-dispatcher-test/coll-b.mp3"],"run_id":"x"})";
+        size_t toasts_before = rig.tg.toasts.size();
+        rig.d.handleCallback(makeCq("pl:dl:go:run123456"));
+        CHECK(rig.tg.audios.size() == 2,
+              "R5: Download N songs sends the per-track files");
+        CHECK(rig.tg.toasts.size() > toasts_before &&
+                  contains(rig.tg.toasts.back().text,
+                           "Successfully uploaded 2 from a Spotify "
+                           "playlist"),
+              "R5: collection completion report follows the files");
+    }
+
+    // --- Package 3, R6: Check Again retry on not-available ---------
+    {
+        Rig rig;
+        rig.ipc.download_error = "Track is not available yet";
+        rig.d.handleMessage(
+            makeMsg(-1121, 111, "/download some song"));
+        CHECK(!rig.tg.edits.empty() &&
+                  contains(rig.tg.edits[0].text, "not available"),
+              "R6: not-available failure renders the retry card");
+        CHECK(!rig.tg.edit_markups.empty() &&
+                  contains(rig.tg.edit_markups[0], "pl:dl:retry:"),
+              "R6: retry card carries the Check Again button");
+        std::string run;
+        {
+            const std::string& m = rig.tg.edit_markups[0];
+            size_t p = m.find("pl:dl:retry:");
+            if (p != std::string::npos) {
+                size_t e = m.find('|', p);
+                run = m.substr(p + std::string("pl:dl:retry:").size(),
+                               e == std::string::npos
+                                   ? std::string::npos
+                                   : e - p -
+                                         std::string("pl:dl:retry:").size());
+            }
+        }
+        CHECK(!run.empty(), "R6: retry run id recoverable from the card");
+        size_t edits_before = rig.tg.edits.size();
+        rig.d.handleCallback(
+            makeCq("pl:dl:retry:" + run, -1121, 111, 1));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text ==
+                      "Track is still being processed. Please try "
+                      "again later" &&
+                  !rig.tg.toasts[0].alert,
+              "R6: still-unavailable tap answers the non-alert "
+              "still-processing toast");
+        CHECK(rig.tg.edits.size() == edits_before,
+              "R6: still-unavailable tap leaves the card in place");
+        // Now the track becomes available: success replaces the card.
+        rig.ipc.download_error.clear();
+        rig.ipc.download_response =
+            R"({"track":{"title":"Some Song","artist":"A"},"file_path":"/tmp/parlay-dispatcher-test/retry-song.mp3"})";
+        {
+            std::ofstream f("/tmp/parlay-dispatcher-test/retry-song.mp3");
+        }
+        rig.d.handleCallback(
+            makeCq("pl:dl:retry:" + run, -1121, 111, 1));
+        CHECK(rig.tg.audios.size() == 1,
+              "R6: retry success delivers the audio file");
+        CHECK(rig.tg.edits.size() > edits_before &&
+                  contains(rig.tg.edits.back().text,
+                           "Song downloaded successfully!"),
+              "R6: retry success replaces the failure card");
+    }
+    {
+        // A generic download failure is NOT a retry card.
+        Rig rig;
+        rig.ipc.download_error = "YouTube lookup failed";
+        rig.d.handleMessage(
+            makeMsg(-1121, 111, "/download some song"));
+        CHECK(!rig.tg.edits.empty() &&
+                  contains(rig.tg.edits[0].text, "Download failed") &&
+                  (rig.tg.edit_markups.empty() ||
+                   !contains(rig.tg.edit_markups[0], "pl:dl:retry:")),
+              "R6: other failures render a plain failure card, no "
+              "retry button");
+    }
+
+    // --- Package 3, R1/R7: inline result card buttons --------------
+    // Exercised through the inline query: the FakeSender records the
+    // Bot API-shaped results, so the test sees the exact markup the
+    // core hands to answerInlineQuery.
+    {
+        Rig rig;
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"yt:abc","title":"Song","artist":"Artist","url":"https://www.youtube.com/watch?v=abc","duration_sec":200,"source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("bohemian"));
+        CHECK(rig.tg.inlines.size() == 1,
+              "R1/R7: inline search answers one result set");
+        std::string dump = rig.tg.inlines[0].results_json;
+        CHECK(contains(dump, "Copy link") &&
+                  contains(dump, "copy_text") &&
+                  contains(dump, "https://www.youtube.com/watch?v=abc"),
+              "R1: inline search result carries a Copy link button "
+              "with the track URL");
+        CHECK(contains(dump, "Open in Parlay Bot") &&
+                  contains(dump, "https://t.me/parlaybot?start=spotify----yt:abc"),
+              "R7: inline search result carries the deep-link button "
+              "with a well-formed bot link");
+    }
+    {
+        // np results carry no deep-link button (with_button=false).
+        Rig rig;
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","duration_sec":200,"stream_url":"https://example.invalid/audio.webm","thumbnail":"https://example.invalid/t.jpg","source":"youtube"}]})";
+        rig.d.handleMessage(makeMsg(-1001, 5001, "hello"));
+        rig.d.handleInlineQuery(makeIq("np", 5001));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  !contains(rig.tg.inlines[0].results_json,
+                            "Open in Parlay Bot"),
+              "R7: np inline result carries no deep-link button");
+    }
+
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
     if (failures == 0) {

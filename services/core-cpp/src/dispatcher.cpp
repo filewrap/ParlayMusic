@@ -1700,18 +1700,21 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     InlineKeyboard kb = ui_texts::playerKeyboard(
         chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
         settingsFor(chat_id).thumbnails);
-    std::string thumb =
-        track->find("thumbnail") ? track->find("thumbnail")->asString() : "";
+    std::string thumb = effectiveThumb(
+        chat_id, track->find("thumbnail")
+                     ? track->find("thumbnail")->asString()
+                     : "");
     CommandContext fake;
     fake.message.chat.id = chat_id;
     int64_t id = -1;
     bool is_photo = false;
-    if (!thumb.empty() && thumbnailsOn(chat_id)) {
+    if (!thumb.empty()) {
         id = tg_.sendPhoto(chat_id, thumb, text, kb);
         if (id > 0) is_photo = true;
     }
     if (id < 0) {
-        // No thumbnail, thumbnails off, or sendPhoto failed: text card.
+        // No thumbnail (track or configured default), thumbnails off,
+        // or sendPhoto failed: text card.
         id = tg_.sendMessageHtml(chat_id, text, kb, 0);
     }
     if (id > 0) recordCard(chat_id, id, is_photo);
@@ -1763,8 +1766,10 @@ bool Dispatcher::buildQueueCard(int64_t chat_id, bool show_all,
     text_out = ui_texts::queueText(now, up, total);
     kb_out = ui_texts::queueKeyboard(chat_id, up, has_more,
                                      total - up.size());
-    thumb_out =
-        track.find("thumbnail") ? track.find("thumbnail")->asString() : "";
+    thumb_out = effectiveThumb(
+        chat_id, track.find("thumbnail")
+                     ? track.find("thumbnail")->asString()
+                     : "");
     return true;
 }
 
@@ -2901,10 +2906,10 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                 ui_texts::CardTrack ct = cardTrack(*lt, by);
                 std::string text = ui_texts::queuedText(
                     static_cast<int>(items->size()), ct);
-                std::string thumb =
-                    lt->find("thumbnail")
-                        ? lt->find("thumbnail")->asString()
-                        : "";
+                std::string thumb = effectiveThumb(
+                    chat, lt->find("thumbnail")
+                              ? lt->find("thumbnail")->asString()
+                              : "");
                 InlineKeyboard kb = ui_texts::queuedKeyboard(ct.token);
                 // s-alias: the queueing itself still happens (the
                 // backend accepted it); only the success card is
@@ -4192,6 +4197,19 @@ void Dispatcher::onLyrics(const CommandContext& ctx) {
 }
 
 // --- handlers: search / download / radio / share / engine -------------------
+// A download failure means "the track is not available yet" when the
+// backend says so in these words (lemonic TRACK_NOT_AVAILABLE):
+// the card then offers a Check Again retry instead of a dead end.
+static bool isNotAvailableYet(const std::string& error) {
+    std::string low;
+    low.reserve(error.size());
+    for (char c : error)
+        low += static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c)));
+    return low.find("not available") != std::string::npos ||
+           low.find("not yet available") != std::string::npos ||
+           low.find("still being processed") != std::string::npos;
+}
 std::string Dispatcher::searchResultsText(const std::string& query,
                                           const Json& results, int page) {
     std::string text = ui_texts::searchHeaderText(query);
@@ -4226,6 +4244,9 @@ std::string Dispatcher::searchResultsText(const std::string& query,
     }
     text += "\n";
     text += ui_texts::kSearchFooter;
+    int total_pages = static_cast<int>((results.size() + 9) / 10);
+    std::string footer = ui_texts::searchPageFooterText(page, total_pages);
+    if (!footer.empty()) text += "\n" + footer;
     return text;
 }
 
@@ -4433,6 +4454,18 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
     };
     IpcResult r = ipc_.post(action, body, 120);
     if (!r.ok) {
+        if (isNotAvailableYet(r.error_message)) {
+            // Not available yet: keep the request so a Check Again
+            // tap can re-run exactly this download (lemonic
+            // replyWithSongNotAvailable).
+            store_.set("dlretry:" + run_id,
+                       action + "\n" + query + "\n" +
+                           std::to_string(ctx.message.chat.id) + "\n" +
+                           std::to_string(ctx.message.from.id));
+            edit_progress(ui_texts::kDlNotAvailable,
+                          ui_texts::dlRetryKeyboard(run_id));
+            return;
+        }
         edit_progress(ui_texts::dlFailedText(r.error_message),
                       InlineKeyboard{});
         return;
@@ -7132,13 +7165,34 @@ Json Dispatcher::inlineTrackResult(const Json& track, const std::string& id,
                       : 0;
     Json open_kb = Json(nullptr);
     if (with_button && !bot_username_.empty()) {
-        Json btn = Json::objectOf({
-            {"text", Json(ui_texts::kInlineOpenInParlay)},
-            {"url", Json(ui_texts::inlineOpenUrl(bot_username_, id))},
-        });
-        open_kb = Json::objectOf({
-            {"inline_keyboard", Json(Json::Array{Json(Json::Array{btn})})},
-        });
+        // Search-result card keyboard (NoxBeats yt_key + Music163bot
+        // guestKeyboard): a Copy link button for the track URL plus
+        // the deep-link button that opens the bot with the track.
+        // Serialised in the Bot API shape; answerInlineQuery's
+        // inlineResult translation carries both kinds through to
+        // TDLib (copy_text + url), so the sent result keeps them.
+        std::string link_url = !url.empty() ? url : stream;
+        InlineKeyboard card_kb = ui_texts::inlineSearchResultKeyboard(
+            link_url, bot_username_, id);
+        Json::Array rows;
+        for (const auto& row : card_kb) {
+            Json::Array brow;
+            for (const auto& b : row) {
+                Json bj = Json::objectOf({{"text", Json(b.text)}});
+                if (!b.copy_text.empty())
+                    bj.set("copy_text", Json::objectOf(
+                                            {{"text", Json(b.copy_text)}}));
+                else if (!b.url.empty())
+                    bj.set("url", Json(b.url));
+                else if (!b.callback_data.empty())
+                    bj.set("callback_data", Json(b.callback_data));
+                brow.push_back(bj);
+            }
+            rows.push_back(Json(brow));
+        }
+        if (!rows.empty())
+            open_kb = Json::objectOf(
+                {{"inline_keyboard", Json(rows)}});
     }
     if (!stream.empty()) {
         // Audio result (lemonic §6.7, navidrome §7.9.2/§7.9.7): the
@@ -8189,6 +8243,142 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
     }
     const std::string& verb = parts[2];
     const std::string& run_id = parts[3];
+    if (verb == "go") {
+        // pl:dl:go:<run_id> — the "Download N songs" button on a
+        // collection card: start the bulk download stored by the
+        // zip/1by1 pick (value: url\nchat_id\nmode).
+        auto go = store_.get("dlgo:" + run_id);
+        if (!go) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::string url = go->substr(0, go->find('\n'));
+        std::string rest = go->substr(go->find('\n') + 1);
+        int64_t chat_id = cq.chat_id;
+        std::string mode = "files";
+        size_t nl = rest.find('\n');
+        try {
+            chat_id = std::stoll(nl == std::string::npos
+                                     ? rest
+                                     : rest.substr(0, nl));
+        } catch (...) {
+        }
+        if (nl != std::string::npos) mode = rest.substr(nl + 1);
+        if (chat_id != cq.chat_id) {
+            answerCb(cq, ui_texts::kToastDlWrongChat, true);
+            return;
+        }
+        store_.del("dlgo:" + run_id);
+        answerCb(cq, ui_texts::kDlFetching);
+        deliverSpotifyCollection(cq, url, mode);
+        return;
+    }
+    if (verb == "retry") {
+        // pl:dl:retry:<run_id> — the "Check Again" button on a
+        // track-not-available card: re-run the stored download
+        // (value: action\nquery\nchat_id\nrequested_by).
+        auto saved = store_.get("dlretry:" + run_id);
+        if (!saved) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::vector<std::string> lines;
+        {
+            std::string rest = *saved;
+            while (true) {
+                size_t e = rest.find('\n');
+                if (e == std::string::npos) {
+                    lines.push_back(rest);
+                    break;
+                }
+                lines.push_back(rest.substr(0, e));
+                rest = rest.substr(e + 1);
+            }
+        }
+        if (lines.size() < 4) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::string action = lines[0];
+        std::string query = lines[1];
+        int64_t chat_id = 0;
+        int64_t requested_by = 0;
+        try {
+            chat_id = std::stoll(lines[2]);
+            requested_by = std::stoll(lines[3]);
+        } catch (...) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        if (chat_id != cq.chat_id) {
+            answerCb(cq, ui_texts::kToastDlWrongChat, true);
+            return;
+        }
+        bool url_action = action == "download/spotify" ||
+                          action == "download/tiktok" ||
+                          action == "download/navidrome";
+        Json body = url_action
+                        ? Json::objectOf({
+                              {"url", Json(query)},
+                              {"requested_by", Json(requested_by)},
+                          })
+                        : Json::objectOf({
+                              {"query", Json(query)},
+                              {"requested_by", Json(requested_by)},
+                          });
+        IpcResult r = ipc_.post(action, body, 120);
+        if (!r.ok) {
+            if (isNotAvailableYet(r.error_message)) {
+                // Still unavailable: non-alert toast, the card and
+                // its Check Again button stay for the next tap.
+                answerCb(cq, ui_texts::kToastDlStillProcessing);
+                return;
+            }
+            answerCb(cq, r.error_message, true);
+            editCbCard(cq, ui_texts::dlFailedText(r.error_message),
+                       InlineKeyboard{});
+            return;
+        }
+        const Json* oversize = r.data.find("oversize");
+        if (oversize && oversize->asBool()) {
+            answerCb(cq, "That file is over the 50 MB send cap — not "
+                         "sent. There is no large-file send yet.",
+                     true);
+            editCbCard(cq, "That file is over the 50 MB send cap — not "
+                           "sent. There is no large-file send yet.",
+                       InlineKeyboard{});
+            return;
+        }
+        const Json* track = r.data.find("track");
+        const Json* path = r.data.find("file_path");
+        std::string file_path = path ? path->asString() : "";
+        std::string title =
+            track && track->find("title") ? track->find("title")->asString()
+                                          : query;
+        std::string artist =
+            track && track->find("artist")
+                ? track->find("artist")->asString()
+                : "";
+        if (!file_path.empty() && std::filesystem::exists(file_path)) {
+            std::string err;
+            if (tg_.sendAudioFile(cq.chat_id, file_path,
+                                  audioCaption(track, file_path, title,
+                                               artist, bot_username_),
+                                  &err) < 0) {
+                answerCb(cq, err, true);
+                editCbCard(cq, ui_texts::dlFailedText(err),
+                           InlineKeyboard{});
+                return;
+            }
+        }
+        // Success replaces the failure card.
+        store_.del("dlretry:" + run_id);
+        answerCb(cq, ui_texts::kDlSuccess);
+        std::string text = ui_texts::kDlSuccess;
+        if (track) text += " " + fmtTrack(*track);
+        editCbCard(cq, text, InlineKeyboard{});
+        return;
+    }
     if (verb == "zip" || verb == "1by1") {
         auto pick = store_.get("dlpick:" + run_id);
         if (!pick) {
@@ -8210,7 +8400,67 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
         }
         store_.del("dlpick:" + run_id);
         answerCb(cq, ui_texts::kDlFetching);
-        deliverSpotifyCollection(cq, url, verb == "zip" ? "zip" : "files");
+        std::string mode = verb == "zip" ? "zip" : "files";
+        // Collection card first (lemonic albumMessage /
+        // playlistMessage): spotify.collection gives the name, kind
+        // and track count; the card carries the cover and one
+        // "Download N songs" button that starts the bulk download.
+        // When the metadata call fails (e.g. no Spotify
+        // credentials) deliver directly, exactly as before.
+        IpcResult col = ipc_.post(
+            "spotify.collection",
+            Json::objectOf({{"url", Json(url)},
+                            {"requested_by", Json(cq.from.id)}}),
+            30);
+        int total = 0;
+        std::string kind;
+        std::string name;
+        std::string cover;
+        if (col.ok) {
+            if (const Json* t = col.data.find("total"))
+                total = static_cast<int>(t->asInt());
+            if (const Json* tr = col.data.find("tracks")) {
+                if (total <= 0)
+                    total = static_cast<int>(tr->size());
+                if (!tr->asArray().empty()) {
+                    const Json& first = tr->asArray()[0];
+                    if (const Json* th = first.find("thumbnail"))
+                        cover = th->asString();
+                }
+            }
+            if (const Json* k = col.data.find("kind"))
+                kind = k->asString();
+            if (const Json* n = col.data.find("name"))
+                name = n->asString();
+        }
+        if (col.ok && total > 0) {
+            if (kind.empty())
+                kind = url.find("/album/") != std::string::npos ||
+                               url.find(":album:") != std::string::npos
+                           ? "album"
+                           : "playlist";
+            if (name.empty()) name = "Spotify " + kind;
+            store_.set("dlgo:" + run_id,
+                       url + "\n" + std::to_string(chat_id) + "\n" + mode);
+            std::string text =
+                ui_texts::collectionCardText(kind, name, total);
+            InlineKeyboard kb =
+                ui_texts::dlCollectionCardKeyboard(run_id, total);
+            std::string photo = effectiveThumb(chat_id, cover);
+            // Retire the picker message, then send the collection
+            // card (photo when a cover or a configured default
+            // exists, text otherwise).
+            editCbCard(cq, "Fetching collection...", InlineKeyboard{});
+            std::string err;
+            if (!photo.empty()) {
+                if (tg_.sendPhoto(chat_id, photo, text, kb, &err) < 0)
+                    tg_.sendMessageHtml(chat_id, text, kb, 0, &err);
+            } else {
+                tg_.sendMessageHtml(chat_id, text, kb, 0, &err);
+            }
+            return;
+        }
+        deliverSpotifyCollection(cq, url, mode);
         return;
     }
     auto run = store_.get("dlrun:" + run_id);
@@ -9000,14 +9250,21 @@ Json TdLibTelegramSender::inputMessageText(const std::string& text,
 }
 
 // One button -> its TDLib inlineKeyboardButton. callback_data travels
-// as base64 (TDLib `bytes`); a URL button is a plain URL; a switch
-// button targets the current chat or a chosen chat.
+// as base64 (TDLib `bytes`); a URL button is a plain URL; a copy
+// button is inlineKeyboardButtonTypeCopyText (client-side copy, no
+// callback query); a switch button targets the current chat or a
+// chosen chat.
 static Json tdButton(const InlineButton& b) {
     Json type;
     if (!b.callback_data.empty()) {
         type = Json::objectOf({
             {"@type", Json("inlineKeyboardButtonTypeCallback")},
             {"data", Json(scram::base64Encode(b.callback_data))},
+        });
+    } else if (!b.copy_text.empty()) {
+        type = Json::objectOf({
+            {"@type", Json("inlineKeyboardButtonTypeCopyText")},
+            {"text", Json(b.copy_text)},
         });
     } else if (!b.url.empty()) {
         type = Json::objectOf({
@@ -9336,8 +9593,10 @@ Json TdLibTelegramSender::inlineResult(const Json& r, TdLibClient& bot) {
     const Json* title = r.find("title");
     std::string rtitle = title ? title->asString() : "";
     // reply_markup arrives in the Bot API shape
-    // {inline_keyboard: [[{text, url|callback_data}]]}; translate it
-    // through the same button builder as the live keyboards.
+    // {inline_keyboard: [[{text, url|callback_data|copy_text}]]};
+    // translate it through the same button builder as the live
+    // keyboards. A copy button carries copy_text:{text} (or a plain
+    // string); it produces no callback query.
     Json markup = Json(nullptr);
     if (const Json* rm = r.find("reply_markup")) {
         if (const Json* rows = rm->find("inline_keyboard")) {
@@ -9347,7 +9606,15 @@ Json TdLibTelegramSender::inlineResult(const Json& r, TdLibClient& bot) {
                 for (const auto& b : row.asArray()) {
                     const Json* bt = b.find("text");
                     std::string btext = bt ? bt->asString() : "";
-                    if (const Json* u = b.find("url"))
+                    if (const Json* c = b.find("copy_text")) {
+                        std::string copy;
+                        if (c->isString()) copy = c->asString();
+                        else if (const Json* t = c->find("text"))
+                            copy = t->asString();
+                        if (!copy.empty())
+                            brow.push_back(
+                                InlineButton::copy(btext, copy));
+                    } else if (const Json* u = b.find("url"))
                         brow.push_back(
                             InlineButton::link(btext, u->asString()));
                     else if (const Json* d = b.find("callback_data"))

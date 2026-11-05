@@ -31,8 +31,8 @@
 //   searchmsg:/searchcool:/search:/inlinesearch: (transient search
 //   state), last_chat:<user_id> (last chat an inline query came
 //   from), panelmsg:/paneluser: (transient UI state),
-//   dlrun:/dlset:/dlpick:/dlset_tpl_pending: (transient download
-//   state), sharetarget:/sharetok:/sharelink:/sharefb: (transient
+//   dlrun:/dlset:/dlpick:/dlgo:/dlretry:/dlset_tpl_pending:
+//   (transient download state), sharetarget:/sharetok:/sharelink:/sharefb: (transient
 //   share state), vote:<track_id> (transient), dlsrv:,
 //   last_requester_name:/last_requester_id:<chat_id>, autoleave,
 //   and the in-memory TTL admin cache (cacheGet/cacheSet).
