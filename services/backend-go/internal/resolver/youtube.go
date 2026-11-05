@@ -130,6 +130,10 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 		return tracks[0], nil
 	}
 	if vid := ExtractYouTubeID(q); vid != "" {
+		// Primary: NubCoders /info -> signed MP4 (no cookies/PO token).
+		if track, err := y.nubPrimary(ctx, q); err == nil {
+			return track, nil
+		}
 		track, err := y.fetchVideo(ctx, vid)
 		if err == nil {
 			return track, nil
@@ -144,6 +148,10 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 			}
 		}
 		return Track{}, err
+	}
+	// Free text: NubCoders primary first (search + stream in 1-2 calls).
+	if track, err := y.nubPrimary(ctx, q); err == nil {
+		return track, nil
 	}
 	tracks, err := y.Search(ctx, q, 1)
 	if err != nil {
