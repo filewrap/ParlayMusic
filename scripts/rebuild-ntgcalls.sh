@@ -29,9 +29,11 @@
 #            after headers are installed).
 #
 # Expected result: refs/ntgcalls/shared-output/lib/libntgcalls.so
-# (~98,092,096 bytes for this toolchain; the packaging size pin in
-# scripts/package-release.sh must be updated if a rebuild changes
-# it), exporting the 3 ntg_opus_* symbols. The script verifies that
+# (~98,092,096 bytes on the VPS toolchain, ~98,123,704 bytes in the
+# sandbox — the size varies with the vendored clang revision; the
+# packaging size pin in scripts/package-release.sh accepts both
+# known-good sizes and must be extended if a rebuild produces a new
+# one), exporting the 3 ntg_opus_* symbols. The script verifies that
 # and fails loudly otherwise.
 set -euo pipefail
 

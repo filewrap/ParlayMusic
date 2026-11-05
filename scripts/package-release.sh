@@ -140,13 +140,18 @@ DSP_SRC="$DSP_SO"
 need_file "$TDJSON_SRC"; need_file "$NTG_SRC"; need_file "$DSP_SRC"
 # Guard against accidental rebuilds / wrong files: sizes are pinned.
 [ "$(stat -c%s "$TDJSON_SRC")" = "50166944" ] || fail "$TDJSON_SRC has an unexpected size (expected 50166944 B)"
-# NTG size is the PATCHED Phase 5 build (98,092,096 B, rebuilt
-# 2026-11-05 with the vendored clang 24 toolchain). The stock 3.0.5
+# NTG size is the PATCHED Phase 5 build. The size varies with the
+# vendored clang revision, so TWO legitimate sizes are known:
+# 98,092,096 B (VPS rebuild 2026-11-05) and 98,123,704 B (sandbox
+# rebuild 2026-11-05). Both probe-verify: 3 ntg_opus_* symbols,
+# defaults 192000 bps / 20 ms, 256k/10ms round-trips. The stock 3.0.5
 # .so is 98,121,040 B — if this pin trips on the stock size, the
 # patch was never applied; rebuild with scripts/rebuild-ntgcalls.sh.
-# If a legitimate rebuild changes the size, update this pin (and
-# patches/ntgcalls-opus-encoder/README.md).
-[ "$(stat -c%s "$NTG_SRC")" = "98092096" ] || fail "$NTG_SRC has an unexpected size (expected 98092096 B)"
+# If a legitimate rebuild produces a NEW size, add it here (and in
+# patches/ntgcalls-opus-encoder/README.md) — never silently widen
+# the pin to accept any size.
+NTG_SIZE="$(stat -c%s "$NTG_SRC")"
+[ "$NTG_SIZE" = "98092096" ] || [ "$NTG_SIZE" = "98123704" ] || fail "$NTG_SRC has an unexpected size ($NTG_SIZE B; expected 98092096 or 98123704 B)"
 cp "$TDJSON_SRC" "$STAGE/lib/libtdjson.so.1.8.69"
 cp "$NTG_SRC" "$STAGE/lib/libntgcalls.so"
 cp "$DSP_SRC" "$STAGE/lib/libparlay_dsp.so"

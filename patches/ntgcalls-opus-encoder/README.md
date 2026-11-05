@@ -70,7 +70,9 @@ push. What DOES survive:
 - This patch file + README + `scripts/rebuild-ntgcalls.sh` (all
   committed in the outer repo).
 - `scripts/package-release.sh`, which ships the rebuilt
-  `libntgcalls.so` (98,092,096 bytes, size-pinned) in the release
+  `libntgcalls.so` (98,092,096 bytes on the VPS toolchain,
+  98,123,704 bytes in the sandbox — size varies with the vendored
+  clang revision; both sizes are size-pinned) in the release
   tarball under `lib/`.
 
 What does NOT survive a fresh clone and must be rebuilt on the
@@ -102,9 +104,10 @@ change. A VM replacement wipes apt-installed packages, so
 re-install on every fresh build host.)
 
 Expected result: `refs/ntgcalls/shared-output/lib/libntgcalls.so`,
-98,092,096 bytes (size varies slightly per toolchain — the
-packaging size pin in `scripts/package-release.sh` must be updated
-if a rebuild changes it), exporting `ntg_opus_set_config`,
-`ntg_opus_get_config`, `ntg_opus_set_bitrate` (verify with
-`nm -D … | grep ntg_opus`), plus the `OpusEncoderFactory` symbols
-(22 new dynamic symbol names vs stock, 0 missing).
+98,092,096 bytes on the VPS toolchain or 98,123,704 bytes in the
+sandbox (size varies slightly per toolchain — the packaging size
+pin in `scripts/package-release.sh` accepts both known-good sizes
+and must be extended if a rebuild produces a new one), exporting
+`ntg_opus_set_config`, `ntg_opus_get_config`, `ntg_opus_set_bitrate`
+(verify with `nm -D … | grep ntg_opus`), plus the `OpusEncoderFactory`
+symbols (22 new dynamic symbol names vs stock, 0 missing).
