@@ -184,6 +184,7 @@ func Register(s *uds.Server, d *app.Deps) {
 		"vc.stop":          h.vcStop,
 		"vc.seek":          h.vcSeek,
 		"vc.queue":         h.vcQueue,
+		"vc.play_next":     h.vcPlayNext,
 		"vc.loop":          h.vcLoop,
 		"vc.shuffle":       h.vcShuffle,
 		"vc.autoplay":      h.vcAutoplay,

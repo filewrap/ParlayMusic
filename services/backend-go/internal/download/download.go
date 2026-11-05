@@ -74,7 +74,7 @@ func NewServiceWithRegistry(deps *app.Deps, registry *Registry, prefs *PrefsStor
 // download.youtube, download.deezer, download.tiktok,
 // download.navidrome, download.spotify, download.spotify_playlist,
 // download.soulseek, download.progress, download.cancel,
-// download.prefs, mix.generate. (vc.play_file is registered by
+// download.cancel_chat, download.prefs, mix.generate. (vc.play_file is registered by
 // handlers only — see the package header.)
 func Register(s *uds.Server, d *app.Deps) {
 	svc := NewService(d)
@@ -87,6 +87,7 @@ func Register(s *uds.Server, d *app.Deps) {
 	s.Register("download.soulseek", svc.handleSoulseek)
 	s.Register("download.progress", svc.handleProgress)
 	s.Register("download.cancel", svc.handleCancel)
+	s.Register("download.cancel_chat", svc.handleCancelChat)
 	s.Register("download.prefs", svc.handlePrefs)
 	s.Register("mix.generate", svc.handleMix)
 }
@@ -193,10 +194,16 @@ func (s *Service) runJob(ctx context.Context, req uds.Request, kind, title strin
 		// had its answer); the run's own cancel still works via
 		// download.cancel.
 		run := s.registry.NewRun(context.Background(), kind, title)
+		if req.HasChatID {
+			run.SetChatID(req.ChatID)
+		}
 		go s.executeJob(req, run, dest, true, do)
 		return map[string]any{"run_id": run.ID, "phase": string(PhaseSearching)}, nil
 	}
 	run := s.registry.NewRun(ctx, kind, title)
+	if req.HasChatID {
+		run.SetChatID(req.ChatID)
+	}
 	return s.executeJob(req, run, dest, false, do)
 }
 

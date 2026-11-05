@@ -92,6 +92,12 @@ type Run struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	once   sync.Once
+	// chatID is the chat that requested the run (0 = unknown): the
+	// per-chat cancel flag (queue-port Tier 3, item 25 — Parvati
+	// DL_CANCELS, ported onto the run-context mechanism) cancels
+	// every live run for a chat without knowing any run id. Set
+	// once at run creation; read under mu by CancelChat.
+	chatID int64
 	// restored marks a run rebuilt from the store (AttachStore):
 	// it is already terminal, its done channel is already closed,
 	// and Finish/Fail are no-ops for it — finishing it again would
@@ -220,6 +226,15 @@ func (r *Registry) NewRun(ctx context.Context, kind, title string) *Run {
 // between chunks / between tracks.
 func (run *Run) Context() context.Context { return run.ctx }
 
+// SetChatID records the requesting chat on the run. Called once at
+// run creation (runJob); 0 leaves the run unaddressed by
+// CancelChat.
+func (run *Run) SetChatID(chatID int64) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	run.chatID = chatID
+}
+
 // Get returns a run by id (live or finished), or false.
 func (r *Registry) Get(runID string) (*Run, bool) {
 	r.mu.Lock()
@@ -258,6 +273,36 @@ func (r *Registry) Cancel(runID string) (cancelled bool, phase RunPhase, found b
 	r.mu.Unlock()
 	run.cancel()
 	return true, PhaseFailed, true
+}
+
+// CancelChat cancels every live run for a chat (queue-port Tier 3,
+// item 25 — Parvati DL_CANCELS, ported onto the run-context
+// mechanism: the download loop checks the run context between
+// chunks/tracks, so cancelling the contexts aborts the downloads
+// and the jobs' failure paths delete the partial files). It
+// returns the ids of the cancelled runs, sorted; an empty result
+// means nothing was live in that chat (200, not an error — the
+// core's "Nothing to cancel" path). Finished runs are untouched.
+// The core needs this per-chat form because it cannot know a
+// run's backend id mid-download: the id is only revealed in the
+// POST response, after the download.
+func (r *Registry) CancelChat(chatID int64) []string {
+	r.mu.Lock()
+	var ids []string
+	for id, run := range r.live {
+		run.mu.Lock()
+		match := run.chatID == chatID && chatID != 0
+		run.mu.Unlock()
+		if match {
+			ids = append(ids, id)
+		}
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		_, _, _ = r.Cancel(id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // Report applies a provider progress snapshot to the run. The

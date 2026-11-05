@@ -391,6 +391,41 @@ func (h *Handlers) vcQueue(ctx context.Context, req uds.Request) (any, error) {
 	}
 }
 
+// vcPlayNext moves an already-queued track to the front of the
+// waiting list (queue-port Tier 3, item 23 — the "Play Now" button
+// on a queued card): with the one-list model that is list index 1
+// while a track is playing, so the normal advance path picks it up
+// next. No track is resolved or added and nothing is interrupted;
+// the track must already be waiting in this chat's queue.
+// Response is the now_playing snapshot plus moved (false when the
+// track was already next or already playing) and the track id.
+func (h *Handlers) vcPlayNext(ctx context.Context, req uds.Request) (any, error) {
+	var p struct {
+		ChatID  int64  `json:"chat_id"`
+		TrackID string `json:"track_id"`
+	}
+	if err := decodePayload(req, &p); err != nil {
+		return nil, err
+	}
+	chatID, err := chatIDOf(req, p.ChatID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(p.TrackID) == "" {
+		return nil, errBadRequest("track_id is required")
+	}
+	h.chatLock(chatID).Lock()
+	defer h.chatLock(chatID).Unlock()
+	snap, moved, err := h.rooms.MoveToNext(chatID, p.TrackID)
+	if err != nil {
+		return nil, mapRoomErr(err)
+	}
+	resp := nowPlayingResp(snap)
+	resp["moved"] = moved
+	resp["track_id"] = p.TrackID
+	return resp, nil
+}
+
 // --- vc.loop / vc.shuffle / vc.autoplay / vc.autoplay_skip / vc.volume ---
 
 // vcLoop sets the remaining replays of the current track (0-10).

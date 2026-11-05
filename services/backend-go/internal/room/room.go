@@ -536,6 +536,54 @@ func (m *Manager) Remove(chatID int64, pos int) ([]model.QueueItem, error) {
 	return waitingLocked(rs), nil
 }
 
+// MoveToNext moves a waiting track to the front of the waiting list
+// (list index 1 while a track is playing, index 0 while idle), so
+// the normal advance path picks it up next (queue-port Tier 3,
+// item 23 — TgMusicBot force-play is insert-at-1 + PlayNext; the
+// one-list model makes waiting position 0 exactly "play next").
+// Already-next and already-playing are no-ops (moved=false). An
+// unknown track id, or an empty room, is an error and mutates
+// nothing.
+func (m *Manager) MoveToNext(chatID int64, trackID string) (model.NowPlaying, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs, ok := m.rooms[chatID]
+	if !ok || len(rs.st.Queue) == 0 {
+		return model.NowPlaying{}, false, ErrNothingPlaying
+	}
+	if trackID == "" {
+		return model.NowPlaying{}, false, fmt.Errorf("%w: track id is required", ErrInvalid)
+	}
+	// The front track while playing; the waiting list starts at 1.
+	start := 0
+	if rs.st.Playing {
+		if rs.st.Queue[0].Track.ID == trackID {
+			return snapshotLocked(rs), false, nil // already playing
+		}
+		start = 1
+	}
+	idx := -1
+	for i := start; i < len(rs.st.Queue); i++ {
+		if rs.st.Queue[i].Track.ID == trackID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return model.NowPlaying{}, false, fmt.Errorf("%w: track %q is not in the queue", ErrInvalid, trackID)
+	}
+	if idx == start {
+		return snapshotLocked(rs), false, nil // already next
+	}
+	item := rs.st.Queue[idx]
+	rs.st.Queue = append(rs.st.Queue[:idx], rs.st.Queue[idx+1:]...)
+	rs.st.Queue = append(rs.st.Queue[:start], append([]model.QueueItem{item}, rs.st.Queue[start:]...)...)
+	if err := m.persistLocked(rs); err != nil {
+		return model.NowPlaying{}, false, err
+	}
+	return snapshotLocked(rs), true, nil
+}
+
 // ClearQueue empties the waiting list only; the active track keeps
 // playing.
 func (m *Manager) ClearQueue(chatID int64) ([]model.QueueItem, error) {

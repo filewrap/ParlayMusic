@@ -269,6 +269,37 @@ func (s *Service) handleCancel(_ context.Context, req uds.Request) (any, error) 
 	}, nil
 }
 
+// handleCancelChat implements download.cancel_chat (queue-port Tier
+// 3, item 25): cancels every live run for a chat, without a run
+// id. The core's per-run cancel button cannot know the backend run
+// id mid-download (the id is only revealed in the POST response,
+// after the download), so the per-chat flag is the mechanism that
+// makes the button work. Response {cancelled, chat_id, run_ids};
+// no live run is 200 with cancelled:false (the core's "Nothing to
+// cancel — already finished." path).
+func (s *Service) handleCancelChat(_ context.Context, req uds.Request) (any, error) {
+	var body struct {
+		ChatID int64 `json:"chat_id"`
+	}
+	if len(req.Payload) > 0 {
+		if err := json.Unmarshal(req.Payload, &body); err != nil {
+			return nil, uds.NewHandlerError(uds.ErrBadRequest, fmt.Sprintf("bad download.cancel_chat request: %v", err))
+		}
+	}
+	if body.ChatID == 0 {
+		return nil, uds.NewHandlerError(uds.ErrBadRequest, "chat_id is required")
+	}
+	ids := s.registry.CancelChat(body.ChatID)
+	if ids == nil {
+		ids = []string{}
+	}
+	return map[string]any{
+		"cancelled": len(ids) > 0,
+		"chat_id":   body.ChatID,
+		"run_ids":   ids,
+	}, nil
+}
+
 // handlePrefs implements download.prefs (§9-E9). GET {user_id}
 // returns the stored prefs or the defaults (200, never 404). POST
 // {user_id, format?, use_youtube?, path_template?} validates and

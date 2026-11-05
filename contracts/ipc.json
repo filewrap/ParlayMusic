@@ -83,6 +83,19 @@
       "service": "backend-go:download",
       "ported": "Phase 3 Wave 2 (OD-3)"
     },
+    "download.cancel_chat": {
+      "from": "queue-port Tier 3 item 25 (Parvati DL_CANCELS, ported onto the run-context mechanism)",
+      "method": "UDS download.cancel_chat",
+      "request": {
+        "chat_id": "ChatId"
+      },
+      "response": {
+        "cancelled": "boolean (true when at least one run was live)",
+        "chat_id": "ChatId",
+        "run_ids": ["string (backend ids of the cancelled runs)"]
+      },
+      "service": "backend-go:download"
+    },
     "download.deezer": {
       "method": "UDS download.deezer",
       "request": {
@@ -828,6 +841,20 @@
       },
       "service": "backend-go:handlers",
       "ported": "Phase 3 Wave 2 (OD-3) — record-only per inventory §3.3; the only implementation is internal/handlers"
+    },
+    "vc.play_next": {
+      "from": "queue-port Tier 3 item 23 (TgMusicBot force-play: insert at index 1 + PlayNext)",
+      "method": "UDS vc.play_next",
+      "request": {
+        "chat_id": "ChatId",
+        "track_id": "string (id of an already-queued track)"
+      },
+      "response": {
+        "now_playing": "NowPlaying",
+        "moved": "boolean (false when the track was already next or already playing)",
+        "track_id": "string"
+      },
+      "service": "backend-go:handlers"
     },
     "vc.queue": {
       "method": "UDS vc.queue",
