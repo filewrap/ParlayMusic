@@ -54,6 +54,12 @@ fi
 cd "$NTG_DIR"
 git fetch --quiet origin || true
 git checkout --quiet "$BASE_REV"
+# oboe + pybind11 are git submodules; a fresh clone has EMPTY dirs
+# and configure later fails in ThirdPartyNotices.cmake reading
+# deps/oboe/LICENSE and deps/pybind11/LICENSE. Initialise them here.
+# (No-op when already initialised.)
+echo "==> submodules (oboe, pybind11)"
+git submodule update --init -- deps/oboe deps/pybind11
 # The patch must apply cleanly to the pristine base. Detect "already
 # applied" from the TREE (reverse-apply check), not from an existing
 # .so: after `git checkout -- .` the tree is pristine but a stale
@@ -100,7 +106,45 @@ echo "==> configure"
 # configure fails at FindWebRTC.cmake:1 with "Unknown CMake command
 # 'GetProperty'". It worked in the sandbox only because build-c/
 # already had the toolchain file cached from the first configure.
-cmake -S . -B build-c -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=OFF -DUSE_LIBCXX=ON -DBINDING=c -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain.cmake
+#
+# Two more toolchain traps, both proven in the sandbox 2026-11-05 on
+# a fresh clone:
+#  * FindClang downloads the Chromium clang toolchain via update.py,
+#    but it runs it with ${Python_EXECUTABLE}, which is defined
+#    NOWHERE in ntgcalls — so the download silently never runs and
+#    project() fails with "not a full path to an existing compiler
+#    tool". Pass it explicitly.
+#  * The extracted clang binaries can land non-executable (mode 660
+#    on overlayfs), so the compiler test then fails with "Permission
+#    denied". Fix the mode before configuring; and if a fresh
+#    download still lands non-executable, the first configure fails
+#    at project() — retry once after fixing the mode.
+PYTHON_BIN="$(command -v python3 || true)"
+[ -n "$PYTHON_BIN" ] || { echo "ERROR: python3 not found (needed to download the Clang toolchain)" >&2; exit 1; }
+[ -d "$NTG_DIR/deps/clang/bin" ] && chmod +x "$NTG_DIR/deps/clang/bin/"* 2>/dev/null || true
+# Pass the toolchain flag ONLY when the cache does not already have
+# it loaded. Re-passing it on a warm tree overwrites the cache's
+# FILEPATH entry with UNINITIALIZED (proven 2026-11-05: one bare
+# re-configure flipped it), which makes the next run think the cache
+# is stale and wipe build-c — a full rebuild on every run. The cache
+# already knows the toolchain file on a warm tree; cmake reuses it
+# without the flag.
+configure_ntg() {
+    local args=(-DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=OFF -DUSE_LIBCXX=ON -DBINDING=c -DPython_EXECUTABLE="$PYTHON_BIN")
+    if ! grep -q "^CMAKE_TOOLCHAIN_FILE:FILEPATH=$NTG_DIR/cmake/Toolchain.cmake\$" build-c/CMakeCache.txt 2>/dev/null; then
+        args+=(-DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain.cmake)
+    fi
+    cmake -S . -B build-c "${args[@]}"
+}
+if ! configure_ntg; then
+    if [ -f "$NTG_DIR/deps/clang/bin/clang" ] && [ ! -x "$NTG_DIR/deps/clang/bin/clang" ]; then
+        echo "==> clang was downloaded but is not executable; fixing perms and retrying configure once"
+        chmod +x "$NTG_DIR/deps/clang/bin/"*
+        configure_ntg
+    else
+        exit 1
+    fi
+fi
 echo "==> build (incremental; ~4 min first time after libpulse-dev install)"
 cmake --build build-c --target ntgcalls -j2
 
