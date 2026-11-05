@@ -761,6 +761,12 @@ private:
     // store "card:<chat>" = "photo|<id>" or "text|<id>".
     void recordCard(int64_t chat_id, int64_t message_id, bool is_photo);
     bool cardInfo(int64_t chat_id, int64_t& message_id, bool& is_photo);
+    // Report a card's message id back to the backend (vc.card):
+    // the backend persists it on the room's front track, so the id
+    // survives a core restart. Fire-and-forget — a failed report
+    // is a stderr line, never a card failure.
+    void reportCardId(int64_t chat_id, const std::string& track_id,
+                      int64_t message_id);
     // Render the rich /queue card (Yukki §3.4, §5): now-playing + up to
     // 15 up-next tracks with per-track delete buttons, Show-more after
     // 15. show_all=true renders the whole tail (after pl:queue:more).

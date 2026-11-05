@@ -842,6 +842,19 @@
       "service": "backend-go:handlers",
       "ported": "Phase 3 Wave 2 (OD-3) — record-only per inventory §3.3; the only implementation is internal/handlers"
     },
+    "vc.card": {
+      "from": "queue-port Tier 6 item 32 (NoxBeats Track::message_id)",
+      "method": "UDS vc.card",
+      "request": {
+        "chat_id": "ChatId",
+        "track_id": "string (id of the track the card shows)",
+        "message_id": "integer (Telegram message id of the now-playing card)"
+      },
+      "response": {
+        "now_playing": "NowPlaying"
+      },
+      "service": "backend-go:handlers"
+    },
     "vc.play_next": {
       "from": "queue-port Tier 3 item 23 (TgMusicBot force-play: insert at index 1 + PlayNext)",
       "method": "UDS vc.play_next",
@@ -1204,6 +1217,10 @@
         "is_live": {
           "type": "boolean",
           "description": "IPC-3: true for a live stream"
+        },
+        "card_message_id": {
+          "type": "integer",
+          "description": "queue-port Tier 6 item 32: Telegram message id of this track's now-playing card, reported back by the core over vc.card and persisted with the room; 0/absent when no card has been sent for this track yet"
         }
       },
       "required": [

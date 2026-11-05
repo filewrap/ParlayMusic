@@ -916,6 +916,13 @@ struct CardTrack {
     std::string duration;   // human duration ("3:24", "∞")
     std::string requester;  // display name of the requester, escaped
     std::string token;      // queue token (trackToken)
+    // Thumbnail URL (jpg-normalized by the backend's ensureThumb /
+    // thumbs.NormalizeURL), for the thumbnail-as-hyperlink fallback
+    // (queue-port Tier 4, item 27): when no local photo exists for
+    // the text card, the title links here instead of `url`, so
+    // Telegram renders the image preview. Empty when the track has
+    // no thumbnail.
+    std::string thumb_url;
 };
 
 inline std::string trackLink(const CardTrack& t) {

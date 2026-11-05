@@ -1689,6 +1689,38 @@ std::string Dispatcher::displayName(const TgUser& u) {
     return name;
 }
 
+// Force the jpg thumbnail variant for the hyperlink fallback
+// (queue-port Tier 4, item 28 — NoxBeats yt.cpp:68): yt-dlp often
+// reports .webp; Telegram only reliably fetches the jpg variant.
+// Only i.ytimg.com/vi/<id>/<variant> URLs are rewritten, to
+// .../hqdefault.jpg; everything else passes through unchanged. The
+// backend applies the same rule before caching
+// (thumbs.NormalizeURL); this is the display-side copy for tracks
+// whose thumbnail URL never went through ensureThumb.
+static std::string normalizeThumbUrl(const std::string& url) {
+    std::string scheme;
+    for (const char* s : {"https://i.ytimg.com/vi/",
+                          "http://i.ytimg.com/vi/"}) {
+        if (url.rfind(s, 0) == 0) {
+            scheme = s;
+            break;
+        }
+    }
+    if (scheme.empty()) return url;
+    std::string rest = url.substr(scheme.size());
+    size_t slash = rest.find('/');
+    if (slash == std::string::npos || slash == 0) return url;
+    std::string id = rest.substr(0, slash);
+    std::string tail = rest.substr(slash + 1);
+    // The variant is the last path segment with no further slash;
+    // anything else (a query string, an unexpected shape) is left
+    // alone rather than guessed at.
+    if (tail.empty() || tail.find('/') != std::string::npos ||
+        tail.find('?') != std::string::npos)
+        return url;
+    return scheme + id + "/hqdefault.jpg";
+}
+
 ui_texts::CardTrack Dispatcher::cardTrack(const Json& track,
                                          const std::string& requester) {
     ui_texts::CardTrack t;
@@ -1702,6 +1734,8 @@ ui_texts::CardTrack Dispatcher::cardTrack(const Json& track,
     t.requester = requester;
     std::string id = track.find("id") ? track.find("id")->asString() : "";
     t.token = ui_texts::trackToken(id);
+    t.thumb_url =
+        track.find("thumbnail") ? normalizeThumbUrl(track.find("thumbnail")->asString()) : "";
     return t;
 }
 
@@ -1785,6 +1819,28 @@ bool Dispatcher::cardInfo(int64_t chat_id, int64_t& message_id,
     return message_id != 0;
 }
 
+// Report a now-playing card's message id back to the backend
+// (queue-port Tier 6, item 32): the backend persists it on the
+// room's front track (vc.card), so the id survives a core restart
+// and vc.now_playing surfaces it on the track. Fire-and-forget:
+// a failed report is a stderr line, never an owner DM and never a
+// card failure — the local recordCard entry still covers this
+// core's own edits.
+void Dispatcher::reportCardId(int64_t chat_id, const std::string& track_id,
+                              int64_t message_id) {
+    if (track_id.empty() || message_id <= 0) return;
+    CommandContext fake;
+    fake.message.chat.id = chat_id;
+    Json body = Json::objectOf({{"chat_id", Json(chat_id)},
+                                {"track_id", Json(track_id)},
+                                {"message_id", Json(message_id)}});
+    IpcResult r = vcCall(fake, "vc.card", body);
+    if (!r.ok)
+        std::cerr << "[card] vc.card report failed in chat " << chat_id
+                  << " for track " << track_id << ": " << r.describe()
+                  << "\n";
+}
+
 bool Dispatcher::nowPlayingCardParts(int64_t chat_id, const Json& np,
                                      const std::string& state_line_in,
                                      std::string& text_out,
@@ -1811,6 +1867,19 @@ bool Dispatcher::nowPlayingCardParts(int64_t chat_id, const Json& np,
     int64_t dur =
         track->find("duration_sec") ? track->find("duration_sec")->asInt()
                                     : 0;
+    // Thumbnail-as-hyperlink fallback (queue-port Tier 4, item 27 —
+    // Tina's zero-cost trick): when no local photo exists for the
+    // text card, the title links to the thumbnail URL so Telegram
+    // renders the image preview — zero disk I/O, zero upload, zero
+    // inputFile. Gated by the chat's thumbnails setting, like the
+    // photo path. The photo paths never see the swap: the rich
+    // photo card reads ct.url only for its title block, which runs
+    // only when a local photo exists, and the sendPhoto caption
+    // path is reached only with a non-empty thumb.
+    if (thumbnailsOn(chat_id) &&
+        effectiveThumb(chat_id, trackThumb(track)).empty() &&
+        !ct.thumb_url.empty())
+        ct.url = ct.thumb_url;
     bool paused = false;
     if (const Json* p = np.find("paused")) paused = p->asBool();
     if (const Json* p = np.find("is_paused")) paused = p->asBool();
@@ -1914,7 +1983,12 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
         id = tg_.sendMessageHtml(chat_id, text, kb, 0, &err);
         if (id < 0) last_err = err;
     }
-    if (id > 0) recordCard(chat_id, id, is_photo);
+    if (id > 0) {
+        recordCard(chat_id, id, is_photo);
+        std::string track_id =
+            track->find("id") ? track->find("id")->asString() : "";
+        reportCardId(chat_id, track_id, id);
+    }
     if (id < 0)
         reportOwnerError("sendNowPlayingCard", chat_id, last_err);
     return id;
@@ -2177,6 +2251,12 @@ void Dispatcher::refreshCard(const TgCallbackQuery& cq, int64_t chat_id) {
     if (!cardInfo(chat_id, card_id, is_photo) || card_id != cq.message_id)
         return;
     refreshCardText(chat_id, cq.message_id, is_photo, np);
+    // The card now renders the current front track: move the
+    // persisted card id onto it so the backend stays current
+    // (queue-port Tier 6, item 32).
+    std::string track_id =
+        track.find("id") ? track.find("id")->asString() : "";
+    reportCardId(chat_id, track_id, cq.message_id);
 }
 
 void Dispatcher::logToLogger(const std::string& text) {
@@ -2706,13 +2786,51 @@ void Dispatcher::onPlayProgress(const Json& data) {
 // Edit the recorded now-playing card for a chat in place; send a fresh
 // card when none is recorded.
 void Dispatcher::editNowPlayingCard(int64_t chat_id, const Json& np) {
+    // Prefer the card id the backend persisted on the track
+    // (vc.card, queue-port Tier 6 item 32): it survives a core
+    // restart and a lost state.json, while the local recordCard
+    // entry covers only this core's own sends. Fall back to the
+    // recorded card; send a fresh card when neither knows one.
+    // (Correction to the port-list premise: recordCard is NOT
+    // in-memory only — Store::set writes state.json on every set,
+    // so a plain core restart keeps it. The backend copy is the
+    // second durable home: it survives core data loss / a fresh
+    // deploy, and it surfaces the id in the NowPlaying snapshot
+    // for any consumer.)
+    const Json* track = np.find("track");
     int64_t card_id = 0;
     bool is_photo = false;
-    if (cardInfo(chat_id, card_id, is_photo)) {
-        refreshCardText(chat_id, card_id, is_photo, np);
+    bool have = false;
+    if (track) {
+        if (const Json* cid = track->find("card_message_id"))
+            if (cid->asInt() > 0) {
+                card_id = cid->asInt();
+                have = true;
+            }
+    }
+    if (have) {
+        // The edit kind still comes from the recorded card when
+        // it agrees; editCard falls back to the other kind on
+        // failure, so an unknown kind is a retry, not a failure.
+        int64_t rec_id = 0;
+        bool rec_photo = false;
+        if (cardInfo(chat_id, rec_id, rec_photo) && rec_id == card_id)
+            is_photo = rec_photo;
+    } else if (cardInfo(chat_id, card_id, is_photo)) {
+        have = true;
+    }
+    if (!have) {
+        sendNowPlayingCard(chat_id, np, "");
         return;
     }
-    sendNowPlayingCard(chat_id, np, "");
+    refreshCardText(chat_id, card_id, is_photo, np);
+    // The card now renders the current front track: move the
+    // persisted card id onto it so the backend stays current.
+    if (track) {
+        std::string track_id =
+            track->find("id") ? track->find("id")->asString() : "";
+        reportCardId(chat_id, track_id, card_id);
+    }
 }
 
 // Render the now-playing card text + keyboard for a chat and edit the
@@ -2725,6 +2843,14 @@ void Dispatcher::refreshCardText(int64_t chat_id, int64_t message_id,
     auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
     requester = rn ? *rn : "";
     ui_texts::CardTrack ct = cardTrack(*track, requester);
+    // Same thumbnail-as-hyperlink fallback as nowPlayingCardParts
+    // (item 27), for the text-card refresh: a photo card keeps
+    // the watch URL (the photo is already showing), a text card
+    // with no local photo links the title to the thumbnail URL.
+    if (!is_photo && thumbnailsOn(chat_id) &&
+        effectiveThumb(chat_id, trackThumb(track)).empty() &&
+        !ct.thumb_url.empty())
+        ct.url = ct.thumb_url;
     int64_t pos = np.find("position_sec") ? np.find("position_sec")->asInt()
                                           : 0;
     int64_t dur =

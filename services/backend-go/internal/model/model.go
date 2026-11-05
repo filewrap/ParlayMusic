@@ -31,7 +31,7 @@ type Track struct {
 	// so card edits target the right message after a core restart
 	// without a separate lookup. 0 when no card has been sent for
 	// this track yet.
-	CardMessageID int64 `json:"card_message_id,omitempty"`
+	CardMessageID int64   `json:"card_message_id,omitempty"`
 	StreamURL     string  `json:"stream_url,omitempty"`
 	DurationStr   string  `json:"duration_str,omitempty"`
 	Views         *int64  `json:"views,omitempty"`
