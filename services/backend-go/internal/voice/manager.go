@@ -1,6 +1,7 @@
 package voice
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -95,6 +96,25 @@ var ErrNoFeed = errors.New("voice: no live feed in this chat")
 // It performs the join handshake through its JoinFunc and drives
 // the DSP frame feed for playback. It never calls TDLib and
 // never touches the UDS socket.
+//
+// Assistant rotation (queue-port Tier 2, item 13) — the seam, not
+// the full plumbing: the Manager holds a registry of assistant
+// accounts and Join rotates through the healthy ones, evicting
+// the one a Rotate-class error names. Today the registry holds
+// exactly ONE assistant ("assistant") — the C++ core runs
+// joinVideoChat on its single shared assistant TDLib session
+// (dispatcher.cpp: "the shared assistant session"), and the
+// JoinFunc carries no assistant id, so every attempt reaches
+// that same session. A second assistant becomes real only with
+// core-side work: one TDLib client (session dir) per assistant
+// plus an assistant id on the UDS JoinRequest so the core can
+// route the join to the right session. Until that lands,
+// registering a second assistant here changes nothing at the
+// core, and a Rotate-class error with one assistant ends the
+// join with "no healthy assistant available" — honest, and the
+// eviction lasts for the process lifetime (a restart gives a
+// clean slate). Do not present the registry as multi-assistant
+// support until the core routing exists.
 type Manager struct {
 	client *Client
 	join   JoinFunc
@@ -107,6 +127,26 @@ type Manager struct {
 
 	mu    sync.Mutex
 	calls map[int64]*Call
+
+	// assistants is the rotation registry (item 13). assistantMu
+	// guards it separately from mu so an eviction never blocks
+	// on a join in progress.
+	assistantMu sync.Mutex
+	assistants  []Assistant
+
+	// joining tracks chats with a Join call in flight, guarded
+	// by joiningMu. Join is retried in a loop now (up to
+	// MaxAttempts with sleeps between attempts), so the
+	// prologue check and the first record creation are no
+	// longer one lock hold — without this mark, two concurrent
+	// Joins (vc.play under the chat lock, radio's voiceHandoff
+	// outside it) could both pass the prologue and run two
+	// handshakes for one chat. The mark is the "already in
+	// progress" answer; the Connected check still runs first,
+	// so a join that just succeeded answers with its group
+	// call id instead of "in progress".
+	joiningMu sync.Mutex
+	joining   map[int64]bool
 
 	// preJoinHook, when set, runs before CreateCall on every
 	// Join (after the already-connected / already-in-progress
@@ -130,14 +170,33 @@ type Manager struct {
 	transitionHandlers       []func(chatID int64, trackID string)
 }
 
+// Assistant is one assistant account in the rotation registry
+// (queue-port Tier 2, item 13). ID is the stable name the core
+// will one day route a join to; Evicted means a Rotate-class
+// error named this account and it is out of rotation until the
+// backend restarts. EvictReason is the error that evicted it.
+type Assistant struct {
+	ID          string
+	Evicted     bool
+	EvictReason string
+}
+
+// singleAssistantID is the id of the one assistant Parlay has
+// today: the core's single shared assistant session. It is the
+// registry's only entry until the core-side multi-assistant
+// plumbing lands (see the Manager doc).
+const singleAssistantID = "assistant"
+
 // NewManager builds a Manager around client. join may be nil only
 // when Join will never be called; Join with a nil JoinFunc fails with
 // an explicit error instead of pretending to join.
 func NewManager(client *Client, join JoinFunc) *Manager {
 	m := &Manager{
-		client: client,
-		join:   join,
-		calls:  make(map[int64]*Call),
+		client:     client,
+		join:       join,
+		calls:      make(map[int64]*Call),
+		assistants: []Assistant{{ID: singleAssistantID}},
+		joining:    map[int64]bool{},
 	}
 	// ntgcalls callbacks arrive on library threads and must not
 	// block, so the Manager's own dispatch runs in a goroutine.
@@ -148,6 +207,82 @@ func NewManager(client *Client, join JoinFunc) *Manager {
 		go m.dispatchConnectionChange(chatID, state, kind)
 	})
 	return m
+}
+
+// RegisterAssistant adds id to the rotation registry, if it is
+// not already there. It is the seam for N assistants — but
+// registering a second id changes nothing until the core routes
+// joins per assistant (see the Manager doc): the JoinFunc
+// carries no assistant id today, so every attempt still reaches
+// the single shared session.
+func (m *Manager) RegisterAssistant(id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	m.assistantMu.Lock()
+	defer m.assistantMu.Unlock()
+	for _, a := range m.assistants {
+		if a.ID == id {
+			return
+		}
+	}
+	m.assistants = append(m.assistants, Assistant{ID: id})
+}
+
+// CurrentAssistantID returns the first non-evicted assistant's
+// id, or "" when every assistant is evicted.
+func (m *Manager) CurrentAssistantID() string {
+	m.assistantMu.Lock()
+	defer m.assistantMu.Unlock()
+	for _, a := range m.assistants {
+		if !a.Evicted {
+			return a.ID
+		}
+	}
+	return ""
+}
+
+// HealthyAssistants returns the ids of the non-evicted
+// assistants, in registry order.
+func (m *Manager) HealthyAssistants() []string {
+	m.assistantMu.Lock()
+	defer m.assistantMu.Unlock()
+	var out []string
+	for _, a := range m.assistants {
+		if !a.Evicted {
+			out = append(out, a.ID)
+		}
+	}
+	return out
+}
+
+// EvictAssistant marks id evicted with reason, out of rotation
+// until the backend restarts. It is a no-op for an unknown id.
+// It returns whether an entry was actually evicted.
+func (m *Manager) EvictAssistant(id, reason string) bool {
+	m.assistantMu.Lock()
+	defer m.assistantMu.Unlock()
+	for i := range m.assistants {
+		if m.assistants[i].ID == id && !m.assistants[i].Evicted {
+			m.assistants[i].Evicted = true
+			m.assistants[i].EvictReason = reason
+			log.Printf("voice: assistant %q evicted: %s", id, reason)
+			return true
+		}
+	}
+	return false
+}
+
+// EvictCurrentAssistant evicts the first healthy assistant and
+// returns its id, or "" when none is healthy. The join path
+// calls this on a Rotate-class error (item 13).
+func (m *Manager) EvictCurrentAssistant(reason string) string {
+	id := m.CurrentAssistantID()
+	if id == "" {
+		return ""
+	}
+	m.EvictAssistant(id, reason)
+	return id
 }
 
 // SetPreJoinHook installs fn, run before CreateCall on every
@@ -275,19 +410,96 @@ func stateName(s ConnectionState) string {
 // FailedReason set, and never reports success. Joining a chat that is
 // already connected returns the existing group call id without
 // re-running the handshake.
+//
+// Retry/rotate policy (queue-port Tier 2, items 13 + 16): one
+// handshake is attempted at most MaxAttempts times, classified by
+// the shared classifier (errors.go). A Fatal or Unknown error
+// returns immediately; a Retryable error sleeps RetryDelay
+// (ctx-aware — a cancelled context ends the join with the last
+// stage error, not a context error) and retries the same
+// assistant; a Rotate error evicts the current assistant and
+// tries the next healthy one, and when none is healthy the join
+// fails with "no healthy assistant available". The per-attempt
+// work lives in joinOnce; the policy lives here, so the stages
+// never learn about rotation.
 func (m *Manager) Join(ctx context.Context, chatID int64) (int64, error) {
 	m.mu.Lock()
-	if call, ok := m.calls[chatID]; ok {
-		switch call.State {
-		case StateConnected:
-			groupCallID := call.GroupCallID
-			m.mu.Unlock()
+	if call, ok := m.calls[chatID]; ok && call.State == StateConnected {
+		groupCallID := call.GroupCallID
+		m.mu.Unlock()
+		return groupCallID, nil
+	}
+	m.mu.Unlock()
+
+	// One Join per chat at a time (see the joining field): a
+	// second caller gets "already in progress" instead of
+	// starting a parallel handshake.
+	m.joiningMu.Lock()
+	if m.joining[chatID] {
+		m.joiningMu.Unlock()
+		return 0, fmt.Errorf("voice: join chat %d: join already in progress", chatID)
+	}
+	m.joining[chatID] = true
+	m.joiningMu.Unlock()
+	defer func() {
+		m.joiningMu.Lock()
+		delete(m.joining, chatID)
+		m.joiningMu.Unlock()
+	}()
+
+	var lastErr error
+	for attempt := 1; attempt <= MaxAttempts; attempt++ {
+		groupCallID, err := m.joinOnce(ctx, chatID)
+		if err == nil {
 			return groupCallID, nil
-		case StateJoining, StateCreated:
-			m.mu.Unlock()
-			return 0, fmt.Errorf("voice: join chat %d: join already in progress (state %s)", chatID, call.State)
+		}
+		lastErr = err
+		if attempt == MaxAttempts {
+			break
+		}
+		switch Classify(err) {
+		case ClassFatal, ClassUnknown:
+			return 0, err
+		case ClassRotate:
+			evicted := m.EvictCurrentAssistant(err.Error())
+			if m.CurrentAssistantID() == "" {
+				return 0, fmt.Errorf("voice: join chat %d: assistant %q evicted (%s); no healthy assistant available: %w", chatID, evicted, err.Error(), err)
+			}
+			log.Printf("voice: join chat %d: attempt %d failed (%v); rotating to assistant %q", chatID, attempt, err, m.CurrentAssistantID())
+		case ClassRetryable:
+			delay := RetryDelay(err)
+			log.Printf("voice: join chat %d: attempt %d failed (%v); retrying in %s", chatID, attempt, err, delay)
+			if !sleepCtx(ctx, delay) {
+				return 0, lastErr
+			}
 		}
 	}
+	return 0, fmt.Errorf("voice: join chat %d: failed after %d attempts: %w", chatID, MaxAttempts, lastErr)
+}
+
+// sleepCtx sleeps d, or returns false early when ctx is done. A
+// zero or negative d returns true at once.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// joinOnce runs one join handshake for chatID: the pre-join hook,
+// CreateCall, the JoinFunc, and Connect. It creates a fresh call
+// record (a previous attempt left StateFailed, which Join's
+// prologue lets through) and leaves it StateFailed with
+// FailedStage / FailedReason on any stage failure. Callers must
+// have run Join's prologue (already-connected / already-in-progress
+// checks) — joinOnce does not repeat them.
+func (m *Manager) joinOnce(ctx context.Context, chatID int64) (int64, error) {
+	m.mu.Lock()
 	call := &Call{ChatID: chatID, State: StateCreated}
 	m.calls[chatID] = call
 	hook := m.preJoinHook
@@ -407,6 +619,16 @@ func (m *Manager) Play(ctx context.Context, chatID int64, source string, opts ds
 // the window. A 403 is therefore retried with a 2s backoff (up to
 // 4 retries, ~8s worst case; the URL is valid for hours) before
 // surfacing as an error.
+//
+// The returned body is validated before the DSP ever sees it
+// (queue-port Tier 2, item 15 — the streaming twin of the
+// prefetch prefix check): an empty body, or a body whose first
+// byte is `{`, `<`, or `[`, is a JSON/HTML error document
+// masquerading as media, not audio, and fails here instead of
+// feeding the decoder garbage that ends the track silently.
+// No real media format starts with those bytes (MP3 "ID3"/0xFF,
+// FLAC "fLaC", OGG "OggS", WebM 0x1A, MP4 box size + "ftyp",
+// WAV "RIFF").
 func openSource(ctx context.Context, source string) (io.ReadCloser, error) {
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 		var resp *http.Response
@@ -420,7 +642,7 @@ func openSource(ctx context.Context, source string) (io.ReadCloser, error) {
 				return nil, fmt.Errorf("open stream URL: %w", err)
 			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return resp.Body, nil
+				return validateMediaStream(resp.Body, source)
 			}
 			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusForbidden || attempt >= 4 {
@@ -439,7 +661,38 @@ func openSource(ctx context.Context, source string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open audio file: %w", err)
 	}
-	return f, nil
+	return validateMediaStream(f, source)
+}
+
+// validateMediaStream peeks the first byte of r and rejects an
+// empty body or a body that opens with `{`, `<`, or `[` — a
+// JSON/HTML error document, not media (item 15). The peeked byte
+// is replayed: the returned reader yields the whole stream from
+// the start, so the DSP reads exactly what it would have read.
+// The caller owns the returned ReadCloser; on error r is closed.
+func validateMediaStream(r io.ReadCloser, source string) (io.ReadCloser, error) {
+	display := source
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		display = streamURLShort(source)
+	}
+	br := bufio.NewReader(r)
+	b, err := br.Peek(1)
+	if err != nil {
+		_ = r.Close()
+		if err == io.EOF {
+			return nil, fmt.Errorf("open stream: empty response (0 bytes) for %s", display)
+		}
+		return nil, fmt.Errorf("open stream: peek first byte: %w", err)
+	}
+	switch b[0] {
+	case '{', '<', '[':
+		_ = r.Close()
+		return nil, fmt.Errorf("open stream: response for %s starts with %q — an error document, not media", display, string(b[0]))
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{br, r}, nil
 }
 
 // streamURLShort renders a stream URL for logs: host plus the
@@ -473,6 +726,13 @@ func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser,
 // start the feed pump. The caller owns r on error (startStream
 // closes it when the DSP stream fails to open); on success the
 // DSP stream owns it.
+//
+// Hot-swap (queue-port Tier 2, item 12): this already IS the
+// hot-swap — the old feed is stopped and SetExternalAudioSource
+// re-binds the source inside the EXISTING live call; the call is
+// never left and re-joined for a track change. The only rejoin
+// leg is the set_source failure below, which marks the call
+// record failed so the session ends and a fresh /play rejoins.
 func (m *Manager) startStream(ctx context.Context, chatID int64, r io.ReadCloser, opts dsp.Options) error {
 	if err := opts.Validate(); err != nil {
 		return fmt.Errorf("voice: play stream chat %d: %w", chatID, err)
@@ -503,6 +763,31 @@ func (m *Manager) startStream(ctx context.Context, chatID int64, r io.ReadCloser
 		return fmt.Errorf("voice: play stream chat %d: %w", chatID, dsp.ErrUnavailable)
 	}
 	if err := m.client.SetExternalAudioSource(chatID); err != nil {
+		// Hot-swap failure (queue-port Tier 2, item 12): this
+		// IS the hot-swap — startStream already swaps the
+		// source inside the live call instead of leaving and
+		// rejoining, and the old feed was stopped above. When
+		// the swap itself fails the call record is dead (the
+		// ntgcalls side has no source to feed), so the record
+		// is marked failed here, stage "set_source" — the
+		// NoxBeats rule (erase the call record on set_source
+		// failure and fall through to a full rejoin). Leaving
+		// it StateConnected would make every later bind retry
+		// the same dead swap and drain the queue track by
+		// track; marked failed, hasLiveCall goes false and
+		// the advance path ends the session, and a fresh
+		// /play rejoins — the rejoin leg of the hot-swap
+		// rule. There is no video flag in Parlay (audio-only
+		// external source), so no video-flag rejoin case
+		// exists.
+		m.mu.Lock()
+		if current, ok := m.calls[chatID]; ok && current == call {
+			current.State = StateFailed
+			current.FailedStage = "set_source"
+			current.FailedReason = err.Error()
+		}
+		m.mu.Unlock()
+		log.Printf("voice: play stream chat %d: set external audio source failed (%v); call marked failed", chatID, err)
 		return fmt.Errorf("voice: play stream chat %d: set external audio source: %w", chatID, err)
 	}
 	stream, err := engine.OpenStream(ctx, r, opts)
