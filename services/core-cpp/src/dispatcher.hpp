@@ -594,8 +594,12 @@ private:
                          const ReplyKeyboard& kb, bool remove_kb = false);
     // Photo reply (thumbnail rule §0.3): the card as the caption, HTML,
     // optional inline keyboard. Returns the message id, -1 on failure.
+    // report=false suppresses the owner error DM: the thumbnail
+    // callers fall back to a text card, so a photo failure there is
+    // not an owner-visible problem.
     int64_t replyPhoto(const CommandContext& ctx, const std::string& photo,
-                       const std::string& caption, const InlineKeyboard& kb);
+                       const std::string& caption, const InlineKeyboard& kb,
+                       bool report = true);
     // Answer a callback query: toast (alert=false) or alert dialog.
     bool answerCb(const TgCallbackQuery& cq, const std::string& text,
                   bool alert = false);
@@ -659,6 +663,17 @@ private:
         if (!thumbnailsOn(chat_id)) return "";
         if (!track_thumb.empty()) return track_thumb;
         return cfg_.default_thumbnail;
+    }
+    // Thumbnail source for a track JSON: the backend's cached local
+    // path (thumbnail_path) when present, else the thumbnail URL. A
+    // URL is not a valid inputFile, so the local path is what makes
+    // the photo actually show; a URL falls through to the text card.
+    static std::string trackThumb(const Json* track) {
+        if (!track) return "";
+        if (const Json* p = track->find("thumbnail_path"))
+            if (!p->asString().empty()) return p->asString();
+        if (const Json* t = track->find("thumbnail")) return t->asString();
+        return "";
     }
     // Display name for a user: "FirstName (@username)" / "FirstName" /
     // the bare id when nothing else is known.

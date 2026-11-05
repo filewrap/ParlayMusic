@@ -29,6 +29,7 @@ import (
 	"parlay/backend-go/internal/lyrics"
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
+	"parlay/backend-go/internal/thumbs"
 	"parlay/backend-go/internal/uds"
 	"parlay/backend-go/internal/voice"
 )
@@ -81,6 +82,10 @@ func (h *Handlers) vcPlay(ctx context.Context, req uds.Request) (any, error) {
 	if track.StreamURL == "" && track.Source != string(resolver.SourceRadio) && track.Source != "file" {
 		return nil, errEngineUnavailable("track %s resolved but has no playable stream URL", track.ID)
 	}
+	// Cache the thumbnail to disk now, so the core can send it as
+	// inputFileLocal: an https URL is not a valid TDLib photo. A
+	// failed download is not fatal — the card falls back to text.
+	h.ensureThumb(ctx, &track)
 
 	h.chatLock(chatID).Lock()
 	defer h.chatLock(chatID).Unlock()
@@ -508,6 +513,23 @@ func (h *Handlers) vcVolume(ctx context.Context, req uds.Request) (any, error) {
 
 // --- vc.now_playing / vc.progress (§1.13, §1.14) ---------------------
 
+// ensureThumb downloads the track's thumbnail to disk (cached) and
+// sets track.ThumbnailPath to the local path, so the core can send it
+// as inputFileLocal. It never fails the request: on any error it logs
+// and leaves ThumbnailPath empty, and the core falls back to a text
+// card with no owner error DM.
+func (h *Handlers) ensureThumb(ctx context.Context, track *model.Track) {
+	if track == nil || track.ThumbnailPath != "" || track.Thumbnail == "" {
+		return
+	}
+	p, err := thumbs.Ensure(ctx, h.deps.Config.Backend.DataDir, track.Thumbnail)
+	if err != nil {
+		log.Printf("handlers: thumbnail cache for %s: %v", track.ID, err)
+		return
+	}
+	track.ThumbnailPath = p
+}
+
 // vcNowPlaying returns the room snapshot. No room, or a room with
 // no track and an empty queue, is not_found (vc-go rule); a room
 // with no current but a non-empty queue returns 200 with
@@ -520,6 +542,12 @@ func (h *Handlers) vcNowPlaying(ctx context.Context, req uds.Request) (any, erro
 	snap, ok := h.rooms.Snapshot(chatID)
 	if !ok || (snap.Track == nil && len(snap.Queue) == 0) {
 		return nil, errNotFound("nothing playing in this chat")
+	}
+	// Backstop for tracks resolved before the thumbnail cache
+	// existed (e.g. rooms restored from bbolt after a restart):
+	// ensure the current track's local thumbnail path is set.
+	if snap.Track != nil {
+		h.ensureThumb(ctx, snap.Track)
 	}
 	return nowPlayingResp(snap), nil
 }

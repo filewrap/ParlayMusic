@@ -11,19 +11,25 @@ package model
 // "unknown" serialises as null (and omits on encode when unset),
 // matching the contract's integer|null / string|null types.
 type Track struct {
-	ID          string  `json:"id"`
-	Title       string  `json:"title"`
-	Source      string  `json:"source"`
-	URL         string  `json:"url,omitempty"`
-	Artist      string  `json:"artist,omitempty"`
-	DurationSec int64   `json:"duration_sec,omitempty"`
-	Thumbnail   string  `json:"thumbnail,omitempty"`
-	StreamURL   string  `json:"stream_url,omitempty"`
-	DurationStr string  `json:"duration_str,omitempty"`
-	Views       *int64  `json:"views,omitempty"`
-	Uploader    *string `json:"uploader,omitempty"`
-	UploadTime  *string `json:"upload_time,omitempty"`
-	IsLive      bool    `json:"is_live,omitempty"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Source      string `json:"source"`
+	URL         string `json:"url,omitempty"`
+	Artist      string `json:"artist,omitempty"`
+	DurationSec int64  `json:"duration_sec,omitempty"`
+	Thumbnail   string `json:"thumbnail,omitempty"`
+	// ThumbnailPath is the local path of the backend's cached copy of
+	// the thumbnail (internal/thumbs), set when the track is resolved.
+	// The core sends photos as inputFileLocal, so it prefers this over
+	// Thumbnail (an https URL is not a valid inputFile). Empty when
+	// the thumbnail was never fetched or the download failed.
+	ThumbnailPath string  `json:"thumbnail_path,omitempty"`
+	StreamURL     string  `json:"stream_url,omitempty"`
+	DurationStr   string  `json:"duration_str,omitempty"`
+	Views         *int64  `json:"views,omitempty"`
+	Uploader      *string `json:"uploader,omitempty"`
+	UploadTime    *string `json:"upload_time,omitempty"`
+	IsLive        bool    `json:"is_live,omitempty"`
 	// CachedFileID is the Telegram file_id of the backend's cached
 	// copy of this track, when one is known (actions-inventory §9-E10).
 	// The backend never invents one: it stays empty until the core

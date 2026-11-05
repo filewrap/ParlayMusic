@@ -1548,12 +1548,12 @@ int64_t Dispatcher::replyReplyKb(const CommandContext& ctx,
 int64_t Dispatcher::replyPhoto(const CommandContext& ctx,
                                const std::string& photo,
                                const std::string& caption,
-                               const InlineKeyboard& kb) {
+                               const InlineKeyboard& kb, bool report) {
     std::string err;
     int64_t id = tg_.sendPhoto(ctx.message.chat.id, photo, caption, kb,
                                &err);
     if (id < 0) {
-        reportOwnerError("replyPhoto", ctx.message.chat.id, err);
+        if (report) reportOwnerError("replyPhoto", ctx.message.chat.id, err);
         return -1;
     }
     int mins = settingsFor(ctx.message.chat.id).clean_delay_min;
@@ -1587,7 +1587,17 @@ void Dispatcher::reportOwnerError(const std::string& action, int64_t chat_id,
 bool Dispatcher::answerCb(const TgCallbackQuery& cq, const std::string& text,
                           bool alert) {
     std::string err;
-    return tg_.answerCallbackQuery(cq.id, text, alert, 0, &err);
+    bool ok = tg_.answerCallbackQuery(cq.id, text, alert, 0, &err);
+    if (!ok) {
+        // A failed answer leaves the tapper's spinner hanging with no
+        // toast: log it so a dead button is diagnosable instead of
+        // silent. (Root cause found 2026-11-05: the callback query id
+        // is int64 in td_api.tl and was read with asString(), so it
+        // was always empty; see tdIdString in main.cpp.)
+        std::cerr << "[cb] answerCallbackQuery failed for " << cq.data
+                  << " (id='" << cq.id << "'): " << err << "\n";
+    }
+    return ok;
 }
 
 bool Dispatcher::editCbCard(const TgCallbackQuery& cq,
@@ -1604,20 +1614,35 @@ bool Dispatcher::editCbCard(const TgCallbackQuery& cq,
     bool have_card = cardInfo(cq.chat_id, card_id, is_photo) &&
                      card_id == cq.message_id;
     InlineKeyboard markup = kb;
+    bool ok = false;
     if (have_card && is_photo)
-        return tg_.editMessageCaption(cq.chat_id, cq.message_id, text,
-                                      markup, &err);
-    return tg_.editMessageText(cq.chat_id, cq.message_id, text, markup,
-                               &err);
+        ok = tg_.editMessageCaption(cq.chat_id, cq.message_id, text,
+                                    markup, &err);
+    else
+        ok = tg_.editMessageText(cq.chat_id, cq.message_id, text, markup,
+                                 &err);
+    if (!ok) {
+        // A failed card edit is invisible to the tapper (the toast
+        // already fired): log it and DM the owner so a dead button is
+        // diagnosable instead of silent.
+        std::cerr << "[cb] editCbCard failed in chat " << cq.chat_id
+                  << " for " << cq.data << ": " << err << "\n";
+        reportOwnerError("editCbCard", cq.chat_id, err);
+    }
+    return ok;
 }
 
 bool Dispatcher::editCbKeyboard(const TgCallbackQuery& cq,
                                 const InlineKeyboard& kb) {
     if (!cq.has_message) return false;
     std::string err;
-    return tg_.editMessageReplyMarkup(
-        cq.chat_id, cq.message_id,
-        kb, &err);
+    bool ok = tg_.editMessageReplyMarkup(cq.chat_id, cq.message_id, kb,
+                                         &err);
+    if (!ok) {
+        std::cerr << "[cb] editCbKeyboard failed in chat " << cq.chat_id
+                  << " for " << cq.data << ": " << err << "\n";
+    }
+    return ok;
 }
 
 // --- Phase 9 card rendering -------------------------------------------------
@@ -1625,6 +1650,11 @@ std::string Dispatcher::displayName(const TgUser& u) {
     std::string name = u.first_name;
     if (name.empty()) name = std::to_string(u.id);
     if (!u.username.empty()) name += " (@" + u.username + ")";
+    // Display names come from user-controlled profile data: strip
+    // backticks, which render literally in Rich HTML (a name like
+    // "`Neil" showed a stray backtick in the card) and carry no
+    // meaning in a display name.
+    name.erase(std::remove(name.begin(), name.end(), '`'), name.end());
     return name;
 }
 
@@ -1725,9 +1755,18 @@ bool Dispatcher::cardInfo(int64_t chat_id, int64_t& message_id,
 }
 
 int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
-                                       const std::string& state_line) {
+                                       const std::string& state_line_in) {
     const Json* track = np.find("track");
     if (!track || track->isNull()) return -1;
+    // "Now playing" as a state line duplicates the card's own
+    // "<h2>Now Playing</h2>" heading (the card rendered "Now playing"
+    // + "Now Playing"). Drop it — and a leading "Now playing\n"
+    // prefix when the state carries more (e.g. the muted note). Other
+    // states (Paused / Resumed / Skipped) stay: they add information.
+    std::string state_line = state_line_in;
+    if (state_line == "Now playing") state_line.clear();
+    if (state_line.rfind("Now playing\n", 0) == 0)
+        state_line = state_line.substr(std::string("Now playing\n").size());
     std::string requester;
     auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
     requester = rn ? *rn : "";
@@ -1753,10 +1792,7 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     InlineKeyboard kb = ui_texts::playerKeyboard(
         chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
         settingsFor(chat_id).thumbnails);
-    std::string thumb = effectiveThumb(
-        chat_id, track->find("thumbnail")
-                     ? track->find("thumbnail")->asString()
-                     : "");
+    std::string thumb = effectiveThumb(chat_id, trackThumb(track));
     CommandContext fake;
     fake.message.chat.id = chat_id;
     int64_t id = -1;
@@ -1871,10 +1907,7 @@ bool Dispatcher::buildQueueCard(int64_t chat_id, bool show_all,
     text_out = ui_texts::queueText(now, up, total);
     kb_out = ui_texts::queueKeyboard(chat_id, up, has_more,
                                      total - up.size());
-    thumb_out = effectiveThumb(
-        chat_id, track.find("thumbnail")
-                     ? track.find("thumbnail")->asString()
-                     : "");
+    thumb_out = effectiveThumb(chat_id, trackThumb(&track));
     return true;
 }
 
@@ -1888,7 +1921,7 @@ void Dispatcher::renderQueueCard(const CommandContext& ctx, bool show_all) {
         return;
     }
     if (!thumb.empty() && thumbnailsOn(chat)) {
-        if (replyPhoto(ctx, thumb, text, kb) > 0) return;
+        if (replyPhoto(ctx, thumb, text, kb, false) > 0) return;
     }
     replyKb(ctx, text, kb);
 }
@@ -3011,17 +3044,14 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                 ui_texts::CardTrack ct = cardTrack(*lt, by);
                 std::string text = ui_texts::queuedText(
                     static_cast<int>(items->size()), ct);
-                std::string thumb = effectiveThumb(
-                    chat, lt->find("thumbnail")
-                              ? lt->find("thumbnail")->asString()
-                              : "");
+                std::string thumb = effectiveThumb(chat, trackThumb(lt));
                 InlineKeyboard kb = ui_texts::queuedKeyboard(ct.token);
                 // s-alias: the queueing itself still happens (the
                 // backend accepted it); only the success card is
                 // suppressed. Errors above stay visible.
                 if (!ctx.silent_success) {
                     if (!thumb.empty() && thumbnailsOn(chat)) {
-                        if (replyPhoto(ctx, thumb, text, kb) > 0) {
+                        if (replyPhoto(ctx, thumb, text, kb, false) > 0) {
                             deleteCommandMessage(ctx);
                             return;
                         }
@@ -9382,10 +9412,14 @@ static Json tdButton(const InlineButton& b) {
                                 {{"@type", Json("targetChatCurrent")}})
                           : Json::objectOf({
                                 {"@type", Json("targetChatChosen")},
-                                {"allow_user_chats", Json(true)},
-                                {"allow_bot_chats", Json(true)},
-                                {"allow_group_chats", Json(true)},
-                                {"allow_channel_chats", Json(true)},
+                                {"types",
+                                 Json::objectOf({
+                                     {"@type", Json("targetChatTypes")},
+                                     {"allow_user_chats", Json(true)},
+                                     {"allow_bot_chats", Json(true)},
+                                     {"allow_group_chats", Json(true)},
+                                     {"allow_channel_chats", Json(true)},
+                                 })},
                             });
         type = Json::objectOf({
             {"@type", Json("inlineKeyboardButtonTypeSwitchInline")},

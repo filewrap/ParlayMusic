@@ -917,14 +917,18 @@ inline std::string trackLink(const CardTrack& t) {
 // Started-streaming card (Yukki wins for text, §4). Title truncated to
 // 25 chars in the card (Yukki ShortTitle).
 inline std::string nowPlayingText(const CardTrack& t) {
-    return fmt("<h2>Now Playing</h2>\n"
-               "\n"
-               "<b>▫ Track:</b> {track}\n"
-               "<b>▫ Duration:</b> {duration}\n"
-               "<b>▫ Requested by:</b> {by}",
+    // Each field is its own <p> block: in Rich HTML a bare "\n"
+    // between inline runs is collapsed to a space, so the old
+    // "\n"-separated fields rendered as one run-on line. The classic
+    // caption path strips <p> back to newlines (see
+    // downgradeHeadingsForClassic), so photo captions keep working.
+    return fmt("<h2>Now Playing</h2>"
+               "<p><b>▫ Track:</b> {track}</p>"
+               "<p><b>▫ Duration:</b> {duration}</p>"
+               "<p><b>▫ Requested by:</b> {by}</p>",
                {{"track", trackLink(t)},
                 {"duration", t.duration},
-                {"by", t.requester}});
+                {"by", htmlEscape(t.requester)}});
 }
 
 // State cards (TgMusicBot buildTrackMessage template, §4): the same
@@ -1136,9 +1140,10 @@ inline std::string menuPanelText(const std::string& now_title,
         return "<b><a href=\"" + url + "\">" + title + "</a></b>";
     };
     // The state is carried by the Now/Next labels; no emoji is emitted
-    // anywhere in the UI (§7.3).
-    return "<b>Now:</b> " + linked(now, now_url) + "\n<b>Next:</b> " +
-           linked(next, next_url);
+    // anywhere in the UI (§7.3). Each line is its own <p>: a bare "\n"
+    // collapses to a space in Rich HTML (see nowPlayingText).
+    return "<p><b>Now:</b> " + linked(now, now_url) + "</p>" +
+           "<p><b>Next:</b> " + linked(next, next_url) + "</p>";
 }
 inline InlineKeyboard menuPanelKeyboard(int64_t chat_id) {
     using B = InlineButton;
