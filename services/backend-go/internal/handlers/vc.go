@@ -586,10 +586,17 @@ func (h *Handlers) vcVolume(ctx context.Context, req uds.Request) (any, error) {
 // sets track.ThumbnailPath to the local path, so the core can send it
 // as inputFileLocal. It never fails the request: on any error it logs
 // and leaves ThumbnailPath empty, and the core falls back to a text
-// card with no owner error DM.
+// card with no owner error DM. The thumbnail URL itself is
+// normalized to the jpg variant first (queue-port Tier 4, item 28):
+// the cached file and the snapshot's thumbnail URL both carry
+// hqdefault.jpg, so the item-27 hyperlink fallback gets the
+// variant Telegram reliably fetches.
 func (h *Handlers) ensureThumb(ctx context.Context, track *model.Track) {
 	if track == nil || track.ThumbnailPath != "" || track.Thumbnail == "" {
 		return
+	}
+	if norm := thumbs.NormalizeURL(track.Thumbnail); norm != track.Thumbnail {
+		track.Thumbnail = norm
 	}
 	p, err := thumbs.Ensure(ctx, h.deps.Config.Backend.DataDir, track.Thumbnail)
 	if err != nil {
@@ -597,6 +604,42 @@ func (h *Handlers) ensureThumb(ctx context.Context, track *model.Track) {
 		return
 	}
 	track.ThumbnailPath = p
+}
+
+// vcCard records the now-playing card's Telegram message id on the
+// track (queue-port Tier 6, item 32 — NoxBeats Track::message_id).
+// The core posts it after sending a fresh card or re-rendering the
+// recorded card onto a new front track; the room persists it with
+// the queue in bbolt, so the id survives a core restart and
+// vc.now_playing surfaces it on the track (the core's card
+// refresh prefers it, with recordCard as fallback). Unknown track
+// id or an empty room maps to bad_request / not_found via
+// mapRoomErr; the core treats a failure as a log line, never as a
+// card failure.
+func (h *Handlers) vcCard(ctx context.Context, req uds.Request) (any, error) {
+	var p struct {
+		ChatID    int64  `json:"chat_id"`
+		TrackID   string `json:"track_id"`
+		MessageID int64  `json:"message_id"`
+	}
+	if err := decodePayload(req, &p); err != nil {
+		return nil, err
+	}
+	chatID, err := chatIDOf(req, p.ChatID)
+	if err != nil {
+		return nil, err
+	}
+	if p.TrackID == "" {
+		return nil, errBadRequest("track_id is required")
+	}
+	if p.MessageID <= 0 {
+		return nil, errBadRequest("message_id must be > 0")
+	}
+	snap, err := h.rooms.SetCardMessageID(chatID, p.TrackID, p.MessageID)
+	if err != nil {
+		return nil, mapRoomErr(err)
+	}
+	return nowPlayingResp(snap), nil
 }
 
 // vcNowPlaying returns the room snapshot. No room, or a room with

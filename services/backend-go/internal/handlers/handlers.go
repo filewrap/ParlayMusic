@@ -198,6 +198,7 @@ func Register(s *uds.Server, d *app.Deps) {
 		"vc.mute":          h.vcMute,
 		"vc.radio":         h.vcRadio,
 		"vc.play_file":     h.vcPlayFile,
+		"vc.card":          h.vcCard,
 	} {
 		s.Register(action, fn)
 	}

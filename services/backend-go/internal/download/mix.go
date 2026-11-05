@@ -80,7 +80,7 @@ func (s *Service) handleMix(ctx context.Context, req uds.Request) (any, error) {
 			}
 		}
 		// Autoplay history is excluded too: the room state carries
-		// it (model.RoomState.AutoplayHistory, capped at 50), and
+		// it (model.RoomState.AutoplayHistory, capped at 100), and
 		// the room Manager persists it synchronously on every
 		// transition, so the store read is current.
 		if st, found, err := s.deps.Store.GetRoom(body.ChatID); err == nil && found {

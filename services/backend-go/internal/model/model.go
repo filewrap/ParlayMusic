@@ -23,7 +23,15 @@ type Track struct {
 	// The core sends photos as inputFileLocal, so it prefers this over
 	// Thumbnail (an https URL is not a valid inputFile). Empty when
 	// the thumbnail was never fetched or the download failed.
-	ThumbnailPath string  `json:"thumbnail_path,omitempty"`
+	ThumbnailPath string `json:"thumbnail_path,omitempty"`
+	// CardMessageID is the Telegram message id of this track's
+	// now-playing card (queue-port Tier 6, item 32 — NoxBeats
+	// Track::message_id). The core reports it back over vc.card
+	// after sending the card; the room persists it with the queue,
+	// so card edits target the right message after a core restart
+	// without a separate lookup. 0 when no card has been sent for
+	// this track yet.
+	CardMessageID int64 `json:"card_message_id,omitempty"`
 	StreamURL     string  `json:"stream_url,omitempty"`
 	DurationStr   string  `json:"duration_str,omitempty"`
 	Views         *int64  `json:"views,omitempty"`
@@ -98,7 +106,7 @@ type NowPlaying struct {
 //
 // Wave 2 (room state machine, phase3/actions-inventory.md §4.6)
 // added the remaining PersistedRoom fields: the autoplay history
-// (cap 50), the pre-mute volume, the bass level, the live radio
+// (cap 100, queue-port Tier 5 item 29), the pre-mute volume, the bass level, the live radio
 // state, and the last-track id. All are additive with omitempty
 // tags: records written by Wave 1 simply read back as zero values.
 type RoomState struct {
@@ -127,7 +135,8 @@ type RoomState struct {
 	FXParams    map[string]float64 `json:"fx_params,omitempty"`
 	UpdatedAt   int64              `json:"updated_at"`
 	// AutoplayHistory is the ids of tracks autoplay has already
-	// picked, oldest first, capped at 50 (inventory §4.3). It is
+	// picked, oldest first, capped at MaxAutoplayHistory (100,
+	// queue-port Tier 5 item 29). It is
 	// cleared when autoplay is disabled and when it reaches the
 	// cap at advance time.
 	AutoplayHistory []string `json:"autoplay_history,omitempty"`

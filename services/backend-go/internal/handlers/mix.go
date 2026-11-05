@@ -1,8 +1,13 @@
 // YouTube RD-mix picker — the autoplay pick (inventory §3.2).
 //
-// The picker fetches the mix for a YouTube track — watch?v=<id>&
-// list=RD<id> — and returns the first entry not in the exclude set
-// (last + queue + history), resolved to a playable track.
+// The picker works a fallback tier chain (queue-port Tier 5,
+// item 30): Tier 1 fetches the mix for a YouTube track —
+// watch?v=<id>&list=RD<id> — Tier 2 searches "<clean title>
+// similar songs". Each tier filters candidates against the played
+// set, shuffles, and takes a random pick from the top 4; Tier 0
+// (an iota /similar endpoint) has no Parlay equivalent and is not
+// faked. A pick is resolved to a playable track through the
+// single resolve path.
 //
 // Why this lives here and not in the resolver: no Related/mix
 // method exists in internal/resolver, the yt-dlp daemon runs with
@@ -28,6 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -51,6 +57,20 @@ const (
 // mixPickerTimeout bounds one mix fetch (vc-go used 30 s).
 const mixPickerTimeout = 30 * time.Second
 
+// Autoplay fallback tiers (queue-port Tier 5, item 30 — Parvati
+// platforms/registry.rs tiers + monitor.rs golden_zone_pick).
+// Tier 0 is the iota `/similar` endpoint: it has NO Parlay
+// equivalent — there is no /similar service in-tree, and the
+// picker does not fake one. Tier 1 is the YouTube radio mix
+// (RD<id> via InnerTube `next`, fetchMix). Tier 2 is a
+// `"<clean title> similar songs"` YouTube search. Each tier
+// filters candidates against the played set (exclude), shuffles,
+// and takes a random pick from the top 4 (golden_zone_pick); a
+// tier that yields no playable track falls through to the next,
+// and a fetch error in one tier is not fatal — the next tier is
+// tried. Only when every tier's fetch fails is the error
+// returned (the room then goes idle on autoplay_failed).
+//
 // newMixPicker builds the autoplay picker around the registry.
 func newMixPicker(reg *resolver.Registry) room.Picker {
 	return func(ctx context.Context, last model.Track, exclude map[string]bool) (model.Track, error) {
@@ -61,26 +81,147 @@ func newMixPicker(reg *resolver.Registry) room.Picker {
 		}
 		ctx, cancel := context.WithTimeout(ctx, mixPickerTimeout)
 		defer cancel()
-		candidates, err := fetchMix(ctx, videoID)
-		if err != nil {
-			return model.Track{}, err
+		var lastErr error
+		anyFetched := false
+		// Tier 1: YouTube radio mix.
+		if ids, err := fetchMix(ctx, videoID); err != nil {
+			lastErr = err
+		} else {
+			anyFetched = true
+			if track, ok := pickFromIDs(ctx, reg, ids, exclude); ok {
+				return track, nil
+			}
 		}
-		for _, cand := range candidates {
-			if exclude[cand] {
-				continue
+		// Tier 2: "<clean title> similar songs" search.
+		if ids, err := fetchSimilarSearch(ctx, reg, last); err != nil {
+			lastErr = err
+		} else {
+			anyFetched = true
+			if track, ok := pickFromIDs(ctx, reg, ids, exclude); ok {
+				return track, nil
 			}
-			// Resolve the candidate to a playable track through
-			// the single resolve path (InnerTube player, fast).
-			// An unresolvable candidate is skipped, not fatal:
-			// the mix has more entries.
-			track, err := reg.Resolve(ctx, "yt:"+cand)
-			if err != nil || track.ID == "" || track.StreamURL == "" {
-				continue
-			}
-			return track, nil
+		}
+		if !anyFetched && lastErr != nil {
+			return model.Track{}, lastErr
 		}
 		return model.Track{}, nil
 	}
+}
+
+// pickFromIDs filters ids against exclude (last + queue +
+// history — queue-port Tier 5, item 29: never re-suggest a played
+// track), dedupes, shuffles the survivors (TgMusicBot autoplay
+// shuffle), and resolves the top 4 in order until one yields a
+// playable track (Parvati's golden_zone_pick: random pick from
+// the top 4). An unresolvable candidate is skipped, not fatal:
+// the tier has more entries. It returns false when no candidate
+// resolves.
+func pickFromIDs(ctx context.Context, reg *resolver.Registry, ids []string, exclude map[string]bool) (model.Track, bool) {
+	seen := make(map[string]bool, len(ids))
+	var cands []string
+	for _, id := range ids {
+		if id == "" || exclude[id] || seen[id] {
+			continue
+		}
+		seen[id] = true
+		cands = append(cands, id)
+	}
+	rand.Shuffle(len(cands), func(i, j int) {
+		cands[i], cands[j] = cands[j], cands[i]
+	})
+	if len(cands) > 4 {
+		cands = cands[:4]
+	}
+	for _, cand := range cands {
+		// Resolve the candidate to a playable track through
+		// the single resolve path (InnerTube player, fast).
+		track, err := reg.Resolve(ctx, "yt:"+cand)
+		if err != nil || track.ID == "" || track.StreamURL == "" {
+			continue
+		}
+		return track, true
+	}
+	return model.Track{}, false
+}
+
+// fetchSimilarSearch is autoplay Tier 2: a YouTube search for
+// "<clean title> similar songs", returning the candidate video
+// ids in search order. A track with no usable title yields no
+// candidates (not an error) — the tier simply does not apply.
+func fetchSimilarSearch(ctx context.Context, reg *resolver.Registry, last model.Track) ([]string, error) {
+	title := cleanTitleForSimilar(last.Title)
+	if title == "" {
+		return nil, nil
+	}
+	results, err := reg.Search(ctx, resolver.SourceYouTube, title+" similar songs", 8)
+	if err != nil {
+		return nil, fmt.Errorf("mix: similar search failed: %w", err)
+	}
+	var ids []string
+	for _, t := range results {
+		if id := mixVideoID(t); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// similarTitleNoise are the bracketed tags stripped from a seed
+// title before the Tier 2 search: they describe the video's
+// packaging ("(Official Video)", "[HD]"), not the song, and they
+// narrow the search to the same upload instead of similar songs.
+var similarTitleNoise = []string{
+	"official video", "official audio", "official lyric video",
+	"official music video", "lyric video", "lyrics", "music video",
+	"visualizer", "visualiser", "remaster", "remastered", "hd", "4k",
+	"8d audio", "slowed", "reverb",
+}
+
+// cleanTitleForSimilar strips the packaging off a seed title for
+// the Tier 2 search: bracketed segments that are pure noise go,
+// a trailing " - Topic" (YouTube auto-generated artist channels)
+// goes, and whitespace collapses. The core title is kept intact —
+// "(feat. X)" and "(From ...)" segments that name the song stay,
+// because they are part of what "similar" means. An empty result
+// falls back to the original title.
+func cleanTitleForSimilar(title string) string {
+	t := strings.TrimSpace(title)
+	// Strip bracketed noise segments, repeatedly (a title can
+	// carry "(Official Video) [HD]").
+	for {
+		start := strings.IndexAny(t, "([")
+		if start < 0 {
+			break
+		}
+		closer := byte(')')
+		if t[start] == '[' {
+			closer = ']'
+		}
+		end := strings.IndexByte(t[start+1:], closer)
+		if end < 0 {
+			break
+		}
+		end += start + 1
+		inner := strings.ToLower(strings.TrimSpace(t[start+1 : end]))
+		noise := false
+		for _, n := range similarTitleNoise {
+			if strings.Contains(inner, n) {
+				noise = true
+				break
+			}
+		}
+		if !noise {
+			break
+		}
+		t = strings.TrimSpace(t[:start] + " " + t[end+1:])
+	}
+	t = strings.TrimSuffix(t, " - Topic")
+	t = strings.TrimSuffix(t, "- Topic")
+	t = strings.Join(strings.Fields(t), " ")
+	if t == "" {
+		return strings.Join(strings.Fields(title), " ")
+	}
+	return t
 }
 
 // mixVideoID extracts the 11-char YouTube video id from a track's

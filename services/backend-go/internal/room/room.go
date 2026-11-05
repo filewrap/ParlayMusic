@@ -70,11 +70,12 @@ import (
 	"parlay/backend-go/internal/store"
 )
 
-// MaxAutoplayHistory is the autoplay history cap (inventory §4.3,
-// §10-D11: 50, vc-go/vc-ts rule — vc-rust's 200-with-shift is NOT
-// ported). When the history reaches the cap at advance time it is
-// cleared and the room goes idle.
-const MaxAutoplayHistory = 50
+// MaxAutoplayHistory is the autoplay history cap (inventory §4.3;
+// queue-port Tier 5, item 29: raised from the old locked 50 to
+// Parvati's 100 — room.rs played_history, cap 100). When the
+// history reaches the cap at advance time it is cleared and the
+// room goes idle.
+const MaxAutoplayHistory = 100
 
 // Errors the Manager returns. Handlers map them to contract error
 // codes: ErrNothingPlaying -> not_found, ErrPositionOutOfRange /
@@ -608,7 +609,7 @@ func (m *Manager) ClearQueue(chatID int64) ([]model.QueueItem, error) {
 
 // activateFrontLocked makes the front track the active one:
 // position 0, clock running, not paused. It notes the track in
-// the autoplay history (append if new, cap 50) and clears the
+// the autoplay history (append if new, cap MaxAutoplayHistory) and clears the
 // radio state unless the front track IS the stored radio track.
 func (m *Manager) activateFrontLocked(rs *roomState) {
 	track := rs.st.Queue[0].Track
@@ -824,6 +825,37 @@ func (m *Manager) Advance(ctx context.Context, chatID int64, endedID string, fro
 		reason = "skipped"
 	}
 	return AdvanceOutcome{Kind: AdvanceIdle, EndedTrack: &ended, Reason: reason}, nil
+}
+
+// SetCardMessageID records the Telegram message id of the
+// now-playing card on the track that carries trackID (queue-port
+// Tier 6, item 32 — NoxBeats Track::message_id). The core reports
+// the id back over vc.card after sending (or re-rendering) the
+// card; the room persists it with the queue in bbolt, so the id
+// survives a core restart and the NowPlaying snapshot surfaces it
+// on the track for card edits. Unknown track id, or an empty room,
+// is an error and mutates nothing. A message id of 0 clears the
+// stored id.
+func (m *Manager) SetCardMessageID(chatID int64, trackID string, messageID int64) (model.NowPlaying, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs, ok := m.rooms[chatID]
+	if !ok || len(rs.st.Queue) == 0 {
+		return model.NowPlaying{}, ErrNothingPlaying
+	}
+	if trackID == "" {
+		return model.NowPlaying{}, fmt.Errorf("%w: track id is required", ErrInvalid)
+	}
+	for i := range rs.st.Queue {
+		if rs.st.Queue[i].Track.ID == trackID {
+			rs.st.Queue[i].Track.CardMessageID = messageID
+			if err := m.persistLocked(rs); err != nil {
+				return model.NowPlaying{}, err
+			}
+			return snapshotLocked(rs), nil
+		}
+	}
+	return model.NowPlaying{}, fmt.Errorf("%w: track %q is not in the queue", ErrInvalid, trackID)
 }
 
 // Skip resets the loop counter to 0 (all three engines) and then
