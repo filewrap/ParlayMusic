@@ -1600,6 +1600,42 @@ bool Dispatcher::answerCb(const TgCallbackQuery& cq, const std::string& text,
     return ok;
 }
 
+bool Dispatcher::editCard(int64_t chat_id, int64_t message_id,
+                          bool is_photo, const std::string& text,
+                          const InlineKeyboard& kb, std::string* err_out) {
+    // Photo/text-agnostic card edit (queue-port Tier 3, item 20 —
+    // Parvati card_edit / NoxBeats edit_common): TDLib has separate
+    // editMessageText / editMessageCaption calls, so the helper
+    // tries the edit matching the recorded card kind first and
+    // falls back to the other kind on failure — a card never fails
+    // on the wrong edit type. The keyboard is always re-sent:
+    // omitting reply_markup strips the buttons.
+    std::string err;
+    bool ok = false;
+    if (is_photo) {
+        ok = tg_.editMessageCaption(chat_id, message_id, text, kb,
+                                     &err);
+        if (!ok) {
+            std::string err2;
+            ok = tg_.editMessageText(chat_id, message_id, text, kb,
+                                     &err2);
+            if (ok) err.clear();
+            else err = err2;
+        }
+    } else {
+        ok = tg_.editMessageText(chat_id, message_id, text, kb, &err);
+        if (!ok) {
+            std::string err2;
+            ok = tg_.editMessageCaption(chat_id, message_id, text, kb,
+                                        &err2);
+            if (ok) err.clear();
+            else err = err2;
+        }
+    }
+    if (err_out) *err_out = err;
+    return ok;
+}
+
 bool Dispatcher::editCbCard(const TgCallbackQuery& cq,
                             const std::string& text,
                             const InlineKeyboard& kb) {
@@ -1614,13 +1650,8 @@ bool Dispatcher::editCbCard(const TgCallbackQuery& cq,
     bool have_card = cardInfo(cq.chat_id, card_id, is_photo) &&
                      card_id == cq.message_id;
     InlineKeyboard markup = kb;
-    bool ok = false;
-    if (have_card && is_photo)
-        ok = tg_.editMessageCaption(cq.chat_id, cq.message_id, text,
-                                    markup, &err);
-    else
-        ok = tg_.editMessageText(cq.chat_id, cq.message_id, text, markup,
-                                 &err);
+    bool ok = editCard(cq.chat_id, cq.message_id, have_card && is_photo,
+                       text, markup, &err);
     if (!ok) {
         // A failed card edit is invisible to the tapper (the toast
         // already fired): log it and DM the owner so a dead button is
@@ -2532,12 +2563,8 @@ void Dispatcher::onTrackEvent(const std::string& event, const Json& data) {
         if (!cardInfo(chat_id, card_id, is_photo)) return;
         std::string err;
         InlineKeyboard empty;
-        if (is_photo)
-            tg_.editMessageCaption(chat_id, card_id, ui_texts::kNowIdle,
-                                   empty, &err);
-        else
-            tg_.editMessageText(chat_id, card_id, ui_texts::kNowIdle, empty,
-                                &err);
+        editCard(chat_id, card_id, is_photo, ui_texts::kNowIdle, empty,
+                 &err);
         return;
     }
     if (event == "VoiceError") {
@@ -2719,10 +2746,7 @@ void Dispatcher::refreshCardText(int64_t chat_id, int64_t message_id,
         chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
         settingsFor(chat_id).thumbnails);
     std::string err;
-    if (is_photo)
-        tg_.editMessageCaption(chat_id, message_id, text, kb, &err);
-    else
-        tg_.editMessageText(chat_id, message_id, text, kb, &err);
+    editCard(chat_id, message_id, is_photo, text, kb, &err);
 }
 
 // --- duplex join: TDLib signalling on the shared assistant session --------
@@ -3298,7 +3322,7 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                 std::string text = ui_texts::queuedText(
                     static_cast<int>(items->size()), ct);
                 std::string thumb = effectiveThumb(chat, trackThumb(lt));
-                InlineKeyboard kb = ui_texts::queuedKeyboard(ct.token);
+                InlineKeyboard kb = ui_texts::queuedKeyboard(chat, ct.token);
                 // s-alias: the queueing itself still happens (the
                 // backend accepted it); only the success card is
                 // suppressed. Errors above stay visible.
@@ -3309,10 +3333,15 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                         // second message). A photo card cannot be
                         // edited into a text message, so the thumb
                         // path below drops the status and sends the
-                        // existing photo card instead.
+                        // existing photo card instead. The queued
+                        // card is NOT recorded as the now-playing
+                        // card (queue-port Tier 3, item 22): the
+                        // queued reply edits only the /play message,
+                        // and the recorded card stays the track that
+                        // is actually playing, so a later advance
+                        // refreshes the right message.
                         if (editPlayStatus(chat, status_msg_id, text, kb,
                                            true)) {
-                            recordCard(chat, status_msg_id, false);
                             clearPlayStatus(chat, status_msg_id);
                             deleteCommandMessage(ctx);
                             return;
@@ -3785,7 +3814,7 @@ void Dispatcher::onMix(const CommandContext& ctx) {
     if (items && items->size() > 0) {
         int pos = static_cast<int>(items->size()) - added + 1;
         finish(ui_texts::queuedText(pos, ct),
-               ui_texts::queuedKeyboard(ct.token));
+               ui_texts::queuedKeyboard(chat, ct.token));
     } else {
         finish("Added " + std::to_string(added) +
                    " mix tracks to the queue.",
@@ -4922,29 +4951,91 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
             {"requested_by", Json(ctx.message.from.id)},
         });
     }
-    // Progress message, edited in place (§8): the download POST is
-    // synchronous, so the core cannot poll live percentages — the
-    // downloaders only reveal their run_id in the POST response, by
-    // design (server.py). The message is edited to the outcome, and
-    // the final IPC-4 snapshot is fetched for the album checklist
-    // and the lossy prompt.
+    // The backend records the requesting chat on the run (the
+    // per-chat cancel flag, queue-port Tier 3 item 25): the core
+    // sends chat_id so download.cancel_chat can cancel this run
+    // without knowing its backend id.
+    body.set("chat_id", Json(ctx.message.chat.id));
+    // Progress message, edited in place (§8): the download POST
+    // runs on a worker thread (startDownloadWorker), so the main
+    // thread keeps pumping TDLib updates and the Cancel button on
+    // this message is answered mid-download. The core cannot poll
+    // live percentages — the downloaders only reveal their run_id
+    // in the POST response, by design (server.py). The message is
+    // edited to the outcome, and the final IPC-4 snapshot is
+    // fetched for the album checklist and the lossy prompt.
     std::string run_id = mintRunId();
     store_.set("dlrun:" + run_id,
                "pending\n" + std::to_string(ctx.message.chat.id));
     InlineKeyboard cancel_kb = {{InlineButton::callback(
         ui_texts::kDlCancelBtn, ui_texts::cbDlCancel(run_id))}};
     int64_t progress_msg = replyKb(ctx, ui_texts::kDlFetching, cancel_kb);
+    startDownloadWorker(ctx, action, body, query, run_id, progress_msg);
+}
+
+// The blocking download.* POST runs here, on a worker thread —
+// never on the main thread, which must keep pumping TDLib updates
+// so the Cancel button on the progress message is answered
+// mid-download (queue-port Tier 3, item 25; same shape as
+// startPlayWorker). IpcClient::call is multiplexed by request_id
+// with its writes serialized, so a call from this thread is safe
+// while the main thread makes its own calls. Nothing here touches
+// TDLib or the store: the outcome is handed to the main thread,
+// which renders it (finishDownload) exactly once.
+void Dispatcher::startDownloadWorker(CommandContext ctx,
+                                     std::string action, Json body,
+                                     std::string query, std::string run_id,
+                                     int64_t progress_msg) {
+    std::thread([this, ctx, action, body, query, run_id, progress_msg] {
+        IpcResult r = ipc_.post(action, body, 120);
+        // Final IPC-4 snapshot for the album checklist + lossy
+        // prompt: the server run id rides in the POST response.
+        IpcResult snap;
+        bool have_snap = false;
+        if (r.ok) {
+            std::string server_run;
+            if (const Json* rid = r.data.find("run_id"))
+                server_run = rid->asString();
+            if (!server_run.empty()) {
+                snap = ipc_.get("/v1/download/progress?run_id=" +
+                                    server_run,
+                                10);
+                have_snap = snap.ok;
+            }
+        }
+        std::lock_guard<std::mutex> lk(work_mu_);
+        pending_work_.push_back(
+            [this, ctx, action, query, run_id, progress_msg, r, snap,
+             have_snap] {
+                finishDownload(ctx, action, query, run_id, progress_msg,
+                               r, snap, have_snap);
+            });
+    }).detach();
+}
+
+void Dispatcher::finishDownload(const CommandContext& ctx,
+                                const std::string& action,
+                                const std::string& query,
+                                const std::string& run_id,
+                                int64_t progress_msg, const IpcResult& r,
+                                const IpcResult& snap, bool have_snap) {
     auto edit_progress = [&](const std::string& text,
                              const InlineKeyboard& kb) {
         if (progress_msg <= 0) return;
         std::string err;
         tg_.editMessageText(ctx.message.chat.id, progress_msg, text,
-                            kb.empty() ? InlineKeyboard{}
-                                       : kb,
-                            &err);
+                            kb.empty() ? InlineKeyboard{} : kb, &err);
     };
-    IpcResult r = ipc_.post(action, body, 120);
     if (!r.ok) {
+        if (r.error_message == "cancelled by user") {
+            // The Cancel button's download.cancel_chat landed: the
+            // backend aborted the run (that exact string is the
+            // download package's cancel reason). The tap already
+            // edited the card to the same text; this re-edit is a
+            // no-op when the message already reads it.
+            edit_progress(ui_texts::kToastDlCancelled, InlineKeyboard{});
+            return;
+        }
         if (isNotAvailableYet(r.error_message)) {
             // Not available yet: keep the request so a Check Again
             // tap can re-run exactly this download (lemonic
@@ -4989,16 +5080,11 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
     // Final IPC-4 snapshot: album checklist + lossy prompt trigger.
     bool lossy = false;
     std::string lossy_summary;
-    if (!server_run.empty()) {
-        IpcResult snap = ipc_.get("/v1/download/progress?run_id=" +
-                                      server_run,
-                                  10);
-        if (snap.ok) {
-            if (const Json* la = snap.data.find("lossy_available"))
-                lossy = la->asBool();
-            if (const Json* ls = snap.data.find("lossy_summary"))
-                lossy_summary = ls->asString();
-        }
+    if (have_snap) {
+        if (const Json* la = snap.data.find("lossy_available"))
+            lossy = la->asBool();
+        if (const Json* ls = snap.data.find("lossy_summary"))
+            lossy_summary = ls->asString();
     }
     if (lossy) {
         edit_progress(ui_texts::fmt(ui_texts::kLossyPrompt,
@@ -5722,6 +5808,7 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
     // vc.play means the first track is really playing.
     setCallActive(vcTarget(ctx), true);
     int queued = 0;
+    std::vector<Json> added;
     for (size_t i = 1; i < tracks.size(); ++i) {
         Json add = Json::objectOf({
             {"chat_id", Json(vcTarget(ctx))},
@@ -5732,9 +5819,32 @@ void Dispatcher::onPlayPlaylist(const CommandContext& ctx) {
         IpcResult ar = vcCall(ctx, "queue", add);
         if (!ar.ok) break;
         ++queued;
+        added.push_back(tracks[i]);
     }
     reply(ctx, "Playing your playlist: " + fmtTrack(first) +
                    (queued ? " (+" + std::to_string(queued) + " queued)" : ""));
+    if (!added.empty()) {
+        // Playlist remainder as a separate expandable blockquote
+        // (queue-port Tier 3, item 24 — NoxBeats playlist_to_queue
+        // / TgMusicBot handleMultipleTracks): every queued track +
+        // totals, capped so the message stays well inside the
+        // 32768-char rich limit.
+        std::vector<std::string> lines;
+        for (size_t i = 0; i < added.size(); ++i) {
+            const Json& t = added[i];
+            std::string title =
+                t.find("title") ? t.find("title")->asString() : "?";
+            int64_t dur = t.find("duration_sec")
+                              ? t.find("duration_sec")->asInt()
+                              : 0;
+            lines.push_back(std::to_string(i + 1) + ". " +
+                            ui_texts::htmlEscape(title) + " — " +
+                            ui_texts::durationStr(dur));
+        }
+        replyHtml(ctx, ui_texts::playlistRemainderText(
+                           lines, queued,
+                           static_cast<int>(list.size())));
+    }
 }
 
 // --- handlers: named playlists (Parvati/TgMusicBot model, §17) -------------
@@ -7509,11 +7619,31 @@ void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
     // negative; inline-mode buttons carry no message (chat_id 0).
     if (cq.chat_id < 0) noteLastChat(cq.from.id, cq.chat_id);
     const std::string& domain = parts[1];
+    // Answer-first (queue-port Tier 3, item 21 — NoxBeats
+    // play_cb.cpp): resolve the tapper's spinner BEFORE any work
+    // runs, so a slow backend round-trip never leaves the button
+    // loading. The answer is empty (no toast); the handler's
+    // outcome toast below is the second answer on the same query —
+    // the dl:go path already answers twice today. Unknown domains
+    // keep their single "🖐️" answer (see the router-level unknowns
+    // above), so the first answer fires for known domains only.
+    static const char* kKnownDomains[] = {
+        "help", "start", "close", "player", "queue", "set", "lang",
+        "dl", "bcast", "auth", "search", "vote", "share", "del",
+        "lossy", "restart", "dlset", "spotify", "play",
+    };
+    for (const char* d : kKnownDomains) {
+        if (domain == d) {
+            answerCb(cq, "");
+            break;
+        }
+    }
     try {
         if (domain == "help") cbHelp(cq, parts);
         else if (domain == "start") cbStart(cq);
         else if (domain == "close") cbClose(cq);
         else if (domain == "player") cbPlayer(cq, parts);
+        else if (domain == "play") cbPlay(cq, parts);
         else if (domain == "queue") cbQueue(cq, parts);
         else if (domain == "set") cbSet(cq, parts);
         else if (domain == "lang") cbLang(cq, parts);
@@ -8297,36 +8427,12 @@ void Dispatcher::cbPlayer(const TgCallbackQuery& cq,
         return;
     }
     if (verb == "playnow") {
-        Json item;
-        int64_t pos = 0;
-        if (!resolveQueueToken(chat_id, token, item, pos)) {
-            answerCb(cq, ui_texts::kToastExpired, true);
-            return;
-        }
-        const Json* t = item.find("track");
-        if (!t) {
-            answerCb(cq, ui_texts::kToastExpired, true);
-            return;
-        }
-        std::string url = t->find("url") ? t->find("url")->asString() : "";
-        std::string id = t->find("id") ? t->find("id")->asString() : "";
-        std::string q = !url.empty() ? url : id;
-        if (q.empty()) {
-            answerCb(cq, ui_texts::kToastInvalidRequest, true);
-            return;
-        }
-        CommandContext ctx;
-        ctx.message.chat.id = chat_id;
-        ctx.message.from = cq.from;
-        ctx.command = "play";
-        ctx.args = q;
-        // Play-now interrupts: stop the current track first, then
-        // play the chosen one (onPlay attaches the audio).
-        vcCall(ctx, "stop",
-               Json::objectOf({{"chat_id", Json(chat_id)}}));
-        onPlay(ctx);
-        answerCb(cq, ui_texts::kToastSkipped);
-        refreshCard(cq, chat_id);
+        // Legacy Play Now button (pre-Tier 3 queued cards still
+        // carry pl:player:playnow:<token>): same move as the new
+        // pl:play:force button — the old stop-then-replay shape
+        // cleared the whole queue to interrupt, which is not what
+        // Play Now means anymore.
+        forcePlayNext(cq, chat_id, token);
         return;
     }
     if (verb == "addlist") {
@@ -8429,6 +8535,87 @@ void Dispatcher::cbPlayer(const TgCallbackQuery& cq,
         refreshPanel(cq, chat_id);
     else
         refreshCard(cq, chat_id);
+}
+
+// --- Play Now force (queue-port Tier 3, item 23) -------------------------
+bool Dispatcher::forcePlayNext(const TgCallbackQuery& cq, int64_t chat_id,
+                               const std::string& token) {
+    // The tapper must be allowed to control playback in this chat
+    // (same gate as the player buttons).
+    if (!callbackCanControl(chat_id, cq.from.id)) {
+        answerCb(cq, ui_texts::kToastNotAllowed, true);
+        return false;
+    }
+    Json item;
+    int64_t pos = 0;
+    if (!resolveQueueToken(chat_id, token, item, pos)) {
+        answerCb(cq, ui_texts::kToastExpired, true);
+        return false;
+    }
+    const Json* t = item.find("track");
+    std::string id = t && t->find("id") ? t->find("id")->asString() : "";
+    if (id.empty()) {
+        answerCb(cq, ui_texts::kToastInvalidRequest, true);
+        return false;
+    }
+    CommandContext ctx;
+    ctx.message.chat.id = chat_id;
+    IpcResult r = vcCall(ctx, "play_next",
+                         Json::objectOf({{"chat_id", Json(chat_id)},
+                                         {"track_id", Json(id)}}));
+    if (!r.ok) {
+        answerCb(cq, r.error_message, true);
+        return false;
+    }
+    bool moved = false;
+    if (const Json* m = r.data.find("moved")) moved = m->asBool();
+    if (moved) {
+        answerCb(cq, ui_texts::kToastPlayNext);
+        // The queued card re-renders at its new position (#1): the
+        // track is the head of the waiting list now. The requester
+        // line keeps the original requester, not the tapper.
+        if (t) {
+            int64_t by = item.find("requested_by")
+                             ? item.find("requested_by")->asInt()
+                             : cq.from.id;
+            ui_texts::CardTrack ct = cardTrack(*t, by);
+            editCbCard(cq, ui_texts::queuedText(1, ct),
+                       ui_texts::queuedKeyboard(chat_id, token));
+        }
+        return true;
+    }
+    // Not moved: the track was already next, or already playing.
+    const Json* np = r.data.find("now_playing");
+    const Json* cur = np ? np->find("track") : nullptr;
+    std::string cur_id =
+        cur && cur->find("id") ? cur->find("id")->asString() : "";
+    answerCb(cq, cur_id == id ? ui_texts::kToastAlreadyPlaying
+                              : ui_texts::kToastAlreadyNext);
+    return true;
+}
+
+void Dispatcher::cbPlay(const TgCallbackQuery& cq,
+                        const std::vector<std::string>& parts) {
+    // pl:play:force:<chat_id>:<token>
+    if (parts.size() < 5 || parts[2] != "force") {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    int64_t chat_id = 0;
+    try {
+        chat_id = std::stoll(parts[3]);
+    } catch (...) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    // The button sits on a message in the chat it acts on; a chat
+    // id that does not match the callback's own message is a stale
+    // or forged tap.
+    if (cq.has_message && chat_id != cq.chat_id) {
+        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        return;
+    }
+    forcePlayNext(cq, chat_id, parts[4]);
 }
 
 void Dispatcher::cbQueue(const TgCallbackQuery& cq,
@@ -8974,12 +9161,17 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
             } catch (...) {
             }
         }
-        // download.cancel (Phase 3, OD-3): {run_id} ->
-        // {cancelled, run_id, phase}. Unknown run_id is a 404; a
-        // finished run answers cancelled:false (200, not an error).
-        IpcResult r = ipc_.post("download.cancel",
-                                Json::objectOf({{"run_id", Json(run_id)}}),
-                                30);
+        // download.cancel_chat (queue-port Tier 3, item 25): the
+        // per-chat cancel flag — {chat_id} -> {cancelled, chat_id,
+        // run_ids}. The per-run download.cancel cannot be the
+        // button's mechanism: the core's run_id is client-minted
+        // and the backend never sees it (the server run id is only
+        // revealed in the POST response, after the download), so a
+        // cancel posted with it 404s. The per-chat flag cancels
+        // every live run in the chat instead.
+        IpcResult r = ipc_.post(
+            "download.cancel_chat",
+            Json::objectOf({{"chat_id", Json(cq.chat_id)}}), 30);
         if (!r.ok) {
             answerCb(cq, r.error_message, true);
             return;

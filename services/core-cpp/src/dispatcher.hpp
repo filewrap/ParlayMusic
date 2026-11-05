@@ -670,6 +670,15 @@ private:
     // unchanged — "message is not modified" is a caller-level no-op).
     bool editCbCard(const TgCallbackQuery& cq, const std::string& text,
                     const InlineKeyboard& kb);
+    // Photo/text-agnostic card edit (queue-port Tier 3, item 20 —
+    // Parvati card_edit / NoxBeats edit_common): try the edit
+    // matching the card kind first, fall back to the other kind on
+    // failure, and always re-send the keyboard (omitting
+    // reply_markup strips the buttons). The now-playing card edits
+    // all go through here.
+    bool editCard(int64_t chat_id, int64_t message_id, bool is_photo,
+                  const std::string& text, const InlineKeyboard& kb,
+                  std::string* err_out = nullptr);
     // Edit only the keyboard of the message a button sits on.
     bool editCbKeyboard(const TgCallbackQuery& cq, const InlineKeyboard& kb);
     void replyError(const CommandContext& ctx, const IpcResult& r);
@@ -848,6 +857,10 @@ private:
     void cbClose(const TgCallbackQuery& cq);
     void cbPlayer(const TgCallbackQuery& cq,
                   const std::vector<std::string>& parts);
+    // Play Now force button (queue-port Tier 3, item 23):
+    // pl:play:force:<chat>:<token>.
+    void cbPlay(const TgCallbackQuery& cq,
+                const std::vector<std::string>& parts);
     void cbQueue(const TgCallbackQuery& cq,
                  const std::vector<std::string>& parts);
     void cbSet(const TgCallbackQuery& cq,
@@ -884,6 +897,15 @@ private:
     bool playerAction(int64_t chat_id, const std::string& verb,
                       int64_t user_id, const TgCallbackQuery* cq,
                       std::string& error);
+    // Play Now force (queue-port Tier 3, item 23 — shared by cbPlay
+    // and the legacy pl:player:playnow button): resolve the queue
+    // token to the track id and move the track to the front of the
+    // waiting list via vc.play_next. Answers the outcome toast and,
+    // on a move, re-renders the queued card at position #1. False
+    // when the token is expired or the backend refuses (the toast is
+    // already answered in that case).
+    bool forcePlayNext(const TgCallbackQuery& cq, int64_t chat_id,
+                       const std::string& token);
     // Shared vc.volume step (the /menu Vol-/Vol+ panel buttons and
     // the /volume text command): clamps the target to 0-200, posts
     // vc.volume, records the applied value in the runtime hash, and
@@ -995,6 +1017,27 @@ private:
     // Handlers: search / download / radio / share / engine.
     void onSearch(const CommandContext& ctx);
     void onDownload(const CommandContext& ctx);
+    // The blocking download.* POST runs here, on a worker thread —
+    // never on the main thread, which must keep pumping TDLib
+    // updates so the Cancel button on the progress message is
+    // answered mid-download (queue-port Tier 3, item 25; same shape
+    // as startPlayWorker). Nothing here touches TDLib or the store:
+    // the outcome is handed to the main thread, which renders it
+    // (finishDownload) exactly once.
+    void startDownloadWorker(CommandContext ctx, std::string action,
+                             Json body, std::string query,
+                             std::string run_id, int64_t progress_msg);
+    // Post-download rendering for onDownload (main thread): outcome
+    // edits on the progress message, lossy prompt, file delivery,
+    // FX picker. `snap` is the download.progress snapshot when the
+    // POST answered with a server run id (have_snap false when the
+    // snapshot GET failed or there was no run id).
+    void finishDownload(const CommandContext& ctx,
+                        const std::string& action,
+                        const std::string& query,
+                        const std::string& run_id, int64_t progress_msg,
+                        const IpcResult& r, const IpcResult& snap,
+                        bool have_snap);
     void onRadio(const CommandContext& ctx);
     // Radio lifecycle (§21): /new starts the chat's radio from a
     // station id, /destroy stops it, /manage shows its status card.
