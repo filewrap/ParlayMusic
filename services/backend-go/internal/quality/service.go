@@ -45,12 +45,15 @@ func opusWire(cfg voice.OpusEncoderConfig) map[string]any {
 }
 
 // handleGet answers quality.get: the effective Opus config
-// for chatID (store override > file > profile > default),
-// the winning level per field, the library's current stored
-// config (what the next encoder will actually use), and
-// whether the chat has a live call. The core's /quality
-// command and the settings-panel quality section render from
-// this; neither recomputes the precedence itself.
+// for chatID (store override > file > profile > default —
+// or the library's stock defaults with numeric sources
+// "stock" while the Opus DSP is off for this chat, see
+// Effective), the winning level per field, whether the DSP
+// is enabled, the library's current stored config (what the
+// next encoder will actually use), and whether the chat has
+// a live call. The core's /quality command and the
+// settings-panel quality section render from this; neither
+// recomputes the precedence itself.
 //
 // applies_on is always "next join": the settings are
 // process-global and apply to encoders created after the
@@ -77,7 +80,7 @@ func (s *Service) handleGet(ctx context.Context, req uds.Request) (any, error) {
 	if err != nil {
 		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("settings lookup failed: %v", err))
 	}
-	eff, sources := Resolve(s.cfg, stored)
+	eff, sources, dspEnabled := Effective(s.cfg, stored)
 	lib, err := voice.OpusConfig()
 	if err != nil {
 		return nil, uds.NewHandlerError(uds.ErrInternal, fmt.Sprintf("opus config readback failed: %v", err))
@@ -88,6 +91,7 @@ func (s *Service) handleGet(ctx context.Context, req uds.Request) (any, error) {
 		"chat_id":     chatID,
 		"effective":   opusWire(eff),
 		"sources":     sources,
+		"dsp_enabled": dspEnabled,
 		"library":     opusWire(lib),
 		"active_call": active,
 		"applies_on":  "next join",
