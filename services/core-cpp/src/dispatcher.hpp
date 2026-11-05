@@ -565,6 +565,66 @@ private:
                          Json& response_out, std::string& error);
     // Main-thread handling of one dequeued backend event.
     void onTrackEvent(const std::string& event, const Json& data);
+    // PlayProgress event for an in-flight /play: edit that play's
+    // status message (resolved / thumbnail / joining). Events for a
+    // chat with no registered status, or with a stale status id, are
+    // ignored — a silent /play never shows progress.
+    void onPlayProgress(const Json& data);
+    // --- /play async status flow (NoxBeats/TgMusicBot/Parvati) --------
+    // Send the status message the moment /play lands and register it
+    // as the chat's in-flight play (-1 on failure; the caller then
+    // falls back to the legacy synchronous path). The message is a
+    // reply to the command but is deliberately NOT clean-delete
+    // scheduled: it morphs into the final card, and scheduling a
+    // delete would delete that card.
+    int64_t sendPlayStatus(const CommandContext& ctx, int64_t chat,
+                           const std::string& text);
+    // Drop the in-flight status for a chat (delete the message best
+    // effort, clear the registration). Used when the final card is
+    // sent as a fresh message, or when an edit fallback replies
+    // separately — never leave a stale "Searching…" behind.
+    void dropPlayStatus(int64_t chat, int64_t status_id);
+    // Forget the registration without deleting the message (the
+    // message already became the final card, or was deleted).
+    void clearPlayStatus(int64_t chat, int64_t status_id);
+    // Edit a registered status message. Edits are throttled to one
+    // per second per chat (Telegram flood control on same-message
+    // edits); a throttled edit is remembered as pending and applied
+    // by flushPlayStatusEdits(). `force` bypasses the throttle for
+    // terminal states (final card / error). Identical text is never
+    // re-sent (TDLib 400 "message is not modified"). False when the
+    // status is gone or the edit failed — the caller falls back to a
+    // fresh reply so the outcome is still shown.
+    bool editPlayStatus(int64_t chat, int64_t status_id,
+                        const std::string& text, const InlineKeyboard& kb,
+                        bool force);
+    // Apply pending throttled status edits whose window has elapsed.
+    // Called from processPendingWork() (the pump drains ~1/s, so a
+    // slow stage still surfaces within about a second).
+    void flushPlayStatusEdits();
+    // Run one vc.play off the main thread: the blocking IPC happens
+    // on a worker thread (IpcClient::call is multiplexed and safe
+    // from any thread) while the main thread keeps pumping, so
+    // backend PlayProgress events can edit the status message live.
+    // The outcome is enqueued to pending_work_ and rendered on the
+    // main thread by finishPlay(..., status_msg_id).
+    void startPlayWorker(CommandContext ctx, Json body, int64_t chat,
+                         int64_t status_id, std::string query,
+                         bool was_active, std::string old_id);
+    // Render the now-playing text card (text + keyboard) for a
+    // now_playing object, exactly as sendNowPlayingCard's text path
+    // does — shared so the status message can be edited into the
+    // final card instead of sending a second message. False when
+    // there is no track (the caller falls back to sendNowPlayingCard).
+    // Also returns the normalized state line (the "Now playing"
+    // duplicate heading stripped) and the card track, which the rich
+    // photo path needs.
+    bool nowPlayingCardParts(int64_t chat_id, const Json& np,
+                             const std::string& state_line,
+                             std::string& text_out,
+                             InlineKeyboard& kb_out,
+                             ui_texts::CardTrack& ct_out,
+                             std::string& state_line_out);
     // Re-render the recorded now-playing card for a chat in place
     // (event path): edit the recorded card when one exists, else send
     // a fresh card. No-op when the backend reports no track.
@@ -594,8 +654,12 @@ private:
                          const ReplyKeyboard& kb, bool remove_kb = false);
     // Photo reply (thumbnail rule §0.3): the card as the caption, HTML,
     // optional inline keyboard. Returns the message id, -1 on failure.
+    // report=false suppresses the owner error DM: the thumbnail
+    // callers fall back to a text card, so a photo failure there is
+    // not an owner-visible problem.
     int64_t replyPhoto(const CommandContext& ctx, const std::string& photo,
-                       const std::string& caption, const InlineKeyboard& kb);
+                       const std::string& caption, const InlineKeyboard& kb,
+                       bool report = true);
     // Answer a callback query: toast (alert=false) or alert dialog.
     bool answerCb(const TgCallbackQuery& cq, const std::string& text,
                   bool alert = false);
@@ -659,6 +723,17 @@ private:
         if (!thumbnailsOn(chat_id)) return "";
         if (!track_thumb.empty()) return track_thumb;
         return cfg_.default_thumbnail;
+    }
+    // Thumbnail source for a track JSON: the backend's cached local
+    // path (thumbnail_path) when present, else the thumbnail URL. A
+    // URL is not a valid inputFile, so the local path is what makes
+    // the photo actually show; a URL falls through to the text card.
+    static std::string trackThumb(const Json* track) {
+        if (!track) return "";
+        if (const Json* p = track->find("thumbnail_path"))
+            if (!p->asString().empty()) return p->asString();
+        if (const Json* t = track->find("thumbnail")) return t->asString();
+        return "";
     }
     // Display name for a user: "FirstName (@username)" / "FirstName" /
     // the bare id when nothing else is known.
@@ -891,14 +966,29 @@ private:
     // limit stop, call-active marking, last-track bookkeeping, logger
     // line, and the queued vs now-playing card. Replies exactly once.
     // `r` must be ok (the caller reports the backend error itself).
+    // `status_msg_id` (> 0) is the in-flight /play status message:
+    // the final card is edited into it when it is a text card, or
+    // the status is deleted and the existing photo-card path runs.
+    // 0 keeps the legacy behaviour (send a fresh card).
     void finishPlay(const CommandContext& ctx, int64_t chat,
                     const IpcResult& r, const std::string& query,
-                    bool was_active, const std::string& old_id);
+                    bool was_active, const std::string& old_id,
+                    int64_t status_msg_id = 0);
+    // Final now-playing card for a finished play (see finishPlay):
+    // edit the status message into the text card when there is no
+    // thumbnail, else drop the status and send the existing card.
+    void finishNowPlayingCard(const CommandContext& ctx, int64_t chat,
+                              const Json& now,
+                              const std::string& state_line,
+                              int64_t status_msg_id);
     // vc.play request body (§1.1 + §4.4): the contract fields plus
     // the chat's stored speed/bass, so the backend room carries them
     // on every play (record-only until the Phase 5 DSP).
+    // `play_status_id` (> 0) is echoed back by the backend in its
+    // PlayProgress events so the core can route them to the right
+    // in-flight /play status message; 0 omits the field.
     Json vcPlayBody(int64_t chat, const std::string& query,
-                    int64_t requested_by);
+                    int64_t requested_by, int64_t play_status_id = 0);
     void onReplay(const CommandContext& ctx);
     void onPlayer(const CommandContext& ctx);
     void onLyrics(const CommandContext& ctx);
@@ -1050,6 +1140,23 @@ private:
     // events, drained by processPendingWork() on the main thread.
     std::mutex work_mu_;
     std::vector<std::function<void()>> pending_work_;
+    // In-flight /play status messages (chat -> PlayStatus), main
+    // thread only: set by sendPlayStatus, edited by onPlayProgress /
+    // editPlayStatus, cleared by the play's completion. One entry
+    // per chat — a second /play replaces the first's registration,
+    // and its events are routed by play_status_id, so a stale play
+    // can never edit the newer play's message.
+    struct PlayStatus {
+        int64_t message_id = 0;
+        int64_t last_edit_us = 0;
+        std::string last_text;
+        std::string found_line;  // "<b>Found:</b> …" line, reused
+                                 // by the later (joining) stages
+        std::string pending_text;
+        InlineKeyboard pending_kb;
+        bool has_pending = false;
+    };
+    std::map<int64_t, PlayStatus> play_status_;
     // Pending duplex JoinRequests, drained by processPendingWork().
     struct PendingJoin {
         int64_t chat_id = 0;

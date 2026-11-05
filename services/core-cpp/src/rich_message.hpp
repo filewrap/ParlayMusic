@@ -262,6 +262,9 @@ inline bool validateRichHtml(const std::string& html,
 // Tags with attributes are left untouched (they fail loudly instead
 // of being silently mangled).
 inline std::string downgradeHeadingsForClassic(const std::string& html) {
+    // Classic captions (formattedText) reject <h1>..<h6> and <p>:
+    // headings become bold, paragraph tags become line breaks, so a
+    // Rich HTML card keeps its layout as a classic caption.
     std::string out;
     out.reserve(html.size());
     const std::size_t n = html.size();
@@ -279,6 +282,12 @@ inline std::string downgradeHeadingsForClassic(const std::string& html) {
                 html[j + 2] == '>') {
                 out += closing ? "</b>" : "<b>";
                 i = j + 3;
+                continue;
+            }
+            if (j + 1 < n && (html[j] == 'p' || html[j] == 'P') &&
+                html[j + 1] == '>') {
+                out += closing ? "" : "\n";
+                i = j + 2;
                 continue;
             }
         }
@@ -523,10 +532,14 @@ inline Json inlineButtonJson(const RichButton& b, std::string* error_out) {
                 ? Json::objectOf({{"@type", Json("targetChatCurrent")}})
                 : Json::objectOf({
                       {"@type", Json("targetChatChosen")},
-                      {"allow_user_chats", Json(true)},
-                      {"allow_bot_chats", Json(true)},
-                      {"allow_group_chats", Json(true)},
-                      {"allow_channel_chats", Json(true)},
+                      {"types",
+                       Json::objectOf({
+                           {"@type", Json("targetChatTypes")},
+                           {"allow_user_chats", Json(true)},
+                           {"allow_bot_chats", Json(true)},
+                           {"allow_group_chats", Json(true)},
+                           {"allow_channel_chats", Json(true)},
+                       })},
                   });
         type = Json::objectOf({
             {"@type", Json("inlineKeyboardButtonTypeSwitchInline")},

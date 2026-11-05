@@ -29,6 +29,7 @@ import (
 	"parlay/backend-go/internal/lyrics"
 	"parlay/backend-go/internal/model"
 	"parlay/backend-go/internal/resolver"
+	"parlay/backend-go/internal/thumbs"
 	"parlay/backend-go/internal/uds"
 	"parlay/backend-go/internal/voice"
 )
@@ -44,12 +45,13 @@ import (
 // so a failed bind rolls the room back to idle with no event.
 func (h *Handlers) vcPlay(ctx context.Context, req uds.Request) (any, error) {
 	var p struct {
-		ChatID      int64    `json:"chat_id"`
-		Query       string   `json:"query"`
-		RequestedBy int64    `json:"requested_by"`
-		Volume      *int     `json:"volume"`
-		Speed       *float64 `json:"speed"`
-		Bass        *int     `json:"bass"`
+		ChatID       int64    `json:"chat_id"`
+		Query        string   `json:"query"`
+		RequestedBy  int64    `json:"requested_by"`
+		Volume       *int     `json:"volume"`
+		Speed        *float64 `json:"speed"`
+		Bass         *int     `json:"bass"`
+		PlayStatusID int64    `json:"play_status_id"`
 	}
 	if err := decodePayload(req, &p); err != nil {
 		return nil, err
@@ -81,10 +83,33 @@ func (h *Handlers) vcPlay(ctx context.Context, req uds.Request) (any, error) {
 	if track.StreamURL == "" && track.Source != string(resolver.SourceRadio) && track.Source != "file" {
 		return nil, errEngineUnavailable("track %s resolved but has no playable stream URL", track.ID)
 	}
+	// The core already sent this play's status message ("Searching…"):
+	// report each step as it completes so the message can be edited
+	// live (resolved -> thumbnail -> joining -> the card the core
+	// renders from this response). Only when the core asked for it
+	// (play_status_id); silent/sync plays get no progress events.
+	if p.PlayStatusID != 0 {
+		h.events.PlayProgress(chatID, p.PlayStatusID, "resolved", map[string]any{
+			"title": track.Title, "artist": track.Artist,
+			"duration_str": track.DurationStr, "source": track.Source,
+		})
+	}
+	// Cache the thumbnail to disk now, so the core can send it as
+	// inputFileLocal: an https URL is not a valid TDLib photo. A
+	// failed download is not fatal — the card falls back to text.
+	h.ensureThumb(ctx, &track)
+	if p.PlayStatusID != 0 {
+		h.events.PlayProgress(chatID, p.PlayStatusID, "thumbnail", map[string]any{
+			"has_thumbnail": track.ThumbnailPath != "",
+		})
+	}
 
 	h.chatLock(chatID).Lock()
 	defer h.chatLock(chatID).Unlock()
 
+	if p.PlayStatusID != 0 {
+		h.events.PlayProgress(chatID, p.PlayStatusID, "joining", nil)
+	}
 	if err := h.ensureCall(ctx, chatID); err != nil {
 		h.events.VoiceError(chatID, "join_failed", err.Error())
 		return nil, errEngineUnavailable("voice join failed: %v", err)
@@ -508,6 +533,23 @@ func (h *Handlers) vcVolume(ctx context.Context, req uds.Request) (any, error) {
 
 // --- vc.now_playing / vc.progress (§1.13, §1.14) ---------------------
 
+// ensureThumb downloads the track's thumbnail to disk (cached) and
+// sets track.ThumbnailPath to the local path, so the core can send it
+// as inputFileLocal. It never fails the request: on any error it logs
+// and leaves ThumbnailPath empty, and the core falls back to a text
+// card with no owner error DM.
+func (h *Handlers) ensureThumb(ctx context.Context, track *model.Track) {
+	if track == nil || track.ThumbnailPath != "" || track.Thumbnail == "" {
+		return
+	}
+	p, err := thumbs.Ensure(ctx, h.deps.Config.Backend.DataDir, track.Thumbnail)
+	if err != nil {
+		log.Printf("handlers: thumbnail cache for %s: %v", track.ID, err)
+		return
+	}
+	track.ThumbnailPath = p
+}
+
 // vcNowPlaying returns the room snapshot. No room, or a room with
 // no track and an empty queue, is not_found (vc-go rule); a room
 // with no current but a non-empty queue returns 200 with
@@ -520,6 +562,12 @@ func (h *Handlers) vcNowPlaying(ctx context.Context, req uds.Request) (any, erro
 	snap, ok := h.rooms.Snapshot(chatID)
 	if !ok || (snap.Track == nil && len(snap.Queue) == 0) {
 		return nil, errNotFound("nothing playing in this chat")
+	}
+	// Backstop for tracks resolved before the thumbnail cache
+	// existed (e.g. rooms restored from bbolt after a restart):
+	// ensure the current track's local thumbnail path is set.
+	if snap.Track != nil {
+		h.ensureThumb(ctx, snap.Track)
 	}
 	return nowPlayingResp(snap), nil
 }

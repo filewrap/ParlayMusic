@@ -405,6 +405,18 @@ bool base64Decode(const std::string& in, std::string& out) {
     return true;
 }
 
+// TDLib update ids (updateNewCallbackQuery.id, updateNewInlineQuery.id)
+// are int64 in the schema (td_api.tl), but the answer calls take the
+// id as a decimal STRING. asString() on a JSON number returns "" —
+// which made every answerCallbackQuery / answerInlineQuery fail with
+// an empty id (buttons looked dead: no toast, spinner never resolved).
+// Read the id as int when it is one, as a string when it is not.
+std::string tdIdString(const parlay::Json* v) {
+    if (!v) return "";
+    if (v->isInt()) return std::to_string(v->asInt());
+    return v->asString();
+}
+
 std::string tdMemberStatus(const parlay::Json* status_obj) {
     if (!status_obj) return "";
     const parlay::Json* t = status_obj->find("@type");
@@ -442,7 +454,7 @@ bool dispatchTdUpdate(const parlay::Json& upd, parlay::TdLibClient& bot,
     if (t == "updateCallbackQuery") {
         parlay::TgCallbackQuery cq;
         const parlay::Json* id = upd.find("id");
-        cq.id = id ? id->asString() : "";
+        cq.id = tdIdString(id);
         const parlay::Json* uid = upd.find("sender_user_id");
         cq.from.id = uid ? uid->asInt() : 0;
         const parlay::Json* chat_id = upd.find("chat_id");
@@ -502,7 +514,7 @@ bool dispatchTdUpdate(const parlay::Json& upd, parlay::TdLibClient& bot,
     if (t == "updateNewInlineQuery") {
         parlay::TgInlineQuery iq;
         const parlay::Json* id = upd.find("id");
-        iq.id = id ? id->asString() : "";
+        iq.id = tdIdString(id);
         const parlay::Json* uid = upd.find("sender_user_id");
         iq.from.id = uid ? uid->asInt() : 0;
         const parlay::Json* query = upd.find("query");

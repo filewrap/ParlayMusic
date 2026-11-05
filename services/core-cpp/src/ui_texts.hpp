@@ -917,14 +917,18 @@ inline std::string trackLink(const CardTrack& t) {
 // Started-streaming card (Yukki wins for text, §4). Title truncated to
 // 25 chars in the card (Yukki ShortTitle).
 inline std::string nowPlayingText(const CardTrack& t) {
-    return fmt("<h2>Now Playing</h2>\n"
-               "\n"
-               "<b>▫ Track:</b> {track}\n"
-               "<b>▫ Duration:</b> {duration}\n"
-               "<b>▫ Requested by:</b> {by}",
+    // Each field is its own <p> block: in Rich HTML a bare "\n"
+    // between inline runs is collapsed to a space, so the old
+    // "\n"-separated fields rendered as one run-on line. The classic
+    // caption path strips <p> back to newlines (see
+    // downgradeHeadingsForClassic), so photo captions keep working.
+    return fmt("<h2>Now Playing</h2>"
+               "<p><b>▫ Track:</b> {track}</p>"
+               "<p><b>▫ Duration:</b> {duration}</p>"
+               "<p><b>▫ Requested by:</b> {by}</p>",
                {{"track", trackLink(t)},
                 {"duration", t.duration},
-                {"by", t.requester}});
+                {"by", htmlEscape(t.requester)}});
 }
 
 // State cards (TgMusicBot buildTrackMessage template, §4): the same
@@ -1136,9 +1140,10 @@ inline std::string menuPanelText(const std::string& now_title,
         return "<b><a href=\"" + url + "\">" + title + "</a></b>";
     };
     // The state is carried by the Now/Next labels; no emoji is emitted
-    // anywhere in the UI (§7.3).
-    return "<b>Now:</b> " + linked(now, now_url) + "\n<b>Next:</b> " +
-           linked(next, next_url);
+    // anywhere in the UI (§7.3). Each line is its own <p>: a bare "\n"
+    // collapses to a space in Rich HTML (see nowPlayingText).
+    return "<p><b>Now:</b> " + linked(now, now_url) + "</p>" +
+           "<p><b>Next:</b> " + linked(next, next_url) + "</p>";
 }
 inline InlineKeyboard menuPanelKeyboard(int64_t chat_id) {
     using B = InlineButton;
@@ -1414,6 +1419,28 @@ inline std::string playTooLongText(int minutes) {
     return fmt("Sorry, song exceeds max duration of {n} minutes.",
                {{"n", std::to_string(minutes)}});
 }
+
+// /play async status flow (NoxBeats cmd/play.cpp play_searching,
+// TgMusicBot play.go "Searching and downloading...", ParvatiMusic
+// play.rs LiveMsg "searching"/"searching_query"): ONE message is
+// sent the moment /play lands and edited in place as each step
+// completes — searching -> found -> joining -> the now-playing /
+// queued card. Errors edit the same message in place, never a new
+// message and never a silent drop.
+inline std::string playSearchingText(const std::string& query) {
+    return fmt("Searching for <b>{query}</b>…",
+               {{"query", htmlEscape(query)}});
+}
+inline std::string playFoundText(const std::string& title,
+                                 const std::string& artist,
+                                 const std::string& duration) {
+    std::string out = "<b>Found:</b> " + htmlEscape(title);
+    if (!artist.empty()) out += " — " + htmlEscape(artist);
+    if (!duration.empty()) out += "\n<i>" + htmlEscape(duration) + "</i>";
+    return out;
+}
+inline const char* kPlayFetchingFile = "Fetching file…";
+inline const char* kPlayJoining = "Joining voice chat…";
 
 // /mix lifecycle (TgMusicBot mix.go): usage when there is no query
 // and nothing playing to seed from; the fetching line while the

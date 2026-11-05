@@ -18,6 +18,12 @@
 //	              failure). NOT for resolve failures (synchronous
 //	              action errors) and NOT for autoplay pick
 //	              failures (those are TrackEnded/QueueEmpty).
+//	PlayProgress  One vc.play's staged progress (resolved /
+//	              thumbnail / joining), emitted mid-request so the
+//	              core can edit that play's status message live.
+//	              Only when the play body carried play_status_id;
+//	              the core ignores it otherwise (unknown stages
+//	              are ignored, per the protocol).
 //
 // DownloadReady belongs to Worker B (download package) and is
 // deliberately NOT emitted here.
@@ -79,4 +85,23 @@ func (e *Emitter) VoiceError(chatID int64, code, message string) {
 	e.srv.Emit("VoiceError", chatID, map[string]any{
 		"chat_id": chatID, "code": code, "message": message,
 	})
+}
+
+// PlayProgress fires one staged update for an in-flight vc.play
+// (stage "resolved" | "thumbnail" | "joining"), so the core can
+// edit that play's status message live. statusID is the
+// play_status_id the core sent in the play body: the core routes
+// the event to that status message and ignores events for a status
+// it no longer tracks. fields carries the stage's data (resolved:
+// title, artist, duration_str, source; thumbnail: has_thumbnail).
+// Fire-and-forget like every other event: with no core connected
+// the event is dropped, never queued, never blocking playback.
+func (e *Emitter) PlayProgress(chatID, statusID int64, stage string, fields map[string]any) {
+	data := map[string]any{
+		"chat_id": chatID, "play_status_id": statusID, "stage": stage,
+	}
+	for k, v := range fields {
+		data[k] = v
+	}
+	e.srv.Emit("PlayProgress", chatID, data)
 }
