@@ -197,7 +197,6 @@ struct Config {
     // Local state / logging.
     std::string data_dir = "data";           // PARLAY_DATA_DIR (file-backend state)
     std::string log_file;                    // PARLAY_LOG_FILE (optional stdout/stderr tee)
-    std::string telegram_api_base = "https://api.telegram.org";  // TELEGRAM_API_BASE
 
     // Playback limits — mirrors of limits.max_duration_minutes /
     // limits.max_queue_size, kept so dispatcher.cpp needs no edit in

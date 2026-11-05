@@ -268,7 +268,6 @@ error naming the exact key. Required to start: `BOT_TOKEN`,
 | `ASSISTANT_IDS` | unset | comma-separated user ids |
 | `PARLAY_VOTE_THRESHOLD` | 3 | votes to queue a track |
 | `TD_PHONE` / `TD_CODE` / `TD_PASSWORD` / `TD_EMAIL` / `TD_EMAIL_CODE` / `TD_FIRST_NAME` / `TD_LAST_NAME` / `TD_QR` | unset / false | TDLib first-auth inputs |
-| `TELEGRAM_API_BASE` | `https://api.telegram.org` | legacy — the bot is TDLib now, not Bot API long-poll |
 | `START_IMG` / `PING_IMG` / `PARLAY_UPDATES_URL` / `PARLAY_SUPPORT_URL` / `PARLAY_SOURCE_URL` / `SUPPORT_CHAT` | unset | UI links/images; empty = row omitted / text-only card |
 | `VOICE_RTP_SINK` | unset | `host:port` for the Opus pipeline proof |
 | TDLib poll | 1 s | `sessions.pollUpdate(upd, from, 1.0)` |
@@ -284,8 +283,8 @@ authenticates with its bot token (`checkAuthenticationBotToken` —
 session in `data/tdlib-bot`); the **assistant account** authenticates
 with phone/code/2FA (session in `data/tdlib`) and is the only thing
 that joins voice chats. There is no Bot API long-poll anymore
-(`getUpdates` is gone from the core); the Bot API base URL
-(`TELEGRAM_API_BASE`) survives only as a legacy config value.
+(`getUpdates` is gone from the core), and the Bot API base URL config
+(`TELEGRAM_API_BASE`) is deleted.
 
 Correction to an earlier claim: bot tokens **do** work over MTProto
 (`checkAuthenticationBotToken` in TDLib; `auth.importBotAuthorization` in

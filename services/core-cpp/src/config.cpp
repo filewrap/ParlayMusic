@@ -387,7 +387,6 @@ void applyLegacyEnv(Config& c) {
     std::string td_qr = envStr("TD_QR");
     c.td_qr = (td_qr == "1" || td_qr == "true" || td_qr == "yes");
     c.log_file = envStr("PARLAY_LOG_FILE");
-    c.telegram_api_base = envStr("TELEGRAM_API_BASE", c.telegram_api_base);
     c.support_chat = envStr("SUPPORT_CHAT");
     c.start_img = envStr("START_IMG");
     c.ping_img = envStr("PING_IMG");
