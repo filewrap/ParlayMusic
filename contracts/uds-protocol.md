@@ -378,6 +378,7 @@ The backend pushes these over the same socket whenever they happen
 | `QueueEmpty` | `chat_id` | The queue drained (autoplay decision point). |
 | `DownloadReady` | `run_id`, `file_path`, `track`, `chat_id` | An async download finished (Phase 3+; `download.*` POSTs are synchronous until then). |
 | `VoiceError` | `chat_id`, `code`, `message` | Voice-call failure the core should surface (e.g. join failed, stream error). |
+| `PlayProgress` | `chat_id`, `play_status_id`, `stage`, `title`, `artist`, `duration_str`, `source`, `has_thumbnail` | One vc.play's staged progress (`resolved` / `thumbnail` / `joining`), emitted mid-request so the core can edit that play's status message live. Only when the play body carried `play_status_id`; the core ignores it for a status it no longer tracks. |
 
 Event frames carry `chat_id` at top level as well as in `data`.
 The core's event handler runs on the reader thread and must be

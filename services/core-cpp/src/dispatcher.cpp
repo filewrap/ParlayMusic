@@ -1754,10 +1754,14 @@ bool Dispatcher::cardInfo(int64_t chat_id, int64_t& message_id,
     return message_id != 0;
 }
 
-int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
-                                       const std::string& state_line_in) {
+bool Dispatcher::nowPlayingCardParts(int64_t chat_id, const Json& np,
+                                     const std::string& state_line_in,
+                                     std::string& text_out,
+                                     InlineKeyboard& kb_out,
+                                     ui_texts::CardTrack& ct_out,
+                                     std::string& state_line_out) {
     const Json* track = np.find("track");
-    if (!track || track->isNull()) return -1;
+    if (!track || track->isNull()) return false;
     // "Now playing" as a state line duplicates the card's own
     // "<h2>Now Playing</h2>" heading (the card rendered "Now playing"
     // + "Now Playing"). Drop it — and a leading "Now playing\n"
@@ -1792,6 +1796,29 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     InlineKeyboard kb = ui_texts::playerKeyboard(
         chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
         settingsFor(chat_id).thumbnails);
+    text_out = text;
+    kb_out = kb;
+    ct_out = ct;
+    state_line_out = state_line;
+    return true;
+}
+
+int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
+                                       const std::string& state_line_in) {
+    const Json* track = np.find("track");
+    if (!track || track->isNull()) return -1;
+    std::string text;
+    InlineKeyboard kb;
+    ui_texts::CardTrack ct;
+    std::string state_line;
+    if (!nowPlayingCardParts(chat_id, np, state_line_in, text, kb, ct,
+                             state_line))
+        return -1;
+    // Raw requester name for the rich photo path (rtPlain takes raw
+    // text; ct.requester is already HTML-escaped for the HTML card).
+    std::string requester;
+    auto rn = store_.get("last_requester_name:" + std::to_string(chat_id));
+    requester = rn ? *rn : "";
     std::string thumb = effectiveThumb(chat_id, trackThumb(track));
     CommandContext fake;
     fake.message.chat.id = chat_id;
@@ -2445,6 +2472,8 @@ void Dispatcher::processPendingWork() {
                       << "\n";
         }
     }
+    // Throttled /play status edits whose window has elapsed.
+    flushPlayStatusEdits();
     std::vector<PendingJoin> joins;
     {
         std::lock_guard<std::mutex> lk(joins_mu_);
@@ -2471,8 +2500,20 @@ void Dispatcher::onTrackEvent(const std::string& event, const Json& data) {
     const Json* chat = data.find("chat_id");
     int64_t chat_id = chat ? chat->asInt() : 0;
     if (chat_id == 0) return;
+    if (event == "PlayProgress") {
+        // Progress for an in-flight /play (resolved / thumbnail /
+        // joining): edit that play's status message in place.
+        onPlayProgress(data);
+        return;
+    }
     if (event == "TrackStarted" || event == "TrackAdvanced" ||
         event == "TrackChanged") {
+        // A /play is in flight for this chat: it owns the card
+        // transition, and its completion renders the card. Refreshing
+        // here would send a SECOND card — the TrackStarted for the
+        // new track arrives before the play's completion lambda is
+        // drained (FIFO: the event was enqueued first).
+        if (play_status_.find(chat_id) != play_status_.end()) return;
         // The backend advanced the track: refresh the Telegram card
         // from the backend's now-playing (the event is the trigger;
         // the backend is the source of truth for the track).
@@ -2513,6 +2554,126 @@ void Dispatcher::onTrackEvent(const std::string& event, const Json& data) {
     }
     // DownloadReady and unknown events: no UI action (forward
     // compatibility — unknown names are ignored per the protocol).
+}
+
+// --- /play async status flow (NoxBeats/TgMusicBot/Parvati) -------------
+// One message, sent the moment /play lands, edited in place as each
+// step completes. All of these run on the main thread (the only
+// thread that may call TDLib); the worker thread only runs IPC and
+// enqueues its outcome to pending_work_.
+
+int64_t Dispatcher::sendPlayStatus(const CommandContext& ctx, int64_t chat,
+                                   const std::string& text) {
+    std::string err;
+    int64_t id = tg_.sendMessageHtml(chat, text, InlineKeyboard{},
+                                     ctx.message.message_id, &err);
+    if (id <= 0) return -1;
+    PlayStatus st;
+    st.message_id = id;
+    st.last_edit_us = telemetry::nowUs();
+    st.last_text = text;
+    play_status_[chat] = st;
+    return id;
+}
+
+void Dispatcher::clearPlayStatus(int64_t chat, int64_t status_id) {
+    auto it = play_status_.find(chat);
+    if (it != play_status_.end() && it->second.message_id == status_id)
+        play_status_.erase(it);
+}
+
+void Dispatcher::dropPlayStatus(int64_t chat, int64_t status_id) {
+    tg_.deleteMessage(chat, status_id);
+    clearPlayStatus(chat, status_id);
+}
+
+bool Dispatcher::editPlayStatus(int64_t chat, int64_t status_id,
+                                const std::string& text,
+                                const InlineKeyboard& kb, bool force) {
+    auto it = play_status_.find(chat);
+    if (it == play_status_.end() ||
+        it->second.message_id != status_id)
+        return false;  // stale play, or already finished
+    PlayStatus& st = it->second;
+    // Never re-send identical text (TDLib 400 "message is not
+    // modified") — including for forced terminal edits, whose text
+    // always differs from the status text in practice.
+    if (text == st.last_text) return true;
+    int64_t now = telemetry::nowUs();
+    if (!force && now - st.last_edit_us < 1000000) {
+        // Same-message edits are flood-controlled: remember the
+        // newest text and apply it from processPendingWork() once
+        // the window elapsed. A newer stage overwrites the pending
+        // one — the final card always supersedes them.
+        st.pending_text = text;
+        st.pending_kb = kb;
+        st.has_pending = true;
+        return true;
+    }
+    std::string err;
+    if (!tg_.editMessageText(chat, status_id, text, kb, &err)) return false;
+    st.last_edit_us = now;
+    st.last_text = text;
+    st.has_pending = false;
+    st.pending_text.clear();
+    return true;
+}
+
+void Dispatcher::flushPlayStatusEdits() {
+    int64_t now = telemetry::nowUs();
+    for (auto& kv : play_status_) {
+        PlayStatus& st = kv.second;
+        if (!st.has_pending) continue;
+        if (now - st.last_edit_us < 1000000) continue;
+        std::string err;
+        if (tg_.editMessageText(kv.first, st.message_id, st.pending_text,
+                                st.pending_kb, &err)) {
+            st.last_edit_us = now;
+            st.last_text = st.pending_text;
+        }
+        st.has_pending = false;
+        st.pending_text.clear();
+    }
+}
+
+void Dispatcher::onPlayProgress(const Json& data) {
+    const Json* chat = data.find("chat_id");
+    int64_t chat_id = chat ? chat->asInt() : 0;
+    if (chat_id == 0) return;
+    auto it = play_status_.find(chat_id);
+    if (it == play_status_.end()) return;  // no in-flight /play here
+    const Json* sid = data.find("play_status_id");
+    if (sid && sid->asInt() != it->second.message_id) return;  // stale play
+    const Json* stage = data.find("stage");
+    std::string st = stage ? stage->asString() : "";
+    if (st == "resolved") {
+        const Json* t = data.find("title");
+        const Json* a = data.find("artist");
+        const Json* d = data.find("duration_str");
+        std::string found = ui_texts::playFoundText(
+            t ? t->asString() : "", a ? a->asString() : "",
+            d ? d->asString() : "");
+        it->second.found_line = found;
+        editPlayStatus(chat_id, it->second.message_id, found,
+                       InlineKeyboard{}, false);
+    } else if (st == "thumbnail") {
+        // Thumbnail cached (or skipped on failure — the card falls
+        // back to text): keep the Found line, note the step. Usually
+        // coalesced away by the edit throttle; the final card
+        // follows within a moment either way.
+        std::string line = it->second.found_line;
+        if (!line.empty()) line += "\n<i>Fetching thumbnail…</i>";
+        if (!line.empty())
+            editPlayStatus(chat_id, it->second.message_id, line,
+                           InlineKeyboard{}, false);
+    } else if (st == "joining") {
+        std::string line = it->second.found_line;
+        if (!line.empty()) line += "\n<i>Joining voice chat…</i>";
+        else line = ui_texts::kPlayJoining;
+        editPlayStatus(chat_id, it->second.message_id, line,
+                       InlineKeyboard{}, false);
+    }
+    // Unknown stages are ignored (forward compatibility).
 }
 
 // Edit the recorded now-playing card for a chat in place; send a fresh
@@ -2932,6 +3093,26 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     bool was_active = nowPlaying(vcTarget(ctx), np_before, track_before);
     std::string old_id =
         track_before.find("id") ? track_before.find("id")->asString() : "";
+    // Async status flow (NoxBeats/TgMusicBot/Parvati): the status
+    // message goes out NOW, before any resolve, and the blocking
+    // vc.play runs on a worker thread while the main thread keeps
+    // pumping — so backend PlayProgress events edit the status live
+    // and the chat never stares at silence. The s-alias silent
+    // plays keep the legacy synchronous path: silence covers the
+    // success outcome, and a status message would be visible output.
+    if (!ctx.silent_success) {
+        int64_t status_id = sendPlayStatus(
+            ctx, vcTarget(ctx), ui_texts::playSearchingText(query));
+        if (status_id > 0) {
+            Json body = vcPlayBody(vcTarget(ctx), trim(query),
+                                   ctx.message.from.id, status_id);
+            startPlayWorker(ctx, std::move(body), vcTarget(ctx),
+                            status_id, query, was_active, old_id);
+            return;
+        }
+        // Status send failed: fall through to the synchronous path
+        // below (its own replies surface errors as before).
+    }
     Json body = vcPlayBody(vcTarget(ctx), trim(query),
                            ctx.message.from.id);
     // Phase 1 telemetry: dispatch -> IPC POST issued, and POST
@@ -2954,28 +3135,85 @@ void Dispatcher::onPlay(const CommandContext& ctx) {
     finishPlay(ctx, vcTarget(ctx), r, query, was_active, old_id);
 }
 
+// The blocking vc.play runs here, on a worker thread — never on the
+// main thread, which must keep pumping TDLib updates and backend
+// events. IpcClient::call is multiplexed by request_id with its
+// writes serialized, so a call from this thread is safe while the
+// main thread makes its own calls. Nothing here touches TDLib or
+// the store: the outcome is handed to the main thread, which
+// renders it (finishPlay) exactly once.
+void Dispatcher::startPlayWorker(CommandContext ctx, Json body,
+                                 int64_t chat, int64_t status_id,
+                                 std::string query, bool was_active,
+                                 std::string old_id) {
+    int64_t receipt = receiptUs(ctx);
+    std::thread([this, ctx, body, chat, status_id, query, was_active,
+                 old_id, receipt] {
+        const int64_t t_post = telemetry::nowUs();
+        IpcResult r = vcCall(ctx, "play", body);
+        const int64_t t_resp = telemetry::nowUs();
+        std::lock_guard<std::mutex> lk(work_mu_);
+        pending_work_.push_back(
+            [this, ctx, r, chat, status_id, query, was_active, old_id,
+             t_post, t_resp, receipt] {
+                emitDispatchToIpc(t_resp - receipt, t_post - receipt,
+                                  t_resp - t_post, chat, r.ok,
+                                  r.ok ? "" : r.error_code + ": " +
+                                                 r.error_message);
+                if (!r.ok) {
+                    // Honest error in place on the status message
+                    // (no owner DM: the failure is already shown to
+                    // the user). If the edit fails (message gone),
+                    // reply separately — never a silent drop.
+                    std::string err_text = ui_texts::htmlEscape(
+                        "Service error (" + r.error_code +
+                        "): " + r.error_message);
+                    if (!editPlayStatus(chat, status_id, err_text,
+                                        InlineKeyboard{}, true)) {
+                        dropPlayStatus(chat, status_id);
+                        replyError(ctx, r);
+                    } else {
+                        clearPlayStatus(chat, status_id);
+                    }
+                    return;
+                }
+                finishPlay(ctx, chat, r, query, was_active, old_id,
+                           status_id);
+            });
+    }).detach();
+}
+
 // --- shared vc.play / vc.play_file rendering -------------------------------
 // The vc.play and vc.play_file responses are the same shape
 // ({now_playing}, plus the `queued` superset field), so both handlers
 // share this tail. `r` must be ok — the caller reports the backend
 // error itself.
 Json Dispatcher::vcPlayBody(int64_t chat, const std::string& query,
-                            int64_t requested_by) {
+                            int64_t requested_by,
+                            int64_t play_status_id) {
     // §4.4: the room carries the chat's stored speed/bass on every
     // play (record-only until the Phase 5 DSP); the backend reads
     // them off this body. No `video` / `force` fields (§10-D13).
-    return Json::objectOf({
+    // `play_status_id` (when > 0) is echoed by the backend in its
+    // PlayProgress events so the core can route them to the right
+    // in-flight /play status message; the backend ignores unknown
+    // fields, so omitting it elsewhere changes nothing.
+    Json body = Json::objectOf({
         {"chat_id", Json(chat)},
         {"query", Json(query)},
         {"requested_by", Json(requested_by)},
         {"speed", Json(chatRtSpeedField(chat))},
         {"bass", Json(static_cast<int64_t>(chatRtIntField(chat, "bass", 0)))},
     });
+    if (play_status_id > 0)
+        body.set("play_status_id", Json(play_status_id));
+    return body;
 }
 
 void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                             const IpcResult& r, const std::string& query,
-                            bool was_active, const std::string& old_id) {
+                            bool was_active, const std::string& old_id,
+                            int64_t status_msg_id) {
     const Json* np = r.data.find("now_playing");
     Json now = np ? *np : r.data;
     const Json* track = now.find("track");
@@ -2985,7 +3223,22 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
         if (dur > 0 && dur > cfg_.duration_limit_min * 60) {
             vcCall(ctx, "stop",
                    Json::objectOf({{"chat_id", Json(chat)}}));
-            replyHtml(ctx, ui_texts::playTooLongText(cfg_.duration_limit_min));
+            if (status_msg_id > 0) {
+                // Too long: the status message becomes the refusal.
+                if (!editPlayStatus(
+                        chat, status_msg_id,
+                        ui_texts::playTooLongText(cfg_.duration_limit_min),
+                        InlineKeyboard{}, true)) {
+                    dropPlayStatus(chat, status_msg_id);
+                    replyHtml(ctx, ui_texts::playTooLongText(
+                                       cfg_.duration_limit_min));
+                } else {
+                    clearPlayStatus(chat, status_msg_id);
+                }
+            } else {
+                replyHtml(ctx,
+                          ui_texts::playTooLongText(cfg_.duration_limit_min));
+            }
             return;
         }
     }
@@ -3050,6 +3303,24 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                 // backend accepted it); only the success card is
                 // suppressed. Errors above stay visible.
                 if (!ctx.silent_success) {
+                    if (status_msg_id > 0 && thumb.empty()) {
+                        // Text card: the status message BECOMES the
+                        // queued card (same text + keyboard, no
+                        // second message). A photo card cannot be
+                        // edited into a text message, so the thumb
+                        // path below drops the status and sends the
+                        // existing photo card instead.
+                        if (editPlayStatus(chat, status_msg_id, text, kb,
+                                           true)) {
+                            recordCard(chat, status_msg_id, false);
+                            clearPlayStatus(chat, status_msg_id);
+                            deleteCommandMessage(ctx);
+                            return;
+                        }
+                        dropPlayStatus(chat, status_msg_id);
+                    } else if (status_msg_id > 0) {
+                        dropPlayStatus(chat, status_msg_id);
+                    }
                     if (!thumb.empty() && thumbnailsOn(chat)) {
                         if (replyPhoto(ctx, thumb, text, kb, false) > 0) {
                             deleteCommandMessage(ctx);
@@ -3057,6 +3328,9 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                         }
                     }
                     replyKb(ctx, text, kb);
+                } else if (status_msg_id > 0) {
+                    // Silent success: no card at all — drop the status.
+                    dropPlayStatus(chat, status_msg_id);
                 }
                 deleteCommandMessage(ctx);
                 return;
@@ -3066,7 +3340,10 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
         // is playing, so show its card (the queued track is visible
         // in /queue). Never claim the queued track is playing.
         if (!ctx.silent_success)
-            sendNowPlayingCard(chat, now, "Now playing");
+            finishNowPlayingCard(ctx, chat, now, "Now playing",
+                                 status_msg_id);
+        else if (status_msg_id > 0)
+            dropPlayStatus(chat, status_msg_id);
         deleteCommandMessage(ctx);
         return;
     }
@@ -3074,8 +3351,47 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
     if (chatRtIntField(chat, "muted", 0))
         state_line += "\n(muted — use /unmute)";
     if (!ctx.silent_success)
-        sendNowPlayingCard(chat, now, state_line);
+        finishNowPlayingCard(ctx, chat, now, state_line, status_msg_id);
+    else if (status_msg_id > 0)
+        dropPlayStatus(chat, status_msg_id);
     deleteCommandMessage(ctx);
+}
+
+// Render the now-playing card for a finished /play. With a status
+// message and no thumbnail, the status is edited into the text card
+// (same renderer as sendNowPlayingCard's text path); with a
+// thumbnail, a text message cannot become a photo, so the status is
+// dropped and the existing card is sent. Without a status message,
+// the card is sent as before.
+void Dispatcher::finishNowPlayingCard(const CommandContext& ctx,
+                                      int64_t chat, const Json& now,
+                                      const std::string& state_line,
+                                      int64_t status_msg_id) {
+    (void)ctx;
+    if (status_msg_id <= 0) {
+        sendNowPlayingCard(chat, now, state_line);
+        return;
+    }
+    const Json* track = now.find("track");
+    std::string thumb =
+        track ? effectiveThumb(chat, trackThumb(track)) : "";
+    if (thumb.empty()) {
+        std::string text;
+        InlineKeyboard kb;
+        ui_texts::CardTrack ct;
+        std::string norm;
+        if (nowPlayingCardParts(chat, now, state_line, text, kb, ct,
+                                norm) &&
+            editPlayStatus(chat, status_msg_id, text, kb, true)) {
+            recordCard(chat, status_msg_id, false);
+            clearPlayStatus(chat, status_msg_id);
+            return;
+        }
+        dropPlayStatus(chat, status_msg_id);
+    } else {
+        dropPlayStatus(chat, status_msg_id);
+    }
+    sendNowPlayingCard(chat, now, state_line);
 }
 
 // --- /play from a replied-to Telegram file ----------------------------------
@@ -3090,9 +3406,29 @@ bool Dispatcher::playRepliedFile(const CommandContext& ctx,
                                  const std::string& title,
                                  const std::string& kind) {
     int64_t chat = vcTarget(ctx);
+    // Status first, as for a query play: the download is the slow
+    // step, and it must run on the main thread (TDLib calls are
+    // main-thread-only), so the status message is what makes the
+    // wait visible. Silent plays skip the status (legacy path).
+    int64_t status_id = 0;
+    if (!ctx.silent_success)
+        status_id = sendPlayStatus(ctx, chat, ui_texts::kPlayFetchingFile);
     std::string saved, err;
     if (!tg_.downloadFile(file_id, cfg_.data_dir + "/replied", saved, err)) {
-        reply(ctx, "Could not fetch the replied file: " + err);
+        if (status_id > 0) {
+            if (!editPlayStatus(chat, status_id,
+                                ui_texts::htmlEscape(
+                                    "Could not fetch the replied file: " +
+                                    err),
+                                InlineKeyboard{}, true)) {
+                dropPlayStatus(chat, status_id);
+                reply(ctx, "Could not fetch the replied file: " + err);
+            } else {
+                clearPlayStatus(chat, status_id);
+            }
+        } else {
+            reply(ctx, "Could not fetch the replied file: " + err);
+        }
         return false;
     }
     std::string track_title = title.empty() ? "Replied file" : title;
@@ -3112,6 +3448,13 @@ bool Dispatcher::playRepliedFile(const CommandContext& ctx,
         {"kind", Json(kind)},
         {"requested_by", Json(ctx.message.from.id)},
     });
+    // The file is local now; the remaining work is the voice join.
+    // (vc.play_file stays synchronous: it is record + join, no
+    // resolve, and the JoinRequest handshake already runs on its own
+    // worker thread — a status edit here is visible before the call.)
+    if (status_id > 0)
+        editPlayStatus(chat, status_id, ui_texts::kPlayJoining,
+                       InlineKeyboard{}, true);
     const int64_t t_post = telemetry::nowUs();
     IpcResult r = vcCall(ctx, "vc.play_file", body);
     const int64_t t_resp = telemetry::nowUs();
@@ -3120,10 +3463,23 @@ bool Dispatcher::playRepliedFile(const CommandContext& ctx,
                       r.ok ? ""
                            : r.error_code + ": " + r.error_message);
     if (!r.ok) {
-        replyError(ctx, r);
+        if (status_id > 0) {
+            std::string err_text = ui_texts::htmlEscape(
+                "Service error (" + r.error_code +
+                "): " + r.error_message);
+            if (!editPlayStatus(chat, status_id, err_text,
+                                InlineKeyboard{}, true)) {
+                dropPlayStatus(chat, status_id);
+                replyError(ctx, r);
+            } else {
+                clearPlayStatus(chat, status_id);
+            }
+        } else {
+            replyError(ctx, r);
+        }
         return false;
     }
-    finishPlay(ctx, chat, r, track_title, was_active, old_id);
+    finishPlay(ctx, chat, r, track_title, was_active, old_id, status_id);
     return true;
 }
 

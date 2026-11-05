@@ -1420,6 +1420,28 @@ inline std::string playTooLongText(int minutes) {
                {{"n", std::to_string(minutes)}});
 }
 
+// /play async status flow (NoxBeats cmd/play.cpp play_searching,
+// TgMusicBot play.go "Searching and downloading...", ParvatiMusic
+// play.rs LiveMsg "searching"/"searching_query"): ONE message is
+// sent the moment /play lands and edited in place as each step
+// completes — searching -> found -> joining -> the now-playing /
+// queued card. Errors edit the same message in place, never a new
+// message and never a silent drop.
+inline std::string playSearchingText(const std::string& query) {
+    return fmt("Searching for <b>{query}</b>…",
+               {{"query", htmlEscape(query)}});
+}
+inline std::string playFoundText(const std::string& title,
+                                 const std::string& artist,
+                                 const std::string& duration) {
+    std::string out = "<b>Found:</b> " + htmlEscape(title);
+    if (!artist.empty()) out += " — " + htmlEscape(artist);
+    if (!duration.empty()) out += "\n<i>" + htmlEscape(duration) + "</i>";
+    return out;
+}
+inline const char* kPlayFetchingFile = "Fetching file…";
+inline const char* kPlayJoining = "Joining voice chat…";
+
 // /mix lifecycle (TgMusicBot mix.go): usage when there is no query
 // and nothing playing to seed from; the fetching line while the
 // backend builds the mix; the already-queued line when every mix
