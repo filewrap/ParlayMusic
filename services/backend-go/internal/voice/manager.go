@@ -7,9 +7,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"parlay/backend-go/internal/dsp"
 )
@@ -397,27 +399,57 @@ func (m *Manager) Play(ctx context.Context, chatID int64, source string, opts ds
 // openSource opens source for DSP decoding: an http(s) URL is
 // fetched (the body streams; a non-2xx status is an error), any
 // other path is opened as a local file.
+//
+// A YouTube signed URL 403s for a few seconds after it is issued —
+// the videoplayback edge's signature check lags the player API's
+// response. The play path opens the URL 2-4s after resolve (the join
+// handshake runs first), so the first attempt can still land inside
+// the window. A 403 is therefore retried with a 2s backoff (up to
+// 4 retries, ~8s worst case; the URL is valid for hours) before
+// surfacing as an error.
 func openSource(ctx context.Context, source string) (io.ReadCloser, error) {
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
-		if err != nil {
-			return nil, fmt.Errorf("open stream URL: %w", err)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("open stream URL: %w", err)
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var resp *http.Response
+		for attempt := 0; ; attempt++ {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+			if err != nil {
+				return nil, fmt.Errorf("open stream URL: %w", err)
+			}
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				return nil, fmt.Errorf("open stream URL: %w", err)
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp.Body, nil
+			}
 			_ = resp.Body.Close()
-			return nil, fmt.Errorf("open stream URL: HTTP %d", resp.StatusCode)
+			if resp.StatusCode != http.StatusForbidden || attempt >= 4 {
+				log.Printf("voice: open stream URL: HTTP %d (%s)", resp.StatusCode, streamURLShort(source))
+				return nil, fmt.Errorf("open stream URL: HTTP %d", resp.StatusCode)
+			}
+			log.Printf("voice: open stream URL: HTTP 403 on fresh signed URL, retry %d/4 in 2s", attempt+1)
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("open stream URL: %w", ctx.Err())
+			case <-time.After(2 * time.Second):
+			}
 		}
-		return resp.Body, nil
 	}
 	f, err := os.Open(source)
 	if err != nil {
 		return nil, fmt.Errorf("open audio file: %w", err)
 	}
 	return f, nil
+}
+
+// streamURLShort renders a stream URL for logs: host plus the
+// itag/ip query params that identify the signed format.
+func streamURLShort(source string) string {
+	u, err := url.Parse(source)
+	if err != nil {
+		return source[:min(len(source), 80)]
+	}
+	return fmt.Sprintf("%s itag=%s ip=%s", u.Host, u.Query().Get("itag"), u.Query().Get("ip"))
 }
 
 // PlayStream starts playback of a pre-buffered stream (the

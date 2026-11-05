@@ -293,20 +293,37 @@ func (p *Prefetcher) run(chatID int64, s *PrebufferedStream) {
 		s.setErr(fmt.Errorf("prefetch: track %s has no HTTP stream URL", fresh.ID))
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fresh.StreamURL, nil)
-	if err != nil {
-		s.setErr(fmt.Errorf("prefetch open: %w", err))
-		return
-	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		s.setErr(fmt.Errorf("prefetch open: %w", err))
-		return
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	// A YouTube signed URL 403s for a few seconds after it is
+	// issued (the videoplayback edge's signature check lags the
+	// player API's response), and this open runs immediately after
+	// the re-resolve. Retry a 403 with a 2s backoff (up to 4
+	// retries), like the voice play path does.
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fresh.StreamURL, nil)
+		if err != nil {
+			s.setErr(fmt.Errorf("prefetch open: %w", err))
+			return
+		}
+		resp, err = p.client.Do(req)
+		if err != nil {
+			s.setErr(fmt.Errorf("prefetch open: %w", err))
+			return
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			break
+		}
 		_ = resp.Body.Close()
-		s.setErr(fmt.Errorf("prefetch open: HTTP %d for %s", resp.StatusCode, fresh.StreamURL))
-		return
+		if resp.StatusCode != http.StatusForbidden || attempt >= 4 {
+			s.setErr(fmt.Errorf("prefetch open: HTTP %d for %s", resp.StatusCode, fresh.StreamURL))
+			return
+		}
+		select {
+		case <-ctx.Done():
+			s.setErr(fmt.Errorf("prefetch open: %w", ctx.Err()))
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 	prefix, err := readUpTo(resp.Body, p.prefixBytes)
 	if err != nil {
