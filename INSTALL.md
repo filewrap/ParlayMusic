@@ -6,9 +6,9 @@ and an embedded bbolt store — no inter-service HTTP, no Mongo/Redis.
 See `FINAL-ARCHITECTURE.md` for the locked architecture. This guide
 covers the **repo-checkout install** on a plain Linux VPS.
 
-> The v0.3.0 release tarball installs this architecture (2-process
+> The v0.3.1 release tarball installs this architecture (2-process
 > engine, prebuilt) — one-click: download it from
-> https://github.com/filewrap/ParlayMusic/releases/tag/v0.3.0,
+> https://github.com/filewrap/ParlayMusic/releases/tag/v0.3.1,
 > extract, `./install.sh && ./start.sh`. The guide below covers the
 > **repo-checkout install** instead.
 

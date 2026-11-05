@@ -1,3 +1,57 @@
+# Parlay — v0.3.1 Release (Phase 10 UI completion + NubCoders primary resolver)
+
+Date: 2026-11-05. Branch: `main`. Tag: `v0.3.1`.
+
+One-click install (VPS, Ubuntu 22.04+/Debian 12 x86_64):
+
+```bash
+curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.3.1/parlay-v0.3.1-linux-x86_64.tar.gz
+tar -xzf parlay-v0.3.1-linux-x86_64.tar.gz
+cd parlay-v0.3.1-linux-x86_64 && ./install.sh && ./start.sh
+```
+
+Phase 10: full Telegram UI completion from all 21 refs (704
+inventoried, 17 ported) — `/mix`, `/volume`, `/recognize`,
+`/rmcache`, `/scan`, `/sharescan`, s-aliases, copy-text buttons,
+"Download N songs", "Check Again", inline deep-link, default
+thumbnail fallback, blockquote queue, italic page footer, album
+photo card, admin-refresh, owner blacklist exemption; unknown
+command → "doesn't exist, use /help" reply, unknown callback →
+"🖐️" toast. NubCoders `/info` is now the primary YouTube resolver
+(signed MP4, no cookies/PO token, ~2.4s); InnerTube ANDROID_VR and
+the yt-dlp daemon stay as fallbacks. `scripts/youtube-probe.sh`
+tests the three YouTube approaches in order and verifies real bytes.
+ntgcalls size pin now accepts both known patched builds (98,092,096
+B VPS / 98,123,704 B sandbox — size varies with the vendored clang).
+No initData validation in-tree — the Mini App binds loopback-only
+by default; put a trusted reverse proxy with TLS + initData check
+in front of it on a VPS.
+
+## Release artifact
+
+- `release/parlay-v0.3.1-linux-x86_64.tar.gz` — 57,639,585 bytes (55M),
+  26 tar entries.
+- SHA256:
+  `75c5eabaf0748e3103b42c7bc89b8c1ad5a81ddb02220447e251dc734e189f7d`
+  (sidecar `.sha256` next to the tarball; `SHA256SUMS` inside it,
+  verified).
+- Contents: `bin/parlay-core`, `bin/parlay-backend`,
+  `lib/libtdjson.so.1.8.69` (50,166,944 B, prebuilt) +
+  `lib/libntgcalls.so` (98,123,704 B, PATCHED Phase 5 Opus build) +
+  `lib/libparlay_dsp.so` (2,552,488 B, Rust DSP engine),
+  `services/miniapp/dist/` (built bundle), `scripts/yt_dlp_worker.py`,
+  `install.sh`, `start.sh`, `stop.sh`, `status.sh`, `.env.example`,
+  `parlay.toml.example`, `README.md`, `INSTALL.md`, `VERSION`,
+  `SHA256SUMS`. No `.env`, no tokens, no session files, no `refs/`,
+  no build dirs, no venvs. slskd is NOT in the tarball —
+  `install.sh` fetches it from upstream (pinned 0.26.2).
+- Secret scan clean (package-release.sh step 7).
+
+Expected release URL once published:
+https://github.com/filewrap/ParlayMusic/releases/tag/v0.3.1
+
+---
+
 # Parlay — v0.3.0 Release (2-process engine, Phases 1–6)
 
 Date: 2026-11-04. Branch: `main`. Tag: `v0.3.0`.

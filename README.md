@@ -13,13 +13,13 @@ Go, Rust, C++, JavaScript / TypeScript — in one Telegram music bot.**
 
 ## Install
 
-One-click, from the v0.3.0 release tarball (prebuilt 2-process engine —
+One-click, from the v0.3.1 release tarball (prebuilt 2-process engine —
 core-cpp + backend-go over UDS, bbolt store, parlay-dsp, Mini App):
 
 ```bash
-curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.3.0/parlay-v0.3.0-linux-x86_64.tar.gz
-tar -xzf parlay-v0.3.0-linux-x86_64.tar.gz
-cd parlay-v0.3.0-linux-x86_64 && ./install.sh && ./start.sh
+curl -LO https://github.com/filewrap/ParlayMusic/releases/download/v0.3.1/parlay-v0.3.1-linux-x86_64.tar.gz
+tar -xzf parlay-v0.3.1-linux-x86_64.tar.gz
+cd parlay-v0.3.1-linux-x86_64 && ./install.sh && ./start.sh
 ```
 
 Or build from the repo (main, Phase 6):

@@ -545,7 +545,7 @@ int main() {
     CHECK(std::string(kInlineHelpTitle2) ==
               "2. Enter search + keyword to search songs",
           "kInlineHelpTitle2: second help article");
-    CHECK(std::string(kInlineHelpMessage) == "Parlay v0.3.0",
+    CHECK(std::string(kInlineHelpMessage) == "Parlay v0.3.1",
           "kInlineHelpMessage: help articles send the version line");
     CHECK(std::string(kInlineNeedKeyword) == "Please enter a keyword",
           "kInlineNeedKeyword: bare search article");

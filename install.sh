@@ -9,7 +9,7 @@
 # Usage:
 #   ./install.sh [--from-repo] [--dir <path>]
 #
-# Default mode downloads the v0.3.0 release tarball and extracts it here.
+# Default mode downloads the v0.3.1 release tarball and extracts it here.
 # --from-repo clones https://github.com/filewrap/ParlayMusic.git instead
 # (use when no release asset exists yet, or you want the live tree).
 # If this directory is already a Parlay checkout (tarball root or repo
@@ -26,8 +26,8 @@
 #   PARLAY_TARBALL_URL, PARLAY_REPO_URL, SLSKD_LOCAL_ZIP
 set -euo pipefail
 
-PARLAY_VERSION="v0.3.0"
-TARBALL_URL="${PARLAY_TARBALL_URL:-https://github.com/filewrap/ParlayMusic/releases/download/v0.3.0/parlay-v0.3.0-linux-x86_64.tar.gz}"
+PARLAY_VERSION="v0.3.1"
+TARBALL_URL="${PARLAY_TARBALL_URL:-https://github.com/filewrap/ParlayMusic/releases/download/v0.3.1/parlay-v0.3.1-linux-x86_64.tar.gz}"
 REPO_URL="${PARLAY_REPO_URL:-https://github.com/filewrap/ParlayMusic.git}"
 SLSKD_VERSION="0.26.2"
 SLSKD_URL="https://github.com/slskd/slskd/releases/download/${SLSKD_VERSION}/slskd-${SLSKD_VERSION}-linux-x64.zip"

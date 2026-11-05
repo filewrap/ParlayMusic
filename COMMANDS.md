@@ -179,7 +179,7 @@ inline query carries no chat id). `l` fetches the lyrics text via
 the `vc.lyrics` UDS action with the same `chat_id` and renders the article
 (`Lyrics: {title}`, first 100 chars in the description, plain lyrics
 truncated to 4000 chars + `\n...`). `lib` / `del` return empty results
-(no library backend). `help` → two articles sending `Parlay v0.3.0`;
+(no library backend). `help` → two articles sending `Parlay v0.3.1`;
 bare `search` → `Please enter a keyword`; no matches → `No results
 found`. Search tracks render as audio results when a `stream_url` is
 known, otherwise as articles — both with the `[Open in Parlay Bot]`
