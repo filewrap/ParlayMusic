@@ -54,25 +54,43 @@ fi
 cd "$NTG_DIR"
 git fetch --quiet origin || true
 git checkout --quiet "$BASE_REV"
-# The patch must apply cleanly to the pristine base. If the tree
-# already carries the patch (a previous run), `git apply --check`
-# fails on the already-applied hunks — detect that via the marker
-# symbol instead of failing.
-if nm -D shared-output/lib/libntgcalls.so 2>/dev/null | grep -q "ntg_opus_set_config"; then
-    echo "NOTE: a patched .so already exists; rebuilding from current (patched) sources"
+# The patch must apply cleanly to the pristine base. Detect "already
+# applied" from the TREE (reverse-apply check), not from an existing
+# .so: after `git checkout -- .` the tree is pristine but a stale
+# patched .so may still sit in shared-output, and trusting the .so
+# would skip the apply and build unpatched sources (caught only by
+# the nm check at the end). The tree is the truth.
+if git apply --check --reverse "$PATCH" >/dev/null 2>&1; then
+    echo "NOTE: patch already applied in tree; skipping git apply"
+elif git diff --quiet && [ -z "$(git status --porcelain -- wrtc targets ntgcalls | grep -v '^?? build-c')" ]; then
+    echo "==> applying $PATCH"
+    git apply --check "$PATCH"
+    git apply "$PATCH"
 else
-    if git diff --quiet && [ -z "$(git status --porcelain -- wrtc targets ntgcalls | grep -v '^?? build-c')" ]; then
-        echo "==> applying $PATCH"
-        git apply --check "$PATCH"
-        git apply "$PATCH"
-    else
-        echo "==> working tree already carries changes; skipping git apply (verify below)"
-    fi
+    echo "==> working tree already carries changes; skipping git apply (verify below)"
 fi
 
 if [ "${1:-}" = "--clean" ]; then
     echo "==> --clean: removing build-c"
     rm -rf build-c
+elif [ -f build-c/CMakeCache.txt ]; then
+    # CMake loads the toolchain file ONLY on the first configure of a
+    # build dir. A cache created by a configure WITHOUT the toolchain
+    # file (the old script, or a manual cmake run) records the flag as
+    # UNINITIALIZED and silently ignores it on every later run — the
+    # configure keeps failing at FindWebRTC.cmake:1 with "Unknown
+    # CMake command 'GetProperty'" no matter how many times you pass
+    # -DCMAKE_TOOLCHAIN_FILE. Proven in the sandbox 2026-11-05: same
+    # build dir, flag added, identical failure; cache line read
+    # CMAKE_TOOLCHAIN_FILE:UNINITIALIZED=cmake/Toolchain.cmake. The
+    # only cure is a fresh build dir, so detect the stale cache and
+    # wipe it automatically. A cache with the toolchain loaded
+    # (CMAKE_TOOLCHAIN_FILE:FILEPATH=<abs path>) is kept for an
+    # incremental build.
+    if ! grep -q "^CMAKE_TOOLCHAIN_FILE:FILEPATH=$NTG_DIR/cmake/Toolchain.cmake\$" build-c/CMakeCache.txt; then
+        echo "==> build-c cache has no loaded toolchain file (stale from a configure without it); removing build-c for a fresh configure"
+        rm -rf build-c
+    fi
 fi
 
 echo "==> configure"
@@ -89,9 +107,16 @@ cmake --build build-c --target ntgcalls -j2
 SO="shared-output/lib/libntgcalls.so"
 [ -f "$SO" ] || { echo "ERROR: expected $SO missing after build" >&2; exit 1; }
 echo "==> verify: $SO ($(stat -c%s "$SO") bytes)"
-nm -D "$SO" | grep -q " T ntg_opus_set_config" || { echo "ERROR: ntg_opus_set_config not exported" >&2; exit 1; }
-nm -D "$SO" | grep -q " T ntg_opus_get_config" || { echo "ERROR: ntg_opus_get_config not exported" >&2; exit 1; }
-nm -D "$SO" | grep -q " T ntg_opus_set_bitrate" || { echo "ERROR: ntg_opus_set_bitrate not exported" >&2; exit 1; }
+# Do NOT use `nm | grep -q` here: the script runs under `set -o
+# pipefail`, nm -D emits ~820 KB, and grep -q exits on the first
+# match while nm still has hundreds of KB to write — nm dies with
+# SIGPIPE (141), pipefail propagates it, and the check fails even
+# though the symbol IS exported (proven 2026-11-05: 20/20 fails
+# under pipefail, 0/20 without). grep -c reads the whole stream, so
+# nm always finishes cleanly.
+[ "$(nm -D "$SO" | grep -c " T ntg_opus_set_config")" -gt 0 ] || { echo "ERROR: ntg_opus_set_config not exported" >&2; exit 1; }
+[ "$(nm -D "$SO" | grep -c " T ntg_opus_get_config")" -gt 0 ] || { echo "ERROR: ntg_opus_get_config not exported" >&2; exit 1; }
+[ "$(nm -D "$SO" | grep -c " T ntg_opus_set_bitrate")" -gt 0 ] || { echo "ERROR: ntg_opus_set_bitrate not exported" >&2; exit 1; }
 nm -D "$SO" | grep "ntg_opus"
 echo "OK: patched libntgcalls.so rebuilt at $NTG_DIR/$SO"
 echo "NOTE: if the size changed, update the NTG size pin in scripts/package-release.sh"
