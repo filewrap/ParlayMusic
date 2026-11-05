@@ -8,6 +8,16 @@ path in the new architecture: the fallback when native InnerTube
 hits an age-gated or signature-ciphered edge case, the TikTok
 metadata path, and the YouTube/Spotify download path.
 
+Cookie policy (probe 2026-11-05): COOKIELESS FIRST. Passing cookies
+switches yt-dlp's default client set to the logged-in set
+(web_embedded/tv_samsung/web, web_creator for premium), whose
+web/web_creator formats need GVS PO tokens — without a PO provider
+those formats are skipped or 403 (the VPS probe got a URL with
+cookies that 403'd on fetch). So the warm instance never carries a
+cookie file; cookies are used ONLY as a one-shot retry when the
+cookieless attempt fails with an age-gate / login error
+(_needs_auth), for genuinely age-restricted or members-only videos.
+
 Protocol: one JSON object per line, both directions.
   Request:  {"id": <int>, "method": <str>, "params": {...}}
   Response: {"id": <int>, "result": {...}}
@@ -45,6 +55,7 @@ except ImportError as exc:  # pragma: no cover - startup failure
     raise SystemExit(1)
 
 _YDL = None
+_YDL_COOKIES = None
 
 
 def _find_cookie_file():
@@ -66,7 +77,12 @@ def _find_cookie_file():
 
 
 def _ydl():
-    """One warm YoutubeDL instance for the life of the process."""
+    """One warm YoutubeDL instance for the life of the process.
+
+    COOKIELESS by design (see module docstring): the default client
+    set stays the cookieless one, so no PO-gated formats are pulled
+    in. Cookies are only used by _ydl_cookies() as a retry.
+    """
     global _YDL
     if _YDL is None:
         opts = {
@@ -78,18 +94,86 @@ def _ydl():
             "retries": 3,
             "remote_components": ["ejs:github"],
         }
-        cf = _find_cookie_file()
-        if cf:
-            opts["cookiefile"] = cf
         _YDL = yt_dlp.YoutubeDL(opts)
     return _YDL
+
+
+# Substrings (lowercased) in a yt-dlp error that mean "this video
+# needs a logged-in session" — age gates, login gates, members-only.
+# Anything else (bot-check 403, PO-token 403, unavailable, network)
+# is NOT retried with cookies: cookies cannot fix those, and the VPS
+# probe proved a cookie retry can hand back a URL that 403s on fetch.
+_AUTH_MARKERS = (
+    "age-restricted",
+    "age restricted",
+    "age-verification",
+    "age verification",
+    "sign in to confirm",
+    "login required",
+    "log in to",
+    "login to",
+    "members-only",
+    "members only",
+    "private video",
+    "only available to",
+    "premium members",
+)
+
+
+def _needs_auth(msg):
+    """True when a yt-dlp failure looks like an age/login gate."""
+    m = (msg or "").lower()
+    return any(marker in m for marker in _AUTH_MARKERS)
+
+
+def _ydl_cookies():
+    """Warm YoutubeDL instance WITH the cookie file, or None.
+
+    Built lazily on first auth-gated retry only. Returns None when
+    no cookie file exists, so the caller can report honestly instead
+    of retrying into the void.
+    """
+    global _YDL_COOKIES
+    if _YDL_COOKIES is None:
+        cf = _find_cookie_file()
+        if not cf:
+            return None
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+            "retries": 3,
+            "remote_components": ["ejs:github"],
+            "cookiefile": cf,
+        }
+        _YDL_COOKIES = yt_dlp.YoutubeDL(opts)
+    return _YDL_COOKIES
 
 
 def _extract(params):
     url = (params or {}).get("url", "")
     if not url:
         raise ValueError("extract: url is required")
-    return _ydl().extract_info(url, download=False)
+    try:
+        return _ydl().extract_info(url, download=False)
+    except Exception as exc:  # noqa: BLE001 - retry path below
+        if not _needs_auth(str(exc)):
+            raise
+        ydl_c = _ydl_cookies()
+        if ydl_c is None:
+            raise
+        sys.stderr.write(
+            "yt-dlp: cookieless extract failed (%s), retrying with cookies\n"
+            % str(exc)[:160])
+        sys.stderr.flush()
+        try:
+            return ydl_c.extract_info(url, download=False)
+        except Exception as exc2:  # noqa: BLE001 - report both attempts
+            raise RuntimeError(
+                "extract failed cookieless (%s) and with cookies (%s)"
+                % (exc, exc2))
 
 
 def _download(params):
@@ -125,12 +209,28 @@ def _download(params):
             "preferredquality": "0",
         }],
     }
-    cf = _find_cookie_file()
-    if cf:
-        opts["cookiefile"] = cf
-    ydl = yt_dlp.YoutubeDL(opts)
+    # Cookieless first (see module docstring); retry with cookies
+    # only on an age/login gate.
     before = set(os.listdir(outdir))
-    ydl.download([url])
+    try:
+        yt_dlp.YoutubeDL(opts).download([url])
+    except Exception as exc:  # noqa: BLE001 - retry path below
+        if not _needs_auth(str(exc)):
+            raise
+        cf = _find_cookie_file()
+        if not cf:
+            raise
+        sys.stderr.write(
+            "yt-dlp: cookieless download failed (%s), retrying with cookies\n"
+            % str(exc)[:160])
+        sys.stderr.flush()
+        opts["cookiefile"] = cf
+        try:
+            yt_dlp.YoutubeDL(opts).download([url])
+        except Exception as exc2:  # noqa: BLE001 - report both attempts
+            raise RuntimeError(
+                "download failed cookieless (%s) and with cookies (%s)"
+                % (exc, exc2))
     after = sorted(
         (os.path.join(outdir, f) for f in os.listdir(outdir)
          if f not in before and os.path.isfile(os.path.join(outdir, f))),

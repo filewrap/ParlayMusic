@@ -1,8 +1,17 @@
 // YouTube resolver — native Go InnerTube (BENCHMARKS.md §2, locked).
 //
-// Strategy (measured Phase 1, same video dQw4w9WgXcQ): one in-process
-// HTTPS POST, no subprocess — ANDROID_VR player 0.61 s / ANDROID player
-// 0.81 s / WEB search 1.56 s, vs yt-dlp 5.7–6.7 s (7–10x faster).
+// Resolve order (probe 2026-11-05, same video dQw4w9WgXcQ, bytes
+// verified on both the VPS and the sandbox):
+//  1. Native InnerTube ANDROID_VR player — 199 ms VPS / 615 ms
+//     sandbox. Works on both IPs, no cookies, no PO token, no
+//     subprocess. ANDROID is the player fallback (0.81 s).
+//  2. NubCoders /info — signed MP4, ~2.4–9.8 s. Server-side
+//     bot-bypass; no cookies/PO token.
+//  3. Warm yt-dlp daemon — cookieless-first (cookies only for
+//     age-gated/members-only retries inside the daemon). yt-dlp
+//     defaults are IP-dependent (visionos,web works in the sandbox
+//     but fails on the VPS; full ladder 20–27 s), so it is LAST.
+//
 // WEB player is UNPLAYABLE (metadata only), so the player call always
 // uses ANDROID_VR (fallback ANDROID); search uses ANDROID first — WEB
 // gets WAF 403 on datacenter IPs (VPS 2026-11-04: WEB search 403,
@@ -130,29 +139,33 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 		return tracks[0], nil
 	}
 	if vid := ExtractYouTubeID(q); vid != "" {
-		// Primary: NubCoders /info -> signed MP4 (no cookies/PO token).
-		if track, err := y.nubPrimary(ctx, q); err == nil {
-			return track, nil
-		}
+		// Primary: native InnerTube ANDROID_VR player (probe
+		// 2026-11-05: 199 ms VPS / 615 ms sandbox, works on both
+		// IPs, no cookies, no PO token, no subprocess).
 		track, err := y.fetchVideo(ctx, vid)
 		if err == nil {
 			return track, nil
 		}
-		// Player failed (age-gated / ciphered / unplayable): warm
-		// yt-dlp daemon fallback, exactly one path.
+		// Fallback: NubCoders /info -> signed MP4 (no cookies/PO token).
+		if ntrack, nerr := y.nubFallback(ctx, q); nerr == nil {
+			return ntrack, nil
+		}
+		// Player + API failed (age-gated / ciphered / unplayable):
+		// warm yt-dlp daemon fallback, exactly one path,
+		// cookieless-first (cookies only for age-gated retries
+		// inside the daemon).
 		if y.ytdlp != nil {
 			if dt, derr := y.resolveViaDaemon(ctx, vid); derr == nil {
 				return dt, nil
 			} else {
-				return Track{}, fmt.Errorf("youtube player failed for %s: %v; yt-dlp daemon fallback also failed: %v", vid, err, derr)
+				return Track{}, fmt.Errorf("youtube resolve failed for %s: player (%v) + nubcoders failed; yt-dlp daemon fallback also failed: %v", vid, err, derr)
 			}
 		}
 		return Track{}, err
 	}
-	// Free text: NubCoders primary first (search + stream in 1-2 calls).
-	if track, err := y.nubPrimary(ctx, q); err == nil {
-		return track, nil
-	}
+	// Free text: InnerTube search first (ANDROID, then WEB), player
+	// on the top hit; NubCoders is the fallback (search + stream in
+	// 1-2 calls), daemon last.
 	tracks, err := y.Search(ctx, q, 1)
 	if err != nil {
 		return Track{}, err
@@ -168,6 +181,10 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 			resolved.Title = tracks[0].Title
 		}
 		return resolved, nil
+	}
+	// Player failed: NubCoders fallback.
+	if track, nerr := y.nubFallback(ctx, q); nerr == nil {
+		return track, nil
 	}
 	if y.ytdlp != nil {
 		dstart := time.Now()
