@@ -76,7 +76,13 @@ if [ "${1:-}" = "--clean" ]; then
 fi
 
 echo "==> configure"
-cmake -S . -B build-c -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=OFF -DUSE_LIBCXX=ON -DBINDING=c
+# The toolchain file is REQUIRED, not optional: GetProperty (used by
+# every cmake/Find*.cmake) is defined in cmake/PlatformUtils.cmake,
+# which is loaded only via cmake/Toolchain.cmake. Without it a fresh
+# configure fails at FindWebRTC.cmake:1 with "Unknown CMake command
+# 'GetProperty'". It worked in the sandbox only because build-c/
+# already had the toolchain file cached from the first configure.
+cmake -S . -B build-c -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=OFF -DUSE_LIBCXX=ON -DBINDING=c -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain.cmake
 echo "==> build (incremental; ~4 min first time after libpulse-dev install)"
 cmake --build build-c --target ntgcalls -j2
 
