@@ -380,6 +380,7 @@ void applyLegacyEnv(Config& c) {
     c.support_chat = envStr("SUPPORT_CHAT");
     c.start_img = envStr("START_IMG");
     c.ping_img = envStr("PING_IMG");
+    c.default_thumbnail = envStr("PARLAY_DEFAULT_THUMBNAIL");
     c.updates_url = envStr("PARLAY_UPDATES_URL");
     c.support_url = envStr("PARLAY_SUPPORT_URL");
     if (c.support_url.empty() && !c.support_chat.empty()) {

@@ -93,6 +93,10 @@ public:
         std::string text, kind;  // kind: text | caption | markup
     };
     std::vector<EditCall> edits;
+    // Serialised keyboard of each editMessageText / editMessageCaption
+    // call, in order (Package 3: the retry button on an edited card
+    // is only visible through the markup).
+    std::vector<std::string> edit_markups;
     struct ToastCall {
         std::string id, text;
         bool alert;
@@ -120,6 +124,7 @@ public:
             for (const auto& b : row) {
                 out += b.text + "=";
                 if (!b.callback_data.empty()) out += b.callback_data;
+                else if (!b.copy_text.empty()) out += b.copy_text;
                 else if (!b.url.empty()) out += b.url;
                 else if (b.has_switch) out += b.switch_inline_query;
                 out += "|";
@@ -195,18 +200,18 @@ public:
                          const std::string& text,
                          const parlay::InlineKeyboard& kb,
                          std::string* error_out = nullptr) override {
-        (void)kb;
         (void)error_out;
         edits.push_back({chat_id, message_id, text, "text"});
+        edit_markups.push_back(serialiseKb(kb));
         return true;
     }
     bool editMessageCaption(int64_t chat_id, int64_t message_id,
                             const std::string& caption,
                             const parlay::InlineKeyboard& kb,
                             std::string* error_out = nullptr) override {
-        (void)kb;
         (void)error_out;
         edits.push_back({chat_id, message_id, caption, "caption"});
+        edit_markups.push_back(serialiseKb(kb));
         return true;
     }
     bool editMessageReplyMarkup(int64_t chat_id, int64_t message_id,
@@ -342,21 +347,48 @@ public:
     mutable std::string skip_response;
     mutable std::string pause_response;
     mutable std::string resume_response;
+    // Scripted Package 2 answers (empty = fall through to the 404
+    // below, per the FakeIpc contract above): mix.generate /
+    // audio.recognize success payloads and failure messages, and a
+    // vc.volume failure message. mix_error / recognize_error are
+    // reported as bad_request / engine_unavailable respectively (the
+    // codes the real backend uses for a refused mix and an
+    // unconfigured recognition provider).
+    mutable std::string mix_response;
+    mutable std::string mix_error;
+    mutable std::string recognize_response;
+    mutable std::string recognize_error;
+    mutable std::string volume_error;
     // Scripted Phase 9-gaps answers (empty = fall through to the 404
     // below, per the FakeIpc contract above): search.inline tracks,
     // vc.lyrics text, NetEase search/lyrics, download POSTs, and the
     // radio status GET. last_post_body records the most recent POST
     // body so tests can assert the chat_id the core passed.
     mutable std::string inline_response;
+    // Scripted /search answer (Package 3, R4): when set, the search
+    // POST succeeds with this JSON ({"results":[...]}).
+    mutable std::string search_response;
     mutable std::string lyrics_response;
     mutable std::string netease_search_response;
     mutable std::string netease_lyrics_response;
     mutable std::string download_response;
+    // Scripted download failure (Package 3, R6): when set, every
+    // download/* POST fails with this message instead of succeeding.
+    mutable std::string download_error;
+    // Scripted spotify.collection answer (Package 3, R5): when set,
+    // the collection metadata call succeeds with this JSON.
+    mutable std::string spotify_collection_response;
     mutable std::string radio_status_response;
     // Scripted Phase 4 (Q4) answers (empty = fall through to the 404
     // below): download.cancel / library.delete success payloads.
     mutable std::string download_cancel_response;
     mutable std::string library_delete_response;
+    // Scripted Package 1 answers (empty = fall through to the 404
+    // below): library.scan / library.sharescan / cache.clear success
+    // payloads.
+    mutable std::string library_scan_response;
+    mutable std::string library_sharescan_response;
+    mutable std::string cache_clear_response;
     mutable std::string last_post_body;
     // Every POST body, in order (last_post_body keeps the latest).
     mutable std::vector<std::string> post_bodies;
@@ -418,6 +450,12 @@ public:
             r.data = parlay::Json::parse(inline_response);
             return r;
         }
+        if (action == "search" && !search_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(search_response);
+            return r;
+        }
         if (action == "lyrics" && !lyrics_response.empty()) {
             r.ok = true;
             r.http_status = 200;
@@ -439,10 +477,25 @@ public:
             return r;
         }
         if (action.rfind("download/", 0) == 0 &&
+            !download_error.empty()) {
+            r.ok = false;
+            r.http_status = 400;
+            r.error_code = "download_failed";
+            r.error_message = download_error;
+            return r;
+        }
+        if (action.rfind("download/", 0) == 0 &&
             !download_response.empty()) {
             r.ok = true;
             r.http_status = 200;
             r.data = parlay::Json::parse(download_response);
+            return r;
+        }
+        if (action == "spotify.collection" &&
+            !spotify_collection_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(spotify_collection_response);
             return r;
         }
         if (action == "loop") {
@@ -479,6 +532,27 @@ public:
             r.data = parlay::Json::parse(library_delete_response);
             return r;
         }
+        if (action == "library.scan" &&
+            !library_scan_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(library_scan_response);
+            return r;
+        }
+        if (action == "library.sharescan" &&
+            !library_sharescan_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(library_sharescan_response);
+            return r;
+        }
+        if (action == "cache.clear" &&
+            !cache_clear_response.empty()) {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(cache_clear_response);
+            return r;
+        }
         if (action == "fx" && !fx_response.empty()) {
             r.ok = true;
             r.http_status = 200;
@@ -510,6 +584,52 @@ public:
             r.http_status = 200;
             r.data = parlay::Json::parse(skip_response);
             return r;
+        }
+        if (action == "stop") {
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
+        if (action == "volume") {
+            if (!volume_error.empty()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = volume_error;
+                return r;
+            }
+            r.ok = true;
+            r.http_status = 200;
+            r.data = parlay::Json::parse(R"({})");
+            return r;
+        }
+        if (action == "mix.generate") {
+            if (!mix_error.empty()) {
+                r.http_status = 400;
+                r.error_code = "bad_request";
+                r.error_message = mix_error;
+                return r;
+            }
+            if (!mix_response.empty()) {
+                r.ok = true;
+                r.http_status = 200;
+                r.data = parlay::Json::parse(mix_response);
+                return r;
+            }
+        }
+        if (action == "audio.recognize") {
+            if (!recognize_error.empty()) {
+                r.http_status = 502;
+                r.error_code = "engine_unavailable";
+                r.error_message = recognize_error;
+                return r;
+            }
+            if (!recognize_response.empty()) {
+                r.ok = true;
+                r.http_status = 200;
+                r.data = parlay::Json::parse(recognize_response);
+                return r;
+            }
         }
         // Queue actions (Phase 9 §K): list returns the scripted
         // waiting queue when set, else an empty queue; clear/add/
@@ -1590,28 +1710,34 @@ int main() {
         Rig rig;
         rig.d.handleCallback(makeCq("pl:unknown:thing"));
         CHECK(rig.tg.toasts.size() == 1 &&
-                  rig.tg.toasts[0].alert &&
-                  contains(rig.tg.toasts[0].text, "Unknown"),
-              "callback: unknown domain gets a polite alert, no crash");
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: unknown domain gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq(""));
-        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
-              "callback: empty data gets an alert, no crash");
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: empty data gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq("pl:player:pause:" +
                                     std::string(70, '9')));
-        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
-              "callback: over-64-byte data gets an alert, no crash");
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: over-64-byte data gets the hand toast, no crash");
     }
     {
         Rig rig;
         rig.d.handleCallback(makeCq("not-a-callback"));
-        CHECK(rig.tg.toasts.size() == 1 && rig.tg.toasts[0].alert,
-              "callback: non-pl data gets an alert, no crash");
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text == "🖐️" &&
+                  !rig.tg.toasts[0].alert,
+              "callback: non-pl data gets the hand toast, no crash");
     }
     {
         Rig rig;
@@ -3656,7 +3782,803 @@ int main() {
               "cbSpotify dislike: still routed to spotify.dislike");
     }
 
-    std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
+    // --- Package 1 (S0–S5): silent denials + sudo gaps ---------------
+    // S0 (per user ruling 2026-11-05, superseding the silent drop):
+    // unknown commands answer the refined kUnknownCommand card — the
+    // command doesn't exist, use /help. No IPC post.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 111, "/nosuchcommand"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "doesn't exist") &&
+                  contains(rig.tg.replies[0], "/help") &&
+                  rig.ipc.posts.empty(),
+              "pkg1 unknown command: refined reply, no post");
+    }
+    // S1: /rmcache — sudo-only gate, cache.clear post, cleared
+    // result, honest refusal when the backend refuses.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 112, "/rmcache"));
+        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
+              "pkg1 rmcache: non-sudo is denied silently, no post");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.cache_clear_response =
+            R"({"cleared": true, "names": ["Song A", "Song B"]})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/rmcache"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 rmcache: cache.clear issued to the backend");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Cache cleared.") &&
+                  contains(rig.tg.replies[0], "2 entries removed."),
+              "pkg1 rmcache: cleared result with entry count");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.cache_clear_response =
+            R"({"cleared": true, "names": ["Song A"]})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/rmcache Song A"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 rmcache named: cache.clear issued");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("scope") &&
+                      b.find("scope")->asString() == "track" &&
+                      b.find("name") &&
+                      b.find("name")->asString() == "Song A",
+                  "pkg1 rmcache named: scope track + name carried");
+        }
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/rmcache"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 rmcache, backend refuses: cache.clear issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "fake: no engine here") &&
+                  !contains(rig.tg.replies[0], "Cache cleared"),
+              "pkg1 rmcache, backend refuses: honest error, no fake "
+              "success");
+    }
+    // S2: /scan — sudo-only gate, library.scan post, trigger result,
+    // honest not-configured text, honest refusal.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 112, "/scan"));
+        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
+              "pkg1 scan: non-sudo is denied silently, no post");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_scan_response =
+            R"({"triggered": true, "tracks_found": 5})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/scan"));
+        CHECK(has_post(rig, "library.scan"),
+              "pkg1 scan: library.scan issued to the backend");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Library scan triggered.") &&
+                  contains(rig.tg.replies[0], "5 tracks found."),
+              "pkg1 scan: trigger result with track count");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_scan_response =
+            R"({"triggered": false, "error": "not configured"})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/scan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "not configured") &&
+                  !contains(rig.tg.replies[0], "Library scan triggered."),
+              "pkg1 scan, not configured: honest text, no fake success");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/scan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "fake: no engine here") &&
+                  !contains(rig.tg.replies[0], "Library scan triggered."),
+              "pkg1 scan, backend refuses: honest error, no fake success");
+    }
+    // S3: /sharescan — sudo-only gate, library.sharescan post,
+    // triggered / already-running / scheduled results, honest refusal.
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 112, "/sharescan"));
+        CHECK(rig.tg.replies.empty() && rig.ipc.posts.empty(),
+              "pkg1 sharescan: non-sudo is denied silently, no post");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_sharescan_response = R"({"triggered": true})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(has_post(rig, "library.sharescan"),
+              "pkg1 sharescan: library.sharescan issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "slskd share scan triggered."),
+              "pkg1 sharescan: triggered result");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_sharescan_response = R"({"triggered": false})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "already in progress") &&
+                  !contains(rig.tg.replies[0], "triggered."),
+              "pkg1 sharescan, already running: honest text, no fake "
+              "success");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.ipc.library_sharescan_response =
+            R"({"triggered": false, "scheduled_in_min": 7})";
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "scheduled in ~7m."),
+              "pkg1 sharescan, scheduled: scheduled result with minutes");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("sudoers", "111");
+        rig.d.handleMessage(makeMsg(-1001, 111, "/sharescan"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "fake: no engine here") &&
+                  !contains(rig.tg.replies[0], "triggered."),
+              "pkg1 sharescan, backend refuses: honest error, no fake "
+              "success");
+    }
+    // S4: admin-list refresh on admin transitions (remix
+    // chat_member_updated), observed through /settings admin-gating:
+    // a promotion re-fetches the list so the new admin passes the
+    // gate at once; an ordinary member join refreshes nothing, so
+    // the newcomer is still denied; a demotion re-fetches, so the
+    // demoted admin is denied again. (User ids 5222/5333 are fresh:
+    // an earlier test blacklists 222 in the shared file store.)
+    {
+        Rig rig;
+        rig.tg.admins = {111};
+        rig.d.handleMessage(makeMsg(-100777, 5222, "/settings"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Access Denied"),
+              "pkg1 admin transition: non-admin is denied before "
+              "promotion (cache seeded {111})");
+        rig.tg.admins = {111, 5222};
+        CHECK(rig.d.handleAdminTransition(
+                  parlay::TgChatMemberUpdate{-100777, 5222, "member",
+                                             "administrator"}),
+              "pkg1 admin transition: promotion refreshes");
+        rig.d.handleMessage(makeMsg(-100777, 5222, "/settings"));
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[1], "Chat Settings"),
+              "pkg1 admin transition: promoted admin opens settings "
+              "without waiting for the TTL");
+        rig.tg.admins = {111, 5222, 5333};
+        CHECK(!rig.d.handleAdminTransition(
+                  parlay::TgChatMemberUpdate{-100777, 5333, "left",
+                                             "member"}),
+              "pkg1 admin transition: member join does not refresh");
+        rig.d.handleMessage(makeMsg(-100777, 5333, "/settings"));
+        CHECK(rig.tg.replies.size() == 3 &&
+                  contains(rig.tg.replies[2], "Access Denied"),
+              "pkg1 admin transition: member join leaves the cache "
+              "unchanged, newcomer still denied");
+        rig.tg.admins = {111};
+        CHECK(rig.d.handleAdminTransition(
+                  parlay::TgChatMemberUpdate{-100777, 5222, "administrator",
+                                             "member"}),
+              "pkg1 admin transition: demotion refreshes");
+        rig.d.handleMessage(makeMsg(-100777, 5222, "/settings"));
+        CHECK(rig.tg.replies.size() == 4 &&
+                  contains(rig.tg.replies[3], "Access Denied"),
+              "pkg1 admin transition: demoted admin is denied again");
+    }
+    // S5: the owner is exempt from the blacklist-user refusal on
+    // Everyone commands; a blacklisted non-owner is still refused
+    // silently, and a non-blacklisted non-owner still runs them.
+    // The blacklisted non-owner is 4444, a fresh id: 111 is the
+    // workhorse user for later package tests and must not be
+    // blacklisted in the shared file store (merge fix: it was 111,
+    // which silently refused every later Everyone command from 111
+    // and segfaulted the /mix tests on an empty post_bodies[0]).
+    {
+        Rig rig;
+        rig.store.sadd("bl_users", "999");
+        rig.d.handleMessage(makeMsg(-1001, 999, "/id"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "This chat has ID"),
+              "pkg1 blacklist: blacklisted owner still runs /id");
+    }
+    {
+        Rig rig;
+        rig.store.sadd("bl_users", "4444");
+        rig.d.handleMessage(makeMsg(-1001, 4444, "/id"));
+        CHECK(rig.tg.replies.empty(),
+              "pkg1 blacklist: blacklisted non-owner still refused "
+              "silently");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1001, 113, "/id"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "This chat has ID"),
+              "pkg1 blacklist: non-blacklisted non-owner still runs /id");
+    }
+
+    // --- P2. /mix, /volume, /recognize, s-aliases (Package 2) -------------
+    const std::string mix_tracks =
+        R"({"tracks":[{"id":"yt:mix1","title":"Mix Song One","artist":"Mix Artist","source":"youtube","url":"https://www.youtube.com/watch?v=mix1","duration_sec":200,"duration_str":"3:20"},{"id":"yt:mix2","title":"Mix Song Two","artist":"Mix Artist","source":"youtube","url":"https://www.youtube.com/watch?v=mix2","duration_sec":180,"duration_str":"3:00"}],"source_track":{"id":"yt:seed","title":"Seed Song","source":"youtube"}})";
+    {
+        // Bare /mix with nothing playing: usage, no backend call.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1301, 111, "/mix"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage:") &&
+                  contains(rig.tg.replies[0], "/mix [song or URL]"),
+              "mix no-query: usage card, no mix.generate post");
+        CHECK(!has_post(rig, "mix.generate"),
+              "mix no-query: no mix.generate posted");
+    }
+    {
+        // /mix with a query: mix.generate posted, tracks enqueued
+        // (vc.queue add per track), first track's queued card
+        // rendered by editing the fetching message in place.
+        Rig rig;
+        rig.ipc.mix_response = mix_tracks;
+        rig.ipc.queue_list_response = R"({"queue":[{},{}]})";
+        rig.d.handleMessage(makeMsg(-1302, 111, "/mix Seed Song"));
+        CHECK(has_post(rig, "mix.generate"),
+              "mix query: mix.generate issued to the backend");
+        CHECK(!rig.ipc.post_bodies.empty(),
+              "mix query: a post body was recorded");
+        if (!rig.ipc.post_bodies.empty()) {
+            parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[0]);
+            CHECK(b.find("query") &&
+                      b.find("query")->asString() == "Seed Song",
+                  "mix query: mix.generate carries the query");
+        }
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Fetching mix tracks...",
+              "mix query: fetching reply sent");
+        int queue_posts = 0;
+        for (const auto& p : rig.ipc.posts)
+            if (p.find("|queue") != std::string::npos) ++queue_posts;
+        CHECK(queue_posts == 3,
+              "mix query: two vc.queue adds + one list");
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Added to Queue:") &&
+                  contains(rig.tg.edits[0].text, "#1") &&
+                  contains(rig.tg.edits[0].text, "Mix Song One"),
+              "mix query: first mix track queued card edited in place");
+    }
+    {
+        // Bare /mix while a track is playing: seeds from the current
+        // song (empty query posted).
+        Rig rig;
+        rig.ipc.mix_response = mix_tracks;
+        rig.ipc.queue_list_response = R"({"queue":[{},{}]})";
+        rig.store.set("call:-1303", "1");
+        rig.d.handleMessage(makeMsg(-1303, 111, "/mix"));
+        CHECK(has_post(rig, "mix.generate"),
+              "mix bare while playing: mix.generate issued");
+        CHECK(!rig.ipc.post_bodies.empty(),
+              "mix bare while playing: a post body was recorded");
+        if (!rig.ipc.post_bodies.empty()) {
+            parlay::Json b = parlay::Json::parse(rig.ipc.post_bodies[0]);
+            CHECK(b.find("query") && b.find("query")->asString().empty(),
+                  "mix bare while playing: empty query seeds from current");
+        }
+    }
+    {
+        // Backend refuses the mix: the exact error, edited in place.
+        Rig rig;
+        rig.ipc.mix_error = "Seed is not a YouTube track.";
+        rig.d.handleMessage(makeMsg(-1304, 111, "/mix Seed Song"));
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text, "Service error") &&
+                  contains(rig.tg.edits[0].text,
+                           "Seed is not a YouTube track."),
+              "mix failure: exact backend error edited in place");
+    }
+    {
+        // Empty mix: every track already queued or playing.
+        Rig rig;
+        rig.ipc.mix_response =
+            R"({"tracks":[],"source_track":{"id":"yt:seed","title":"Seed Song","source":"youtube"}})";
+        rig.d.handleMessage(makeMsg(-1305, 111, "/mix Seed Song"));
+        CHECK(rig.tg.edits.size() == 1 &&
+                  contains(rig.tg.edits[0].text,
+                           "already in the queue or playing"),
+              "mix empty: already-queued text edited in place");
+        CHECK(!has_post(rig, "queue"),
+              "mix empty: nothing enqueued");
+    }
+    {
+        // /volume: usage, non-numeric, out of range, nothing
+        // playing, success, boundaries, backend refusal.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1310, 111, "/volume"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /volume"),
+              "volume usage: no argument answers the usage line");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1311, 111, "/volume loud"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "must be a number"),
+              "volume non-numeric: refused honestly");
+        CHECK(!has_post(rig, "volume"),
+              "volume non-numeric: no vc.volume posted");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1312, 111, "/volume 201"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "must be between 0 and 200"),
+              "volume out-of-range: 201 refused");
+        Rig rig2;
+        rig2.d.handleMessage(makeMsg(-1313, 111, "/volume -5"));
+        CHECK(rig2.tg.replies.size() == 1 &&
+                  contains(rig2.tg.replies[0],
+                           "must be between 0 and 200"),
+              "volume out-of-range: -5 refused");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1314, 111, "/volume 80"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Not in call.",
+              "volume nothing-playing: Not in call.");
+        CHECK(!has_post(rig, "volume"),
+              "volume nothing-playing: no vc.volume posted");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1315", "1");
+        rig.d.handleMessage(makeMsg(-1315, 111, "/volume 80"));
+        CHECK(has_post(rig, "volume"),
+              "volume success: vc.volume issued to the backend");
+        {
+            parlay::Json b = parlay::Json::parse(last_post_body(rig));
+            CHECK(b.find("volume") && b.find("volume")->asInt() == 80,
+                  "volume success: vc.volume carries 80");
+        }
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] == "Volume set to 80.",
+              "volume success: Volume set to 80.");
+        auto f = rig.store.hgetall("chatrt:-1315");
+        CHECK(f["volume"] == "80",
+              "volume success: applied value kept for the +/- buttons");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1316", "1");
+        rig.d.handleMessage(makeMsg(-1316, 111, "/volume 0"));
+        rig.d.handleMessage(makeMsg(-1316, 111, "/volume 200"));
+        CHECK(rig.tg.replies.size() == 2 &&
+                  rig.tg.replies[0] == "Volume set to 0." &&
+                  rig.tg.replies[1] == "Volume set to 200.",
+              "volume boundaries: 0 and 200 both accepted");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1317", "1");
+        rig.ipc.volume_error = "engine down";
+        rig.d.handleMessage(makeMsg(-1317, 111, "/volume 80"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "engine down"),
+              "volume backend refusal: exact error reported");
+        auto f = rig.store.hgetall("chatrt:-1317");
+        CHECK(f.count("volume") == 0,
+              "volume backend refusal: no value recorded");
+    }
+    {
+        // /splay: same play, success card suppressed, call still
+        // marked active; usage and backend errors stay visible.
+        Rig rig;
+        rig.ipc.play_response = play_np;
+        rig.d.handleMessage(makeMsg(-1321, 111, "/splay Test Song"));
+        CHECK(has_post(rig, "play"),
+              "splay: vc.play issued to the backend");
+        CHECK(rig.tg.replies.empty(),
+              "splay: success card suppressed");
+        auto c = rig.store.get("call:-1321");
+        CHECK(c && *c == "1", "splay: call marked active");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1322, 111, "/splay Test Song"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Service error"),
+              "splay error: backend refusal stays visible");
+    }
+    {
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1323, 111, "/splay"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Whoops! Nothing to play."),
+              "splay usage: no-query usage stays visible");
+    }
+    {
+        // Plain /pause still renders its card: suppression is
+        // per-invocation, not a mode.
+        Rig rig;
+        rig.store.set("call:-1324", "1");
+        rig.ipc.pause_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
+        rig.d.handleMessage(makeMsg(-1324, 111, "/pause"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Paused"),
+              "pause control: plain /pause renders its card");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1325", "1");
+        rig.ipc.skip_response = skip_np;
+        rig.d.handleMessage(makeMsg(-1325, 111, "/sskip"));
+        CHECK(has_post(rig, "skip"), "sskip: vc.skip issued");
+        CHECK(rig.tg.replies.empty(),
+              "sskip: success card suppressed");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1326", "1");
+        rig.d.handleMessage(makeMsg(-1326, 111, "/sstop"));
+        CHECK(has_post(rig, "stop"), "sstop: vc.stop issued");
+        CHECK(rig.tg.replies.empty(),
+              "sstop: success reply suppressed");
+        auto c = rig.store.get("call:-1326");
+        CHECK(!c || *c != "1", "sstop: call marked inactive");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1327", "1");
+        rig.ipc.pause_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":true}})";
+        rig.d.handleMessage(makeMsg(-1327, 111, "/spause"));
+        CHECK(has_post(rig, "pause"), "spause: vc.pause issued");
+        CHECK(rig.tg.replies.empty(),
+              "spause: success card suppressed");
+    }
+    {
+        Rig rig;
+        rig.store.set("call:-1328", "1");
+        rig.ipc.resume_response =
+            R"({"now_playing":{"track":{"id":"t1","title":"Test Song","duration_sec":200},"position_sec":30,"paused":false}})";
+        rig.d.handleMessage(makeMsg(-1328, 111, "/sresume"));
+        CHECK(has_post(rig, "resume"), "sresume: vc.resume issued");
+        CHECK(rig.tg.replies.empty(),
+              "sresume: success card suppressed");
+    }
+    {
+        // /recognize: usage without a replied audio/voice message.
+        Rig rig;
+        rig.d.handleMessage(makeMsg(-1331, 111, "/recognize"));
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /recognize"),
+              "recognize no-reply: usage");
+        CHECK(!has_post(rig, "audio.recognize"),
+              "recognize no-reply: no audio.recognize posted");
+    }
+    {
+        Rig rig;
+        parlay::TgMessage m = makeMsg(-1332, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "PHOTO1";
+        m.reply_media_kind = "photo";
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Usage: /recognize"),
+              "recognize non-audio reply: usage");
+    }
+    {
+        // Recognized: the identified track is named.
+        Rig rig;
+        rig.ipc.recognize_response =
+            R"({"recognized":true,"name":"Song Title","artists":"Some Artist","album":"Some Album","source":"audd"})";
+        parlay::TgMessage m = makeMsg(-1333, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "VOICE1";
+        m.reply_media_kind = "voice";
+        rig.d.handleMessage(m);
+        CHECK(has_post(rig, "audio.recognize"),
+              "recognize match: audio.recognize issued");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "Recognized:") &&
+                  contains(rig.tg.replies[0], "Song Title") &&
+                  contains(rig.tg.replies[0], "Some Artist"),
+              "recognize match: identified track named");
+    }
+    {
+        // Unconfigured provider: honest feature-unavailable reply,
+        // never a fabricated identification, no setup text leaked.
+        Rig rig;
+        rig.ipc.recognize_error =
+            "Music recognition is not configured: set AUDD_API_TOKEN "
+            "(from dashboard.audd.io) in the environment";
+        parlay::TgMessage m = makeMsg(-1334, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "AUDIO1";
+        m.reply_media_kind = "audio";
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  rig.tg.replies[0] ==
+                      "Music recognition is not configured.",
+              "recognize unconfigured: honest unavailable reply");
+    }
+    {
+        // Provider finds no match: honest not-recognized reply.
+        Rig rig;
+        rig.ipc.recognize_response = R"({"recognized":false})";
+        parlay::TgMessage m = makeMsg(-1335, 111, "/recognize");
+        m.has_reply_to = true;
+        m.reply_to_message_id = 7;
+        m.has_reply_media = true;
+        m.reply_media_file_id = "VOICE1";
+        m.reply_media_kind = "voice";
+        rig.d.handleMessage(m);
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0],
+                           "Could not recognize this track."),
+              "recognize no-match: honest not-recognized reply");
+    }
+
+    // --- Package 3, R2: configured default-thumbnail fallback -----
+    // Exercised through /play -> finishPlay -> sendNowPlayingCard.
+    {
+        auto npNoThumb = std::string(
+            R"({"now_playing":{"track":{"id":"t1","title":"No Thumb Song","artist":"A","duration_sec":200},"position_sec":0,"paused":false}})");
+        {
+            Rig rig;
+            rig.cfg.default_thumbnail =
+                "https://example.invalid/default.jpg";
+            rig.ipc.play_response = npNoThumb;
+            rig.d.handleMessage(makeMsg(-1101, 111, "/play No Thumb Song"));
+            CHECK(rig.tg.photos.size() == 1 &&
+                      rig.tg.photos[0] ==
+                          "https://example.invalid/default.jpg",
+                  "R2: default thumbnail used when the track has none");
+        }
+        {
+            Rig rig;
+            rig.ipc.play_response = npNoThumb;
+            rig.d.handleMessage(makeMsg(-1102, 111, "/play No Thumb Song"));
+            CHECK(rig.tg.photos.empty(),
+                  "R2: text card when neither track nor default "
+                  "thumbnail exists");
+        }
+        {
+            Rig rig;
+            rig.cfg.default_thumbnail =
+                "https://example.invalid/default.jpg";
+            rig.ipc.seedSetting(-1103, "thumbnails", "false");
+            rig.ipc.play_response = npNoThumb;
+            rig.d.handleMessage(makeMsg(-1103, 111, "/play No Thumb Song"));
+            CHECK(rig.tg.photos.empty(),
+                  "R2: thumbnails-off still forces a text card");
+        }
+        {
+            Rig rig;
+            rig.cfg.default_thumbnail =
+                "https://example.invalid/default.jpg";
+            rig.ipc.play_response =
+                R"({"now_playing":{"track":{"id":"t1","title":"Thumb Song","artist":"A","duration_sec":200,"thumbnail":"https://example.invalid/track.jpg"},"position_sec":0,"paused":false}})";
+            rig.d.handleMessage(makeMsg(-1104, 111, "/play Thumb Song"));
+            CHECK(rig.tg.photos.size() == 1 &&
+                      rig.tg.photos[0] ==
+                          "https://example.invalid/track.jpg",
+                  "R2: track thumbnail takes precedence over the "
+                  "default");
+        }
+    }
+
+    // --- Package 3, R4: italic page footer on search pages ---------
+    // Exercised through /search -> searchResultsText, then the page
+    // callback -> the same text edited in place.
+    {
+        auto searchJson = [](int n) {
+            std::string arr = "{\"results\":[";
+            for (int i = 0; i < n; ++i) {
+                if (i) arr += ",";
+                arr += "{\"id\":\"t" + std::to_string(i) +
+                       "\",\"title\":\"Song " + std::to_string(i) +
+                       "\",\"url\":\"https://example.invalid/" +
+                       std::to_string(i) + "\",\"artist\":\"A\"}";
+            }
+            arr += "]}";
+            return arr;
+        };
+        {
+            Rig rig;
+            rig.ipc.search_response = searchJson(25);
+            rig.d.handleMessage(makeMsg(-1001, 111, "/search q"));
+            CHECK(rig.tg.replies.size() == 1 &&
+                      contains(rig.tg.replies[0], "<i>Page 1 of 3</i>"),
+                  "R4: search page 1 carries the italic Page 1 of 3 "
+                  "footer");
+            rig.d.handleCallback(makeCq(
+                "pl:search:page:111:2:" +
+                    parlay::ui_texts::queryHash("q"),
+                -1001, 111, 1));
+            CHECK(!rig.tg.edits.empty() &&
+                      contains(rig.tg.edits[0].text, "<i>Page 2 of 3</i>"),
+                  "R4: search page 2 carries the italic Page 2 of 3 "
+                  "footer");
+            rig.d.handleCallback(makeCq(
+                "pl:search:page:111:3:" +
+                    parlay::ui_texts::queryHash("q"),
+                -1001, 111, 1));
+            CHECK(rig.tg.edits.size() >= 2 &&
+                      contains(rig.tg.edits[1].text, "<i>Page 3 of 3</i>"),
+                  "R4: last search page carries the italic Page 3 of "
+                  "3 footer");
+        }
+        {
+            Rig rig;
+            rig.ipc.search_response = searchJson(3);
+            rig.d.handleMessage(makeMsg(-1001, 111, "/search q"));
+            CHECK(rig.tg.replies.size() == 1 &&
+                      !contains(rig.tg.replies[0], "Page "),
+                  "R4: single-page search carries no page footer");
+        }
+    }
+
+    // --- Package 3, R5: collection photo card + Download N songs ---
+    {
+        std::filesystem::create_directories("/tmp/parlay-dispatcher-test");
+        {
+            std::ofstream a("/tmp/parlay-dispatcher-test/coll-a.mp3");
+            std::ofstream b("/tmp/parlay-dispatcher-test/coll-b.mp3");
+        }
+        Rig rig;
+        rig.store.set("dlpick:run123456",
+                      "https://open.spotify.com/playlist/xyz\n-1001");
+        rig.ipc.spotify_collection_response =
+            R"({"kind":"playlist","name":"Chill Mix","total":2,"tracks":[{"title":"A","artist":"X","thumbnail":"https://example.invalid/cover.jpg"},{"title":"B","artist":"Y","thumbnail":"https://example.invalid/cover2.jpg"}],"truncated":false})";
+        rig.d.handleCallback(makeCq("pl:dl:1by1:run123456"));
+        CHECK(rig.tg.photos.size() == 1 &&
+                  rig.tg.photos[0] == "https://example.invalid/cover.jpg",
+              "R5: collection card sent as a photo with the cover");
+        bool card_ok = false;
+        for (const auto& r : rig.tg.replies)
+            if (contains(r, "Chill Mix") && contains(r, "2 songs"))
+                card_ok = true;
+        CHECK(card_ok && !rig.tg.markups.empty() &&
+                  contains(rig.tg.markups.back(), "pl:dl:go:run123456"),
+              "R5: collection card caption + Download N songs button");
+        rig.ipc.download_response =
+            R"({"count":2,"file_paths":["/tmp/parlay-dispatcher-test/coll-a.mp3","/tmp/parlay-dispatcher-test/coll-b.mp3"],"run_id":"x"})";
+        size_t toasts_before = rig.tg.toasts.size();
+        rig.d.handleCallback(makeCq("pl:dl:go:run123456"));
+        CHECK(rig.tg.audios.size() == 2,
+              "R5: Download N songs sends the per-track files");
+        CHECK(rig.tg.toasts.size() > toasts_before &&
+                  contains(rig.tg.toasts.back().text,
+                           "Successfully uploaded 2 from a Spotify "
+                           "playlist"),
+              "R5: collection completion report follows the files");
+    }
+
+    // --- Package 3, R6: Check Again retry on not-available ---------
+    {
+        Rig rig;
+        rig.ipc.download_error = "Track is not available yet";
+        rig.d.handleMessage(
+            makeMsg(-1121, 111, "/download some song"));
+        CHECK(!rig.tg.edits.empty() &&
+                  contains(rig.tg.edits[0].text, "not available"),
+              "R6: not-available failure renders the retry card");
+        CHECK(!rig.tg.edit_markups.empty() &&
+                  contains(rig.tg.edit_markups[0], "pl:dl:retry:"),
+              "R6: retry card carries the Check Again button");
+        std::string run;
+        {
+            const std::string& m = rig.tg.edit_markups[0];
+            size_t p = m.find("pl:dl:retry:");
+            if (p != std::string::npos) {
+                size_t e = m.find('|', p);
+                run = m.substr(p + std::string("pl:dl:retry:").size(),
+                               e == std::string::npos
+                                   ? std::string::npos
+                                   : e - p -
+                                         std::string("pl:dl:retry:").size());
+            }
+        }
+        CHECK(!run.empty(), "R6: retry run id recoverable from the card");
+        size_t edits_before = rig.tg.edits.size();
+        rig.d.handleCallback(
+            makeCq("pl:dl:retry:" + run, -1121, 111, 1));
+        CHECK(rig.tg.toasts.size() == 1 &&
+                  rig.tg.toasts[0].text ==
+                      "Track is still being processed. Please try "
+                      "again later" &&
+                  !rig.tg.toasts[0].alert,
+              "R6: still-unavailable tap answers the non-alert "
+              "still-processing toast");
+        CHECK(rig.tg.edits.size() == edits_before,
+              "R6: still-unavailable tap leaves the card in place");
+        // Now the track becomes available: success replaces the card.
+        rig.ipc.download_error.clear();
+        rig.ipc.download_response =
+            R"({"track":{"title":"Some Song","artist":"A"},"file_path":"/tmp/parlay-dispatcher-test/retry-song.mp3"})";
+        {
+            std::ofstream f("/tmp/parlay-dispatcher-test/retry-song.mp3");
+        }
+        rig.d.handleCallback(
+            makeCq("pl:dl:retry:" + run, -1121, 111, 1));
+        CHECK(rig.tg.audios.size() == 1,
+              "R6: retry success delivers the audio file");
+        CHECK(rig.tg.edits.size() > edits_before &&
+                  contains(rig.tg.edits.back().text,
+                           "Song downloaded successfully!"),
+              "R6: retry success replaces the failure card");
+    }
+    {
+        // A generic download failure is NOT a retry card.
+        Rig rig;
+        rig.ipc.download_error = "YouTube lookup failed";
+        rig.d.handleMessage(
+            makeMsg(-1121, 111, "/download some song"));
+        CHECK(!rig.tg.edits.empty() &&
+                  contains(rig.tg.edits[0].text, "Download failed") &&
+                  (rig.tg.edit_markups.empty() ||
+                   !contains(rig.tg.edit_markups[0], "pl:dl:retry:")),
+              "R6: other failures render a plain failure card, no "
+              "retry button");
+    }
+
+    // --- Package 3, R1/R7: inline result card buttons --------------
+    // Exercised through the inline query: the FakeSender records the
+    // Bot API-shaped results, so the test sees the exact markup the
+    // core hands to answerInlineQuery.
+    {
+        Rig rig;
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"yt:abc","title":"Song","artist":"Artist","url":"https://www.youtube.com/watch?v=abc","duration_sec":200,"source":"youtube"}]})";
+        rig.d.handleInlineQuery(makeIq("bohemian"));
+        CHECK(rig.tg.inlines.size() == 1,
+              "R1/R7: inline search answers one result set");
+        std::string dump = rig.tg.inlines[0].results_json;
+        CHECK(contains(dump, "Copy link") &&
+                  contains(dump, "copy_text") &&
+                  contains(dump, "https://www.youtube.com/watch?v=abc"),
+              "R1: inline search result carries a Copy link button "
+              "with the track URL");
+        CHECK(contains(dump, "Open in Parlay Bot") &&
+                  contains(dump, "https://t.me/parlaybot?start=spotify----yt:abc"),
+              "R7: inline search result carries the deep-link button "
+              "with a well-formed bot link");
+    }
+    {
+        // np results carry no deep-link button (with_button=false).
+        Rig rig;
+        rig.ipc.inline_response =
+            R"({"results":[{"id":"t1","title":"T","artist":"A","duration_sec":200,"stream_url":"https://example.invalid/audio.webm","thumbnail":"https://example.invalid/t.jpg","source":"youtube"}]})";
+        rig.d.handleMessage(makeMsg(-1001, 5001, "hello"));
+        rig.d.handleInlineQuery(makeIq("np", 5001));
+        CHECK(rig.tg.inlines.size() == 1 &&
+                  !contains(rig.tg.inlines[0].results_json,
+                            "Open in Parlay Bot"),
+              "R7: np inline result carries no deep-link button");
+    }
+
 
     std::filesystem::remove_all("/tmp/parlay-dispatcher-test");
     if (failures == 0) {

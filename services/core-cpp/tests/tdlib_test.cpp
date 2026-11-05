@@ -53,7 +53,9 @@
 #include <vector>
 
 #include "config.hpp"
+#include "dispatcher.hpp"
 #include "tdlib_client.hpp"
+#include "tg_types.hpp"
 
 static int failures = 0;
 #define CHECK(cond, msg)                                                    \
@@ -614,6 +616,52 @@ int main() {
         restore();
         std::error_code ec;
         std::filesystem::remove_all("/tmp/parlay-dual-test", ec);
+    }
+
+    // --- Package 3, R1: copy-button TDLib serialisation --------------
+    // Pure JSON translation, no TDLib calls: a copy button serialises
+    // as inlineKeyboardButtonTypeCopyText carrying the text and no
+    // callback data; the neighbouring kinds are unchanged.
+    {
+        using parlay::InlineButton;
+        parlay::InlineKeyboard kb = {
+            {InlineButton::copy("Copy link",
+                                "https://www.youtube.com/watch?v=abc"),
+             InlineButton::link("YouTube",
+                                "https://www.youtube.com/watch?v=abc")},
+            {InlineButton::callback("Pick", "pl:search:1:999:tok")},
+        };
+        parlay::Json markup =
+            parlay::TdLibTelegramSender::inlineMarkup(kb);
+        parlay::Json parsed = parlay::Json::parse(markup.dump());
+        const parlay::Json* rows = parsed.find("rows");
+        CHECK(rows != nullptr && rows->size() == 2,
+              "copy serialisation: two rows survive");
+        const parlay::Json* b0 =
+            rows ? rows->asArray()[0].asArray()[0].find("type") : nullptr;
+        CHECK(b0 != nullptr && b0->find("@type") &&
+                  b0->find("@type")->asString() ==
+                      "inlineKeyboardButtonTypeCopyText" &&
+                  b0->find("text") &&
+                  b0->find("text")->asString() ==
+                      "https://www.youtube.com/watch?v=abc" &&
+                  b0->find("data") == nullptr,
+              "copy serialisation: CopyText type carries the text and "
+              "no callback_data");
+        const parlay::Json* b1 =
+            rows ? rows->asArray()[0].asArray()[1].find("type") : nullptr;
+        CHECK(b1 != nullptr && b1->find("@type") &&
+                  b1->find("@type")->asString() ==
+                      "inlineKeyboardButtonTypeUrl",
+              "copy serialisation: URL button beside it is unchanged");
+        const parlay::Json* b2 =
+            rows ? rows->asArray()[1].asArray()[0].find("type") : nullptr;
+        CHECK(b2 != nullptr && b2->find("@type") &&
+                  b2->find("@type")->asString() ==
+                      "inlineKeyboardButtonTypeCallback" &&
+                  b2->find("data") != nullptr,
+              "copy serialisation: callback button beside it is "
+              "unchanged");
     }
 
     std::cout << (failures == 0 ? "ALL PASS" : "FAILURES") << ": " << failures

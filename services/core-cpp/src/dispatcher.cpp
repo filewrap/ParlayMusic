@@ -326,6 +326,8 @@ void Dispatcher::registerCommands() {
     // Playback / queue (NoxBeats cmd/play.cpp, playback.cpp, queue_ops.cpp).
     add({"play", "playforce", "vplay", "vplayforce"}, Scope::Group,
         Perm::Everyone, [this](const CommandContext& c) { onPlay(c); });
+    add({"mix"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onMix(c); });
     add({"playplaylist"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onPlayPlaylist(c); });
     add({"skip", "next"}, Scope::Group, Perm::Everyone,
@@ -364,12 +366,16 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onBass(c); });
     add({"mute", "unmute"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onMute(c); });
+    add({"volume"}, Scope::Group, Perm::Everyone,
+        [this](const CommandContext& c) { onVolume(c); });
     add({"replay"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onReplay(c); });
     add({"player"}, Scope::Group, Perm::Everyone,
         [this](const CommandContext& c) { onPlayer(c); });
     add({"lyrics", "lyric"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onLyrics(c); });
+    add({"recognize"}, Scope::Any, Perm::Everyone,
+        [this](const CommandContext& c) { onRecognize(c); });
     // Search / download / radio / share / engine.
     add({"search"}, Scope::Any, Perm::Everyone,
         [this](const CommandContext& c) { onSearch(c); });
@@ -499,6 +505,14 @@ void Dispatcher::registerCommands() {
         [this](const CommandContext& c) { onLogger(c); });
     add({"restart"}, Scope::Any, Perm::Sudo,
         [this](const CommandContext& c) { onRestart(c); });
+    // Library / cache tools (Package 1, §9-E5/E6/E7): sudo-only admin
+    // commands that post the existing backend actions.
+    add({"rmcache"}, Scope::Any, Perm::Sudo,
+        [this](const CommandContext& c) { onRmcache(c); });
+    add({"scan"}, Scope::Any, Perm::Sudo,
+        [this](const CommandContext& c) { onScan(c); });
+    add({"sharescan"}, Scope::Any, Perm::Sudo,
+        [this](const CommandContext& c) { onShareScan(c); });
     // RTMP.
     add({"setrtmp"}, Scope::Private, Perm::Everyone,
         [this](const CommandContext& c) { onSetRtmp(c); });
@@ -544,7 +558,13 @@ void Dispatcher::registerCommands() {
         {"assistant", "userbot"}, {"userbotjoin", "userbot"},
         {"assistantjoin", "userbot"},
         {"setcplay", "channelplay"}, {"rtmp", "setrtmp"},
+        // s-aliases (TgMusicBot load.go: s + name for every command
+        // in SupportsSilence): the same handler, with only the
+        // success message suppressed (see silent_aliases_).
+        {"splay", "play"}, {"sskip", "skip"}, {"sstop", "stop"},
+        {"spause", "pause"}, {"sresume", "resume"},
     };
+    silent_aliases_ = {"splay", "sskip", "sstop", "spause", "sresume"};
     // c-commands (NoxBeats channel_commands()): name -> (base, is_play).
     channel_cmds_ = {
         {"cplay", {"play", true}}, {"vcplay", {"vplay", true}},
@@ -938,6 +958,8 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         ctx.via_channel = true;
     } else if (auto al = aliases_.find(cmd); al != aliases_.end()) {
         ctx.command = al->second;
+        // s-alias: same handler, success message suppressed.
+        ctx.silent_success = silent_aliases_.count(cmd) > 0;
     }
 
     if (!chatAllowed(msg.chat.id)) {
@@ -956,10 +978,12 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         if (r.perm == Perm::Sudo && !isSudo(msg.from.id)) return;
         if (r.perm == Perm::Owner && !isOwner(msg.from.id)) return;
         // Blacklisted users are refused on Everyone commands (except
-        // /start and /listsudo).
+        // /start and /listsudo). The owner is exempt: a blacklisted
+        // owner still runs Everyone commands (telegram-music-bot-rust
+        // ADMIN_ID ban checks return false for the owner).
         if (r.perm == Perm::Everyone && ctx.command != "start" &&
             ctx.command != "listsudo" && ctx.command != "sudolist" &&
-            isBlUser(msg.from.id))
+            !isOwner(msg.from.id) && isBlUser(msg.from.id))
             return;
         // Blacklisted chat: leave.
         if (isBlChat(msg.chat.id)) {
@@ -1004,12 +1028,10 @@ void Dispatcher::handleMessage(const TgMessage& msg) {
         }
         return;  // first match wins
     }
-    // Unknown command: the §3 reply (never silent, never a crash).
+    // Unknown command: the refined §3 reply (row C92) — the command
+    // doesn't exist, use /help. Never silent, never a crash.
     replyHtml(ctx, ui_texts::fmt(ui_texts::kUnknownCommand,
-                                 {{"command", "/" + ctx.command},
-                                  {"list", availableCommandsList(
-                                               isSudo(msg.from.id),
-                                               isOwner(msg.from.id))}}));
+                                 {{"command", "/" + ctx.command}}));
 }
 
 // --- permissions -----------------------------------------------------------
@@ -1676,19 +1698,23 @@ int64_t Dispatcher::sendNowPlayingCard(int64_t chat_id, const Json& np,
     std::string text = ui_texts::nowPlayingText(ct);
     if (!state_line.empty()) text = state_line + "\n\n" + text;
     InlineKeyboard kb = ui_texts::playerKeyboard(
-        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
-    std::string thumb =
-        track->find("thumbnail") ? track->find("thumbnail")->asString() : "";
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
+        settingsFor(chat_id).thumbnails);
+    std::string thumb = effectiveThumb(
+        chat_id, track->find("thumbnail")
+                     ? track->find("thumbnail")->asString()
+                     : "");
     CommandContext fake;
     fake.message.chat.id = chat_id;
     int64_t id = -1;
     bool is_photo = false;
-    if (!thumb.empty() && thumbnailsOn(chat_id)) {
+    if (!thumb.empty()) {
         id = tg_.sendPhoto(chat_id, thumb, text, kb);
         if (id > 0) is_photo = true;
     }
     if (id < 0) {
-        // No thumbnail, thumbnails off, or sendPhoto failed: text card.
+        // No thumbnail (track or configured default), thumbnails off,
+        // or sendPhoto failed: text card.
         id = tg_.sendMessageHtml(chat_id, text, kb, 0);
     }
     if (id > 0) recordCard(chat_id, id, is_photo);
@@ -1740,8 +1766,10 @@ bool Dispatcher::buildQueueCard(int64_t chat_id, bool show_all,
     text_out = ui_texts::queueText(now, up, total);
     kb_out = ui_texts::queueKeyboard(chat_id, up, has_more,
                                      total - up.size());
-    thumb_out =
-        track.find("thumbnail") ? track.find("thumbnail")->asString() : "";
+    thumb_out = effectiveThumb(
+        chat_id, track.find("thumbnail")
+                     ? track.find("thumbnail")->asString()
+                     : "");
     return true;
 }
 
@@ -2389,7 +2417,8 @@ void Dispatcher::refreshCardText(int64_t chat_id, int64_t message_id,
     if (loop == 0) loop = chatRtIntField(chat_id, "loop", 0);
     std::string text = ui_texts::nowPlayingText(ct);
     InlineKeyboard kb = ui_texts::playerKeyboard(
-        chat_id, paused, autoplay, loop, ct.token, true, pos, dur);
+        chat_id, paused, autoplay, loop, ct.token, true, pos, dur,
+        settingsFor(chat_id).thumbnails);
     std::string err;
     if (is_photo)
         tg_.editMessageCaption(chat_id, message_id, text, kb, &err);
@@ -2877,18 +2906,23 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
                 ui_texts::CardTrack ct = cardTrack(*lt, by);
                 std::string text = ui_texts::queuedText(
                     static_cast<int>(items->size()), ct);
-                std::string thumb =
-                    lt->find("thumbnail")
-                        ? lt->find("thumbnail")->asString()
-                        : "";
+                std::string thumb = effectiveThumb(
+                    chat, lt->find("thumbnail")
+                              ? lt->find("thumbnail")->asString()
+                              : "");
                 InlineKeyboard kb = ui_texts::queuedKeyboard(ct.token);
-                if (!thumb.empty() && thumbnailsOn(chat)) {
-                    if (replyPhoto(ctx, thumb, text, kb) > 0) {
-                        deleteCommandMessage(ctx);
-                        return;
+                // s-alias: the queueing itself still happens (the
+                // backend accepted it); only the success card is
+                // suppressed. Errors above stay visible.
+                if (!ctx.silent_success) {
+                    if (!thumb.empty() && thumbnailsOn(chat)) {
+                        if (replyPhoto(ctx, thumb, text, kb) > 0) {
+                            deleteCommandMessage(ctx);
+                            return;
+                        }
                     }
+                    replyKb(ctx, text, kb);
                 }
-                replyKb(ctx, text, kb);
                 deleteCommandMessage(ctx);
                 return;
             }
@@ -2896,14 +2930,16 @@ void Dispatcher::finishPlay(const CommandContext& ctx, int64_t chat,
         // Queue list unavailable: the current track is still what
         // is playing, so show its card (the queued track is visible
         // in /queue). Never claim the queued track is playing.
-        sendNowPlayingCard(chat, now, "Now playing");
+        if (!ctx.silent_success)
+            sendNowPlayingCard(chat, now, "Now playing");
         deleteCommandMessage(ctx);
         return;
     }
     std::string state_line = "Now playing";
     if (chatRtIntField(chat, "muted", 0))
         state_line += "\n(muted — use /unmute)";
-    sendNowPlayingCard(chat, now, state_line);
+    if (!ctx.silent_success)
+        sendNowPlayingCard(chat, now, state_line);
     deleteCommandMessage(ctx);
 }
 
@@ -2973,10 +3009,12 @@ void Dispatcher::onPause(const CommandContext& ctx) {
     std::string state_line = ui_texts::kCtlPaused;
     // The backend owns the call and the audio: its pause is the
     // pause. No core-side voice step remains.
-    if (state.find("track"))
-        sendNowPlayingCard(vcTarget(ctx), state, state_line);
-    else
-        replyHtml(ctx, state_line);
+    if (!ctx.silent_success) {
+        if (state.find("track"))
+            sendNowPlayingCard(vcTarget(ctx), state, state_line);
+        else
+            replyHtml(ctx, state_line);
+    }
 }
 
 void Dispatcher::onResume(const CommandContext& ctx) {
@@ -2995,10 +3033,12 @@ void Dispatcher::onResume(const CommandContext& ctx) {
     Json state = np ? *np : r.data;
     std::string state_line = ui_texts::kCtlResumed;
     // Mirror of onPause: the backend's resume is the resume.
-    if (state.find("track"))
-        sendNowPlayingCard(vcTarget(ctx), state, state_line);
-    else
-        replyHtml(ctx, state_line);
+    if (!ctx.silent_success) {
+        if (state.find("track"))
+            sendNowPlayingCard(vcTarget(ctx), state, state_line);
+        else
+            replyHtml(ctx, state_line);
+    }
 }
 
 void Dispatcher::onSkip(const CommandContext& ctx) {
@@ -3019,11 +3059,13 @@ void Dispatcher::onSkip(const CommandContext& ctx) {
         // The backend moved to a new track and owns its audio: render
         // the new card. A backend failure would already have been
         // reported above via replyError.
-        sendNowPlayingCard(vcTarget(ctx), *np, ui_texts::kCtlSkipped);
+        if (!ctx.silent_success)
+            sendNowPlayingCard(vcTarget(ctx), *np, ui_texts::kCtlSkipped);
     } else {
         // Queue empty: the backend stopped, so the call is inactive.
         setCallActive(vcTarget(ctx), false);
-        reply(ctx, "Skipped — the queue is now empty.");
+        if (!ctx.silent_success)
+            reply(ctx, "Skipped — the queue is now empty.");
     }
 }
 
@@ -3071,12 +3113,254 @@ void Dispatcher::onStop(const CommandContext& ctx) {
         replyError(ctx, r);
         return;
     }
-    if (was_active)
-        replyHtml(ctx, ui_texts::fmt(ui_texts::kStoppedCard,
-                                     {{"user", ui_texts::htmlEscape(
-                                                   userLabel(ctx))}}));
-    else
-        replyHtml(ctx, ui_texts::kCtlNotStreaming);
+    if (!ctx.silent_success) {
+        if (was_active)
+            replyHtml(ctx, ui_texts::fmt(ui_texts::kStoppedCard,
+                                         {{"user", ui_texts::htmlEscape(
+                                                       userLabel(ctx))}}));
+        else
+            replyHtml(ctx, ui_texts::kCtlNotStreaming);
+    }
+}
+
+// --- /volume shared step ----------------------------------------------------
+// The panel Vol-/Vol+ buttons and the /volume text command share this
+// step: the backend room owns the live volume, the core keeps only
+// the last applied value (runtime hash) so the +/- buttons can step
+// from it; the vc.volume call is the authority.
+bool Dispatcher::applyVolume(const CommandContext& ctx, int64_t chat_id,
+                             int target, std::string& toast_out) {
+    int v = target;
+    if (v < 0) v = 0;
+    if (v > 200) v = 200;
+    IpcResult r = vcCall(ctx, "volume",
+                         Json::objectOf({
+                             {"chat_id", Json(chat_id)},
+                             {"volume", Json(static_cast<int64_t>(v))},
+                         }));
+    if (!r.ok) {
+        toast_out = r.error_message;
+        return false;
+    }
+    setChatRtField(chat_id, "volume", std::to_string(v));
+    toast_out = ui_texts::toastVolumeSet(v);
+    return true;
+}
+
+// --- /volume <0-200> (remix controls.ts, anonx-cpp handle_volume) ---------
+// Text form of the /menu Vol-/Vol+ buttons: same vc.volume path, same
+// 0-200 range, same "Volume set to N." reply. Usage, non-numeric and
+// out-of-range inputs are refused honestly before any backend call;
+// with nothing in the call the answer is "Not in call."
+void Dispatcher::onVolume(const CommandContext& ctx) {
+    if (!isGroup(ctx)) {
+        reply(ctx, "Music only plays in groups (supergroups).");
+        return;
+    }
+    if (!canManageVc(ctx)) return;
+    std::string arg = trim(ctx.args);
+    if (arg.empty()) {
+        reply(ctx, ui_texts::kVolumeUsage);
+        return;
+    }
+    // Strict integer: an optional '-' followed by digits only (stoi
+    // would silently accept "80x" and "+80").
+    std::string digits = arg;
+    bool negative = false;
+    if (!digits.empty() && digits[0] == '-') {
+        negative = true;
+        digits = digits.substr(1);
+    }
+    long value = 0;
+    bool numeric = !digits.empty() && isDigits(digits);
+    if (numeric) {
+        try {
+            value = std::stol(digits);
+        } catch (...) {
+            numeric = false;
+        }
+    }
+    if (!numeric) {
+        reply(ctx, ui_texts::kVolumeNotNumeric);
+        return;
+    }
+    if (negative) value = -value;
+    if (value < 0 || value > 200) {
+        reply(ctx, ui_texts::kVolumeOutOfRange);
+        return;
+    }
+    if (!callActive(vcTarget(ctx))) {
+        reply(ctx, "Not in call.");
+        return;
+    }
+    std::string toast;
+    if (!applyVolume(ctx, vcTarget(ctx), static_cast<int>(value), toast)) {
+        reply(ctx, toast);
+        return;
+    }
+    reply(ctx, toast);
+}
+
+// --- /mix [song or URL] (TgMusicBot mix.go, §9-E3) ------------------------
+// Posts mix.generate with the query, or with an empty query to seed
+// from the current song. The backend returns a track list; the core
+// enqueues it (vc.queue add per track) and renders the result
+// through the existing queued card path (the first mix track's
+// queued card, with the Play Now button). The fetching message is
+// edited in place with the outcome, so the chat sees one message.
+void Dispatcher::onMix(const CommandContext& ctx) {
+    if (!isGroup(ctx)) {
+        reply(ctx, "Music only plays in groups (supergroups).");
+        return;
+    }
+    if (!playAllowed(ctx, false)) return;
+    int64_t chat = vcTarget(ctx);
+    std::string query = trim(ctx.args);
+    // Bare /mix seeds from the current track (the backend rule);
+    // with nothing playing there is no seed, so answer the usage
+    // card instead of posting a mix the backend must refuse.
+    if (query.empty() && !callActive(chat)) {
+        replyHtml(ctx, ui_texts::kMixUsage);
+        return;
+    }
+    int64_t fetching = reply(ctx, ui_texts::kMixFetching);
+    Json body = Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"query", Json(query)},
+        {"requested_by", Json(ctx.message.from.id)},
+    });
+    IpcResult r = vcCall(ctx, "mix.generate", body);
+    // Edit the fetching message with the outcome; a failed edit
+    // falls back to a fresh reply so the outcome is never lost.
+    auto finish = [&](const std::string& text, const InlineKeyboard& kb) {
+        std::string err;
+        if (fetching > 0 &&
+            tg_.editMessageText(chat, fetching, text, kb, &err))
+            return;
+        replyKb(ctx, text, kb);
+    };
+    if (!r.ok) {
+        finish("Service error (" + r.error_code + "): " + r.error_message,
+               InlineKeyboard{});
+        return;
+    }
+    const Json* tracks = r.data.find("tracks");
+    if (!tracks || tracks->size() == 0) {
+        finish(ui_texts::kMixAlreadyQueued, InlineKeyboard{});
+        return;
+    }
+    int added = 0;
+    std::string add_error;
+    for (const auto& t : tracks->asArray()) {
+        Json add = Json::objectOf({
+            {"chat_id", Json(chat)},
+            {"action", Json("add")},
+            {"track", t},
+            {"requested_by", Json(ctx.message.from.id)},
+        });
+        IpcResult ar = vcCall(ctx, "queue", add);
+        if (!ar.ok) {
+            add_error = "Service error (" + ar.error_code + "): " +
+                        ar.error_message;
+            break;
+        }
+        ++added;
+    }
+    if (added == 0) {
+        finish(add_error, InlineKeyboard{});
+        return;
+    }
+    if (!add_error.empty()) {
+        // Partial enqueue: say exactly how many landed before the
+        // refusal, never a blanket success.
+        finish("Added " + std::to_string(added) + " of " +
+                   std::to_string(tracks->size()) +
+                   " mix tracks, then failed: " + add_error,
+               InlineKeyboard{});
+        return;
+    }
+    // Queued card path: the first mix track's queued card. Its
+    // display position comes from the queue list (the tail's
+    // position, like finishPlay); when the list is unavailable the
+    // honest fallback is a plain count, never a guessed position.
+    const Json& first = tracks->asArray()[0];
+    ui_texts::CardTrack ct = cardTrack(first, ctx.message.from.id);
+    Json qbody = Json::objectOf({
+        {"chat_id", Json(chat)},
+        {"action", Json("list")},
+    });
+    IpcResult qr = vcCall(ctx, "queue", qbody);
+    const Json* items = qr.ok ? qr.data.find("queue") : nullptr;
+    if (items && items->size() > 0) {
+        int pos = static_cast<int>(items->size()) - added + 1;
+        finish(ui_texts::queuedText(pos, ct),
+               ui_texts::queuedKeyboard(ct.token));
+    } else {
+        finish("Added " + std::to_string(added) +
+                   " mix tracks to the queue.",
+               InlineKeyboard{});
+    }
+    deleteCommandMessage(ctx);
+}
+
+// --- /recognize (Music163bot-Go /recognize, §9-E4) ------------------------
+// Replies to an audio or voice message: the core downloads it via
+// the TDLib bot session (the same flow as vc.play_file) and posts
+// audio.recognize with the local path. The reply names the
+// identified track, or says honestly that nothing was recognized.
+// When the backend has no provider token it answers
+// engine_unavailable "Music recognition is not configured": that
+// surfaces as the feature-unavailable reply, never a fabricated
+// identification.
+void Dispatcher::onRecognize(const CommandContext& ctx) {
+    if (!ctx.message.has_reply_media ||
+        (ctx.message.reply_media_kind != "audio" &&
+         ctx.message.reply_media_kind != "voice")) {
+        reply(ctx, ui_texts::kRecognizeUsage);
+        return;
+    }
+    std::string saved, err;
+    if (!tg_.downloadFile(ctx.message.reply_media_file_id,
+                          cfg_.data_dir + "/recognize", saved, err)) {
+        reply(ctx, "Could not fetch the replied file: " + err);
+        return;
+    }
+    Json body = Json::objectOf({
+        {"file_path", Json(saved)},
+        {"file_id", Json(ctx.message.reply_media_file_id)},
+    });
+    IpcResult r = vcCall(ctx, "audio.recognize", body);
+    if (!r.ok) {
+        if (r.error_code == "engine_unavailable" &&
+            r.error_message.find("not configured") != std::string::npos) {
+            reply(ctx, ui_texts::kRecognizeNotConfigured);
+            return;
+        }
+        replyError(ctx, r);
+        return;
+    }
+    const Json* rec = r.data.find("recognized");
+    if (!rec || !rec->asBool()) {
+        reply(ctx, ui_texts::kRecognizeNotFound);
+        return;
+    }
+    std::string name =
+        r.data.find("name") ? r.data.find("name")->asString() : "";
+    std::string artists =
+        r.data.find("artists") ? r.data.find("artists")->asString() : "";
+    std::string album =
+        r.data.find("album") ? r.data.find("album")->asString() : "";
+    if (name.empty()) {
+        const Json* track = r.data.find("track");
+        if (track) {
+            name = track->find("title") ? track->find("title")->asString()
+                                        : "";
+            artists = track->find("artist")
+                          ? track->find("artist")->asString()
+                          : "";
+        }
+    }
+    replyHtml(ctx, ui_texts::recognizeText(name, artists, album));
 }
 
 void Dispatcher::onQueue(const CommandContext& ctx) {
@@ -3913,6 +4197,19 @@ void Dispatcher::onLyrics(const CommandContext& ctx) {
 }
 
 // --- handlers: search / download / radio / share / engine -------------------
+// A download failure means "the track is not available yet" when the
+// backend says so in these words (lemonic TRACK_NOT_AVAILABLE):
+// the card then offers a Check Again retry instead of a dead end.
+static bool isNotAvailableYet(const std::string& error) {
+    std::string low;
+    low.reserve(error.size());
+    for (char c : error)
+        low += static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c)));
+    return low.find("not available") != std::string::npos ||
+           low.find("not yet available") != std::string::npos ||
+           low.find("still being processed") != std::string::npos;
+}
 std::string Dispatcher::searchResultsText(const std::string& query,
                                           const Json& results, int page) {
     std::string text = ui_texts::searchHeaderText(query);
@@ -3947,6 +4244,9 @@ std::string Dispatcher::searchResultsText(const std::string& query,
     }
     text += "\n";
     text += ui_texts::kSearchFooter;
+    int total_pages = static_cast<int>((results.size() + 9) / 10);
+    std::string footer = ui_texts::searchPageFooterText(page, total_pages);
+    if (!footer.empty()) text += "\n" + footer;
     return text;
 }
 
@@ -4154,6 +4454,18 @@ void Dispatcher::onDownload(const CommandContext& ctx) {
     };
     IpcResult r = ipc_.post(action, body, 120);
     if (!r.ok) {
+        if (isNotAvailableYet(r.error_message)) {
+            // Not available yet: keep the request so a Check Again
+            // tap can re-run exactly this download (lemonic
+            // replyWithSongNotAvailable).
+            store_.set("dlretry:" + run_id,
+                       action + "\n" + query + "\n" +
+                           std::to_string(ctx.message.chat.id) + "\n" +
+                           std::to_string(ctx.message.from.id));
+            edit_progress(ui_texts::kDlNotAvailable,
+                          ui_texts::dlRetryKeyboard(run_id));
+            return;
+        }
         edit_progress(ui_texts::dlFailedText(r.error_message),
                       InlineKeyboard{});
         return;
@@ -5641,6 +5953,100 @@ void Dispatcher::onAdmincache(const CommandContext& ctx) {
     reply(ctx, ui_texts::kReloadShortOk);
 }
 
+void Dispatcher::onRmcache(const CommandContext& ctx) {
+    // /rmcache (Music163bot-Go adminOnly /rmcache): clear the
+    // backend's per-track cache via cache.clear (Phase 3, §9-E7). No
+    // name clears the whole cache (scope "all"); a name clears one
+    // entry (scope "track"). A backend refusal is answered with the
+    // backend's exact error, never a fake success.
+    Json body = Json::objectOf({});
+    if (!trim(ctx.args).empty()) {
+        body.set("scope", Json("track"));
+        body.set("name", Json(trim(ctx.args)));
+    }
+    IpcResult r = ipc_.post("cache.clear", body, 30);
+    if (!r.ok) {
+        reply(ctx, r.error_message);
+        return;
+    }
+    bool cleared = false;
+    if (const Json* c = r.data.find("cleared")) cleared = c->asBool();
+    if (!cleared) {
+        reply(ctx, "Cache is already empty.");
+        return;
+    }
+    std::string out = "Cache cleared.";
+    if (const Json* names = r.data.find("names")) {
+        if (names->isArray() && names->size() > 0)
+            out += " " + std::to_string(names->size()) +
+                   " entries removed.";
+    }
+    reply(ctx, out);
+}
+
+void Dispatcher::onScan(const CommandContext& ctx) {
+    // /scan (music-bot-navidrome cmd_scan): trigger a Navidrome
+    // library rescan via library.scan (Phase 3, §9-E5). The scan
+    // itself is async on the Navidrome side; the backend answers
+    // {triggered, error?, tracks_found?}. A not-configured backend
+    // answers honestly with the locked not-configured text, and any
+    // other refusal is answered with the backend's exact error —
+    // never a fake "triggered".
+    IpcResult r = ipc_.post("library.scan", Json::objectOf({}), 30);
+    if (!r.ok) {
+        reply(ctx, r.error_message);
+        return;
+    }
+    bool triggered = false;
+    if (const Json* t = r.data.find("triggered")) triggered = t->asBool();
+    if (!triggered) {
+        std::string err;
+        if (const Json* e = r.data.find("error")) err = e->asString();
+        if (err == "not configured") {
+            reply(ctx, "Library scan not configured "
+                       "(NAVIDROME_USER/NAVIDROME_PASS not set).");
+            return;
+        }
+        if (!err.empty()) {
+            reply(ctx, "Library scan failed: " + err + ".");
+            return;
+        }
+        reply(ctx, "Library scan not triggered.");
+        return;
+    }
+    std::string out = "Library scan triggered.";
+    if (const Json* n = r.data.find("tracks_found"))
+        out += " " + std::to_string(n->asInt()) + " tracks found.";
+    reply(ctx, out);
+}
+
+void Dispatcher::onShareScan(const CommandContext& ctx) {
+    // /sharescan (music-bot-navidrome cmd_share_scan): trigger (or
+    // schedule) an slskd share rescan via library.sharescan (Phase 3,
+    // §9-E6). The backend answers {triggered, scheduled_in_min?}: a
+    // 409 from slskd (scan already running) comes back as
+    // triggered:false with no minute estimate, which is reported
+    // honestly instead of inventing one.
+    IpcResult r =
+        ipc_.post("library.sharescan", Json::objectOf({}), 30);
+    if (!r.ok) {
+        reply(ctx, r.error_message);
+        return;
+    }
+    bool triggered = false;
+    if (const Json* t = r.data.find("triggered")) triggered = t->asBool();
+    if (!triggered) {
+        const Json* m = r.data.find("scheduled_in_min");
+        if (m && !m->isNull())
+            reply(ctx, "slskd share scan scheduled in ~" +
+                           std::to_string(m->asInt()) + "m.");
+        else
+            reply(ctx, "slskd share scan already in progress.");
+        return;
+    }
+    reply(ctx, "slskd share scan triggered.");
+}
+
 void Dispatcher::onBlacklist(const CommandContext& ctx) {
     auto args = splitArgs(ctx.args);
     if (args.empty()) {
@@ -6584,18 +6990,27 @@ void Dispatcher::onStreamStatus(const CommandContext& ctx) {
 // --- Phase 9: callback router (UI_INVENTORY.md §1) -------------------------
 // One namespace, colon-separated, 64-byte hard limit:
 //   pl:<domain>:<verb>[:<arg>…]
-// Unknown callbacks get a polite alert, never a crash. Player/queue
+// Unknown callbacks get the hand toast, never a crash. Player/queue
 // buttons are admin-or-requester gated (§28.2): sudo, chat admin, auth
 // user, or admin_mode==2. Search buttons are requester-only. The remix
 // /menu panel is the exception: other users' taps are silently ignored.
 void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
+    // Unknown callbacks are answered with the hand toast by direct
+    // user order (2026-11-05, see phase10/PHASE10.md): the query is
+    // still answered, with the text "🖐️" and alert off, so the
+    // spinner ends. This covers only the router-level unknowns
+    // below (empty / over-64-byte / non-pl: data, unknown domain).
+    // A known domain keeps its own honest alerts for a malformed
+    // verb or bad arguments (e.g. unknown help topic, out-of-range
+    // quality value), and a handler that throws still answers with
+    // the "not available yet" alert.
     if (cq.data.empty() || cq.data.size() > 64) {
-        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        answerCb(cq, "🖐️", false);
         return;
     }
     std::vector<std::string> parts = splitCb(cq.data);
     if (parts.size() < 2 || parts[0] != "pl") {
-        answerCb(cq, ui_texts::kToastUnknownAction, true);
+        answerCb(cq, "🖐️", false);
         return;
     }
     // A button press proves the user is looking at this chat — same
@@ -6623,7 +7038,7 @@ void Dispatcher::handleCallback(const TgCallbackQuery& cq) {
         else if (domain == "dlset") cbDlset(cq, parts);
         else if (domain == "spotify") cbSpotify(cq, parts);
         else
-            answerCb(cq, ui_texts::kToastUnknownAction, true);
+            answerCb(cq, "🖐️", false);  // unknown domain: hand toast (see above)
     } catch (const std::exception& e) {
         std::cerr << "[cb] handler for " << cq.data
                   << " threw: " << e.what() << "\n";
@@ -6644,6 +7059,23 @@ void Dispatcher::handleMyChatMember(const TgChatMemberUpdate& upd) {
     ctx.command = "start";
     replyHtml(ctx, ui_texts::kDemoted);
     tg_.leaveChat(upd.chat_id);
+}
+
+bool Dispatcher::handleAdminTransition(const TgChatMemberUpdate& upd) {
+    // Non-bot member transition touching administrator/creator status
+    // (remix chat_member_updated): a promotion, demotion, or removal
+    // of an admin makes the cached admin list stale, so re-fetch it
+    // now (cachedAdmins with reload re-reads getChatAdministrators
+    // and cacheSets the fresh list) instead of waiting out the 10
+    // min TTL. Ordinary member joins/leaves touch no admin status
+    // and refresh nothing.
+    bool touches_admin = upd.old_status == "administrator" ||
+                         upd.old_status == "creator" ||
+                         upd.new_status == "administrator" ||
+                         upd.new_status == "creator";
+    if (!touches_admin) return false;
+    cachedAdmins(upd.chat_id, true);
+    return true;
 }
 
 // --- inline queries (§13, Phase 9 gaps) ------------------------------------
@@ -6733,13 +7165,34 @@ Json Dispatcher::inlineTrackResult(const Json& track, const std::string& id,
                       : 0;
     Json open_kb = Json(nullptr);
     if (with_button && !bot_username_.empty()) {
-        Json btn = Json::objectOf({
-            {"text", Json(ui_texts::kInlineOpenInParlay)},
-            {"url", Json(ui_texts::inlineOpenUrl(bot_username_, id))},
-        });
-        open_kb = Json::objectOf({
-            {"inline_keyboard", Json(Json::Array{Json(Json::Array{btn})})},
-        });
+        // Search-result card keyboard (NoxBeats yt_key + Music163bot
+        // guestKeyboard): a Copy link button for the track URL plus
+        // the deep-link button that opens the bot with the track.
+        // Serialised in the Bot API shape; answerInlineQuery's
+        // inlineResult translation carries both kinds through to
+        // TDLib (copy_text + url), so the sent result keeps them.
+        std::string link_url = !url.empty() ? url : stream;
+        InlineKeyboard card_kb = ui_texts::inlineSearchResultKeyboard(
+            link_url, bot_username_, id);
+        Json::Array rows;
+        for (const auto& row : card_kb) {
+            Json::Array brow;
+            for (const auto& b : row) {
+                Json bj = Json::objectOf({{"text", Json(b.text)}});
+                if (!b.copy_text.empty())
+                    bj.set("copy_text", Json::objectOf(
+                                            {{"text", Json(b.copy_text)}}));
+                else if (!b.url.empty())
+                    bj.set("url", Json(b.url));
+                else if (!b.callback_data.empty())
+                    bj.set("callback_data", Json(b.callback_data));
+                brow.push_back(bj);
+            }
+            rows.push_back(Json(brow));
+        }
+        if (!rows.empty())
+            open_kb = Json::objectOf(
+                {{"inline_keyboard", Json(rows)}});
     }
     if (!stream.empty()) {
         // Audio result (lemonic §6.7, navidrome §7.9.2/§7.9.7): the
@@ -7189,19 +7642,7 @@ bool Dispatcher::playerAction(int64_t chat_id, const std::string& verb,
         // from it; the vc.volume call is the authority.
         int v = static_cast<int>(chatRtIntField(chat_id, "volume", 100));
         v += verb == "volinc" ? 10 : -10;
-        if (v < 0) v = 0;
-        if (v > 200) v = 200;
-        IpcResult r = vcCall(ctx, "volume",
-                             Json::objectOf({
-                                 {"chat_id", Json(chat_id)},
-                                 {"volume", Json(static_cast<int64_t>(v))},
-                             }));
-        if (!r.ok) {
-            error = r.error_message;
-            return false;
-        }
-        setChatRtField(chat_id, "volume", std::to_string(v));
-        error = ui_texts::toastVolumeSet(v);
+        if (!applyVolume(ctx, chat_id, v, error)) return false;
         return true;
     }
     if (verb == "refresh") {
@@ -7802,6 +8243,142 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
     }
     const std::string& verb = parts[2];
     const std::string& run_id = parts[3];
+    if (verb == "go") {
+        // pl:dl:go:<run_id> — the "Download N songs" button on a
+        // collection card: start the bulk download stored by the
+        // zip/1by1 pick (value: url\nchat_id\nmode).
+        auto go = store_.get("dlgo:" + run_id);
+        if (!go) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::string url = go->substr(0, go->find('\n'));
+        std::string rest = go->substr(go->find('\n') + 1);
+        int64_t chat_id = cq.chat_id;
+        std::string mode = "files";
+        size_t nl = rest.find('\n');
+        try {
+            chat_id = std::stoll(nl == std::string::npos
+                                     ? rest
+                                     : rest.substr(0, nl));
+        } catch (...) {
+        }
+        if (nl != std::string::npos) mode = rest.substr(nl + 1);
+        if (chat_id != cq.chat_id) {
+            answerCb(cq, ui_texts::kToastDlWrongChat, true);
+            return;
+        }
+        store_.del("dlgo:" + run_id);
+        answerCb(cq, ui_texts::kDlFetching);
+        deliverSpotifyCollection(cq, url, mode);
+        return;
+    }
+    if (verb == "retry") {
+        // pl:dl:retry:<run_id> — the "Check Again" button on a
+        // track-not-available card: re-run the stored download
+        // (value: action\nquery\nchat_id\nrequested_by).
+        auto saved = store_.get("dlretry:" + run_id);
+        if (!saved) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::vector<std::string> lines;
+        {
+            std::string rest = *saved;
+            while (true) {
+                size_t e = rest.find('\n');
+                if (e == std::string::npos) {
+                    lines.push_back(rest);
+                    break;
+                }
+                lines.push_back(rest.substr(0, e));
+                rest = rest.substr(e + 1);
+            }
+        }
+        if (lines.size() < 4) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        std::string action = lines[0];
+        std::string query = lines[1];
+        int64_t chat_id = 0;
+        int64_t requested_by = 0;
+        try {
+            chat_id = std::stoll(lines[2]);
+            requested_by = std::stoll(lines[3]);
+        } catch (...) {
+            answerCb(cq, ui_texts::kToastExpired, true);
+            return;
+        }
+        if (chat_id != cq.chat_id) {
+            answerCb(cq, ui_texts::kToastDlWrongChat, true);
+            return;
+        }
+        bool url_action = action == "download/spotify" ||
+                          action == "download/tiktok" ||
+                          action == "download/navidrome";
+        Json body = url_action
+                        ? Json::objectOf({
+                              {"url", Json(query)},
+                              {"requested_by", Json(requested_by)},
+                          })
+                        : Json::objectOf({
+                              {"query", Json(query)},
+                              {"requested_by", Json(requested_by)},
+                          });
+        IpcResult r = ipc_.post(action, body, 120);
+        if (!r.ok) {
+            if (isNotAvailableYet(r.error_message)) {
+                // Still unavailable: non-alert toast, the card and
+                // its Check Again button stay for the next tap.
+                answerCb(cq, ui_texts::kToastDlStillProcessing);
+                return;
+            }
+            answerCb(cq, r.error_message, true);
+            editCbCard(cq, ui_texts::dlFailedText(r.error_message),
+                       InlineKeyboard{});
+            return;
+        }
+        const Json* oversize = r.data.find("oversize");
+        if (oversize && oversize->asBool()) {
+            answerCb(cq, "That file is over the 50 MB send cap — not "
+                         "sent. There is no large-file send yet.",
+                     true);
+            editCbCard(cq, "That file is over the 50 MB send cap — not "
+                           "sent. There is no large-file send yet.",
+                       InlineKeyboard{});
+            return;
+        }
+        const Json* track = r.data.find("track");
+        const Json* path = r.data.find("file_path");
+        std::string file_path = path ? path->asString() : "";
+        std::string title =
+            track && track->find("title") ? track->find("title")->asString()
+                                          : query;
+        std::string artist =
+            track && track->find("artist")
+                ? track->find("artist")->asString()
+                : "";
+        if (!file_path.empty() && std::filesystem::exists(file_path)) {
+            std::string err;
+            if (tg_.sendAudioFile(cq.chat_id, file_path,
+                                  audioCaption(track, file_path, title,
+                                               artist, bot_username_),
+                                  &err) < 0) {
+                answerCb(cq, err, true);
+                editCbCard(cq, ui_texts::dlFailedText(err),
+                           InlineKeyboard{});
+                return;
+            }
+        }
+        // Success replaces the failure card.
+        store_.del("dlretry:" + run_id);
+        answerCb(cq, ui_texts::kDlSuccess);
+        std::string text = ui_texts::kDlSuccess;
+        if (track) text += " " + fmtTrack(*track);
+        editCbCard(cq, text, InlineKeyboard{});
+        return;
+    }
     if (verb == "zip" || verb == "1by1") {
         auto pick = store_.get("dlpick:" + run_id);
         if (!pick) {
@@ -7823,7 +8400,67 @@ void Dispatcher::cbDl(const TgCallbackQuery& cq,
         }
         store_.del("dlpick:" + run_id);
         answerCb(cq, ui_texts::kDlFetching);
-        deliverSpotifyCollection(cq, url, verb == "zip" ? "zip" : "files");
+        std::string mode = verb == "zip" ? "zip" : "files";
+        // Collection card first (lemonic albumMessage /
+        // playlistMessage): spotify.collection gives the name, kind
+        // and track count; the card carries the cover and one
+        // "Download N songs" button that starts the bulk download.
+        // When the metadata call fails (e.g. no Spotify
+        // credentials) deliver directly, exactly as before.
+        IpcResult col = ipc_.post(
+            "spotify.collection",
+            Json::objectOf({{"url", Json(url)},
+                            {"requested_by", Json(cq.from.id)}}),
+            30);
+        int total = 0;
+        std::string kind;
+        std::string name;
+        std::string cover;
+        if (col.ok) {
+            if (const Json* t = col.data.find("total"))
+                total = static_cast<int>(t->asInt());
+            if (const Json* tr = col.data.find("tracks")) {
+                if (total <= 0)
+                    total = static_cast<int>(tr->size());
+                if (!tr->asArray().empty()) {
+                    const Json& first = tr->asArray()[0];
+                    if (const Json* th = first.find("thumbnail"))
+                        cover = th->asString();
+                }
+            }
+            if (const Json* k = col.data.find("kind"))
+                kind = k->asString();
+            if (const Json* n = col.data.find("name"))
+                name = n->asString();
+        }
+        if (col.ok && total > 0) {
+            if (kind.empty())
+                kind = url.find("/album/") != std::string::npos ||
+                               url.find(":album:") != std::string::npos
+                           ? "album"
+                           : "playlist";
+            if (name.empty()) name = "Spotify " + kind;
+            store_.set("dlgo:" + run_id,
+                       url + "\n" + std::to_string(chat_id) + "\n" + mode);
+            std::string text =
+                ui_texts::collectionCardText(kind, name, total);
+            InlineKeyboard kb =
+                ui_texts::dlCollectionCardKeyboard(run_id, total);
+            std::string photo = effectiveThumb(chat_id, cover);
+            // Retire the picker message, then send the collection
+            // card (photo when a cover or a configured default
+            // exists, text otherwise).
+            editCbCard(cq, "Fetching collection...", InlineKeyboard{});
+            std::string err;
+            if (!photo.empty()) {
+                if (tg_.sendPhoto(chat_id, photo, text, kb, &err) < 0)
+                    tg_.sendMessageHtml(chat_id, text, kb, 0, &err);
+            } else {
+                tg_.sendMessageHtml(chat_id, text, kb, 0, &err);
+            }
+            return;
+        }
+        deliverSpotifyCollection(cq, url, mode);
         return;
     }
     auto run = store_.get("dlrun:" + run_id);
@@ -8613,14 +9250,21 @@ Json TdLibTelegramSender::inputMessageText(const std::string& text,
 }
 
 // One button -> its TDLib inlineKeyboardButton. callback_data travels
-// as base64 (TDLib `bytes`); a URL button is a plain URL; a switch
-// button targets the current chat or a chosen chat.
+// as base64 (TDLib `bytes`); a URL button is a plain URL; a copy
+// button is inlineKeyboardButtonTypeCopyText (client-side copy, no
+// callback query); a switch button targets the current chat or a
+// chosen chat.
 static Json tdButton(const InlineButton& b) {
     Json type;
     if (!b.callback_data.empty()) {
         type = Json::objectOf({
             {"@type", Json("inlineKeyboardButtonTypeCallback")},
             {"data", Json(scram::base64Encode(b.callback_data))},
+        });
+    } else if (!b.copy_text.empty()) {
+        type = Json::objectOf({
+            {"@type", Json("inlineKeyboardButtonTypeCopyText")},
+            {"text", Json(b.copy_text)},
         });
     } else if (!b.url.empty()) {
         type = Json::objectOf({
@@ -8949,8 +9593,10 @@ Json TdLibTelegramSender::inlineResult(const Json& r, TdLibClient& bot) {
     const Json* title = r.find("title");
     std::string rtitle = title ? title->asString() : "";
     // reply_markup arrives in the Bot API shape
-    // {inline_keyboard: [[{text, url|callback_data}]]}; translate it
-    // through the same button builder as the live keyboards.
+    // {inline_keyboard: [[{text, url|callback_data|copy_text}]]};
+    // translate it through the same button builder as the live
+    // keyboards. A copy button carries copy_text:{text} (or a plain
+    // string); it produces no callback query.
     Json markup = Json(nullptr);
     if (const Json* rm = r.find("reply_markup")) {
         if (const Json* rows = rm->find("inline_keyboard")) {
@@ -8960,7 +9606,15 @@ Json TdLibTelegramSender::inlineResult(const Json& r, TdLibClient& bot) {
                 for (const auto& b : row.asArray()) {
                     const Json* bt = b.find("text");
                     std::string btext = bt ? bt->asString() : "";
-                    if (const Json* u = b.find("url"))
+                    if (const Json* c = b.find("copy_text")) {
+                        std::string copy;
+                        if (c->isString()) copy = c->asString();
+                        else if (const Json* t = c->find("text"))
+                            copy = t->asString();
+                        if (!copy.empty())
+                            brow.push_back(
+                                InlineButton::copy(btext, copy));
+                    } else if (const Json* u = b.find("url"))
                         brow.push_back(
                             InlineButton::link(btext, u->asString()));
                     else if (const Json* d = b.find("callback_data"))

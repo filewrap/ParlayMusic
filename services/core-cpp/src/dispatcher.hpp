@@ -271,6 +271,12 @@ public:
                       std::string* error_out = nullptr) override;
     std::string getUserMention(int64_t user_id) override;
 
+    // TDLib replyMarkup JSON for an inline keyboard (Json(nullptr)
+    // when empty = "pass null if none"). Public so the serialisation
+    // is directly testable (tdlib_test): a copy button must serialise
+    // as inlineKeyboardButtonTypeCopyText with no callback data.
+    static Json inlineMarkup(const InlineKeyboard& kb);
+
 private:
     // parseTextEntities (HTML) or a plain formattedText when
     // parse_mode is empty. Json() (null) + error_out on parse failure.
@@ -282,9 +288,6 @@ private:
     Json inputMessageText(const std::string& text,
                           const std::string& parse_mode,
                           std::string& error_out);
-    // TDLib replyMarkup JSON for an inline keyboard (Json(nullptr)
-    // when empty = "pass null if none").
-    static Json inlineMarkup(const InlineKeyboard& kb);
     static Json replyMarkup(const ReplyKeyboard& kb);
     // One Bot API-shaped InlineQueryResult -> its TDLib
     // inputInlineQueryResult (audio keeps audio_url; article keeps its
@@ -309,6 +312,12 @@ struct CommandContext {
     std::string command;  // lowercased, without leading '/' or @bot suffix
     std::string args;     // raw argument text after the command
     bool via_channel = false;  // c-command: run against the linked channel
+    // s-alias invocation (TgMusicBot SupportsSilence: /splay, /sskip,
+    // /sstop, /spause, /sresume): the base handler runs exactly as
+    // for the plain command, except its SUCCESS message is
+    // suppressed. Usage replies, denials, progress and backend
+    // errors stay visible — silence covers only the success outcome.
+    bool silent_success = false;
     // Phase 1 telemetry: steady-clock microseconds when
     // Dispatcher::handleMessage received this command (0 = unknown,
     // e.g. a context built outside handleMessage). t_dispatch_to_ipc
@@ -328,15 +337,26 @@ public:
 
     // Handle one callback_query update (Phase 9, UI_INVENTORY.md §1):
     // the "pl:<domain>:<verb>[:<arg>…]" namespace only. Unknown
-    // callbacks get a polite alert, never a crash. Wrong-user taps get
-    // the "You aren't allowed" toast (admin-or-requester gate per row),
-    // except the remix /menu panel rule where other users are silently
-    // ignored.
+    // callbacks (empty / over-64-byte / non-pl: data, unknown domain)
+    // get a silent ack — empty text, query still answered — by direct
+    // user order 2026-11-05, overriding the locked §7.5 "never
+    // silent" rule for this point only (see phase10/PHASE10.md). A
+    // known domain keeps its own honest alerts for a malformed verb
+    // or bad arguments. Wrong-user taps get the "You aren't allowed"
+    // toast (admin-or-requester gate per row), except the remix /menu
+    // panel rule where other users are silently ignored.
     void handleCallback(const TgCallbackQuery& cq);
     // Handle one my_chat_member update (bot status change): the
     // demotion goodbye (§2) — the bot sends the notice and leaves when
     // it loses admin rights in a group.
     void handleMyChatMember(const TgChatMemberUpdate& upd);
+    // Handle one chat_member update for a non-bot member whose
+    // transition touches administrator/creator status (remix
+    // chat_member_updated): re-fetch the chat admin list so the admin
+    // cache (10 min TTL) does not serve a stale list after a
+    // promotion/demotion. Returns true when the cache was refreshed;
+    // ordinary member joins/leaves return false and refresh nothing.
+    bool handleAdminTransition(const TgChatMemberUpdate& upd);
     // Handle one inline_query update (Phase 9 gaps, §13): the core
     // calls search.inline (vc-ts /v1/inline) and renders the
     // InlineQueryResult objects itself — vc-ts returns Tracks only.
@@ -587,6 +607,16 @@ private:
     bool thumbnailsOn(int64_t chat_id) {
         return settingsFor(chat_id).thumbnails;
     }
+    // Effective card photo for a chat (NoxBeats DEFAULT_THUMB gated
+    // by THUMB_GEN, §0.3): the track thumbnail, else the configured
+    // default thumbnail, else "" (text card). The thumbnails setting
+    // gates the whole chain: thumbnails off always yields "".
+    std::string effectiveThumb(int64_t chat_id,
+                               const std::string& track_thumb) {
+        if (!thumbnailsOn(chat_id)) return "";
+        if (!track_thumb.empty()) return track_thumb;
+        return cfg_.default_thumbnail;
+    }
     // Display name for a user: "FirstName (@username)" / "FirstName" /
     // the bare id when nothing else is known.
     static std::string displayName(const TgUser& u);
@@ -736,6 +766,13 @@ private:
     bool playerAction(int64_t chat_id, const std::string& verb,
                       int64_t user_id, const TgCallbackQuery* cq,
                       std::string& error);
+    // Shared vc.volume step (the /menu Vol-/Vol+ panel buttons and
+    // the /volume text command): clamps the target to 0-200, posts
+    // vc.volume, records the applied value in the runtime hash, and
+    // returns the success toast in toast_out. False + the backend's
+    // error message in toast_out when the backend refuses.
+    bool applyVolume(const CommandContext& ctx, int64_t chat_id,
+                     int target, std::string& toast_out);
     // Re-render the now-playing card in place on the callback's
     // message (after a player action). No-op when there is no card.
     void refreshCard(const TgCallbackQuery& cq, int64_t chat_id);
@@ -775,6 +812,9 @@ private:
     void onStart(const CommandContext& ctx);
     void onHelp(const CommandContext& ctx);
     void onPlay(const CommandContext& ctx);
+    void onMix(const CommandContext& ctx);
+    void onVolume(const CommandContext& ctx);
+    void onRecognize(const CommandContext& ctx);
     void onPause(const CommandContext& ctx);
     void onResume(const CommandContext& ctx);
     void onSkip(const CommandContext& ctx);
@@ -870,6 +910,9 @@ private:
     void onAuth(const CommandContext& ctx);
     void onAuthlist(const CommandContext& ctx);
     void onAdmincache(const CommandContext& ctx);
+    void onRmcache(const CommandContext& ctx);
+    void onScan(const CommandContext& ctx);
+    void onShareScan(const CommandContext& ctx);
     void onBlacklist(const CommandContext& ctx);
     void onBlacklisted(const CommandContext& ctx);
     void onAddSudo(const CommandContext& ctx);
@@ -907,6 +950,9 @@ private:
 
     std::vector<Route> routes_;
     std::map<std::string, std::string> aliases_;
+    // s-aliases (TgMusicBot SupportsSilence): the alias names whose
+    // invocations set CommandContext::silent_success.
+    std::set<std::string> silent_aliases_;
     std::map<std::string, std::pair<std::string, bool>> channel_cmds_;
 
     // Settings cache (Q7): one snapshot per chat, fetched from the

@@ -58,12 +58,15 @@ struct TgMessage {
 };
 
 // One inline-keyboard button. Exactly one of callback_data / url /
-// switch_inline_query is set; the others stay empty.
+// switch_inline_query / copy_text is set; the others stay empty.
+// copy_text is a client-side copy button (NoxBeats Button.copy_text):
+// tapping it copies the text, it produces no callback query.
 struct InlineButton {
     std::string text;
     std::string callback_data;       // callback_data=...
     std::string url;                 // url=...
     std::string switch_inline_query; // switch_inline_query=...
+    std::string copy_text;           // copy_text=... (client-side copy)
     bool switch_current_chat = false;  // ..._current_chat variant
     bool has_switch = false;           // switch_inline_query is set
 
@@ -78,6 +81,15 @@ struct InlineButton {
         InlineButton b;
         b.text = text;
         b.url = u;
+        return b;
+    }
+    // Copy button: tapping it copies `copy` to the clipboard; no
+    // callback query is produced, so no handler is needed for it.
+    static InlineButton copy(const std::string& text,
+                             const std::string& copy) {
+        InlineButton b;
+        b.text = text;
+        b.copy_text = copy;
         return b;
     }
     // switch_inline_query button; current_chat=true -> the

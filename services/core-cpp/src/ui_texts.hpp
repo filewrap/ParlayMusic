@@ -196,6 +196,12 @@ inline std::string cbSearchPage(int64_t user_id, int page,
 inline std::string cbDlCancel(const std::string& run_id) {
     return "pl:dl:cancel:" + run_id;
 }
+inline std::string cbDlGo(const std::string& run_id) {
+    return "pl:dl:go:" + run_id;
+}
+inline std::string cbDlRetry(const std::string& run_id) {
+    return "pl:dl:retry:" + run_id;
+}
 inline std::string cbDlFx(const std::string& run_id,
                           const std::string& effect) {
     return "pl:dl:fx:" + run_id + ":" + effect;
@@ -689,13 +695,16 @@ inline const char* kHelpUnknownCmd =
 inline const char* kHelpBackToast = "Returning to main menu...";
 inline const char* kHelpUnknownCategory = "Unknown help category.";
 
-// Unknown command / unhandled text (rustify §7.1, §3). {list} is the
-// command list for the caller's access level.
+// Unknown command (routing row C92): refined short reply — the
+// command doesn't exist, use /help. No command list: the old card's
+// {list} part is dropped; the call site passes only {command}.
 inline const char* kUnknownCommand =
-    "<b>Command <code>{command}</code> not found.</b>\n"
+    "<b>Command <code>{command}</code> doesn't exist.</b>\n"
     "\n"
-    "<b>Commands available to you:</b>\n"
-    "{list}";
+    "Use /help to see the commands available to you.";
+
+// Unhandled text (rustify §7.1, §3). {list} is the
+// command list for the caller's access level.
 inline const char* kUnhandledText =
     "<b>Your request was not handled</b>\n"
     "\n"
@@ -954,17 +963,21 @@ inline std::string queuedText(int index, const CardTrack& t) {
                 {"by", t.requester}});
 }
 
-// Merged 5-row control keyboard (Tina seek row + Yukki pause toggle +
+// Merged 6-row control keyboard (Tina seek row + Yukki pause toggle +
 // Parvati autoplay row, §4). Row 1 is the no-op progress button (only
 // when NOT queued — the caller omits it for queued cards). The pause
-// button reads Pause while playing, Resume while paused. Row 5 is Close +
-// Add-to-Playlist (TgMusicBot). The loop state is shown on the replay
-// button label when looping ("Loop ×n").
+// button reads Pause while playing, Resume while paused. The autoplay
+// and thumbnails rows show the current per-chat setting, like the
+// autoplay row; the thumbnails row emits the already-routed
+// pl:player:thumb callback. Row 6 is Close + Add-to-Playlist
+// (TgMusicBot). The loop state is shown on the replay button label
+// when looping ("Loop ×n").
 inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
                                      bool autoplay_on, int loop_count,
                                      const std::string& token,
                                      bool include_progress,
-                                     int64_t pos_sec, int64_t dur_sec) {
+                                     int64_t pos_sec, int64_t dur_sec,
+                                     bool thumbnails_on = true) {
     using B = InlineButton;
     InlineKeyboard kb;
     if (include_progress) {
@@ -989,6 +1002,10 @@ inline InlineKeyboard playerKeyboard(int64_t chat_id, bool paused,
     kb.push_back({B::callback(
         std::string("Autoplay: ") + (autoplay_on ? "Enabled" : "Disabled"),
         cbPlayer("autoplay", chat_id))});
+    kb.push_back({B::callback(
+        std::string("Thumbnails: ") +
+            (thumbnails_on ? "Enabled" : "Disabled"),
+        cbPlayer("thumb", chat_id))});
     std::vector<B> row5;
     row5.push_back(B::callback("Close", kCbClose));
     if (!token.empty())
@@ -1141,6 +1158,17 @@ inline std::string toastVolumeSet(int amount) {
     return "Volume set to " + std::to_string(amount) + ".";
 }
 
+// /volume (remix controls.ts, anonx-cpp handle_volume): usage with
+// no argument, the non-numeric reply, and the out-of-range reply.
+// The range is 0-200, the same range the /menu Vol-/Vol+ buttons
+// step through.
+inline const char* kVolumeUsage =
+    "Usage: /volume <0-200>\nPass a number between 0 and 200.";
+inline const char* kVolumeNotNumeric =
+    "Volume must be a number between 0 and 200.";
+inline const char* kVolumeOutOfRange =
+    "Volume must be between 0 and 200.";
+
 // /now (remix §2.2, §4).
 inline std::string nowText(const std::string& title,
                            const std::string& title_url,
@@ -1191,10 +1219,12 @@ inline std::string queueText(const CardTrack& now,
         return out;
     }
     int i = 0;
+    out += "<blockquote expandable>\n";
     for (const auto& t : up_next) {
         out += std::to_string(++i) + ". " + trackLink(t) + " — " +
                t.duration + " — " + t.requester + "\n";
     }
+    out += "</blockquote>";
     return out;
 }
 
@@ -1317,6 +1347,15 @@ inline std::string searchResultLine(int n, const std::string& title,
 inline const char* kSearchFooter =
     "<i>Reply the number of the result you want to stream or /cancel.</i>";
 
+// Italic page index (§7.1 rich_page_index) for paginated search
+// pages. Single-page results carry no footer line: "Page 1 of 1"
+// would state nothing the list does not already show.
+inline std::string searchPageFooterText(int page, int total_pages) {
+    if (total_pages <= 1) return "";
+    return "<i>Page " + std::to_string(page) + " of " +
+           std::to_string(total_pages) + "</i>";
+}
+
 inline InlineKeyboard searchKeyboard(
     const std::vector<std::pair<int, std::string>>& picks) {
     using B = InlineButton;
@@ -1376,6 +1415,39 @@ inline std::string playTooLongText(int minutes) {
                {{"n", std::to_string(minutes)}});
 }
 
+// /mix lifecycle (TgMusicBot mix.go): usage when there is no query
+// and nothing playing to seed from; the fetching line while the
+// backend builds the mix; the already-queued line when every mix
+// track is already in the queue or playing.
+inline const char* kMixUsage =
+    "<b>Usage:</b>\n/mix [song or URL]\n\nOr run /mix while a song is "
+    "currently playing to create a mix based on it.";
+inline const char* kMixFetching = "Fetching mix tracks...";
+inline const char* kMixAlreadyQueued =
+    "All mix tracks are already in the queue or playing.";
+
+// /recognize (Music163bot-Go /recognize): usage when the command does
+// not reply to an audio or voice message; the not-configured line
+// when the backend has no recognition provider token (the backend
+// answers engine_unavailable "Music recognition is not configured");
+// the not-found line when the provider finds no match.
+inline const char* kRecognizeUsage =
+    "Reply to an audio or voice message to recognize it. "
+    "Usage: /recognize";
+inline const char* kRecognizeNotConfigured =
+    "Music recognition is not configured.";
+inline const char* kRecognizeNotFound = "Could not recognize this track.";
+inline std::string recognizeText(const std::string& name,
+                                 const std::string& artists,
+                                 const std::string& album) {
+    std::string out = "<b>Recognized:</b> " + htmlEscape(name);
+    if (!artists.empty())
+        out += "\n<b>Artist:</b> " + htmlEscape(artists);
+    if (!album.empty())
+        out += "\n<b>Album:</b> " + htmlEscape(album);
+    return out;
+}
+
 // --- §8 download progress ---------------------------------------------------
 // Live progress message (Parvati fields + navidrome checklist, §8),
 // edited in place. {done}/{total} byte line is added when known.
@@ -1426,6 +1498,37 @@ inline InlineKeyboard dlSpotifyOptionsKeyboard(const std::string& run_id) {
 inline std::string dlSpotifySuccessText(int count, const std::string& kind) {
     return fmt("Successfully uploaded {x} from a Spotify {kind}",
                {{"x", std::to_string(count)}, {"kind", kind}});
+}
+
+// Album/playlist photo card (lemonic albumMessage / playlistMessage,
+// §8): the cover with the name and track count, plus one
+// "Download N songs" button that starts the bulk download.
+inline std::string collectionCardText(const std::string& kind,
+                                      const std::string& name, int count) {
+    return fmt("<b>{name}</b>\n\n{kind} • {count} songs",
+               {{"name", htmlEscape(name)},
+                {"kind", htmlEscape(kind)},
+                {"count", std::to_string(count)}});
+}
+inline std::string dlCollectionButtonText(int count) {
+    return "Download " + std::to_string(count) + " songs";
+}
+inline InlineKeyboard dlCollectionCardKeyboard(const std::string& run_id,
+                                               int count) {
+    using B = InlineButton;
+    return {{B::callback(dlCollectionButtonText(count), cbDlGo(run_id))}};
+}
+
+// Track-not-available download card (lemonic
+// replyWithSongNotAvailable, §8): the failure card carries one
+// "Check Again" button that re-runs the same download request.
+inline const char* kDlNotAvailable =
+    "This track is not available yet — it may still be processing.";
+inline const char* kToastDlStillProcessing =
+    "Track is still being processed. Please try again later";
+inline InlineKeyboard dlRetryKeyboard(const std::string& run_id) {
+    using B = InlineButton;
+    return {{B::callback("Check Again", cbDlRetry(run_id))}};
 }
 
 // Audio-effect picker (tmb-rust §4.4, §8).
@@ -2128,10 +2231,28 @@ inline std::string inlineLyricsTitle(const std::string& title) {
 // Per-track button on search results (lemonic §6.7): opens the bot
 // with the deep link that downloads the track (/start spotify----{id}).
 inline const char* kInlineOpenInParlay = "Open in Parlay Bot";
+inline const char* kInlineCopyLink = "Copy link";
 inline std::string inlineOpenUrl(const std::string& bot_username,
                                  const std::string& track_id) {
     return "https://t.me/" + bot_username + "?start=spotify----" +
            track_id;
+}
+// Inline search-result card keyboard (NoxBeats yt_key + Music163bot
+// guestKeyboard, §13): a copy button for the track link plus the
+// deep-link button that opens the bot with the track. The copy
+// button produces no callback query; the deep link is a plain URL.
+inline InlineKeyboard inlineSearchResultKeyboard(
+    const std::string& link_url, const std::string& bot_username,
+    const std::string& track_id) {
+    using B = InlineButton;
+    InlineKeyboard kb;
+    if (!link_url.empty())
+        kb.push_back({B::copy(kInlineCopyLink, link_url)});
+    if (!bot_username.empty() && !track_id.empty())
+        kb.push_back(
+            {B::link(kInlineOpenInParlay,
+                     inlineOpenUrl(bot_username, track_id))});
+    return kb;
 }
 // The spotify---- deep link names a track the core can no longer
 // resolve (inline results are stored per user, but the store may have

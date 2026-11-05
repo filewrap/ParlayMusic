@@ -158,11 +158,11 @@ int main() {
     CHECK(cbSearchPick(10, 123456789012LL, "a1b2c3d4e5").size() <= 64,
           "callback_data: search pick fits 64 bytes");
 
-    // --- player keyboard: merged 5-row layout ---------------------------
+    // --- player keyboard: merged 6-row layout ---------------------------
     {
         InlineKeyboard kb = playerKeyboard(-1001, false, true, 2, "tok123",
                                            true, 90, 200);
-        CHECK(kb.size() == 5, "playerKeyboard: 5 rows with progress");
+        CHECK(kb.size() == 6, "playerKeyboard: 6 rows with progress");
         CHECK(kb[0].size() == 1 && kb[0][0].callback_data == "pl:player:progress:-1001",
               "playerKeyboard: row 1 is the progress no-op button");
         CHECK(contains(kb[0][0].text, "1:30"),
@@ -179,18 +179,41 @@ int main() {
         CHECK(kb[3].size() == 1 &&
                   contains(kb[3][0].text, "Autoplay: Enabled"),
               "playerKeyboard: row 4 is the autoplay toggle");
-        CHECK(kb[4].size() == 2 &&
-                  kb[4][1].callback_data == "pl:player:addlist:tok123",
-              "playerKeyboard: row 5 has Close + Add to Playlist");
+        CHECK(kb[4].size() == 1 &&
+                  contains(kb[4][0].text, "Thumbnails: Enabled") &&
+                  kb[4][0].callback_data == "pl:player:thumb:-1001",
+              "playerKeyboard: row 5 is the thumbnails toggle, on");
+        CHECK(kb[5].size() == 2 &&
+                  kb[5][1].callback_data == "pl:player:addlist:tok123",
+              "playerKeyboard: row 6 has Close + Add to Playlist");
     }
     {
         InlineKeyboard kb = playerKeyboard(-1001, true, false, 0, "", false, 0, 0);
-        CHECK(kb.size() == 4, "playerKeyboard: 4 rows without progress");
+        CHECK(kb.size() == 5, "playerKeyboard: 5 rows without progress");
         CHECK(kb[0][0].text == "Resume" &&
                   kb[0][0].callback_data == "pl:player:resume:-1001",
               "playerKeyboard: paused state shows the resume button");
-        CHECK(kb[3].size() == 1 && kb[3][0].text == "Close",
+        CHECK(kb[3].size() == 1 &&
+                  contains(kb[3][0].text, "Thumbnails: Enabled"),
+              "playerKeyboard: thumbnails toggle on by default");
+        CHECK(kb[4].size() == 1 && kb[4][0].text == "Close",
               "playerKeyboard: no Add to Playlist without a token");
+    }
+    {
+        // Thumbnails toggle shows the current state, like the
+        // autoplay row (Package 2, row A35).
+        InlineKeyboard kb = playerKeyboard(-1001, false, true, 0, "", true,
+                                           0, 0, false);
+        CHECK(kb.size() == 6 &&
+                  kb[4].size() == 1 &&
+                  contains(kb[4][0].text, "Thumbnails: Disabled") &&
+                  kb[4][0].callback_data == "pl:player:thumb:-1001",
+              "playerKeyboard: thumbnails toggle shows Disabled when off");
+        InlineKeyboard kb_on = playerKeyboard(-1001, false, true, 0, "",
+                                              true, 0, 0, true);
+        CHECK(kb_on[4].size() == 1 &&
+                  contains(kb_on[4][0].text, "Thumbnails: Enabled"),
+              "playerKeyboard: thumbnails toggle shows Enabled when on");
     }
 
     // --- menu panel keyboard ---------------------------------------------
@@ -541,6 +564,100 @@ int main() {
           "kDlDeepLinkExpired: unresolvable deep link wording");
     CHECK(!contains(kRadioManageCard, "Listener"),
           "kRadioManageCard: no listener rows (ruling 9)");
+
+    // --- Package 3: queue blockquote, search page footer, copy
+    // button + collection / retry keyboards -------------------------
+    {
+        CardTrack now{"Now Song", "https://x/now", "3:00", "Alice", "tok0"};
+        std::vector<CardTrack> up = {
+            {"One", "https://x/1", "2:00", "Bob", "tok1"},
+            {"Two", "https://x/2", "4:00", "Carol", "tok2"},
+        };
+        std::string q = queueText(now, up, 2);
+        CHECK(contains(q, "<blockquote expandable>") &&
+                  contains(q, "</blockquote>"),
+              "queueText: waiting list wrapped in expandable blockquote");
+        CHECK(q.find("<blockquote expandable>") <
+                  q.find("1. "),
+              "queueText: blockquote opens before the waiting list");
+        CHECK(contains(q, "Now Playing"),
+              "queueText: now-playing header stays outside the blockquote");
+        std::string empty = queueText(now, {}, 0);
+        CHECK(!contains(empty, "<blockquote"),
+              "queueText: empty queue carries no blockquote");
+        CHECK(contains(empty, "No more songs in queue."),
+              "queueText: empty queue keeps the empty line");
+    }
+    CHECK(searchPageFooterText(1, 1).empty(),
+          "searchPageFooterText: single page carries no footer");
+    CHECK(searchPageFooterText(1, 3) == "<i>Page 1 of 3</i>",
+          "searchPageFooterText: page 1 of 3");
+    CHECK(searchPageFooterText(2, 3) == "<i>Page 2 of 3</i>",
+          "searchPageFooterText: page 2 of 3");
+    CHECK(searchPageFooterText(3, 3) == "<i>Page 3 of 3</i>",
+          "searchPageFooterText: last page footer");
+    {
+        InlineKeyboard kb = inlineSearchResultKeyboard(
+            "https://www.youtube.com/watch?v=abc", "parlaybot", "yt:abc");
+        CHECK(kb.size() == 2, "inlineSearchResultKeyboard: two rows");
+        CHECK(kb[0].size() == 1 && kb[0][0].text == "Copy link" &&
+                  kb[0][0].copy_text ==
+                      "https://www.youtube.com/watch?v=abc" &&
+                  kb[0][0].callback_data.empty() &&
+                  kb[0][0].url.empty(),
+              "inlineSearchResultKeyboard: copy button carries the link "
+              "and no callback_data");
+        CHECK(kb[1].size() == 1 &&
+                  kb[1][0].text == "Open in Parlay Bot" &&
+                  kb[1][0].url ==
+                      "https://t.me/parlaybot?start=spotify----yt:abc",
+              "inlineSearchResultKeyboard: deep-link button opens the "
+              "bot with the track");
+        InlineKeyboard plain = inlineSearchResultKeyboard("", "", "");
+        CHECK(plain.empty(),
+              "inlineSearchResultKeyboard: no link and no bot -> no "
+              "buttons");
+    }
+    {
+        parlay::InlineButton copy =
+            parlay::InlineButton::copy("Copy link", "https://x/1");
+        CHECK(copy.copy_text == "https://x/1" &&
+                  copy.callback_data.empty() && copy.url.empty(),
+              "InlineButton::copy: exactly one payload kind set");
+    }
+    CHECK(collectionCardText("playlist", "Chill Mix", 12) ==
+              "<b>Chill Mix</b>\n\nplaylist • 12 songs",
+          "collectionCardText: name, kind and count");
+    CHECK(dlCollectionButtonText(12) == "Download 12 songs",
+          "dlCollectionButtonText: count in the label");
+    {
+        InlineKeyboard kb = dlCollectionCardKeyboard("run123456", 12);
+        CHECK(kb.size() == 1 && kb[0].size() == 1 &&
+                  kb[0][0].text == "Download 12 songs" &&
+                  kb[0][0].callback_data == "pl:dl:go:run123456",
+              "dlCollectionCardKeyboard: single Download N songs button");
+        CHECK(kb[0][0].callback_data.size() <= 64,
+              "dlCollectionCardKeyboard: callback within 64 bytes");
+        CHECK(cbDlGo("run123456") == "pl:dl:go:run123456",
+              "cbDlGo: exact string");
+        CHECK(cbDlRetry("run123456") == "pl:dl:retry:run123456",
+              "cbDlRetry: exact string");
+        CHECK(cbDlRetry("run123456").size() <= 64,
+              "cbDlRetry: callback within 64 bytes");
+    }
+    {
+        InlineKeyboard kb = dlRetryKeyboard("run123456");
+        CHECK(kb.size() == 1 && kb[0].size() == 1 &&
+                  kb[0][0].text == "Check Again" &&
+                  kb[0][0].callback_data == "pl:dl:retry:run123456",
+              "dlRetryKeyboard: single Check Again button");
+    }
+    CHECK(std::string(kDlNotAvailable).find("not available") !=
+              std::string::npos,
+          "kDlNotAvailable: names the not-available state");
+    CHECK(std::string(kToastDlStillProcessing) ==
+              "Track is still being processed. Please try again later",
+          "kToastDlStillProcessing: exact still-processing toast");
 
     if (failures == 0) {
         std::cout << "ui_test: ALL PASS\n";

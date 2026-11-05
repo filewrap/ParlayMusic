@@ -21,9 +21,14 @@
 //     (b) pl:restart:bot:<chat_id> exits the process by design
 //         (supervisor restart) — it is length- and table-checked
 //         only, NEVER dispatched.
-//  3. The default branch answers every unknown callback (unknown
-//     domain, non-pl: data, empty data, >64 bytes, unknown verb)
-//     with the "Unknown action." alert — never silence, never a crash.
+//  3. The default branch answers every router-level unknown callback
+//     (unknown domain, non-pl: data, empty data, >64 bytes) with the
+//     hand toast "🖐️" (alert off, query still answered) — by direct
+//     user order 2026-11-05 (see phase10/PHASE10.md). A known domain
+//     keeps its own honest alerts for an unknown verb or bad
+//     arguments, and a handler that throws is answered with "This
+//     feature is not available yet.". Never a crash, never an
+//     un-answered query.
 //  4. Every persistent reply-keyboard button is routed: in a DM it
 //     returns the start card; in a group it runs the claimed action
 //     (gap G1, FIXED 2026-11-03) — Music returns the start card,
@@ -290,6 +295,7 @@ public:
 class FakeIpc : public parlay::IpcClient {
 public:
     explicit FakeIpc(const parlay::Config& cfg) : parlay::IpcClient(cfg) {}
+    mutable std::vector<std::string> posts;  // actions posted, in order
     parlay::IpcResult ok(parlay::Json data) const {
         parlay::IpcResult r;
         r.ok = true;
@@ -312,6 +318,7 @@ public:
     parlay::IpcResult post(const std::string&, const std::string& action,
                            const parlay::Json&,
                            int = 30) const override {
+        posts.push_back(action);
         if (action == "vote" || action == "dislike") return ok(parlay::Json::parse(R"({})"));
         if (action == "spotify.analyze")
             return ok(parlay::Json::parse(
@@ -488,6 +495,8 @@ int main(int argc, char** argv) {
     harvestKb(searchPageKeyboard(kUser, 1, kHash, false, true, 5), harvested);
     harvestKb(lossyKeyboard(kRun, "320kbps MP3"), harvested);
     harvestKb(dlSpotifyOptionsKeyboard(kRun), harvested);
+    harvestKb(dlCollectionCardKeyboard(kRun, 12), harvested);
+    harvestKb(dlRetryKeyboard(kRun), harvested);
     harvestKb(dlFxKeyboard(kRun), harvested);
     harvestKb(settingsKeyboard(ChatSettings{}), harvested);
     harvestKb(settingsQualityKeyboard(QualityInfo{}), harvested);
@@ -509,6 +518,16 @@ int main(int argc, char** argv) {
     harvestKb(shareReceivedKeyboard("111", "222", "unique1"), harvested);
     harvestKb(deleteConfirmKeyboard("track123"), harvested);
     harvestKb(bcastKeyboard(), harvested);
+
+    // --- A35: the thumbnails toggle is emitted by a builder now
+    // (Package 2: playerKeyboard's Thumbnails row), not just handled.
+    {
+        bool thumb_emitted = false;
+        for (const auto& cb : harvested)
+            if (cb.rfind("pl:player:thumb:", 0) == 0) thumb_emitted = true;
+        CHECK(thumb_emitted,
+              "playerKeyboard emits pl:player:thumb (row A35)");
+    }
 
     // --- B. Templates: one per distinct callback shape in the table.
     // Concrete examples are built by calling the real builders, so a
@@ -581,6 +600,8 @@ int main(int argc, char** argv) {
         {"pl:dl:fx:<run_id>:8d", cbDlFx(kRun, "8d")},
         {"pl:dl:zip:<run_id>", "pl:dl:zip:" + kRun},
         {"pl:dl:1by1:<run_id>", "pl:dl:1by1:" + kRun},
+        {"pl:dl:go:<run_id>", cbDlGo(kRun)},
+        {"pl:dl:retry:<run_id>", cbDlRetry(kRun)},
         {"pl:bcast:cancel", kCbBcastCancel},
         {"pl:auth:del:<chat_id>:<user_id>", cbAuthDel(kChat, 111)},
         {"pl:search:<n>:<user_id>:<token>",
@@ -649,6 +670,10 @@ int main(int argc, char** argv) {
                       "/tmp/parlay-routing-test/fx-in.ogg\n-1001234567890");
         rig.store.set("dlpick:" + kRun,
                       "https://open.spotify.com/playlist/xyz\n-1001234567890");
+        rig.store.set("dlgo:" + kRun,
+                      "https://open.spotify.com/playlist/xyz\n-1001234567890\nfiles");
+        rig.store.set("dlretry:" + kRun,
+                      "download/youtube\nsome song\n-1001234567890\n999");
         for (const auto& t : templates) {
             if (!t.dispatch) continue;  // pl:restart:bot exits (42)
             bool is_vote = t.tpl.rfind("pl:vote:", 0) == 0;
@@ -720,8 +745,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- E. Default branch: unknown callbacks are answered, never
-    // silent, never a crash. Includes the 64-byte boundary.
+    // --- E. Default branch: router-level unknown callbacks are
+    // answered with the hand toast "🖐️" (alert off, direct user order
+    // 2026-11-05) — the query is still answered. A known domain keeps
+    // its own honest alert for an unknown verb (pl:player:unknownverb
+    // still answers "Unknown action."). Includes the 64-byte boundary.
     {
         std::error_code ec2;
         std::filesystem::remove_all("/tmp/parlay-routing-test", ec2);
@@ -730,17 +758,25 @@ int main(int argc, char** argv) {
             {"pl:bogus:verb", "unknown domain"},
             {"hello", "non-pl: data"},
             {"", "empty data"},
-            {"pl:player:unknownverb:-1001234567890", "unknown verb"},
         };
         for (const auto& [data, why] : unknowns) {
             size_t before = rig.tg.toasts.size();
             rig.d.handleCallback(makeCq(data));
             CHECK(rig.tg.toasts.size() > before,
                   "unknown callback answered: " + why);
-            CHECK(rig.tg.toasts.back().text == "Unknown action." ||
-                      rig.tg.toasts.back().text ==
-                          "This feature is not available yet.",
-                  "unknown callback toast is honest: " + why);
+            CHECK(rig.tg.toasts.back().text == "🖐️" &&
+                      !rig.tg.toasts.back().alert,
+                  "unknown callback hand toast: " + why);
+        }
+        // Unknown verb inside a known domain keeps its alert.
+        {
+            size_t before = rig.tg.toasts.size();
+            rig.d.handleCallback(
+                makeCq("pl:player:unknownverb:-1001234567890"));
+            CHECK(rig.tg.toasts.size() > before &&
+                      rig.tg.toasts.back().text == "Unknown action.",
+                  "known-domain unknown verb still alerts Unknown "
+                  "action.");
         }
         // spotify details/analyze are routed now (E8, Phase 3):
         // details renders the card in place, analyze renders the
@@ -763,7 +799,7 @@ int main(int argc, char** argv) {
                   "spotify analyze routed: analysis rendered in place");
         }
         // Exactly 64 bytes is accepted by the guard (routed, not
-        // rejected); 65 bytes is rejected with the same alert.
+        // rejected); 65 bytes is rejected with the hand toast.
         std::string sixty_four = "pl:set:info:" + std::string(52, 'x');
         CHECK(sixty_four.size() == 64, "64-byte probe is 64 bytes");
         {
@@ -778,9 +814,57 @@ int main(int argc, char** argv) {
             size_t before = rig.tg.toasts.size();
             rig.d.handleCallback(makeCq(sixty_five));
             CHECK(rig.tg.toasts.size() > before &&
-                      rig.tg.toasts.back().text == "Unknown action.",
-                  "65-byte callback rejected with Unknown action.");
+                      rig.tg.toasts.back().text == "🖐️" &&
+                      !rig.tg.toasts.back().alert,
+                  "65-byte callback rejected with the hand toast.");
         }
+    }
+
+    // --- E2. Package 1 commands (rows C89–C91) are routed: each
+    // posts its backend action and answers honestly. The fake backend
+    // 404s all three, so the reply is the backend's exact "not found"
+    // refusal — never the old unknown-command card, never a fake
+    // success.
+    {
+        std::error_code ec2;
+        std::filesystem::remove_all("/tmp/parlay-routing-test", ec2);
+        Rig rig;
+        auto has_post = [](const Rig& r, const std::string& action) {
+            for (const auto& p : r.ipc.posts)
+                if (p == action) return true;
+            return false;
+        };
+        rig.d.handleMessage(makeMsg(-1001234567890, "supergroup", "/scan"));
+        CHECK(has_post(rig, "library.scan"),
+              "pkg1 C89 /scan posts library.scan");
+        CHECK(rig.tg.replies.size() == 1 &&
+                  contains(rig.tg.replies[0], "not found") &&
+                  !contains(rig.tg.replies[0], "Command /scan"),
+              "pkg1 C89 /scan answered honestly, no unknown-command "
+              "card");
+        CHECK(contains(table, "onScan"),
+              "pkg1 C89 table names onScan");
+        rig.d.handleMessage(
+            makeMsg(-1001234567890, "supergroup", "/sharescan"));
+        CHECK(has_post(rig, "library.sharescan"),
+              "pkg1 C90 /sharescan posts library.sharescan");
+        CHECK(rig.tg.replies.size() == 2 &&
+                  contains(rig.tg.replies[1], "not found") &&
+                  !contains(rig.tg.replies[1], "Command /sharescan"),
+              "pkg1 C90 /sharescan answered honestly, no "
+              "unknown-command card");
+        CHECK(contains(table, "onShareScan"),
+              "pkg1 C90 table names onShareScan");
+        rig.d.handleMessage(makeMsg(-1001234567890, "supergroup", "/rmcache"));
+        CHECK(has_post(rig, "cache.clear"),
+              "pkg1 C91 /rmcache posts cache.clear");
+        CHECK(rig.tg.replies.size() == 3 &&
+                  contains(rig.tg.replies[2], "not found") &&
+                  !contains(rig.tg.replies[2], "Command /rmcache"),
+              "pkg1 C91 /rmcache answered honestly, no unknown-command "
+              "card");
+        CHECK(contains(table, "onRmcache"),
+              "pkg1 C91 table names onRmcache");
     }
 
     // --- F. Reply-keyboard buttons: every label is routed.
@@ -881,8 +965,8 @@ int main(int argc, char** argv) {
             }
             at = close + 1;
         }
-        CHECK(commands.size() == 113,
-              "113 registered command names in source (got " +
+        CHECK(commands.size() == 119,
+              "119 registered command names in source (got " +
                   std::to_string(commands.size()) + ")");
         for (const auto& c : commands)
             CHECK(has_command(c), "table contains command: /" + c);
@@ -901,8 +985,8 @@ int main(int argc, char** argv) {
                 p = b + 1;
             }
         }
-        CHECK(aliases.size() == 70,
-              "70 aliases in source (got " +
+        CHECK(aliases.size() == 75,
+              "75 aliases in source (got " +
                   std::to_string(aliases.size()) + ")");
         for (const auto& c : aliases)
             CHECK(has_command(c), "table contains alias: /" + c);
@@ -933,6 +1017,52 @@ int main(int argc, char** argv) {
                   std::to_string(channel.size()) + ")");
         for (const auto& c : channel)
             CHECK(has_command(c), "table contains channel command: /" + c);
+    }
+
+    // --- G2. Package 2 routes (C87, C88, C103–C108): the new
+    // commands are registered on the right handlers, the s-aliases
+    // map to their bases, and the silent-success flag is set from
+    // the alias table — so each row is routed, not just listed.
+    {
+        size_t reg2 = dispatcher_src.find(
+            "void Dispatcher::registerCommands()");
+        size_t end2 = dispatcher_src.find(
+            "bool Dispatcher::forwardShareMedia", reg2);
+        std::string body2 = dispatcher_src.substr(
+            reg2, end2 == std::string::npos ? std::string::npos
+                                            : end2 - reg2);
+        auto has_reg = [&](const std::string& needle) {
+            return body2.find(needle) != std::string::npos;
+        };
+        CHECK(has_reg("add({\"mix\"}") && has_reg("onMix(c)"),
+              "C87 routed: /mix registered on onMix");
+        CHECK(has_reg("add({\"volume\"}") && has_reg("onVolume(c)"),
+              "C103 routed: /volume registered on onVolume");
+        CHECK(has_reg("add({\"recognize\"}") &&
+                  has_reg("onRecognize(c)"),
+              "C88 routed: /recognize registered on onRecognize");
+        CHECK(has_reg("{\"splay\", \"play\"}") &&
+                  has_reg("{\"sskip\", \"skip\"}") &&
+                  has_reg("{\"sstop\", \"stop\"}") &&
+                  has_reg("{\"spause\", \"pause\"}") &&
+                  has_reg("{\"sresume\", \"resume\"}"),
+              "C104-C108 routed: s-aliases map to their base commands");
+        CHECK(dispatcher_src.find("silent_aliases_ = {\"splay\", "
+                                  "\"sskip\", \"sstop\", \"spause\", "
+                                  "\"sresume\"}") != std::string::npos,
+              "s-aliases: silent_aliases_ lists the five s-forms");
+        CHECK(dispatcher_src.find("ctx.silent_success = "
+                                  "silent_aliases_.count(cmd) > 0;") !=
+                  std::string::npos,
+              "s-aliases: alias resolution sets silent_success");
+        CHECK(contains(table, "onMix` (Group, Everyone)"),
+              "table routes C87 to onMix");
+        CHECK(contains(table, "onVolume` (Group, Everyone)"),
+              "table routes C103 to onVolume");
+        CHECK(contains(table, "onRecognize` (Any, Everyone)"),
+              "table routes C88 to onRecognize");
+        CHECK(contains(table, "silent_aliases_"),
+              "table routes C104-C108 through silent_aliases_");
     }
 
     std::cout << "routing_test: " << templates.size() << " templates, "
