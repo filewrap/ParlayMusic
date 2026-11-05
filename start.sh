@@ -201,6 +201,52 @@ slskd_enabled() {
     [ -n "${SLSKD_SLSK_USERNAME:-}" ] && [ -n "${SLSKD_SLSK_PASSWORD:-}" ]
 }
 
+# ---------------------------------------------------------------- POT sidecar
+# bgutil POT server (build/bgutil-ytdlp-pot-provider/server): mints
+# web PO tokens for the backend's InnerTube player calls and the
+# yt-dlp daemon fallback. Started BEFORE the backend; the backend
+# degrades gracefully (no token, old behavior) when it is down, so
+# a failed sidecar only warns here — it never blocks the engine or
+# fails the start.
+POT_PORT=4416
+POT_DIR="$ROOT/build/bgutil-ytdlp-pot-provider/server"
+start_pot() {
+    local pidf="$ROOT/run/pot.pid" log="$ROOT/logs/pot.log" pid="" detail=""
+    if [ -f "$pidf" ]; then
+        pid="$(cat "$pidf" 2>/dev/null || true)"
+        if pid_alive "$pid"; then
+            print_row "pot" "$POT_PORT" "OK" "already running (pid $pid) — http://127.0.0.1:$POT_PORT/ping"
+            return 0
+        fi
+        rm -f "$pidf"
+    fi
+    if curl -s --max-time 2 "http://127.0.0.1:${POT_PORT}/ping" >/dev/null 2>&1; then
+        print_row "pot" "$POT_PORT" "OK" "already running (no pid file) — http://127.0.0.1:$POT_PORT/ping"
+        return 0
+    fi
+    if ! command -v node >/dev/null 2>&1; then
+        print_row "pot" "$POT_PORT" "WARN" "node not found — backend resolves without PO tokens (install Node 22+ and re-run ./build.sh)"
+        return 0
+    fi
+    if [ ! -f "$POT_DIR/build/main.js" ]; then
+        print_row "pot" "$POT_PORT" "WARN" "sidecar not built ($POT_DIR/build/main.js missing) — backend resolves without PO tokens (run ./build.sh)"
+        return 0
+    fi
+    ( cd "$POT_DIR" && exec setsid node build/main.js --host 127.0.0.1 --port "$POT_PORT" ) >>"$log" 2>&1 < /dev/null &
+    echo $! > "$pidf"
+    disown $! 2>/dev/null || true
+    pid="$(cat "$pidf")"
+    if wait_health "pot" "$POT_PORT" "/ping" 30 0 "$pid"; then
+        print_row "pot" "$POT_PORT" "OK" "pid $pid — http://127.0.0.1:$POT_PORT/ping"
+    else
+        if pid_alive "$pid"; then detail="pid $pid alive but no healthy /ping in 30s — see $log";
+        else detail="process exited — see $log"; fi
+        print_row "pot" "$POT_PORT" "WARN" "$detail — backend resolves without PO tokens"
+        rm -f "$pidf"
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- start loop
 say "Parlay ${LAYOUT} layout at $ROOT — starting the engine…"
 if [ "$DEBUG_MODE" = "1" ]; then
@@ -210,6 +256,8 @@ echo ""
 print_row "SERVICE" "PORT" "STATUS" "DETAIL"
 FAILED=()
 STARTED=()
+
+start_pot
 
 for entry in "${SERVICES[@]}"; do
     IFS='|' read -r name kind <<< "$entry"

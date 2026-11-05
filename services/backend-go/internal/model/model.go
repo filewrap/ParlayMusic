@@ -219,8 +219,8 @@ type SkipCheckRecord struct {
 }
 
 // ChatSettings is the per-chat settings object of the chat.settings
-// action (contracts/ipc.json) — all 21 keys: the 15 legacy keys
-// plus the 6 quality overrides below. Defaults are the
+// action (contracts/ipc.json) — all 22 keys: the 15 legacy keys
+// plus the 7 quality overrides below. Defaults are the
 // legacy values the core's Dispatcher::chatSettings reads when no
 // value is stored: admin_mode 0, play_mode "everyone", thumbnails
 // on, language "en", auto_delete_min 5, paginate_purge_old on,
@@ -260,9 +260,16 @@ type ChatSettings struct {
 	QualityVBR *bool `json:"quality_vbr,omitempty"`
 	QualityFEC *bool `json:"quality_fec,omitempty"`
 	QualityDTX *bool `json:"quality_dtx,omitempty"`
+	// QualityDSPEnabled is the per-chat Opus DSP override
+	// (nil = unset). false disables the Opus DSP for this
+	// chat: no custom Opus config is applied and the encoder
+	// runs the patched library's stock defaults (see
+	// voice.StockOpusEncoderConfig); every other quality
+	// override is ignored while off. Applies on next join.
+	QualityDSPEnabled *bool `json:"quality_dsp_enabled,omitempty"`
 }
 
-// DefaultChatSettings returns the 21-key settings object for a chat
+// DefaultChatSettings returns the 22-key settings object for a chat
 // with no stored settings.
 func DefaultChatSettings() ChatSettings {
 	return ChatSettings{

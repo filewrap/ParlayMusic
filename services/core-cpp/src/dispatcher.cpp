@@ -1368,7 +1368,8 @@ bool Dispatcher::fetchQuality(int64_t chat_id,
     else
         out.library = out.effective;
     static const char* kFields[] = {"bitrate_bps", "frame_ms",
-                                    "complexity", "vbr", "fec", "dtx"};
+                                    "complexity", "vbr", "fec", "dtx",
+                                    "dsp_enabled"};
     const Json* sources = r.data.find("sources");
     if (sources != nullptr && sources->isObject()) {
         for (const char* f : kFields) {
@@ -1377,6 +1378,8 @@ bool Dispatcher::fetchQuality(int64_t chat_id,
                 out.sources[f] = v->asString();
         }
     }
+    const Json* dsp = r.data.find("dsp_enabled");
+    if (dsp != nullptr) out.dsp_enabled = dsp->asBool(true);
     const Json* active = r.data.find("active_call");
     if (active != nullptr) out.active_call = active->asBool(false);
     const Json* applies = r.data.find("applies_on");
@@ -6241,12 +6244,36 @@ void Dispatcher::onSettings(const CommandContext& ctx) {
 void Dispatcher::onQuality(const CommandContext& ctx) {
     // Group only (routing row C102): the quality card describes this
     // chat's effective Opus config. Everyone may read it; changing a
-    // value goes through the settings panel (admin-only callbacks).
+    // value goes through the menu buttons (admin-only callbacks) or
+    // /quality off|on (admin-only, below).
     if (isPrivate(ctx)) {
         replyHtml(ctx, ui_texts::kSettingsGroupOnly);
         return;
     }
     int64_t chat = vcTarget(ctx);
+    auto args = splitArgs(ctx.args);
+    if (!args.empty()) {
+        // /quality off|on: flip the per-chat Opus DSP switch
+        // (quality_dsp_enabled). Off = stock encoder behavior:
+        // no custom Opus config is applied and every other
+        // quality setting is ignored until it is turned back on.
+        // Applies on next join, like every other quality
+        // setting; a running call is untouched.
+        std::string arg = lowerStr(args[0]);
+        if (arg != "off" && arg != "on") {
+            replyHtml(ctx, ui_texts::kQualityUsage);
+            return;
+        }
+        if (!adminCheck(ctx)) return;
+        bool enable = arg == "on";
+        if (!setSetting(chat, "quality_dsp_enabled", Json(enable))) {
+            replyHtml(ctx, ui_texts::kSettingsSaveFailed);
+            return;
+        }
+        replyHtml(ctx, enable ? ui_texts::kQualityDspOn
+                              : ui_texts::kQualityDspOff);
+        return;
+    }
     ui_texts::QualityInfo q;
     if (!fetchQuality(chat, q)) {
         replyHtml(ctx, ui_texts::kQualityLoadFailed);
@@ -8887,14 +8914,21 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
                                     : s.chat_music_download));
         return;
     }
-    // Quality sub-screen (routing rows A96–A99): pl:set:quality shows
-    // the screen; :br:<kbps> / :fr:<ms> write one per-chat override
-    // via the generic chat.settings set path (quality_bitrate_bps /
-    // quality_frame_ms); :reset clears all six quality_* overrides
-    // (JSON null) so the chat falls back to parlay.toml / profile /
-    // default. Out-of-range values are Unknown action, never stored.
-    // Every change applies on the NEXT join (the card says so); the
-    // screen is re-rendered from a fresh quality.get after the write.
+    // Quality sub-screen (routing rows A96–A99, A102–A103):
+    // pl:set:quality shows the screen; :br:<kbps> / :fr:<ms>
+    // write one per-chat override via the generic chat.settings
+    // set path (quality_bitrate_bps / quality_frame_ms);
+    // :preset:<name> sets the voice-profile bitrate as a
+    // per-chat override AND re-enables the DSP (a preset pick
+    // always means "on"); :dsp:<0|1> flips the per-chat Opus
+    // DSP switch (quality_dsp_enabled) — 0 is stock encoder
+    // behavior, no custom Opus config applied; :reset clears
+    // all seven quality_* overrides (JSON null) so the chat
+    // falls back to parlay.toml / profile / default.
+    // Out-of-range values are Unknown action, never stored.
+    // Every change applies on the NEXT join (the card says so);
+    // the screen is re-rendered from a fresh quality.get after
+    // the write.
     if (key == "quality") {
         if (parts.size() == 3) {
             answerCb(cq, "");
@@ -8905,10 +8939,46 @@ void Dispatcher::cbSet(const TgCallbackQuery& cq,
             static const char* kQualityKeys[] = {
                 "quality_bitrate_bps", "quality_frame_ms",
                 "quality_complexity", "quality_vbr", "quality_fec",
-                "quality_dtx"};
+                "quality_dtx", "quality_dsp_enabled"};
             bool ok = true;
             for (const char* k : kQualityKeys)
                 ok = setSetting(cq.chat_id, k, Json(nullptr)) && ok;
+            answerCb(cq, ok ? ui_texts::kSettingsUpdated
+                            : ui_texts::kSettingsSaveFailed,
+                     !ok);
+            renderQualityScreen(cq);
+            return;
+        }
+        if (parts.size() == 5 && parts[3] == "preset") {
+            int kbps = parts[4] == "ultra_320k"     ? 320
+                       : parts[4] == "high_256k"    ? 256
+                       : parts[4] == "standard_192k" ? 192
+                                                      : -1;
+            if (kbps < 0) {
+                answerCb(cq, ui_texts::kToastUnknownAction, true);
+                return;
+            }
+            bool ok = setSetting(cq.chat_id, "quality_bitrate_bps",
+                                 Json(static_cast<int64_t>(kbps * 1000)));
+            // A preset pick re-enables the DSP: the preset is a
+            // quality choice, and quality settings are ignored
+            // while the DSP is off.
+            ok = setSetting(cq.chat_id, "quality_dsp_enabled",
+                            Json(true)) &&
+                 ok;
+            answerCb(cq, ok ? ui_texts::kSettingsUpdated
+                            : ui_texts::kSettingsSaveFailed,
+                     !ok);
+            renderQualityScreen(cq);
+            return;
+        }
+        if (parts.size() == 5 && parts[3] == "dsp") {
+            if (parts[4] != "0" && parts[4] != "1") {
+                answerCb(cq, ui_texts::kToastUnknownAction, true);
+                return;
+            }
+            bool ok = setSetting(cq.chat_id, "quality_dsp_enabled",
+                                 Json(parts[4] == "1"));
             answerCb(cq, ok ? ui_texts::kSettingsUpdated
                             : ui_texts::kSettingsSaveFailed,
                      !ok);

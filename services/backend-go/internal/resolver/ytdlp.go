@@ -11,7 +11,9 @@
 // "params": {...}}; responses carry {"id": n, "result": {...}} or
 // {"id": n, "error": {"code": ..., "message": ...}}. Methods: ping,
 // version, extract (yt-dlp -J metadata), download (bestaudio,
-// extracted to mp3).
+// extracted to mp3). extract/download accept an optional
+// params.po_token ("web.player+<token>") minted by the bgutil POT
+// sidecar (internal/pot); absent means a tokenless call, as before.
 //
 // The daemon is started lazily on first use, never at construction,
 // so a backend that only serves native resolvers never spawns it.
@@ -312,7 +314,18 @@ func (c *YtDlpClient) Version(ctx context.Context) (string, error) {
 
 // Extract returns yt-dlp -J metadata for a URL (download=false).
 func (c *YtDlpClient) Extract(ctx context.Context, url string) (map[string]any, error) {
-	raw, err := c.call(ctx, "extract", map[string]any{"url": url}, 120*time.Second)
+	return c.ExtractWithPoToken(ctx, url, "")
+}
+
+// ExtractWithPoToken is Extract with an optional yt-dlp PO token
+// (params.po_token, "web.player+<token>" — the --po-token CLI
+// format). Empty poToken means a plain tokenless extract.
+func (c *YtDlpClient) ExtractWithPoToken(ctx context.Context, url, poToken string) (map[string]any, error) {
+	params := map[string]any{"url": url}
+	if poToken != "" {
+		params["po_token"] = poToken
+	}
+	raw, err := c.call(ctx, "extract", params, 120*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +339,18 @@ func (c *YtDlpClient) Extract(ctx context.Context, url string) (map[string]any, 
 // Download downloads url (bestaudio, extracted to mp3) into dir
 // and returns the file path.
 func (c *YtDlpClient) Download(ctx context.Context, url, dir string) (string, error) {
-	raw, err := c.call(ctx, "download", map[string]any{"url": url, "dir": dir}, 600*time.Second)
+	return c.DownloadWithPoToken(ctx, url, dir, "")
+}
+
+// DownloadWithPoToken is Download with an optional yt-dlp PO token
+// ("web.player+<token>"). Empty poToken means a plain tokenless
+// download.
+func (c *YtDlpClient) DownloadWithPoToken(ctx context.Context, url, dir, poToken string) (string, error) {
+	params := map[string]any{"url": url, "dir": dir}
+	if poToken != "" {
+		params["po_token"] = poToken
+	}
+	raw, err := c.call(ctx, "download", params, 600*time.Second)
 	if err != nil {
 		return "", err
 	}

@@ -12,12 +12,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 # name|port — same processes as start.sh (reverse order stops the core
-# first, then the backend, then slskd). Empty port = PID only, no
-# port fallback or port verification.
+# first, then the backend, then slskd, then pot — pot started first,
+# so it stops last). Empty port = PID only, no port fallback or port
+# verification.
 SERVICES=(
     "core|8080"
     "backend|"
     "slskd|5030"
+    "pot|4416"
 )
 
 say() { printf '%s\n' "$*"; }

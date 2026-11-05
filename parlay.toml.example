@@ -85,8 +85,17 @@ healthz_ms = 5000
 # resampler_quality: sinc_256 (mastering-grade) | sinc_128 | fast.
 # Env: PARLAY_VOICE_PROFILE, PARLAY_SOURCE_LADDER (comma-separated),
 #      PARLAY_RESAMPLER_QUALITY
+# dsp_enabled: the Opus DSP switch (default true). false means NO
+# custom Opus config is applied at all: the encoder runs the
+# patched library's stock defaults (192000 bps, 20 ms,
+# complexity 10, VBR on, FEC off, DTX off, 48 kHz) and every
+# other key in this section — plus the voice profile — is
+# ignored while off. A per-chat override (/quality off, or the
+# /quality menu's DSP button) wins over this file key. Like
+# every quality setting it applies on next join, never mid-call.
 [quality]
 voice_profile = "standard_192k"
+dsp_enabled = true
 opus_bitrate_bps = 192000
 opus_frame_ms = 20
 opus_complexity = 10

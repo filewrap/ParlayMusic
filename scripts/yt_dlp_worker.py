@@ -26,9 +26,23 @@ Protocol: one JSON object per line, both directions.
 Methods:
   ping     -> {"ok": true} (no network)
   version  -> {"version": "<yt-dlp version>"}
-  extract  -> {"url": ...} -> yt-dlp -J metadata (download=False)
-  download -> {"url": ..., "dir": ...} -> bestaudio, extracted to mp3,
+  extract  -> {"url": ..., "po_token": ...} -> yt-dlp -J metadata (download=False)
+  download -> {"url": ..., "dir": ..., "po_token": ...} -> bestaudio, extracted to mp3,
               {"file_path": ...}
+
+po_token (optional, both methods) is a yt-dlp PO token in --po-token
+form, "web.player+<token>", minted by the bgutil POT sidecar and
+handed over by the Go backend (internal/pot). It is passed to
+yt-dlp as the Python-API equivalent of
+--extractor-args "youtube:po_token=web.player+<token>":
+{"extractor_args": {"youtube": {"po_token": ["web.player+<token>"]}}}
+— the shape YoutubeIE._get_config_po_token reads via
+_configuration_arg('po_token', ..., ie_key=YoutubeIE) in
+yt_dlp/extractor/youtube/_video.py. The token is attached ONLY to
+the cookieless attempt: an anonymously minted token mixed with
+authenticated session cookies can fail validation server-side, so
+the cookie retry (genuinely age-gated / members-only videos) runs
+tokenless, exactly as before.
 
 Stdout carries ONLY JSON-RPC lines: both YoutubeDL instances run
 with "noprogress": True, because yt-dlp's [download] progress bar
@@ -76,6 +90,37 @@ def _find_cookie_file():
     return None
 
 
+def _base_opts():
+    """Opts shared by every YoutubeDL instance built here."""
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "remote_components": ["ejs:github"],
+    }
+
+
+def _ydl_for_po_token(po_token):
+    """A fresh YoutubeDL instance carrying one PO token.
+
+    Built per call, not warm: the warm instance is shared and its
+    opts are fixed at construction, while a token is bound to one
+    video id. The token is the --po-token CLI value
+    ("web.player+<token>"); YoutubeIE._get_config_po_token reads it
+    from extractor_args.youtube.po_token (a list) and presents it on
+    the web client's player request. The token VALUE is never
+    logged.
+    """
+    opts = _base_opts()
+    opts["extractor_args"] = {"youtube": {"po_token": [po_token]}}
+    sys.stderr.write("yt-dlp: extract with po_token (client web, context player)\n")
+    sys.stderr.flush()
+    return yt_dlp.YoutubeDL(opts)
+
+
 def _ydl():
     """One warm YoutubeDL instance for the life of the process.
 
@@ -85,16 +130,7 @@ def _ydl():
     """
     global _YDL
     if _YDL is None:
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "noplaylist": True,
-            "socket_timeout": 30,
-            "retries": 3,
-            "remote_components": ["ejs:github"],
-        }
-        _YDL = yt_dlp.YoutubeDL(opts)
+        _YDL = yt_dlp.YoutubeDL(_base_opts())
     return _YDL
 
 
@@ -138,16 +174,8 @@ def _ydl_cookies():
         cf = _find_cookie_file()
         if not cf:
             return None
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "noplaylist": True,
-            "socket_timeout": 30,
-            "retries": 3,
-            "remote_components": ["ejs:github"],
-            "cookiefile": cf,
-        }
+        opts = _base_opts()
+        opts["cookiefile"] = cf
         _YDL_COOKIES = yt_dlp.YoutubeDL(opts)
     return _YDL_COOKIES
 
@@ -156,8 +184,12 @@ def _extract(params):
     url = (params or {}).get("url", "")
     if not url:
         raise ValueError("extract: url is required")
+    po_token = (params or {}).get("po_token", "")
+    # The token rides only on the cookieless attempt (see module
+    # docstring): the cookie retry below runs tokenless.
+    ydl = _ydl_for_po_token(po_token) if po_token else _ydl()
     try:
-        return _ydl().extract_info(url, download=False)
+        return ydl.extract_info(url, download=False)
     except Exception as exc:  # noqa: BLE001 - retry path below
         if not _needs_auth(str(exc)):
             raise
@@ -183,16 +215,11 @@ def _download(params):
         raise ValueError("download: url is required")
     if not outdir:
         raise ValueError("download: dir is required")
+    po_token = (params or {}).get("po_token", "")
     os.makedirs(outdir, exist_ok=True)
     outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "remote_components": ["ejs:github"],
+    opts = _base_opts()
+    opts.update({
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "restrictfilenames": True,
@@ -208,7 +235,13 @@ def _download(params):
             "preferredcodec": "mp3",
             "preferredquality": "0",
         }],
-    }
+    })
+    # The token rides only on the cookieless attempt (see module
+    # docstring); the cookie retry below drops it again.
+    if po_token:
+        opts["extractor_args"] = {"youtube": {"po_token": [po_token]}}
+        sys.stderr.write("yt-dlp: download with po_token (client web, context player)\n")
+        sys.stderr.flush()
     # Cookieless first (see module docstring); retry with cookies
     # only on an age/login gate.
     before = set(os.listdir(outdir))
@@ -225,6 +258,9 @@ def _download(params):
             % str(exc)[:160])
         sys.stderr.flush()
         opts["cookiefile"] = cf
+        # Anonymously minted token + authenticated cookies can fail
+        # validation server-side: the cookie retry runs tokenless.
+        opts.pop("extractor_args", None)
         try:
             yt_dlp.YoutubeDL(opts).download([url])
         except Exception as exc2:  # noqa: BLE001 - report both attempts

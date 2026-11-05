@@ -202,8 +202,11 @@ void applyToml(const toml::Document& doc, Config& c) {
                     "healthz_ms"});
     checkKnownKeys(doc, "quality",
                    {"voice_profile", "source_ladder", "resampler_quality",
-                    "opus_bitrate_bps", "opus_frame_ms", "opus_complexity",
-                    "opus_vbr", "opus_fec", "opus_dtx"});
+                    "dsp_enabled", "opus_bitrate_bps", "opus_frame_ms",
+                    "opus_complexity", "opus_vbr", "opus_fec", "opus_dtx"});
+    // NOTE: dsp_enabled is accepted here so a file that sets it
+    // parses, but the core never reads it: the backend owns Opus
+    // application (quality.get reports the resolved DSP state).
     checkKnownKeys(doc, "limits",
                    {"max_duration_minutes", "max_queue_size",
                     "prefetch_lead_time_sec", "url_cache_ttl_sec"});

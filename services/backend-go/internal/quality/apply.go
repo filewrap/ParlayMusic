@@ -19,9 +19,14 @@ import (
 // opus_stub.c) and Apply fails loudly instead of letting the
 // backend run on unknown encoder settings. The returned
 // config and sources are the applied values, for logging and
-// for quality.get.
+// for quality.get. When the Opus DSP is off for this chat,
+// the "effective" config is the library's stock defaults
+// (see Effective): Apply restores them so no earlier chat's
+// applied config leaks in through the process-global stored
+// config, and logs that the DSP is off instead of the
+// applied-values line.
 func Apply(cfg *config.Config, st model.ChatSettings) (voice.OpusEncoderConfig, map[string]string, error) {
-	eff, sources := Resolve(cfg, st)
+	eff, sources, enabled := Effective(cfg, st)
 	if err := voice.ValidateOpusConfig(eff); err != nil {
 		return eff, sources, fmt.Errorf("quality: effective opus config invalid: %w", err)
 	}
@@ -34,6 +39,12 @@ func Apply(cfg *config.Config, st model.ChatSettings) (voice.OpusEncoderConfig, 
 	}
 	if got != eff {
 		return eff, sources, fmt.Errorf("quality: opus config did not stick: applied %+v, library reports %+v", eff, got)
+	}
+	if !enabled {
+		log.Printf("quality: opus dsp off — stock encoder defaults restored (bitrate=%d frame=%dms, no custom opus config applied; dsp_enabled source=%s)",
+			eff.BitrateBps, eff.FrameSizeMs,
+			sources[config.OpusFieldDSPEnabled])
+		return eff, sources, nil
 	}
 	log.Printf("quality: opus applied bitrate=%d complexity=%d vbr=%v fec=%v dtx=%v frame=%dms maxplay=%d (sources: bitrate=%s frame=%s complexity=%s vbr=%s fec=%s dtx=%s)",
 		eff.BitrateBps, eff.Complexity, eff.VBREnabled, eff.FECEnabled, eff.DTXEnabled, eff.FrameSizeMs, eff.MaxPlaybackRateHz,

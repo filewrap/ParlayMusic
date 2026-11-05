@@ -76,14 +76,16 @@ type OpusEncoderConfig struct {
 // frame default moved from 60 ms to 20 ms with the bitrate
 // default from 320k to 192k (Opus quality saturates at
 // 128–192 kbps stereo; 256/320 kbps remain selectable, not
-// the default). This is the backend's default, not the
-// library's: a fresh libntgcalls.so still defaults to
-// 320000 bps / 60 ms, so the backend must apply this config
-// at startup (and before every join) for the running default
-// to be 192k / 20 ms. The effective config is resolved by
-// internal/quality (store override > parlay.toml [quality]
-// explicit keys > voice_profile preset > this default); see
-// config.QualityConfig.OpusSettings for the file-level half.
+// the default). This is the backend's default AND the patched
+// library's own fresh default (verified by a fresh-process
+// OpusConfig() readback, 2026-11-05: a fresh patched
+// libntgcalls.so reports exactly this config) — the old
+// "320000 bps / 60 ms" claim described a stock UNPATCHED
+// libntgcalls, not this patched one. The effective config is
+// resolved by internal/quality (store override > parlay.toml
+// [quality] explicit keys > voice_profile preset > this
+// default); see config.QualityConfig.OpusSettings for the
+// file-level half.
 func DefaultOpusEncoderConfig() OpusEncoderConfig {
 	return OpusEncoderConfig{
 		BitrateBps:        192000,
@@ -94,6 +96,21 @@ func DefaultOpusEncoderConfig() OpusEncoderConfig {
 		FrameSizeMs:       20,
 		MaxPlaybackRateHz: 48000,
 	}
+}
+
+// StockOpusEncoderConfig is the patched library's own stock
+// encoder config: exactly what a fresh libntgcalls.so holds
+// before any SetOpusConfig call (verified by a fresh-process
+// OpusConfig() readback, 2026-11-05), which is numerically
+// identical to DefaultOpusEncoderConfig. DSP-off restores
+// this: the backend applies it (rather than skipping the set
+// entirely) so a previous chat's applied config cannot leak
+// into a DSP-off chat's call through the process-global
+// stored config — after the restore, the encoder runs
+// exactly as a fresh patched library would, with no
+// Parlay-applied Opus config in force.
+func StockOpusEncoderConfig() OpusEncoderConfig {
+	return DefaultOpusEncoderConfig()
 }
 
 // Opus bitrate/parameter limits, mirroring the C validation in
@@ -173,8 +190,10 @@ func opusConfigFromC(x C.ntg_opus_encoder_config) OpusEncoderConfig {
 }
 
 // OpusConfig reads back the current global Opus encoder
-// settings (the library's own fresh defaults — 320000 bps,
-// 60 ms — until SetOpusConfig or SetOpusBitrate is called).
+// settings (the patched library's fresh defaults — 192000 bps,
+// 20 ms, complexity 10, VBR on, FEC/DTX off, 48 kHz — until
+// SetOpusConfig or SetOpusBitrate is called; verified by a
+// fresh-process readback, 2026-11-05).
 func OpusConfig() (OpusEncoderConfig, error) {
 	var out C.ntg_opus_encoder_config
 	if err := checkResult(C.ntg_opus_get_config(&out)); err != nil {

@@ -712,12 +712,12 @@ private:
     ui_texts::ChatSettings chatSettings(int64_t chat_id);
     bool saveChatSettings(int64_t chat_id, const ui_texts::ChatSettings& s);
     // Opus quality (quality.get surface, 2026-11-05): fetchQuality()
-    // reads the effective config + per-field sources + library
-    // readback over UDS; false when the backend is down or the
-    // response is unusable. renderQualityScreen() edits the tapped
-    // message to the quality sub-screen (or the load-failure screen
-    // with a Back button); it answers nothing — the caller answers
-    // the callback query exactly once first.
+    // reads the effective config + per-field sources + DSP state +
+    // library readback over UDS; false when the backend is down or
+    // the response is unusable. renderQualityScreen() edits the
+    // tapped message to the quality sub-screen (or the load-failure
+    // screen with a Back button); it answers nothing — the caller
+    // answers the callback query exactly once first.
     bool fetchQuality(int64_t chat_id, ui_texts::QualityInfo& out);
     void renderQualityScreen(const TgCallbackQuery& cq);
     bool thumbnailsOn(int64_t chat_id) {

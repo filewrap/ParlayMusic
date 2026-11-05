@@ -405,7 +405,7 @@ func (s *Store) GetSkipCheck(trackID string) (model.SkipCheckRecord, bool, error
 
 // --- settings: one ChatSettings per chat ------------------------------
 
-// PutSettings stores the 21-key settings object for a chat.
+// PutSettings stores the 22-key settings object for a chat.
 func (s *Store) PutSettings(chatID int64, st model.ChatSettings) error {
 	return s.db.Update(func(tx *bbolt.Tx) error {
 		return putJSON(tx.Bucket(bucketSettings), chatKey(chatID), st)
