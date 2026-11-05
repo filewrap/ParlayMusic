@@ -1,4 +1,7 @@
-// NubCoders YouTube resolver — primary YouTube path.
+// NubCoders YouTube resolver — SECOND YouTube stage (fallback
+// after the native InnerTube ANDROID_VR player; probe 2026-11-05:
+// player 199 ms VPS vs NubCoders ~2.4–9.8 s, so the player goes
+// first and this is the fallback when it fails).
 //
 // Wire (proven 2026-11-05):
 //
@@ -12,9 +15,9 @@
 // hand back a directly playable MP4. No cookies, PO token or local
 // subprocess needed — the API does bot-bypass server-side.
 //
-// Architecture: this is the FIRST YouTube stage inside
-// YouTubeResolver (native InnerTube player, then the warm yt-dlp
-// daemon, stay as fallbacks). No new process, no new IPC, no new
+// Architecture: this is the SECOND YouTube stage inside
+// YouTubeResolver (native InnerTube player first, then the warm
+// yt-dlp daemon last). No new process, no new IPC, no new
 // source name — the contract stays {id,title,source=youtube,
 // stream_url,duration,thumbnail,...}. The API token comes from
 // env NUBCODERS_TOKEN (never logged); unwired when unset, so a
@@ -200,21 +203,21 @@ func nubAvailable() bool {
 	return nubCodersTokenFromEnv() != ""
 }
 
-// nubPrimary is the primary YouTube stage: one /info round-trip
+// nubFallback is the second YouTube stage: one /info round-trip
 // (two on free text) yields a playable MP4, no cookie/PO needed.
-func (y *YouTubeResolver) nubPrimary(ctx context.Context, q string) (Track, error) {
+func (y *YouTubeResolver) nubFallback(ctx context.Context, q string) (Track, error) {
 	if !nubAvailable() {
 		return Track{}, engineUnavailable(SourceYouTube, "nubcoders disabled")
 	}
 	start := time.Now()
 	track, err := nubResolveQuery(ctx, q)
 	if err != nil {
-		log.Printf("youtube: nubcoders primary failed in %s: %v", time.Since(start), err)
+		log.Printf("youtube: nubcoders fallback failed in %s: %v", time.Since(start), err)
 		return Track{}, err
 	}
 	if track.StreamURL == "" || track.ID == "" {
 		return Track{}, engineUnavailable(SourceYouTube, "nubcoders: no stream_url in response")
 	}
-	log.Printf("youtube: nubcoders primary ok in %s id=%s", time.Since(start), track.ID)
+	log.Printf("youtube: nubcoders fallback ok in %s id=%s", time.Since(start), track.ID)
 	return track, nil
 }
