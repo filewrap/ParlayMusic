@@ -488,6 +488,8 @@ int main(int argc, char** argv) {
     harvestKb(searchPageKeyboard(kUser, 1, kHash, false, true, 5), harvested);
     harvestKb(lossyKeyboard(kRun, "320kbps MP3"), harvested);
     harvestKb(dlSpotifyOptionsKeyboard(kRun), harvested);
+    harvestKb(dlCollectionCardKeyboard(kRun, 12), harvested);
+    harvestKb(dlRetryKeyboard(kRun), harvested);
     harvestKb(dlFxKeyboard(kRun), harvested);
     harvestKb(settingsKeyboard(ChatSettings{}), harvested);
     harvestKb(settingsQualityKeyboard(QualityInfo{}), harvested);
@@ -581,6 +583,8 @@ int main(int argc, char** argv) {
         {"pl:dl:fx:<run_id>:8d", cbDlFx(kRun, "8d")},
         {"pl:dl:zip:<run_id>", "pl:dl:zip:" + kRun},
         {"pl:dl:1by1:<run_id>", "pl:dl:1by1:" + kRun},
+        {"pl:dl:go:<run_id>", cbDlGo(kRun)},
+        {"pl:dl:retry:<run_id>", cbDlRetry(kRun)},
         {"pl:bcast:cancel", kCbBcastCancel},
         {"pl:auth:del:<chat_id>:<user_id>", cbAuthDel(kChat, 111)},
         {"pl:search:<n>:<user_id>:<token>",
@@ -649,6 +653,10 @@ int main(int argc, char** argv) {
                       "/tmp/parlay-routing-test/fx-in.ogg\n-1001234567890");
         rig.store.set("dlpick:" + kRun,
                       "https://open.spotify.com/playlist/xyz\n-1001234567890");
+        rig.store.set("dlgo:" + kRun,
+                      "https://open.spotify.com/playlist/xyz\n-1001234567890\nfiles");
+        rig.store.set("dlretry:" + kRun,
+                      "download/youtube\nsome song\n-1001234567890\n999");
         for (const auto& t : templates) {
             if (!t.dispatch) continue;  // pl:restart:bot exits (42)
             bool is_vote = t.tpl.rfind("pl:vote:", 0) == 0;

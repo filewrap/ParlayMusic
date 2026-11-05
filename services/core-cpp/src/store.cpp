@@ -32,8 +32,9 @@ namespace parlay {
 //     inline-search state — message ids, cooldowns, tokens),
 //     last_chat:<user_id> (kv: last chat an inline query came from)
 //   panelmsg:, paneluser: (kv: transient UI-panel state)
-//   dlrun:, dlset:, dlpick:, dlset_tpl_pending: (kv: transient
-//     download state — run records, format picks, pending templates)
+//   dlrun:, dlset:, dlpick:, dlgo:, dlretry:, dlset_tpl_pending:
+//     (kv: transient download state — run records, format picks,
+//     collection go-ahead, not-available retry, pending templates)
 //   sharetarget:, sharetok:, sharelink:, sharefb: (kv: transient
 //     share-link state)
 //   vote:<track_id> (kv: transient vote state — which chat opened it)

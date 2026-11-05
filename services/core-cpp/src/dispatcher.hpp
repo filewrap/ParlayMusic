@@ -271,6 +271,12 @@ public:
                       std::string* error_out = nullptr) override;
     std::string getUserMention(int64_t user_id) override;
 
+    // TDLib replyMarkup JSON for an inline keyboard (Json(nullptr)
+    // when empty = "pass null if none"). Public so the serialisation
+    // is directly testable (tdlib_test): a copy button must serialise
+    // as inlineKeyboardButtonTypeCopyText with no callback data.
+    static Json inlineMarkup(const InlineKeyboard& kb);
+
 private:
     // parseTextEntities (HTML) or a plain formattedText when
     // parse_mode is empty. Json() (null) + error_out on parse failure.
@@ -282,9 +288,6 @@ private:
     Json inputMessageText(const std::string& text,
                           const std::string& parse_mode,
                           std::string& error_out);
-    // TDLib replyMarkup JSON for an inline keyboard (Json(nullptr)
-    // when empty = "pass null if none").
-    static Json inlineMarkup(const InlineKeyboard& kb);
     static Json replyMarkup(const ReplyKeyboard& kb);
     // One Bot API-shaped InlineQueryResult -> its TDLib
     // inputInlineQueryResult (audio keeps audio_url; article keeps its
@@ -586,6 +589,16 @@ private:
     void renderQualityScreen(const TgCallbackQuery& cq);
     bool thumbnailsOn(int64_t chat_id) {
         return settingsFor(chat_id).thumbnails;
+    }
+    // Effective card photo for a chat (NoxBeats DEFAULT_THUMB gated
+    // by THUMB_GEN, §0.3): the track thumbnail, else the configured
+    // default thumbnail, else "" (text card). The thumbnails setting
+    // gates the whole chain: thumbnails off always yields "".
+    std::string effectiveThumb(int64_t chat_id,
+                               const std::string& track_thumb) {
+        if (!thumbnailsOn(chat_id)) return "";
+        if (!track_thumb.empty()) return track_thumb;
+        return cfg_.default_thumbnail;
     }
     // Display name for a user: "FirstName (@username)" / "FirstName" /
     // the bare id when nothing else is known.

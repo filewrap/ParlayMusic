@@ -208,6 +208,11 @@ struct Config {
     // (START_IMG / PING_IMG).
     std::string start_img;      // START_IMG (optional /start photo)
     std::string ping_img;       // PING_IMG (optional /ping photo)
+    // Configured default thumbnail (NoxBeats DEFAULT_THUMB, gated by
+    // THUMB_GEN): the photo used for now-playing / queue / queued
+    // cards when the track itself has no thumbnail. Empty = today's
+    // behaviour (text card when the track has no thumbnail).
+    std::string default_thumbnail;  // PARLAY_DEFAULT_THUMBNAIL
     std::string updates_url;    // PARLAY_UPDATES_URL (updates channel)
     std::string support_url;    // PARLAY_SUPPORT_URL (falls back to
                                 // https://t.me/<SUPPORT_CHAT>)

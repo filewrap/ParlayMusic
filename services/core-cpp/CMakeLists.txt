@@ -202,10 +202,15 @@ add_test(NAME routing_test
 
 add_executable(tdlib_test
     tests/tdlib_test.cpp
+    src/dispatcher.cpp
+    src/ipc.cpp
     src/tdlib_client.cpp
     src/json.cpp
     src/config.cpp
     src/toml.cpp
+    src/rate_limiter.cpp
+    src/store.cpp
+    src/scram.cpp
 )
 target_include_directories(tdlib_test PRIVATE src)
 target_compile_options(tdlib_test PRIVATE -Wall -Wextra -Wpedantic)
