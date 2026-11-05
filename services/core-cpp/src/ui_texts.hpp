@@ -2058,6 +2058,17 @@ inline const char* kBugReport =
     "<b>Bug report</b>\n\nFrom: {from} (<code>{id}</code>)\nWhere: {where}\n\n{text}";
 inline const char* kBugFailed = "» Could not send the report. Try again later.";
 
+// Owner error report (Rich Messages engine): every send/validation
+// failure is DM'd to the owner with the action, the chat it happened
+// in, and the TDLib error. {action} / {chat} / {error} are already
+// HTML-escaped by the caller (reportOwnerError).
+inline const char* kOwnerErrorReport =
+    "<h2>Parlay error</h2>\n"
+    "\n"
+    "<b>Action:</b> <code>{action}</code>\n"
+    "<b>Chat:</b> <code>{chat}</code>\n"
+    "<b>Error:</b> <code>{error}</code>";
+
 // /privacy (Yukki §3.8 full page, §10; bot name + links substituted).
 inline const char* kPrivacy =
     "<h1>Privacy Policy &amp; Data Handling</h1>\n"

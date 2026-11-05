@@ -57,6 +57,13 @@
 
 namespace parlay {
 
+// Forward declaration for the Rich Messages engine
+// (rich_message.hpp). The sender interface only passes it by
+// reference; dispatcher.cpp includes the full header.
+namespace rich {
+class RichMessage;
+}  // namespace rich
+
 // --- Telegram transport -----------------------------------------------------
 // The dispatcher's only Telegram surface. The production implementation
 // (TdLibTelegramSender, below) drives the TDLib bot session; tests
@@ -89,39 +96,62 @@ public:
     virtual int64_t sendMessageId(int64_t chat_id, const std::string& text,
                                   int64_t reply_to = 0,
                                   std::string* error_out = nullptr) = 0;
-    // HTML send (parse_mode=HTML, web preview off) with an optional
-    // inline keyboard. All Phase 9 UI text goes through this; user-
-    // derived text inside must already be HTML-escaped
-    // (ui_texts::htmlEscape).
+    // HTML send with an optional inline keyboard. The text is sent
+    // as a TDLib Rich Message (inputMessageRichMessage with a
+    // richMessageSourceHtml source), so headings <h1>..<h6> and the
+    // rest of the Rich HTML tag list are legal here — the classic
+    // parseTextEntities path this used to take rejected them. All
+    // Phase 9 UI text goes through this; user-derived text inside
+    // must already be HTML-escaped (ui_texts::htmlEscape).
     virtual int64_t sendMessageHtml(int64_t chat_id, const std::string& text,
                                     const InlineKeyboard& kb,
                                     int64_t reply_to = 0,
                                     std::string* error_out = nullptr) = 0;
-    // HTML send with a persistent reply keyboard.
+    // Rich Message send: a built parlay::rich::RichMessage (HTML or
+    // Blocks source) + a prebuilt reply_markup JSON (use
+    // TdLibTelegramSender::inlineMarkup(kb), or Json(nullptr) for
+    // none). The default implementation reports "not supported" so
+    // other TelegramSender implementations keep compiling;
+    // TdLibTelegramSender (the only production sender) implements
+    // it for real. Returns the new message id, -1 + error_out on
+    // failure.
+    virtual int64_t sendRichMessage(int64_t chat_id,
+                                    const rich::RichMessage& msg,
+                                    const Json& reply_markup,
+                                    int64_t reply_to = 0,
+                                    std::string* error_out = nullptr);
+    // HTML send with a persistent reply keyboard. Like
+    // sendMessageHtml, the text goes out as a Rich Message.
     virtual int64_t sendMessageReplyKb(int64_t chat_id,
                                        const std::string& text,
                                        const ReplyKeyboard& kb,
                                        int64_t reply_to = 0,
                                        std::string* error_out = nullptr) = 0;
-    // HTML send removing any reply keyboard.
+    // HTML send removing any reply keyboard. Like sendMessageHtml,
+    // the text goes out as a Rich Message.
     virtual int64_t sendMessageRemoveKb(int64_t chat_id,
                                         const std::string& text,
                                         int64_t reply_to = 0,
                                         std::string* error_out = nullptr) = 0;
-    // Photo send (caption is HTML). `photo` is a TDLib remote file id
-    // (inputFileRemote) or a local file path (inputFileLocal). A remote
-    // HTTP(S) URL is NOT valid: the sender fails it honestly and the
-    // caller falls back to a text card (sendNowPlayingCard).
+    // Photo send (caption is classic HTML formattedText — captions
+    // cannot be Rich Messages in TDLib, so <h1>..<h6> in a caption
+    // are downgraded to bold on retry; see sendPhoto). `photo` is a
+    // TDLib remote file id (inputFileRemote) or a local file path
+    // (inputFileLocal). A remote HTTP(S) URL is NOT valid: the
+    // sender fails it honestly and the caller falls back to a text
+    // card (sendNowPlayingCard).
     virtual int64_t sendPhoto(int64_t chat_id, const std::string& photo,
                               const std::string& caption,
                               const InlineKeyboard& kb,
                               std::string* error_out = nullptr) = 0;
-    // Edit a message's text (HTML) and/or its inline keyboard.
+    // Edit a message's text (Rich Message, like sendMessageHtml)
+    // and/or its inline keyboard.
     virtual bool editMessageText(int64_t chat_id, int64_t message_id,
                                  const std::string& text,
                                  const InlineKeyboard& kb,
                                  std::string* error_out = nullptr) = 0;
-    // Edit a photo message's caption (HTML) and/or its keyboard.
+    // Edit a photo message's caption (classic HTML formattedText)
+    // and/or its keyboard.
     virtual bool editMessageCaption(int64_t chat_id, int64_t message_id,
                                     const std::string& caption,
                                     const InlineKeyboard& kb,
@@ -213,6 +243,9 @@ public:
                           std::string* error_out = nullptr) override;
     int64_t sendMessageHtml(int64_t chat_id, const std::string& text,
                             const InlineKeyboard& kb, int64_t reply_to = 0,
+                            std::string* error_out = nullptr) override;
+    int64_t sendRichMessage(int64_t chat_id, const rich::RichMessage& msg,
+                            const Json& reply_markup, int64_t reply_to = 0,
                             std::string* error_out = nullptr) override;
     int64_t sendMessageReplyKb(int64_t chat_id, const std::string& text,
                                const ReplyKeyboard& kb, int64_t reply_to = 0,
@@ -546,9 +579,11 @@ private:
     // Replies and returns the new message id (-1 on failure); schedules
     // clean-mode deletion of the bot's message.
     int64_t reply(const CommandContext& ctx, const std::string& text);
-    // HTML reply (parse_mode=HTML, web preview off) + clean-mode
+    // HTML reply (Rich Message, like sendMessageHtml) + clean-mode
     // scheduling. All Phase 9 UI text goes through this; user-derived
     // text inside must already be HTML-escaped (ui_texts::htmlEscape).
+    // On failure the TDLib error is reported to the owner (see
+    // reportOwnerError) instead of being dropped silently.
     int64_t replyHtml(const CommandContext& ctx, const std::string& text);
     // HTML reply with an inline keyboard.
     int64_t replyKb(const CommandContext& ctx, const std::string& text,
@@ -575,6 +610,14 @@ private:
     bool editCbKeyboard(const TgCallbackQuery& cq, const InlineKeyboard& kb);
     void replyError(const CommandContext& ctx, const IpcResult& r);
     void logToLogger(const std::string& text);
+    // Report an engine/send failure to the owner: one Rich Message
+    // DM to cfg_.owner_id (works from any chat, including groups)
+    // with the action, chat id and the TDLib error, plus the same
+    // line on stderr. A failure to notify the owner is logged only
+    // and never triggers another notification (no spam loops).
+    // No-op when no owner is configured (owner_id == 0).
+    void reportOwnerError(const std::string& action, int64_t chat_id,
+                          const std::string& error);
     void scheduleDelete(int64_t chat_id, int64_t message_id, int minutes);
     void deleteCommandMessage(const CommandContext& ctx);
 
@@ -945,6 +988,9 @@ private:
     RateLimiter& limiter_;
     std::string bot_username_;
     int64_t bot_id_ = 0;
+    // Reentrancy guard for reportOwnerError: while an owner
+    // notification is in flight, a nested failure only logs.
+    bool notifying_owner_ = false;
     std::chrono::steady_clock::time_point boot_time_ =
         std::chrono::steady_clock::now();
 

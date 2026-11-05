@@ -98,6 +98,7 @@ add_executable(parlay-core
     src/store.cpp
     src/scram.cpp
     src/tdlib_client.cpp
+    src/rich_message.cpp
     src/dispatcher.cpp
 )
 

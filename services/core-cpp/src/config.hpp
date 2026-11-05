@@ -160,7 +160,12 @@ struct Config {
     int port = 8080;  // PORT — core HTTP port (GUI /api surface, Phase 6 A2)
 
     // Group management (NoxBeats sudo/auth model, ported to env lists).
-    int64_t owner_id = 0;                    // OWNER_ID
+    // Default owner is the bot owner (8495104954); override with
+    // [telegram] owner_id in parlay.toml or the OWNER_ID env var
+    // (env wins). The owner has complete access in DM and groups:
+    // owner-only commands, sudo rights, blacklist exemption, and
+    // group-admin rights (see Dispatcher::isOwner / isChatAdmin).
+    int64_t owner_id = 8495104954;           // OWNER_ID
     std::set<int64_t> sudo_ids;              // SUDO_IDS, comma-sep (seeded into the store)
     int64_t logger_id = 0;                   // LOGGER_ID (log channel)
     std::set<int64_t> allow_chats;           // PARLAY_ALLOW_CHATS, comma-sep

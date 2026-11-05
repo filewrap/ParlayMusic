@@ -209,6 +209,13 @@ void applyToml(const toml::Document& doc, Config& c) {
                     "prefetch_lead_time_sec", "url_cache_ttl_sec"});
     // [ipc] holds the UDS socket path (Q6, Phase 4): the only key.
     checkKnownKeys(doc, "ipc", {"socket_path"});
+    // [telegram] holds the owner id (Rich Messages engine, 2026-11-05):
+    // the Telegram user id with complete owner-level access. Env
+    // OWNER_ID always wins over this key.
+    checkKnownKeys(doc, "telegram", {"owner_id"});
+
+    if (doc.has("telegram.owner_id"))
+        c.owner_id = tomlInt(doc, "telegram.owner_id");
 
     if (doc.has("rate_limit.chat.capacity"))
         c.rate_limit.chat.capacity =
@@ -341,12 +348,16 @@ void syncMirrors(Config& c) {
 // Unchanged from the pre-unification fromEnv(), except that the
 // duration/queue limits now flow through limits (above).
 void applyLegacyEnv(Config& c) {
+    std::string raw;
     c.bot_token = envStr("BOT_TOKEN");
     c.api_id = envInt("API_ID");
     c.api_hash = envStr("API_HASH");
     c.parlay_token = envStr("PARLAY_TOKEN");
     c.port = static_cast<int>(envInt("PORT", c.port));
-    c.owner_id = envInt("OWNER_ID");
+    // OWNER_ID wins over [telegram] owner_id and the built-in
+    // default — but only when it is actually set. An unconditional
+    // envInt here would reset a configured owner to 0.
+    if (envPresent("OWNER_ID", raw)) c.owner_id = envStrictInt("OWNER_ID");
     c.sudo_ids = envIdSet("SUDO_IDS");
     c.logger_id = envInt("LOGGER_ID");
     c.allow_chats = envIdSet("PARLAY_ALLOW_CHATS");

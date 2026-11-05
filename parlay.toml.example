@@ -124,6 +124,15 @@ url_cache_ttl_sec = 120
 [ipc]
 # socket_path = "data/parlay-backend.sock"
 
+# --- Telegram: owner ------------------------------------------------------
+# owner_id: the Telegram user id with complete owner-level access
+# (owner-only commands, sudo rights, blacklist exemption, group-admin
+# rights, and the destination for engine error reports). Default
+# 8495104954 (the bot owner). The OWNER_ID env var always wins over
+# this key. Set it to 0 to disable owner access entirely.
+[telegram]
+owner_id = 8495104954
+
 # --- Backend-only keys ------------------------------------------------------
 # The Go backend reads these from the [backend] table
 # (services/backend-go/internal/config/config.go). The C++ core ignores
