@@ -675,6 +675,36 @@ func validateMediaStream(r io.ReadCloser, source string) (io.ReadCloser, error) 
 	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 		display = streamURLShort(source)
 	}
+	// The DSP probe requires a seekable MediaSource. Preserve that
+	// capability for local files instead of hiding it behind a plain
+	// bufio.Reader.
+	if seeker, ok := r.(io.ReadSeeker); ok {
+		var first [1]byte
+		if _, err := seeker.Read(first[:]); err != nil {
+			_ = r.Close()
+			if err == io.EOF {
+				return nil, fmt.Errorf("open stream: empty response (0 bytes) for %s", display)
+			}
+			return nil, fmt.Errorf("open stream: peek first byte: %w", err)
+		}
+		if err := validateMediaFirstByte(first[0], display); err != nil {
+			_ = r.Close()
+			return nil, err
+		}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			_ = r.Close()
+			return nil, fmt.Errorf("open stream: rewind: %w", err)
+		}
+		return struct {
+			io.ReadSeeker
+			io.Closer
+		}{seeker, r}, nil
+	}
+
+	// HTTP bodies are forward-only. Spool them to a temporary file so
+	// WebM/Opus and MP4 probes can seek without making the decoder consume
+	// an already-buffered prefix. The request context still controls body
+	// reads, so a stalled source remains bounded by the caller's deadline.
 	br := bufio.NewReader(r)
 	b, err := br.Peek(1)
 	if err != nil {
@@ -684,15 +714,53 @@ func validateMediaStream(r io.ReadCloser, source string) (io.ReadCloser, error) 
 		}
 		return nil, fmt.Errorf("open stream: peek first byte: %w", err)
 	}
-	switch b[0] {
-	case '{', '<', '[':
+	if err := validateMediaFirstByte(b[0], display); err != nil {
 		_ = r.Close()
-		return nil, fmt.Errorf("open stream: response for %s starts with %q — an error document, not media", display, string(b[0]))
+		return nil, err
 	}
-	return struct {
-		io.Reader
-		io.Closer
-	}{br, r}, nil
+	tmp, err := os.CreateTemp("", "parlay-audio-*")
+	if err != nil {
+		_ = r.Close()
+		return nil, fmt.Errorf("open stream: create seekable spool: %w", err)
+	}
+	path := tmp.Name()
+	if _, err := io.Copy(tmp, br); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(path)
+		_ = r.Close()
+		return nil, fmt.Errorf("open stream: spool media: %w", err)
+	}
+	_ = r.Close()
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("open stream: rewind seekable spool: %w", err)
+	}
+	return &temporaryAudioFile{File: tmp, path: path}, nil
+}
+
+func validateMediaFirstByte(first byte, display string) error {
+	switch first {
+	case '{', '<', '[':
+		return fmt.Errorf("open stream: response for %s starts with %q — an error document, not media", display, string(first))
+	default:
+		return nil
+	}
+}
+
+// temporaryAudioFile owns the complete HTTP response and removes it when
+// the DSP closes the source.
+type temporaryAudioFile struct {
+	*os.File
+	path string
+}
+
+func (f *temporaryAudioFile) Close() error {
+	err := f.File.Close()
+	if removeErr := os.Remove(f.path); err == nil {
+		err = removeErr
+	}
+	return err
 }
 
 // streamURLShort renders a stream URL for logs: host plus the
@@ -719,6 +787,23 @@ func (m *Manager) PlayStream(ctx context.Context, chatID int64, r io.ReadCloser,
 		return fmt.Errorf("voice: play stream chat %d: nil stream reader", chatID)
 	}
 	return m.startStream(ctx, chatID, r, opts)
+}
+
+// WaitForFrames blocks until the current feed has sent real PCM to
+// ntgcalls. A connected call and a started DSP goroutine are not proof of
+// audio; this is the explicit audible-playback readiness gate.
+func (m *Manager) WaitForFrames(ctx context.Context, chatID int64) error {
+	m.mu.Lock()
+	call, ok := m.calls[chatID]
+	var feed *dspFeed
+	if ok {
+		feed = call.feed
+	}
+	m.mu.Unlock()
+	if !ok || feed == nil {
+		return fmt.Errorf("voice: wait for frames chat %d: no active feed", chatID)
+	}
+	return feed.WaitForFrames(ctx)
 }
 
 // startStream is the shared Play/PlayStream construction: bind the

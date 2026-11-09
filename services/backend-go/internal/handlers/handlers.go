@@ -485,6 +485,16 @@ func (h *Handlers) bindTrack(ctx context.Context, chatID int64, track model.Trac
 			}
 		}
 		if err := h.tryBindOnce(ctx, chatID, track, opts); err == nil {
+			// Do not call this a successful bind until the DSP has sent
+			// at least one real PCM frame to ntgcalls. A connected call or
+			// a running decoder goroutine alone can still produce silence.
+			frameCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+			frameErr := h.deps.Voice.WaitForFrames(frameCtx, chatID)
+			cancel()
+			if frameErr != nil {
+				lastErr = frameErr
+				break
+			}
 			h.setFeeding(chatID, track.ID)
 			return true, nil
 		} else {

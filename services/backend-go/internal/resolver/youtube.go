@@ -8,15 +8,16 @@
 //     call as serviceIntegrityDimensions.poToken; when the sidecar
 //     is down the call proceeds tokenless, exactly as before.
 //     ANDROID is the player fallback (0.81 s).
-//  2. NubCoders /info — signed MP4, ~2.4–9.8 s. Server-side
-//     bot-bypass; no cookies/PO token.
-//  3. Warm yt-dlp daemon — cookieless-first (cookies only for
-//     age-gated/members-only retries inside the daemon). yt-dlp
-//     defaults are IP-dependent (visionos,web works in the sandbox
-//     but fails on the VPS; full ladder 20–27 s), so it is LAST.
+//  2. Warm yt-dlp daemon using its explicit PO-token-aware mweb
+//     configuration. The daemon tries cookieless first and only uses
+//     the configured cookie file for an authentication-gated retry.
 //
-// WEB player is UNPLAYABLE (metadata only), so the player call always
-// uses ANDROID_VR (fallback ANDROID); search uses ANDROID first — WEB
+// There is deliberately no NubCoders, ANDROID, or anonymous third-party
+// stream fallback here. A resolver success must identify a source whose
+// media URL can actually be opened; otherwise the request fails honestly.
+//
+// WEB player is UNPLAYABLE (metadata only), so the player call uses
+// ANDROID_VR; search uses ANDROID first — WEB
 // gets WAF 403 on datacenter IPs (VPS 2026-11-04: WEB search 403,
 // resolves 6–13 s through the fallback chain) — with WEB second
 // (params=CAASAhAB, video-only results) and the daemon last.
@@ -159,26 +160,19 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 		if err == nil {
 			return track, nil
 		}
-		// Fallback: NubCoders /info -> signed MP4 (no cookies/PO token).
-		if ntrack, nerr := y.nubFallback(ctx, q); nerr == nil {
-			return ntrack, nil
-		}
-		// Player + API failed (age-gated / ciphered / unplayable):
-		// warm yt-dlp daemon fallback, exactly one path,
-		// cookieless-first (cookies only for age-gated retries
-		// inside the daemon).
+		// Native player failed: use only the PO-token-aware yt-dlp
+		// daemon. NubCoders is intentionally not part of playback.
 		if y.ytdlp != nil {
 			if dt, derr := y.resolveViaDaemon(ctx, vid); derr == nil {
 				return dt, nil
 			} else {
-				return Track{}, fmt.Errorf("youtube resolve failed for %s: player (%v) + nubcoders failed; yt-dlp daemon fallback also failed: %v", vid, err, derr)
+				return Track{}, fmt.Errorf("youtube resolve failed for %s: native ANDROID_VR (%v); PO-token yt-dlp also failed: %v", vid, err, derr)
 			}
 		}
 		return Track{}, err
 	}
-	// Free text: InnerTube search first (ANDROID, then WEB), player
-	// on the top hit; NubCoders is the fallback (search + stream in
-	// 1-2 calls), daemon last.
+	// Free text: search for metadata, then resolve the selected video
+	// through the same native-player/PO-token daemon path.
 	tracks, err := y.Search(ctx, q, 1)
 	if err != nil {
 		return Track{}, err
@@ -195,10 +189,6 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 		}
 		return resolved, nil
 	}
-	// Player failed: NubCoders fallback.
-	if track, nerr := y.nubFallback(ctx, q); nerr == nil {
-		return track, nil
-	}
 	if y.ytdlp != nil {
 		dstart := time.Now()
 		if dt, derr := y.resolveViaDaemon(ctx, tracks[0].ID); derr == nil && dt.StreamURL != "" {
@@ -208,7 +198,7 @@ func (y *YouTubeResolver) Resolve(ctx context.Context, query string) (Track, err
 			log.Printf("youtube: resolve daemon failed in %s: %v", time.Since(dstart), derr)
 		}
 	}
-	return tracks[0], nil
+	return Track{}, engineUnavailable(SourceYouTube, "video %s resolved as metadata only; no verified audio stream", tracks[0].ID)
 }
 
 // Search runs an InnerTube search (ANDROID first — WEB gets WAF 403 on
@@ -279,8 +269,8 @@ func (y *YouTubeResolver) Search(ctx context.Context, query string, limit int) (
 	return nil, engineUnavailable(SourceYouTube, "no YouTube results for %q", query)
 }
 
-// fetchVideo resolves one video id via the ANDROID_VR player call
-// (ANDROID fallback), returning title, duration and the best
+// fetchVideo resolves one video id via the ANDROID_VR player call,
+// returning title, duration and the best
 // adaptive audio stream URL (itag 251 Opus, else 140 AAC). A
 // web-minted PO token (internal/pot, bound to the video id) rides
 // on every player call as serviceIntegrityDimensions.poToken. A
@@ -291,7 +281,6 @@ func (y *YouTubeResolver) fetchVideo(ctx context.Context, videoID string) (Track
 	var lastErr error
 	for _, client := range []struct{ name, ver string }{
 		{innerTubeAndroidVR, innerTubeAndroidVRVer},
-		{innerTubeAndroid, innerTubeAndroidVer},
 	} {
 		track, err := y.fetchVideoWithClient(ctx, videoID, client.name, client.ver, false)
 		if err == nil {
@@ -617,10 +606,20 @@ func trackFromYtDlpInfo(info map[string]any, videoID string) Track {
 		DurationSec: int64(duration),
 		DurationStr: FormatDurationStr(duration, false),
 	}
-	if u, _ := info["url"].(string); u != "" {
-		t.StreamURL = u
-	} else if formats, ok := info["formats"].([]any); ok {
+	// Prefer an explicitly audio-only format. yt-dlp may put a selected
+	// audio+video aggregate in info.url even when adaptive audio formats
+	// are also present; feeding that URL to the audio decoder is invalid.
+	if formats, ok := info["formats"].([]any); ok {
 		t.StreamURL = pickYtDlpAudioURL(formats)
+	}
+	if t.StreamURL == "" {
+		if u, _ := info["url"].(string); u != "" {
+			acodec, _ := info["acodec"].(string)
+			vcodec, _ := info["vcodec"].(string)
+			if acodec != "" && acodec != "none" && (vcodec == "" || vcodec == "none") {
+				t.StreamURL = u
+			}
+		}
 	}
 	if thumb, _ := info["thumbnail"].(string); thumb != "" {
 		t.Thumbnail = thumb

@@ -114,11 +114,11 @@ func (c *Client) Refresh(ctx context.Context, videoID string) (string, error) {
 	return c.token(ctx, videoID, true)
 }
 
-// FormatPlayer renders a minted token the way yt-dlp expects a
-// player-context token: "web.player+<token>" (the --po-token CLI
+// FormatPlayer renders a minted token the way yt-dlp expects an
+// mweb player-context token: "mweb.player+<token>" (the --po-token CLI
 // format; see yt_dlp_worker.py).
 func FormatPlayer(token string) string {
-	return "web.player+" + token
+	return "mweb.player+" + token
 }
 
 func (c *Client) token(ctx context.Context, videoID string, bypassCache bool) (string, error) {

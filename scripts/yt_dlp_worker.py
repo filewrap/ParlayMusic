@@ -100,6 +100,10 @@ def _base_opts():
         "socket_timeout": 30,
         "retries": 3,
         "remote_components": ["ejs:github"],
+        # The VPS rejects the native Android clients. Keep playback on
+        # the explicit PO-token-compatible mweb client instead of
+        # silently returning a URL from another client.
+        "extractor_args": {"youtube": {"player_client": ["mweb"]}},
     }
 
 
@@ -115,8 +119,8 @@ def _ydl_for_po_token(po_token):
     logged.
     """
     opts = _base_opts()
-    opts["extractor_args"] = {"youtube": {"po_token": [po_token]}}
-    sys.stderr.write("yt-dlp: extract with po_token (client web, context player)\n")
+    opts["extractor_args"]["youtube"]["po_token"] = [po_token]
+    sys.stderr.write("yt-dlp: extract with po_token (client mweb, context player)\n")
     sys.stderr.flush()
     return yt_dlp.YoutubeDL(opts)
 
@@ -176,6 +180,11 @@ def _ydl_cookies():
             return None
         opts = _base_opts()
         opts["cookiefile"] = cf
+        # Resolve audio-only media. The default yt-dlp selection can
+        # return an audio+video aggregate whose URL is not a valid input
+        # for the audio DSP, or fail format selection after the mweb
+        # client has exposed only adaptive formats.
+        opts["format"] = "251/bestaudio/best"
         _YDL_COOKIES = yt_dlp.YoutubeDL(opts)
     return _YDL_COOKIES
 
@@ -220,7 +229,7 @@ def _download(params):
     outtmpl = os.path.join(outdir, "%(title).150B [%(id)s].%(ext)s")
     opts = _base_opts()
     opts.update({
-        "format": "bestaudio/best",
+        "format": "251/bestaudio/best",
         "outtmpl": outtmpl,
         "restrictfilenames": True,
         # NOTE: the mp3 extraction is NOT wired by "extractaudio" /
@@ -239,8 +248,8 @@ def _download(params):
     # The token rides only on the cookieless attempt (see module
     # docstring); the cookie retry below drops it again.
     if po_token:
-        opts["extractor_args"] = {"youtube": {"po_token": [po_token]}}
-        sys.stderr.write("yt-dlp: download with po_token (client web, context player)\n")
+        opts["extractor_args"]["youtube"]["po_token"] = [po_token]
+        sys.stderr.write("yt-dlp: download with po_token (client mweb, context player)\n")
         sys.stderr.flush()
     # Cookieless first (see module docstring); retry with cookies
     # only on an age/login gate.

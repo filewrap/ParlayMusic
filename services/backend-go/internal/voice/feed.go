@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -106,6 +107,37 @@ type dspFeed struct {
 	nextTrackID string
 }
 
+// WaitForFrames waits until the feed has successfully pushed at least one
+// PCM frame to the sink. Starting the DSP goroutine is not equivalent to
+// audible playback: OpenStream can succeed while decoding later fails, and
+// SendFrame can fail after the call has connected. Callers use this gate
+// before publishing a "playing" event.
+func (f *dspFeed) WaitForFrames(ctx context.Context) error {
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if f.FramesSent() > 0 {
+			return nil
+		}
+		if err := f.Err(); err != nil {
+			return fmt.Errorf("voice: dsp feed produced no frames: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("voice: waiting for first audio frame: %w", ctx.Err())
+		case <-f.done:
+			if f.FramesSent() == 0 {
+				if err := f.Err(); err != nil {
+					return fmt.Errorf("voice: dsp feed ended before first frame: %w", err)
+				}
+				return errors.New("voice: dsp feed ended before first frame")
+			}
+			return nil
+		case <-t.C:
+		}
+	}
+}
+
 // startDSPFeed starts the pump for stream and returns the feed.
 // onEOF is invoked exactly once when the decode stream ends: with
 // nil on a clean end of stream (track finished), or with the exact
@@ -195,7 +227,11 @@ func (f *dspFeed) pump(onEOF func(error)) {
 		}
 		f.mu.Lock()
 		f.framesSent++
+		framesSent := f.framesSent
 		f.mu.Unlock()
+		if framesSent == 1 {
+			log.Printf("voice: dsp feed chat %d sent first PCM frame (%d bytes)", f.chatID, len(frame))
+		}
 		frameIndex++
 		if transition {
 			f.fireTransition()
